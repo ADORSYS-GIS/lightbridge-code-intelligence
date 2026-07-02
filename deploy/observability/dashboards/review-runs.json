@@ -10,7 +10,7 @@
         "type": "grafana-postgresql-datasource",
         "uid": "${DS_POSTGRES}"
       },
-      "description": "Per review run: repository, PR/target, tier, status, and the key knobs projected from the redacted config blob (run_config_b64) plus the tools offered to the model at turn 0 (run_tools). Indexing runs are excluded (they persist neither). Paste a task id into the Task ID variable to inspect one run in full below.",
+      "description": "Per review run: repository, PR/target, tier, status, and the key knobs projected from the redacted config blob (run_config_b64) plus the tools offered to the model at turn 0 (run_tools). Indexing runs are excluded (they persist neither). Pick a run from the Task ID dropdown to inspect it in full below.",
       "fieldConfig": {
         "defaults": {},
         "overrides": []
@@ -82,20 +82,21 @@
         "type": "grafana-postgresql-datasource",
         "uid": "${DS_POSTGRES}"
       },
-      "description": "The full redacted ReviewConfig for the pasted task, pretty-printed WITHOUT the ~23KB system_prompt (see the next panel for that alone).",
+      "description": "The full redacted ReviewConfig for the selected run, one row per setting, WITHOUT the ~23KB system_prompt (see the next panel for that alone). Nested values (tools array, resilience/extra objects) appear as compact JSON text.",
       "fieldConfig": {
         "defaults": {},
         "overrides": [
           {
             "matcher": {
               "id": "byName",
-              "options": "config (no system_prompt)"
+              "options": "value"
             },
             "properties": [
               {
                 "id": "custom.cellOptions",
                 "value": {
-                  "type": "json-view"
+                  "type": "auto",
+                  "wrapText": true
                 }
               }
             ]
@@ -119,7 +120,7 @@
           "editorMode": "code",
           "format": "table",
           "rawQuery": true,
-          "rawSql": "SELECT jsonb_pretty(  (convert_from(decode(t.run_config_b64, 'base64'), 'UTF8'))::jsonb   - 'system_prompt') AS \"config (no system_prompt)\" FROM tasks t WHERE ${task_id:sqlstring} <> '' AND t.id::text = ${task_id:sqlstring} AND t.run_config_b64 IS NOT NULL",
+          "rawSql": "WITH cfg AS (  SELECT ((convert_from(decode(t.run_config_b64, 'base64'), 'UTF8'))::jsonb     - 'system_prompt') AS c   FROM tasks t   WHERE ${task_id:sqlstring} <> '' AND t.id::text = ${task_id:sqlstring}   AND t.run_config_b64 IS NOT NULL) SELECT kv.key AS \"setting\", kv.value AS \"value\" FROM cfg, jsonb_each_text(cfg.c) kv ORDER BY kv.key",
           "refId": "A"
         }
       ],
@@ -133,25 +134,10 @@
         "type": "grafana-postgresql-datasource",
         "uid": "${DS_POSTGRES}"
       },
-      "description": "The exact tool set offered to the model at turn 0 for the pasted task \u2014 the per-tier allowlist resolved with any MCP-discovered external-knowledge tools. Pretty-printed array of {name, source: builtin|mcp}.",
+      "description": "The exact tool set offered to the model at turn 0 for the selected run \u2014 the per-tier allowlist resolved with any MCP-discovered external-knowledge tools. One row per tool: name and source (builtin|mcp).",
       "fieldConfig": {
         "defaults": {},
-        "overrides": [
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "offered tools"
-            },
-            "properties": [
-              {
-                "id": "custom.cellOptions",
-                "value": {
-                  "type": "json-view"
-                }
-              }
-            ]
-          }
-        ]
+        "overrides": []
       },
       "gridPos": {
         "h": 12,
@@ -170,7 +156,7 @@
           "editorMode": "code",
           "format": "table",
           "rawQuery": true,
-          "rawSql": "SELECT jsonb_pretty(t.run_tools) AS \"offered tools\" FROM tasks t WHERE ${task_id:sqlstring} <> '' AND t.id::text = ${task_id:sqlstring} AND t.run_tools IS NOT NULL",
+          "rawSql": "SELECT e->>'name' AS \"tool\", e->>'source' AS \"source\" FROM tasks t, jsonb_array_elements(t.run_tools) e WHERE ${task_id:sqlstring} <> '' AND t.id::text = ${task_id:sqlstring} AND t.run_tools IS NOT NULL ORDER BY e->>'name'",
           "refId": "A"
         }
       ],
@@ -245,15 +231,20 @@
         "auto": false,
         "auto_count": 30,
         "auto_min": "10s",
+        "datasource": {
+          "type": "grafana-postgresql-datasource",
+          "uid": "${DS_POSTGRES}"
+        },
         "hide": 0,
         "id": "00000000-0000-0000-0000-000000000000",
         "includeAll": false,
         "label": "Task ID (run detail)",
         "multi": false,
         "name": "task_id",
-        "query": "",
+        "query": "SELECT t.id::text AS \"__value\", coalesce(r.owner || '/' || r.name, t.repository_id::text) || ' #' || t.target_id   || ' \u00b7 ' || t.tier || ' \u00b7 ' || to_char(t.created_at, 'MM-DD HH24:MI') AS \"__text\" FROM tasks t LEFT JOIN repositories r ON r.id = t.repository_id WHERE t.run_config_b64 IS NOT NULL AND $__timeFilter(t.created_at) ORDER BY t.created_at DESC, t.id DESC LIMIT 200",
+        "refresh": 2,
         "skipUrlSync": false,
-        "type": "textbox"
+        "type": "query"
       }
     ]
   },
