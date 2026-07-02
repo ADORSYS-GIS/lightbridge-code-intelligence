@@ -226,8 +226,13 @@ pub async fn get_review(pool: &PgPool, task_id: Uuid) -> Result<Option<ReviewRow
 const PRIOR_REVIEWS_CAP: i64 = 20;
 
 /// **All** prior reviews of the same target (ADR-0040 + ADR-0065), newest first, as
-/// `(summary, findings)` — used to feed a re-review its own past output so it re-derives-then-reconciles
-/// instead of anchoring on a single prior verdict. Joins `reviews` to `tasks` to match the same
+/// `(ordinal, summary, findings)` — used to feed a re-review its own past output so it
+/// re-derives-then-reconciles instead of anchoring on a single prior verdict. `ordinal` is the review's
+/// **true 1-based chronological position** (1 = the first review ever posted on this target), computed
+/// with a window function over the FULL prior set *before* the `LIMIT` — so "review #1" stays the first
+/// review even once a PR accumulates more than [`PRIOR_REVIEWS_CAP`] priors, and the labels never shift
+/// between runs. `ORDER BY created_at DESC, task_id DESC` carries a unique tie-breaker so the "latest"
+/// pick is deterministic even on equal timestamps. Joins `reviews` to `tasks` to match the same
 /// `(repository_id, target_type, target_id)` as the current task, excluding the current task itself.
 /// Returns an empty vec when this target has no earlier posted review (e.g. the first review on a freshly
 /// opened PR). Best-effort context: the caller treats a query error as "no prior reviews" so a DB hiccup
@@ -238,13 +243,16 @@ pub async fn all_prior_reviews_for_target(
     target_type: &str,
     target_id: i64,
     current_task_id: Uuid,
-) -> Result<Vec<(String, Value)>, sqlx::Error> {
-    sqlx::query_as::<_, (String, Value)>(
-        "SELECT r.summary, r.findings \
-         FROM reviews r JOIN tasks t ON t.id = r.task_id \
-         WHERE t.repository_id = $1 AND t.target_type = $2 AND t.target_id = $3 \
-           AND r.task_id <> $4 \
-         ORDER BY r.created_at DESC \
+) -> Result<Vec<(i64, String, Value)>, sqlx::Error> {
+    sqlx::query_as::<_, (i64, String, Value)>(
+        "SELECT ordinal, summary, findings FROM ( \
+             SELECT r.summary, r.findings, r.created_at, r.task_id, \
+                    ROW_NUMBER() OVER (ORDER BY r.created_at ASC, r.task_id ASC) AS ordinal \
+             FROM reviews r JOIN tasks t ON t.id = r.task_id \
+             WHERE t.repository_id = $1 AND t.target_type = $2 AND t.target_id = $3 \
+               AND r.task_id <> $4 \
+         ) prior \
+         ORDER BY created_at DESC, task_id DESC \
          LIMIT $5",
     )
     .bind(repository_id)
@@ -256,12 +264,23 @@ pub async fn all_prior_reviews_for_target(
     .await
 }
 
-/// The `findings` JSON arrays already posted by prior Lightbridge reviews on the **same head_sha** as the
-/// current run (ADR-0065, Option B — finalize dedup). We match on head_sha, not just the target, because
-/// line numbers drift across commits: a `(file, line, title)` dedup key is only safe within one commit.
-/// Excludes the current task (a re-finalize must not dedup against its own in-flight review). Returns one
-/// `Value` (a findings array) per prior review; the caller flattens them into a set of normalized keys.
-/// Best-effort: a query error is treated by the caller as "nothing posted yet" (no dedup), never fatal.
+/// The `findings` JSON arrays already posted — or **queued for posting** — by prior Lightbridge reviews
+/// on the **same head_sha** as the current run (ADR-0065, Option B — finalize dedup). We match on
+/// head_sha, not just the target, because line numbers drift across commits: a `(file, line, title)`
+/// dedup key is only safe within one commit.
+///
+/// Two sources, unioned:
+/// - `reviews` — reviews the reconciler already delivered (persisted at post time, ADR-0035);
+/// - `github_outbox` `review`-kind rows still `pending` — a review **enqueued but not yet posted**
+///   (reconciler backoff, or two rapid re-reviews racing finalize). Without these, the second finalize
+///   wouldn't see the first run's findings and would double-post; their findings ride in the payload
+///   (`payload->'findings_json'`, baked at produce time per ADR-0059). `posted` rows are skipped — the
+///   reconciler persists them into `reviews` on delivery, so the first arm already covers them.
+///
+/// Excludes the current task in both arms (a re-finalize must not dedup against its own in-flight
+/// review). Returns one `Value` (a findings array) per prior review; the caller flattens them into a set
+/// of normalized keys. Best-effort: a query error is treated by the caller as "nothing posted yet" (no
+/// dedup), never fatal.
 pub async fn posted_findings_for_head(
     pool: &PgPool,
     repository_id: i64,
@@ -274,7 +293,13 @@ pub async fn posted_findings_for_head(
         "SELECT r.findings \
          FROM reviews r JOIN tasks t ON t.id = r.task_id \
          WHERE t.repository_id = $1 AND t.target_type = $2 AND t.target_id = $3 \
-           AND t.head_sha = $4 AND r.task_id <> $5",
+           AND t.head_sha = $4 AND r.task_id <> $5 \
+         UNION ALL \
+         SELECT o.payload->'findings_json' \
+         FROM github_outbox o JOIN tasks t ON t.id = o.task_id \
+         WHERE o.kind = 'review' AND o.status = 'pending' \
+           AND t.repository_id = $1 AND t.target_type = $2 AND t.target_id = $3 \
+           AND t.head_sha = $4 AND o.task_id <> $5",
     )
     .bind(repository_id)
     .bind(target_type)
@@ -3050,7 +3075,8 @@ mod tests {
     }
 
     /// ADR-0040 + ADR-0065: a re-review on the same target finds ALL earlier reviews (newest first),
-    /// scoped to the same `(repository_id, target_type, target_id)` and excluding the current task.
+    /// each carrying its TRUE chronological ordinal (1 = the first review ever), scoped to the same
+    /// `(repository_id, target_type, target_id)` and excluding the current task.
     #[sqlx::test]
     async fn all_prior_reviews_are_target_scoped_ordered_and_exclude_current(pool: PgPool) {
         let repo_id = seed(&pool).await;
@@ -3101,21 +3127,36 @@ mod tests {
         .await
         .unwrap();
 
-        // The re-review sees BOTH priors, newest first (second before first), excluding itself.
+        // Force distinct, ordered timestamps: two upserts in one fast test can land in the same
+        // microsecond, and the query's tie-breaker (task_id) is a random UUID — deterministic for the
+        // QUERY but not for this test's expectation of "first before second".
+        sqlx::query(
+            "UPDATE reviews SET created_at = created_at - interval '1 minute' WHERE task_id = $1",
+        )
+        .bind(first)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // The re-review sees BOTH priors, newest first (second before first), excluding itself — and
+        // each carries its true chronological ordinal (window over the full set, not the fetched slice).
         let priors = all_prior_reviews_for_target(&pool, repo_id, "pull_request", 7, rereview)
             .await
             .unwrap();
         assert_eq!(priors.len(), 2, "both prior reviews returned");
-        assert_eq!(priors[0].0, "second verdict", "newest first");
-        assert_eq!(priors[1].0, "first verdict");
-        assert_eq!(priors[0].1[0]["title"], "nit");
+        assert_eq!(priors[0].1, "second verdict", "newest first");
+        assert_eq!(priors[0].0, 2, "the newest review is chronologically #2");
+        assert_eq!(priors[1].1, "first verdict");
+        assert_eq!(priors[1].0, 1, "the oldest review is chronologically #1");
+        assert_eq!(priors[0].2[0]["title"], "nit");
 
-        // From the first task's own perspective its own review is excluded → only the second remains.
+        // From the first task's own perspective its own review is excluded → only the second remains,
+        // and its ordinal is computed over the remaining set visible to that task.
         let from_first = all_prior_reviews_for_target(&pool, repo_id, "pull_request", 7, first)
             .await
             .unwrap();
         assert_eq!(from_first.len(), 1, "a task is never its own prior review");
-        assert_eq!(from_first[0].0, "second verdict");
+        assert_eq!(from_first[0].1, "second verdict");
 
         // A different target on the same repo doesn't leak across.
         assert!(
@@ -3202,6 +3243,61 @@ mod tests {
             posted.len(),
             1,
             "still only the *other* task's review, not its own"
+        );
+
+        // A review ENQUEUED but not yet delivered (pending `github_outbox` row — reconciler backoff, or
+        // two rapid re-reviews racing finalize) also counts: its findings ride the payload JSON.
+        let queued_same_head = create_task(
+            &pool,
+            &NewTask {
+                run_epoch: 2,
+                ..pr_task(repo_id, "same")
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let payload = serde_json::json!({
+            "pr": 7, "body": "b", "summary": "v", "comments": [],
+            "inline_n": 1, "deferred_n": 0, "out_of_scope_n": 0,
+            "findings_json": [{ "file": "q.rs", "line": 5, "title": "queued finding", "body": "b" }],
+            "label_findings": true, "label_error": false
+        });
+        enqueue_github_post(
+            &pool,
+            Some(queued_same_head),
+            99,
+            "acme",
+            "rocket",
+            "review",
+            &payload,
+            &format!("{queued_same_head}:review"),
+        )
+        .await
+        .unwrap();
+        let posted = posted_findings_for_head(&pool, repo_id, "pull_request", 7, "same", current)
+            .await
+            .unwrap();
+        assert_eq!(posted.len(), 2, "pending outbox review counts as posted");
+        assert!(
+            posted.iter().any(|arr| arr[0]["title"] == "queued finding"),
+            "the queued review's findings come from the outbox payload"
+        );
+
+        // Once delivered (`posted`), the outbox arm skips it — the reconciler persists it into
+        // `reviews` at that point, so the first arm covers it without double-counting.
+        sqlx::query("UPDATE github_outbox SET status = 'posted' WHERE task_id = $1")
+            .bind(queued_same_head)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let posted = posted_findings_for_head(&pool, repo_id, "pull_request", 7, "same", current)
+            .await
+            .unwrap();
+        assert_eq!(
+            posted.len(),
+            1,
+            "a delivered outbox row no longer contributes (reviews row takes over)"
         );
     }
 

@@ -164,8 +164,9 @@ pub async fn get_context(
     // this target so it re-derives-then-reconciles instead of anchoring on a single verdict. Only for
     // `review` kind (an `ask` reply or an `index` run has nothing to reconcile). Best-effort: a lookup
     // error degrades to a blind re-review (the old behavior), never a failed task. The DB returns the
-    // reviews newest-first; we map them to `PriorReview` with a 1-based chronological ordinal (1 = oldest)
-    // so the compressed older-review lines have a stable, legible reference.
+    // reviews newest-first, each carrying its TRUE chronological ordinal (computed by a window function
+    // over the full prior set BEFORE the fetch cap, so "review #1" is always the first review ever posted
+    // on this target and the labels never shift between runs once a PR exceeds the cap).
     let prior_reviews = if context.kind == "review" {
         match crate::db::all_prior_reviews_for_target(
             pool,
@@ -177,13 +178,10 @@ pub async fn get_context(
         .await
         {
             Ok(rows) if !rows.is_empty() => {
-                let n = rows.len();
                 let priors: Vec<crate::review::PriorReview> = rows
                     .into_iter()
-                    .enumerate()
-                    .map(|(i, (summary, findings))| crate::review::PriorReview {
-                        // rows[0] is newest → ordinal n; rows[n-1] is oldest → ordinal 1.
-                        ordinal: n - i,
+                    .map(|(ordinal, summary, findings)| crate::review::PriorReview {
+                        ordinal: ordinal.max(1) as usize,
                         summary,
                         findings,
                     })
@@ -1091,11 +1089,12 @@ pub async fn finalize_review(
 
         // Cross-run dedup (ADR-0065, Option B): a re-review must not re-post a finding already sitting on
         // this PR from a prior Lightbridge review. Drop findings whose normalized `(file, line, title)`
-        // key matches one already posted on the SAME head_sha — line numbers drift across commits, so a
-        // key match is only trustworthy within one commit. Sourced from our own persisted `reviews`
-        // (ADR-0035), not the GitHub API. Best-effort: a lookup error means "nothing posted yet" → no
-        // dedup, never a failed finalize. The prompt-side re-derive-then-retract framing (Option C)
-        // reduces re-emission upstream; this is the deterministic backstop.
+        // key matches one already posted — or already QUEUED in the outbox — on the SAME head_sha (line
+        // numbers drift across commits, so a key match is only trustworthy within one commit). Sourced
+        // from our own persisted `reviews` + pending `github_outbox` review rows (ADR-0035/0059), not the
+        // GitHub API. Best-effort: a lookup error means "nothing posted yet" → no dedup, never a failed
+        // finalize. The prompt-side re-derive-then-retract framing (Option C) reduces re-emission
+        // upstream; this is the deterministic backstop.
         let (findings, deduped_n) = match context.head_sha.as_deref() {
             Some(head) => {
                 let posted_keys: std::collections::HashSet<(String, u32, String)> =
@@ -1110,9 +1109,9 @@ pub async fn finalize_review(
                     .await
                     {
                         Ok(arrays) => arrays
-                            .iter()
+                            .into_iter()
                             .flat_map(|arr| {
-                                serde_json::from_value::<Vec<crate::review::Finding>>(arr.clone())
+                                serde_json::from_value::<Vec<crate::review::Finding>>(arr)
                                     .unwrap_or_default()
                             })
                             .map(|f| crate::review::dedup_key(&f.file, f.line, &f.title))

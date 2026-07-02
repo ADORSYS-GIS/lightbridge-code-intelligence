@@ -149,16 +149,18 @@ pub struct PriorReview {
 ///
 /// `priors` is ordered **newest-first** (index 0 = the latest review). Returns `None` when there is
 /// nothing useful to inject (every prior has an empty verdict and no findings) so the caller leaves the
-/// field unset. The block is capped at [`PRIOR_BLOCK_CHAR_CAP`] with an explicit truncation marker.
+/// field unset.
+///
+/// Budgeting: the header + the LATEST review's detail get the [`PRIOR_BLOCK_CHAR_CAP`] budget first (a
+/// pathological latest section is cut char-safely by [`cap_block`]); older compressed lines are then
+/// appended only while the block stays under budget, and any omitted are counted in an explicit marker —
+/// so the latest review's detail always survives and truncation is never silent.
 pub fn format_prior_reviews(priors: &[PriorReview]) -> Option<String> {
     // Nothing useful anywhere → no block (mirrors the old single-review empty case). A prior counts as
-    // content if it has a non-empty verdict OR at least one parseable finding — an empty/`[]`/malformed
-    // findings blob with a blank verdict contributes nothing.
-    let has_findings = |p: &PriorReview| {
-        serde_json::from_value::<Vec<Finding>>(p.findings.clone())
-            .map(|v| !v.is_empty())
-            .unwrap_or(false)
-    };
+    // content if it has a non-empty verdict OR a non-empty findings array — an empty/`[]`/malformed
+    // findings blob with a blank verdict contributes nothing. (`as_array` — no clone+deserialize just to
+    // test emptiness; the detailed sections parse properly below.)
+    let has_findings = |p: &PriorReview| p.findings.as_array().is_some_and(|a| !a.is_empty());
     let any_content = priors
         .iter()
         .any(|p| !p.summary.trim().is_empty() || has_findings(p));
@@ -184,16 +186,43 @@ pub fn format_prior_reviews(priors: &[PriorReview]) -> Option<String> {
         } else {
             out.push_str(" — (no verdict or findings recorded)\n");
         }
+        // The latest detail is budgeted FIRST: if it alone blows the cap (pathological verdict/title
+        // lengths), cut it char-safely and stop — the older reviews are the lower-signal tail.
+        if out.len() > PRIOR_BLOCK_CHAR_CAP {
+            let mut capped = cap_block(out);
+            if !older.is_empty() {
+                capped.push_str(&format!(
+                    "… [{} earlier automated review(s) omitted to keep this context bounded] …\n",
+                    older.len(),
+                ));
+            }
+            return Some(capped);
+        }
 
+        // Older reviews: append one-liners while the block stays under budget; count what's omitted and
+        // say so explicitly (ADR-0065: never truncate silently).
         if !older.is_empty() {
             out.push_str("\n### Earlier prior reviews (compressed)\n");
-            for p in older {
-                out.push_str(&compress_prior_line(p));
+            let mut omitted = 0usize;
+            for (i, p) in older.iter().enumerate() {
+                let line = compress_prior_line(p);
+                if out.len() + line.len() > PRIOR_BLOCK_CHAR_CAP {
+                    // Budget exhausted: omit this and everything older (no gaps in the sequence).
+                    omitted = older.len() - i;
+                    break;
+                }
+                out.push_str(&line);
+            }
+            if omitted > 0 {
+                out.push_str(&format!(
+                    "\n… [{omitted} earlier automated review(s) omitted to keep this context \
+                     bounded] …\n",
+                ));
             }
         }
     }
 
-    Some(cap_block(out))
+    Some(out)
 }
 
 /// Detail rendering for the latest prior review: verdict + up to [`PRIOR_FINDINGS_CAP`] findings, each as
@@ -268,18 +297,26 @@ fn one_line(s: &str) -> String {
 
 /// Cap the assembled block at [`PRIOR_BLOCK_CHAR_CAP`], cutting on a line boundary and appending an
 /// explicit truncation marker (ADR-0065: note truncation, don't drop silently). No-op when under budget.
+///
+/// The cut is **UTF-8-safe**: `PRIOR_BLOCK_CHAR_CAP` is a byte offset, and finding titles/verdicts are
+/// arbitrary text (accents, emoji, CJK), so the cap can land inside a multi-byte code point — slicing
+/// there would panic and wedge the whole task-context fetch. Walk back to a char boundary first, then to
+/// the last newline so no line is severed mid-way. The marker makes no claim about *what* was omitted —
+/// this path can cut the latest review's own detail, not just an older tail.
 fn cap_block(block: String) -> String {
     if block.len() <= PRIOR_BLOCK_CHAR_CAP {
         return block;
     }
+    let mut boundary = PRIOR_BLOCK_CHAR_CAP;
+    while boundary > 0 && !block.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
     // Cut at the last newline within budget so we never sever a line mid-way.
-    let cut = block[..PRIOR_BLOCK_CHAR_CAP]
-        .rfind('\n')
-        .unwrap_or(PRIOR_BLOCK_CHAR_CAP);
+    let cut = block[..boundary].rfind('\n').unwrap_or(boundary);
     let mut truncated = block[..cut].to_string();
     truncated.push_str(
-        "\n\n… [prior-review context truncated to keep the prompt bounded — the omitted tail is older, \
-         lower-signal; re-derive from the diff if relevant] …\n",
+        "\n\n… [prior-review context truncated here to stay within the prompt budget — re-derive from \
+         the diff; anything omitted was context only] …\n",
     );
     truncated
 }
@@ -895,11 +932,12 @@ mod tests {
     }
 
     #[test]
-    fn format_prior_reviews_truncates_with_explicit_marker() {
-        // Many older reviews with long titles blow past the char cap → an explicit truncation marker.
+    fn format_prior_reviews_truncates_with_explicit_marker_and_keeps_latest() {
+        // Many older reviews with long titles blow past the char cap → the LATEST review's detail
+        // always survives (it is budgeted first) and the omitted older lines are counted explicitly.
         let big_title = "x".repeat(400);
         let mut priors = vec![prior(60, "latest", vec![finding("a.ts", 1, "leak")])];
-        for i in 1..=59 {
+        for i in (1..=59).rev() {
             priors.push(prior(
                 i,
                 "older verdict here",
@@ -913,8 +951,70 @@ mod tests {
             block.len()
         );
         assert!(
-            block.contains("prior-review context truncated"),
-            "truncation is noted explicitly, not silent"
+            block.contains("[P1/correctness] a.ts:1 — leak"),
+            "the latest review's detail is never sacrificed to older lines: {block}"
+        );
+        assert!(
+            block.contains("earlier automated review(s) omitted"),
+            "omission is counted explicitly, not silent"
+        );
+    }
+
+    #[test]
+    fn format_prior_reviews_latest_overflow_is_cut_with_neutral_marker() {
+        // A pathological LATEST review that alone exceeds the cap is cut (char-safely) with a marker
+        // that does NOT claim the omitted content was older/lower-signal — here it is the latest's own
+        // findings — and the skipped older reviews are still counted.
+        let huge_title = "🐛 mega finding ".repeat(80); // multi-byte chars in the overflowing section
+        let latest_findings: Vec<Finding> = (1..=30)
+            .map(|i| finding("a.ts", i, huge_title.trim()))
+            .collect();
+        let priors = vec![
+            prior(3, "latest verdict", latest_findings),
+            prior(2, "older", vec![finding("b.ts", 1, "old nit")]),
+            prior(1, "oldest", vec![]),
+        ];
+        let block = format_prior_reviews(&priors).expect("some context");
+        assert!(
+            block.len() <= PRIOR_BLOCK_CHAR_CAP + 400,
+            "capped near budget: {} chars",
+            block.len()
+        );
+        assert!(
+            block.contains("truncated here to stay within the prompt budget"),
+            "neutral truncation marker present: {block}"
+        );
+        assert!(
+            !block.contains("omitted tail is older"),
+            "the marker must not claim the cut content was older — it can be the latest's own findings"
+        );
+        assert!(
+            block.contains("2 earlier automated review(s) omitted"),
+            "the skipped older reviews are still counted: {block}"
+        );
+    }
+
+    #[test]
+    fn cap_block_cut_is_utf8_safe() {
+        // Regression (gemini/codex on #266): `PRIOR_BLOCK_CHAR_CAP` is a byte offset and the block is
+        // arbitrary text — the cap can land INSIDE a multi-byte code point, and a naive `block[..CAP]`
+        // slice panics there (wedging the whole task-context fetch). Build a block whose CAP'th byte
+        // straddles a 4-byte emoji and prove the cut walks back to a char boundary instead.
+        let mut s = String::from("first line\n");
+        s.push_str(&"a".repeat(PRIOR_BLOCK_CHAR_CAP - s.len() - 1));
+        s.push_str(&"😀".repeat(8)); // first emoji starts 1 byte before the cap → cap is mid-char
+        assert!(
+            !s.is_char_boundary(PRIOR_BLOCK_CHAR_CAP),
+            "test setup: the cap must straddle a code point"
+        );
+        let capped = cap_block(s); // must not panic
+        assert!(
+            capped.len() < PRIOR_BLOCK_CHAR_CAP + 300,
+            "cut near the budget"
+        );
+        assert!(
+            capped.contains("truncated here to stay within the prompt budget"),
+            "marker present: {capped}"
         );
     }
 
