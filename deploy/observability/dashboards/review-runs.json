@@ -241,7 +241,7 @@
         "label": "Task ID (run detail)",
         "multi": false,
         "name": "task_id",
-        "query": "SELECT t.id::text AS \"__value\", coalesce(r.owner || '/' || r.name, t.repository_id::text) || ' #' || t.target_id   || ' \u00b7 ' || t.tier || ' \u00b7 ' || to_char(t.created_at, 'MM-DD HH24:MI') AS \"__text\" FROM tasks t LEFT JOIN repositories r ON r.id = t.repository_id WHERE t.run_config_b64 IS NOT NULL AND $__timeFilter(t.created_at) ORDER BY t.created_at DESC LIMIT 200",
+        "query": "SELECT t.id::text AS \"__value\", coalesce(r.owner || '/' || r.name, t.repository_id::text) || ' #' || t.target_id   || ' \u00b7 ' || t.tier || ' \u00b7 ' || to_char(t.created_at, 'MM-DD HH24:MI') AS \"__text\" FROM tasks t LEFT JOIN repositories r ON r.id = t.repository_id WHERE t.run_config_b64 IS NOT NULL AND $__timeFilter(t.created_at) ORDER BY t.created_at DESC, t.id DESC LIMIT 200",
         "refresh": 2,
         "skipUrlSync": false,
         "type": "query"

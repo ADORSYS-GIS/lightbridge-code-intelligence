@@ -69,7 +69,8 @@ def dashboard_builder() -> dashboard.Dashboard:
             "  || ' · ' || t.tier || ' · ' || to_char(t.created_at, 'MM-DD HH24:MI') AS \"__text\" "
             "FROM tasks t LEFT JOIN repositories r ON r.id = t.repository_id "
             "WHERE t.run_config_b64 IS NOT NULL AND $__timeFilter(t.created_at) "
-            "ORDER BY t.created_at DESC LIMIT 200"
+            # id DESC tie-breaks same-timestamp rows so the dropdown order is deterministic.
+            "ORDER BY t.created_at DESC, t.id DESC LIMIT 200"
         )
     )
 
