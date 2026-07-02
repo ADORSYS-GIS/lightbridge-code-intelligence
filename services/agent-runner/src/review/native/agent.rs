@@ -1058,9 +1058,12 @@ fn build_messages(
         user.push_str(sast);
     }
 
-    // Prior-review context (A, #137): the agent's own most recent review of this target, so a re-review
-    // reconciles with — rather than contradicts — its past output. Placed after the diff (the thing under
-    // review) and before the repo's own instructions; the tool-protocol in the system message stays
+    // Prior-review context (ADR-0040 + ADR-0065): the agent's own prior reviews of this target,
+    // pre-formatted control-plane-side as explicitly-UNTRUSTED context. The block's framing is
+    // re-derive-then-reconcile: review the diff independently first, then retract any prior finding that
+    // can't be re-derived (Option C) — it does NOT tell the agent to restate priors. All reconcile
+    // wording lives in that string; the runner injects it verbatim. Placed after the diff (the thing
+    // under review) and before the repo's own instructions; the tool-protocol in the system message stays
     // authoritative. `None` on a first review, so a fresh PR reads exactly as before.
     if let Some(prior) = prior_reviews {
         user.push_str("\n\n");
