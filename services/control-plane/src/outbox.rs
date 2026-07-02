@@ -103,10 +103,12 @@ pub async fn enqueue_reply(
     .await
 }
 
-/// Enqueue a lifecycle reaction (👀 `eyes` / 👍 `+1` / 👎 `-1` / 😕 `confused`, ADR-0068) — keyed by
-/// content so the distinct lifecycle reactions don't collide (`<task>:reaction:<content>`). When
-/// `comment_id` is `Some`, the reconciler reacts on that ISSUE COMMENT (the `@mention` that triggered the
-/// task) rather than the PR/issue body — so an @mention review's acknowledgment lands on the request.
+/// Enqueue a lifecycle reaction (👀 `eyes` / 😕 `confused`, ADR-0068) — keyed by content so the distinct
+/// lifecycle reactions don't collide (`<task>:reaction:<content>`). When `comment_id` is `Some`, the
+/// reconciler reacts on that ISSUE COMMENT (the `@mention` that triggered the task) rather than the
+/// PR/issue body — so an @mention review's acknowledgment lands on the request. The 👍/👎 verdict pair
+/// goes through [`enqueue_verdict_reaction`] instead — a content-scoped key would let a verdict flip
+/// across finalize attempts stack BOTH reactions.
 pub async fn enqueue_reaction(
     pool: &PgPool,
     t: &Target<'_>,
@@ -115,6 +117,33 @@ pub async fn enqueue_reaction(
     comment_id: Option<i64>,
 ) -> Result<bool, sqlx::Error> {
     let key = format!("{}:reaction:{content}", t.key_prefix(issue));
+    let value = reaction_payload(issue, content, comment_id);
+    crate::db::enqueue_github_post(
+        pool,
+        t.task_id,
+        t.installation_id,
+        t.owner,
+        t.repo,
+        "reaction",
+        &value,
+        &key,
+    )
+    .await
+}
+
+/// Enqueue the ADR-0068 **verdict** reaction (👍 `+1` clean / 👎 `-1` findings) under ONE shared dedup
+/// key — `<task>:reaction:verdict` — with the content only in the payload. A task gets exactly one
+/// verdict: if a re-finalize (crash-then-requeue, or a stray retry against a now-empty buffer) computes a
+/// *different* verdict, the `ON CONFLICT DO NOTHING` makes the first one win instead of leaving both 👍
+/// and 👎 on the trigger.
+pub async fn enqueue_verdict_reaction(
+    pool: &PgPool,
+    t: &Target<'_>,
+    issue: i64,
+    content: &str,
+    comment_id: Option<i64>,
+) -> Result<bool, sqlx::Error> {
+    let key = format!("{}:reaction:verdict", t.key_prefix(issue));
     let value = reaction_payload(issue, content, comment_id);
     crate::db::enqueue_github_post(
         pool,

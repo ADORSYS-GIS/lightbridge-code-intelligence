@@ -136,7 +136,7 @@ pub async fn run<L: TaskLauncher>(
                 }
             }
             _ = reap_tick.tick() => {
-                if let Err(error) = reaper::reap_once(&pool, &launcher).await {
+                if let Err(error) = reaper::reap_once(&pool, &launcher, &review).await {
                     tracing::error!(%error, "reaper cycle failed");
                 }
                 // Durable backstop for repo data purge (a spawned purge can be lost on restart).
@@ -253,8 +253,8 @@ async fn dispatch<L: TaskLauncher>(
             }
             // ADR-0068: 👀 means "seen AND work started" — enqueue it now the agent Job is launched (the
             // queued→running-and-dispatched transition), not at webhook receipt. Best-effort: a failure
-            // here must never fail the dispatch. Only PR review tasks react; the target is the @mention
-            // comment when mention-triggered, else the PR body.
+            // here must never fail the dispatch. PR tasks and @mention-triggered tasks react; the target
+            // is the @mention comment when mention-triggered, else the PR body.
             react_work_started(pool, task, review).await;
         }
         Err(error) => {
@@ -267,13 +267,15 @@ async fn dispatch<L: TaskLauncher>(
     }
 }
 
-/// Enqueue the 👀 "work started" reaction (ADR-0068) for a just-launched PR review task. It rides the
-/// egress outbox (ADR-0059) like every other reaction; the reconciler posts it. Everything here is
-/// best-effort — the dispatch already succeeded, so a DB/queue hiccup only means the 👀 is missing, never
-/// a failed launch. Non-PR tasks (issue answers) get no 👀. Needs owner/repo + the trigger comment id,
-/// which the lightweight `ClaimedTask` lacks, so it loads the task context.
+/// Enqueue the 👀 "work started" reaction (ADR-0068) for a just-launched task. It rides the egress
+/// outbox (ADR-0059) like every other reaction; the reconciler posts it. Everything here is best-effort
+/// — the dispatch already succeeded, so a DB/queue hiccup only means the 👀 is missing, never a failed
+/// launch. Who reacts: every PR task, plus any `@mention`-triggered task — a plain-ISSUE mention gets
+/// its 👀 on the triggering comment (removing receipt-time 👀 must not leave issue asks
+/// unacknowledged). Index tasks (no human audience) never react. Needs owner/repo + the trigger comment
+/// id, which the lightweight `ClaimedTask` lacks, so it loads the task context.
 async fn react_work_started(pool: &PgPool, task: &db::ClaimedTask, review: &ReviewSection) {
-    if !review.reactions_enabled() || task.target_type != "pull_request" {
+    if !review.reactions_enabled() || task.command_text == "index" {
         return;
     }
     let context = match db::get_task_context(pool, task.id).await {
@@ -284,6 +286,9 @@ async fn react_work_started(pool: &PgPool, task: &db::ClaimedTask, review: &Revi
             return;
         }
     };
+    if context.target_type != "pull_request" && context.trigger_comment_id.is_none() {
+        return; // a non-PR task with no trigger comment has nowhere meaningful to react
+    }
     let t = crate::outbox::Target {
         task_id: Some(task.id),
         installation_id: context.installation_id,
