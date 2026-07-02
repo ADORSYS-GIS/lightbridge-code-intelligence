@@ -220,32 +220,68 @@ pub async fn get_review(pool: &PgPool, task_id: Uuid) -> Result<Option<ReviewRow
         .await
 }
 
-/// The summary + findings of the most recent prior review on the same target (A, #137) — used to feed a
-/// re-review its own past output so it reconciles instead of starting blind. Joins `reviews` to `tasks`
-/// to match the same `(repository_id, target_type, target_id)` as the current task, excluding the
-/// current task itself, newest first. Returns `None` when this target has no earlier posted review
-/// (e.g. the first review on a freshly opened PR). Best-effort context: the caller treats a query error
-/// as "no prior review" so a DB hiccup degrades to the old blind re-review rather than failing the task.
-pub async fn latest_prior_review_for_target(
+/// How many prior reviews of a target to carry into a re-review's context (ADR-0040 + ADR-0065). The
+/// latest is rendered in detail and the rest compressed; this bounds the DB read and the block. A PR
+/// re-reviewed dozens of times keeps only the most recent slice — older passes are the least relevant.
+const PRIOR_REVIEWS_CAP: i64 = 20;
+
+/// **All** prior reviews of the same target (ADR-0040 + ADR-0065), newest first, as
+/// `(summary, findings)` — used to feed a re-review its own past output so it re-derives-then-reconciles
+/// instead of anchoring on a single prior verdict. Joins `reviews` to `tasks` to match the same
+/// `(repository_id, target_type, target_id)` as the current task, excluding the current task itself.
+/// Returns an empty vec when this target has no earlier posted review (e.g. the first review on a freshly
+/// opened PR). Best-effort context: the caller treats a query error as "no prior reviews" so a DB hiccup
+/// degrades to the old blind re-review rather than failing the task. Capped at [`PRIOR_REVIEWS_CAP`].
+pub async fn all_prior_reviews_for_target(
     pool: &PgPool,
     repository_id: i64,
     target_type: &str,
     target_id: i64,
     current_task_id: Uuid,
-) -> Result<Option<(String, Value)>, sqlx::Error> {
+) -> Result<Vec<(String, Value)>, sqlx::Error> {
     sqlx::query_as::<_, (String, Value)>(
         "SELECT r.summary, r.findings \
          FROM reviews r JOIN tasks t ON t.id = r.task_id \
          WHERE t.repository_id = $1 AND t.target_type = $2 AND t.target_id = $3 \
            AND r.task_id <> $4 \
          ORDER BY r.created_at DESC \
-         LIMIT 1",
+         LIMIT $5",
     )
     .bind(repository_id)
     .bind(target_type)
     .bind(target_id)
     .bind(current_task_id)
-    .fetch_optional(pool)
+    .bind(PRIOR_REVIEWS_CAP)
+    .fetch_all(pool)
+    .await
+}
+
+/// The `findings` JSON arrays already posted by prior Lightbridge reviews on the **same head_sha** as the
+/// current run (ADR-0065, Option B — finalize dedup). We match on head_sha, not just the target, because
+/// line numbers drift across commits: a `(file, line, title)` dedup key is only safe within one commit.
+/// Excludes the current task (a re-finalize must not dedup against its own in-flight review). Returns one
+/// `Value` (a findings array) per prior review; the caller flattens them into a set of normalized keys.
+/// Best-effort: a query error is treated by the caller as "nothing posted yet" (no dedup), never fatal.
+pub async fn posted_findings_for_head(
+    pool: &PgPool,
+    repository_id: i64,
+    target_type: &str,
+    target_id: i64,
+    head_sha: &str,
+    current_task_id: Uuid,
+) -> Result<Vec<Value>, sqlx::Error> {
+    sqlx::query_scalar::<_, Value>(
+        "SELECT r.findings \
+         FROM reviews r JOIN tasks t ON t.id = r.task_id \
+         WHERE t.repository_id = $1 AND t.target_type = $2 AND t.target_id = $3 \
+           AND t.head_sha = $4 AND r.task_id <> $5",
+    )
+    .bind(repository_id)
+    .bind(target_type)
+    .bind(target_id)
+    .bind(head_sha)
+    .bind(current_task_id)
+    .fetch_all(pool)
     .await
 }
 
@@ -3013,23 +3049,29 @@ mod tests {
         assert!(get_review(&pool, Uuid::new_v4()).await.unwrap().is_none());
     }
 
-    /// A (#137): a re-review on the same target finds the earlier review's summary + findings, scoped to
-    /// the same `(repository_id, target_type, target_id)` and excluding the current task.
+    /// ADR-0040 + ADR-0065: a re-review on the same target finds ALL earlier reviews (newest first),
+    /// scoped to the same `(repository_id, target_type, target_id)` and excluding the current task.
     #[sqlx::test]
-    async fn latest_prior_review_is_target_scoped_and_excludes_current(pool: PgPool) {
+    async fn all_prior_reviews_are_target_scoped_ordered_and_exclude_current(pool: PgPool) {
         let repo_id = seed(&pool).await;
-        // Two tasks on the SAME PR (#7), different heads — the original review and the re-review.
+        // Three tasks on the SAME PR (#7): two prior reviews and the current re-review.
         let first = create_task(&pool, &pr_task(repo_id, "h1"))
             .await
             .unwrap()
             .unwrap();
-        let rereview = create_task(&pool, &pr_task(repo_id, "h2"))
+        let second = create_task(&pool, &pr_task(repo_id, "h2"))
+            .await
+            .unwrap()
+            .unwrap();
+        let rereview = create_task(&pool, &pr_task(repo_id, "h3"))
             .await
             .unwrap()
             .unwrap();
 
-        let findings = serde_json::json!([{ "file": "a.rs", "line": 3, "priority": "P1",
+        let f1 = serde_json::json!([{ "file": "a.rs", "line": 3, "priority": "P1",
             "category": "quality", "title": "leak", "body": "b" }]);
+        let f2 = serde_json::json!([{ "file": "b.rs", "line": 9, "priority": "P2",
+            "category": "style", "title": "nit", "body": "b" }]);
         upsert_review(
             &pool,
             first,
@@ -3038,37 +3080,128 @@ mod tests {
             1,
             0,
             0,
-            &findings,
+            &f1,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        upsert_review(
+            &pool,
+            second,
+            "second verdict",
+            "body",
+            1,
+            0,
+            0,
+            &f2,
             None,
             None,
         )
         .await
         .unwrap();
 
-        // The re-review sees the first review (excludes itself, which has no review yet).
-        let prior = latest_prior_review_for_target(&pool, repo_id, "pull_request", 7, rereview)
+        // The re-review sees BOTH priors, newest first (second before first), excluding itself.
+        let priors = all_prior_reviews_for_target(&pool, repo_id, "pull_request", 7, rereview)
             .await
-            .unwrap()
-            .expect("prior review found");
-        assert_eq!(prior.0, "first verdict");
-        assert_eq!(prior.1[0]["title"], "leak");
+            .unwrap();
+        assert_eq!(priors.len(), 2, "both prior reviews returned");
+        assert_eq!(priors[0].0, "second verdict", "newest first");
+        assert_eq!(priors[1].0, "first verdict");
+        assert_eq!(priors[0].1[0]["title"], "nit");
 
-        // From the first task's own perspective there is no *other* review → None.
-        assert!(
-            latest_prior_review_for_target(&pool, repo_id, "pull_request", 7, first)
-                .await
-                .unwrap()
-                .is_none(),
-            "a task is never its own prior review"
-        );
+        // From the first task's own perspective its own review is excluded → only the second remains.
+        let from_first = all_prior_reviews_for_target(&pool, repo_id, "pull_request", 7, first)
+            .await
+            .unwrap();
+        assert_eq!(from_first.len(), 1, "a task is never its own prior review");
+        assert_eq!(from_first[0].0, "second verdict");
 
         // A different target on the same repo doesn't leak across.
         assert!(
-            latest_prior_review_for_target(&pool, repo_id, "pull_request", 999, rereview)
+            all_prior_reviews_for_target(&pool, repo_id, "pull_request", 999, rereview)
                 .await
                 .unwrap()
-                .is_none(),
+                .is_empty(),
             "scoped to the target id"
+        );
+    }
+
+    /// ADR-0065 (Option B): the finalize dedup source — findings already posted on the SAME head_sha,
+    /// excluding the current task. A prior review on a *different* head_sha is not returned (line drift).
+    #[sqlx::test]
+    async fn posted_findings_for_head_is_head_scoped_and_excludes_current(pool: PgPool) {
+        let repo_id = seed(&pool).await;
+        let prior_same_head = create_task(&pool, &pr_task(repo_id, "same"))
+            .await
+            .unwrap()
+            .unwrap();
+        let prior_other_head = create_task(&pool, &pr_task(repo_id, "other"))
+            .await
+            .unwrap()
+            .unwrap();
+        // The current re-review shares head_sha "same" with `prior_same_head` (a new run_epoch).
+        let current = create_task(
+            &pool,
+            &NewTask {
+                run_epoch: 1,
+                ..pr_task(repo_id, "same")
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        let f_same =
+            serde_json::json!([{ "file": "a.rs", "line": 3, "title": "leak", "body": "b" }]);
+        let f_other =
+            serde_json::json!([{ "file": "b.rs", "line": 9, "title": "other", "body": "b" }]);
+        upsert_review(
+            &pool,
+            prior_same_head,
+            "v",
+            "b",
+            1,
+            0,
+            0,
+            &f_same,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        upsert_review(
+            &pool,
+            prior_other_head,
+            "v",
+            "b",
+            1,
+            0,
+            0,
+            &f_other,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let posted = posted_findings_for_head(&pool, repo_id, "pull_request", 7, "same", current)
+            .await
+            .unwrap();
+        assert_eq!(posted.len(), 1, "only the same-head prior is returned");
+        assert_eq!(posted[0][0]["title"], "leak");
+
+        // The current task never dedups against its own (not-yet-posted) review.
+        upsert_review(&pool, current, "v", "b", 1, 0, 0, &f_same, None, None)
+            .await
+            .unwrap();
+        let posted = posted_findings_for_head(&pool, repo_id, "pull_request", 7, "same", current)
+            .await
+            .unwrap();
+        assert_eq!(
+            posted.len(),
+            1,
+            "still only the *other* task's review, not its own"
         );
     }
 

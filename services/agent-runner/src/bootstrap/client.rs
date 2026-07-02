@@ -35,9 +35,10 @@ pub struct TaskContext {
     /// (ADR-0025). Defaults to `false` (index) if an older control plane omits the field.
     #[serde(default)]
     pub repo_indexed: bool,
-    /// The agent's own prior review of this target, pre-formatted by the control plane (A, #137). Present
-    /// only on a re-review where an earlier review exists; injected into the prompt so the run reconciles
-    /// with its past output instead of contradicting itself. Defaults to `None` (blind re-review, the old
+    /// The agent's own prior reviews of this target, pre-formatted by the control plane (ADR-0040 +
+    /// ADR-0065). Present only on a re-review where an earlier review exists; injected as explicitly
+    /// UNTRUSTED context so the run re-derives from the diff, then reconciles — retracting prior findings
+    /// it cannot reproduce rather than restating them. Defaults to `None` (blind re-review, the old
     /// behavior) if an older control plane omits the field.
     #[serde(default)]
     pub prior_reviews: Option<String>,

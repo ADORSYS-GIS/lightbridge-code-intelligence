@@ -1,7 +1,7 @@
 # ADR-0065: Re-review must not duplicate — dedup on unchanged commits, reconcile by re-deriving
 
-- **Status:** Proposed
-- **Date:** 2026-06-28
+- **Status:** Accepted
+- **Date:** 2026-06-28 (amended 2026-07-02)
 - **Deciders:** @stephane-segning
 
 ## Context and Problem Statement
@@ -46,6 +46,10 @@ How should a re-review behave when the code hasn't meaningfully changed?
 
 ## Decision Outcome
 
+> **Superseded by the [2026-07-02 amendment](#amendment--2026-07-02-accepted-as-implemented) below:**
+> Option A was **dropped** and all-priors summarization added. The paragraph below is the original
+> Proposed outcome, kept for the record.
+
 Chosen: **A + B + C together.** **A** avoids the wasted run and the duplicate in the common case (re-review,
 no new commits). **B** is the correctness backstop for when a run *does* happen (new commits with overlapping
 findings) — the control plane dedups inline comments against the prior review so a finding is never posted
@@ -54,7 +58,42 @@ breaking the echo: the agent re-derives, then reconciles, and actively **retract
 ADR **refines ADR-0040**, it does not revert it — prior reviews are still injected; their *output* is now
 constrained.
 
-**Proposed** — open for discussion, especially the force-re-run keyword (A) and the dedup key (B).
+## Amendment — 2026-07-02 (Accepted, as implemented)
+
+On review, the owner **revised** the decision. **Option A (unchanged-`head_sha` short-circuit) is
+DROPPED.** The premise — "a re-review of unchanged code has nothing new to say" — is wrong for an agent
+whose output is **non-deterministic**: repeated invocations on the same PR/commit legitimately surface
+*different* real findings (that non-determinism is exactly what ADR-0040 documented). Short-circuiting
+would suppress a genuinely-useful second look to save a run. **The reviewer must always run fully** and
+be free to produce a different review; correctness is enforced at the *output*, not by skipping the run.
+No force-re-run keyword is needed — there is nothing to force past.
+
+What ships instead:
+
+- **B (finalize dedup) — kept.** Before posting, drop any finding whose **normalized key** — `file`,
+  `line`, and a **whitespace-collapsed + case-folded title** — matches one already posted on this PR by a
+  prior Lightbridge review. The source of truth is our **persisted `reviews.findings`** (ADR-0022/0035),
+  not the GitHub API. Dedup is scoped to priors on the **same `head_sha`**: `(file, line, title)` is only
+  a safe identity *within one commit* — line numbers drift across commits, so a cross-commit match would
+  be unsound and could drop a distinct finding. The count dropped is logged (`deduped_n`).
+
+- **C (re-derive-then-reconcile) — kept and strengthened.** ADR-0040's *"reconcile, don't contradict"*
+  **anchors** the model: a prior **false positive** gets *restated* unchecked (the poisoning observed on
+  vymalo-shop#303–305 and webank-mobile#112). The injected block is reframed: prior findings are
+  **UNVERIFIED HYPOTHESES** from an earlier automated pass, possibly wrong. The model must **re-derive its
+  review from the diff first**, then reconcile — **explicitly retracting** any prior finding it cannot
+  re-derive, and never inheriting one without re-verifying it against the code.
+
+- **New: summarize ALL prior reviews, not just the latest.** ADR-0040 injected only the single most-recent
+  review; the "Future" note there anticipated carrying more. We now fetch **every** prior review of the
+  target (excluding the current task) and build the context block **deterministically in Rust** (no LLM
+  call): the **latest** review keeps detail (verdict + findings, `PRIOR_FINDINGS_CAP = 30`), **older**
+  reviews are compressed to **one line each** (chronological ordinal, one-line verdict, finding count +
+  titles only). The whole block is capped (`PRIOR_BLOCK_CHAR_CAP`) with an **explicit truncation marker**
+  rather than a silent cut, in the same idiom as the finding cap.
+
+This refines — does not revert — ADR-0040: prior reviews are still injected; their framing (untrusted
+hypotheses, re-derive-first) and their *output* (deduped at finalize) are now constrained.
 
 ### Consequences
 

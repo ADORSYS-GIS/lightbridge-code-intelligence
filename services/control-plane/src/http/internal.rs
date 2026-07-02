@@ -160,12 +160,14 @@ pub async fn get_context(
         .unwrap_or(None)
         .is_some();
 
-    // Prior-review context (A, #137): on a re-review, feed the agent its own most recent review of this
-    // target so it reconciles instead of contradicting itself across runs. Only for `review` kind (an
-    // `ask` reply or an `index` run has nothing to reconcile). Best-effort: a lookup error degrades to a
-    // blind re-review (the old behavior), never a failed task.
+    // Prior-review context (ADR-0040 + ADR-0065): on a re-review, feed the agent ALL its prior reviews of
+    // this target so it re-derives-then-reconciles instead of anchoring on a single verdict. Only for
+    // `review` kind (an `ask` reply or an `index` run has nothing to reconcile). Best-effort: a lookup
+    // error degrades to a blind re-review (the old behavior), never a failed task. The DB returns the
+    // reviews newest-first; we map them to `PriorReview` with a 1-based chronological ordinal (1 = oldest)
+    // so the compressed older-review lines have a stable, legible reference.
     let prior_reviews = if context.kind == "review" {
-        match crate::db::latest_prior_review_for_target(
+        match crate::db::all_prior_reviews_for_target(
             pool,
             context.repository_id,
             &context.target_type,
@@ -174,10 +176,21 @@ pub async fn get_context(
         )
         .await
         {
-            Ok(Some((summary, findings))) => {
-                crate::review::format_prior_review(&summary, &findings)
+            Ok(rows) if !rows.is_empty() => {
+                let n = rows.len();
+                let priors: Vec<crate::review::PriorReview> = rows
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, (summary, findings))| crate::review::PriorReview {
+                        // rows[0] is newest → ordinal n; rows[n-1] is oldest → ordinal 1.
+                        ordinal: n - i,
+                        summary,
+                        findings,
+                    })
+                    .collect();
+                crate::review::format_prior_reviews(&priors)
             }
-            Ok(None) => None,
+            Ok(_) => None,
             Err(error) => {
                 tracing::warn!(%error, task_id = %id, "prior-review lookup failed (non-fatal)");
                 None
@@ -1075,6 +1088,50 @@ pub async fn finalize_review(
                 resources: Vec::new(),
             })
             .collect();
+
+        // Cross-run dedup (ADR-0065, Option B): a re-review must not re-post a finding already sitting on
+        // this PR from a prior Lightbridge review. Drop findings whose normalized `(file, line, title)`
+        // key matches one already posted on the SAME head_sha — line numbers drift across commits, so a
+        // key match is only trustworthy within one commit. Sourced from our own persisted `reviews`
+        // (ADR-0035), not the GitHub API. Best-effort: a lookup error means "nothing posted yet" → no
+        // dedup, never a failed finalize. The prompt-side re-derive-then-retract framing (Option C)
+        // reduces re-emission upstream; this is the deterministic backstop.
+        let (findings, deduped_n) = match context.head_sha.as_deref() {
+            Some(head) => {
+                let posted_keys: std::collections::HashSet<(String, u32, String)> =
+                    match crate::db::posted_findings_for_head(
+                        pool,
+                        context.repository_id,
+                        &context.target_type,
+                        context.target_id,
+                        head,
+                        id,
+                    )
+                    .await
+                    {
+                        Ok(arrays) => arrays
+                            .iter()
+                            .flat_map(|arr| {
+                                serde_json::from_value::<Vec<crate::review::Finding>>(arr.clone())
+                                    .unwrap_or_default()
+                            })
+                            .map(|f| crate::review::dedup_key(&f.file, f.line, &f.title))
+                            .collect(),
+                        Err(error) => {
+                            tracing::warn!(%error, task_id = %id, "posted-findings lookup failed (non-fatal, no dedup)");
+                            std::collections::HashSet::new()
+                        }
+                    };
+                crate::review::dedup_against_posted(findings, &posted_keys)
+            }
+            None => (findings, 0),
+        };
+        if deduped_n > 0 {
+            tracing::info!(
+                task_id = %id, deduped_n,
+                "re-review dedup: dropped findings already posted on this head_sha (ADR-0065)"
+            );
+        }
         // The model's `finish` verdict, if it produced one. `None` = an exhausted/clean pass (no
         // verdict) — the FAST body then shows its banner alone, while the DEEP body / stored copy fall
         // back to the default so the verdict is never empty.
