@@ -32,7 +32,7 @@
           "editorMode": "code",
           "format": "table",
           "rawQuery": true,
-          "rawSql": "WITH runs AS (  SELECT t.id, t.created_at, t.repository_id, t.target_type, t.target_id,          t.tier, t.status, t.run_tools,          (convert_from(decode(t.run_config_b64, 'base64'), 'UTF8'))::jsonb AS cfg   FROM tasks t   WHERE t.run_config_b64 IS NOT NULL AND $__timeFilter(t.created_at)) SELECT runs.created_at AS \"created\", coalesce(r.owner || '/' || r.name, runs.repository_id::text) AS \"repository\", runs.target_type AS \"target\", runs.target_id AS \"number\", runs.tier, runs.status, runs.cfg->>'model' AS \"model\", runs.cfg->>'temperature' AS \"temp\", runs.cfg->>'top_p' AS \"top_p\", runs.cfg->>'max_tokens' AS \"max_tokens\", runs.cfg->>'max_turns' AS \"max_turns\", runs.cfg->>'context_window' AS \"ctx_window\", runs.cfg->>'stream' AS \"stream\", coalesce(jsonb_array_length(runs.run_tools), 0) AS \"offered\", (SELECT string_agg(e->>'name', ', ' ORDER BY e->>'name')  FROM jsonb_array_elements(runs.run_tools) e) AS \"offered tools\", runs.id AS \"task id\" FROM runs LEFT JOIN repositories r ON r.id = runs.repository_id ORDER BY runs.created_at DESC LIMIT 200",
+          "rawSql": "WITH runs AS MATERIALIZED (  SELECT t.id, t.created_at, t.repository_id, t.target_type, t.target_id,          t.tier, t.status, t.run_tools,          (convert_from(decode(t.run_config_b64, 'base64'), 'UTF8'))::jsonb AS cfg   FROM tasks t   WHERE t.run_config_b64 IS NOT NULL AND $__timeFilter(t.created_at)) SELECT runs.created_at AS \"created\", coalesce(r.owner || '/' || r.name, runs.repository_id::text) AS \"repository\", runs.target_type AS \"target\", runs.target_id AS \"number\", runs.tier, runs.status, runs.cfg->>'model' AS \"model\", runs.cfg->>'temperature' AS \"temp\", runs.cfg->>'top_p' AS \"top_p\", runs.cfg->>'max_tokens' AS \"max_tokens\", runs.cfg->>'max_turns' AS \"max_turns\", runs.cfg->>'context_window' AS \"ctx_window\", runs.cfg->>'stream' AS \"stream\", coalesce(jsonb_array_length(runs.run_tools), 0) AS \"offered\", (SELECT string_agg(e->>'name', ', ' ORDER BY e->>'name')  FROM jsonb_array_elements(runs.run_tools) e) AS \"offered tools\", runs.id AS \"task id\" FROM runs LEFT JOIN repositories r ON r.id = runs.repository_id ORDER BY runs.created_at DESC, runs.id DESC LIMIT 200",
           "refId": "A"
         }
       ],
@@ -68,7 +68,7 @@
           "editorMode": "code",
           "format": "time_series",
           "rawQuery": true,
-          "rawSql": "SELECT $__timeGroupAlias(t.created_at, $__interval), t.tier AS \"tier\", count(*) AS \"runs\" FROM tasks t WHERE t.run_config_b64 IS NOT NULL AND $__timeFilter(t.created_at) GROUP BY 1, 2 ORDER BY 1",
+          "rawSql": "SELECT $__timeGroupAlias(t.created_at, $__interval), t.tier AS \"tier\", count(*) AS \"runs\" FROM tasks t WHERE t.run_config_b64 IS NOT NULL AND $__timeFilter(t.created_at) GROUP BY 1, 2 ORDER BY 1, 2",
           "refId": "A"
         }
       ],
@@ -85,7 +85,22 @@
       "description": "The full redacted ReviewConfig for the pasted task, pretty-printed WITHOUT the ~23KB system_prompt (see the next panel for that alone).",
       "fieldConfig": {
         "defaults": {},
-        "overrides": []
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "config (no system_prompt)"
+            },
+            "properties": [
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "json-view"
+                }
+              }
+            ]
+          }
+        ]
       },
       "gridPos": {
         "h": 12,
@@ -104,7 +119,7 @@
           "editorMode": "code",
           "format": "table",
           "rawQuery": true,
-          "rawSql": "SELECT jsonb_pretty(  (convert_from(decode(t.run_config_b64, 'base64'), 'UTF8'))::jsonb   - 'system_prompt') AS \"config (no system_prompt)\" FROM tasks t WHERE '${task_id}' <> '' AND t.id::text = '${task_id}' AND t.run_config_b64 IS NOT NULL",
+          "rawSql": "SELECT jsonb_pretty(  (convert_from(decode(t.run_config_b64, 'base64'), 'UTF8'))::jsonb   - 'system_prompt') AS \"config (no system_prompt)\" FROM tasks t WHERE ${task_id:sqlstring} <> '' AND t.id::text = ${task_id:sqlstring} AND t.run_config_b64 IS NOT NULL",
           "refId": "A"
         }
       ],
@@ -121,7 +136,22 @@
       "description": "The exact tool set offered to the model at turn 0 for the pasted task \u2014 the per-tier allowlist resolved with any MCP-discovered external-knowledge tools. Pretty-printed array of {name, source: builtin|mcp}.",
       "fieldConfig": {
         "defaults": {},
-        "overrides": []
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "offered tools"
+            },
+            "properties": [
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "json-view"
+                }
+              }
+            ]
+          }
+        ]
       },
       "gridPos": {
         "h": 12,
@@ -140,7 +170,7 @@
           "editorMode": "code",
           "format": "table",
           "rawQuery": true,
-          "rawSql": "SELECT jsonb_pretty(t.run_tools) AS \"offered tools\" FROM tasks t WHERE '${task_id}' <> '' AND t.id::text = '${task_id}' AND t.run_tools IS NOT NULL",
+          "rawSql": "SELECT jsonb_pretty(t.run_tools) AS \"offered tools\" FROM tasks t WHERE ${task_id:sqlstring} <> '' AND t.id::text = ${task_id:sqlstring} AND t.run_tools IS NOT NULL",
           "refId": "A"
         }
       ],
@@ -157,7 +187,23 @@
       "description": "The verbatim reviewer system_prompt this run was configured with \u2014 the exact ~23KB of guidance the model received, decoded from the redacted config blob.",
       "fieldConfig": {
         "defaults": {},
-        "overrides": []
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "system_prompt"
+            },
+            "properties": [
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "auto",
+                  "wrapText": true
+                }
+              }
+            ]
+          }
+        ]
       },
       "gridPos": {
         "h": 14,
@@ -176,7 +222,7 @@
           "editorMode": "code",
           "format": "table",
           "rawQuery": true,
-          "rawSql": "SELECT ((convert_from(decode(t.run_config_b64, 'base64'), 'UTF8'))::jsonb   ->>'system_prompt') AS \"system_prompt\" FROM tasks t WHERE '${task_id}' <> '' AND t.id::text = '${task_id}' AND t.run_config_b64 IS NOT NULL",
+          "rawSql": "SELECT ((convert_from(decode(t.run_config_b64, 'base64'), 'UTF8'))::jsonb   ->>'system_prompt') AS \"system_prompt\" FROM tasks t WHERE ${task_id:sqlstring} <> '' AND t.id::text = ${task_id:sqlstring} AND t.run_config_b64 IS NOT NULL",
           "refId": "A"
         }
       ],

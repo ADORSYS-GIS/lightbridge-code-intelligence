@@ -13,21 +13,30 @@ guess. Projected knobs: `model`, `tier`, `temperature`, `top_p`, `max_tokens`, `
 
 `decode(..., 'base64')` throws on malformed input; every row here is runner-written so that is
 acceptable, and the detail panels additionally guard on a non-empty `${task_id}` so an unset textbox
-yields no rows rather than a cast/decode error.
+yields no rows rather than a cast/decode error. The detail panels interpolate the textbox via
+Grafana's `:sqlstring` format (a single-quoted, SQL-escaped literal) — deliberately stricter than
+the house `'${var}'` pattern, because this variable is FREE TEXT while the dropdown variables on the
+other dashboards are enum-constrained.
 """
 
 from __future__ import annotations
 
 from grafana_foundation_sdk.builders import dashboard, table, timeseries
+from grafana_foundation_sdk.models.dashboard import DynamicConfigValue
 
 from .common import POSTGRES, Layout, sql
 
 UID = "lci-review-runs"
 
-# Decode the base64 config blob to jsonb ONCE per row (a CTE/LATERAL, not per projected column).
-# `cfg` is the decoded object; the giant `system_prompt` is only pulled in the detail panels.
+# Decode the base64 config blob to jsonb ONCE per row. MATERIALIZED is load-bearing: PG >= 12 inlines
+# a plain single-reference CTE into the outer query, which re-expands `cfg` into one
+# convert_from(decode(...)) call PER PROJECTED COLUMN — seven decodes per row instead of one, for
+# every row in the time window before the LIMIT sort. MATERIALIZED forces the CTE to be computed
+# first so the decode really does run once per row. Grafana passes rawSql through verbatim, so the
+# keyword is safe. `cfg` is the decoded object; the giant `system_prompt` is only pulled in the
+# detail panels.
 _RUNS_CTE = (
-    "WITH runs AS ("
+    "WITH runs AS MATERIALIZED ("
     "  SELECT t.id, t.created_at, t.repository_id, t.target_type, t.target_id, "
     "         t.tier, t.status, t.run_tools, "
     "         (convert_from(decode(t.run_config_b64, 'base64'), 'UTF8'))::jsonb AS cfg "
@@ -74,7 +83,8 @@ def dashboard_builder() -> dashboard.Dashboard:
                 " FROM jsonb_array_elements(runs.run_tools) e) AS \"offered tools\", "
                 "runs.id AS \"task id\" "
                 "FROM runs LEFT JOIN repositories r ON r.id = runs.repository_id "
-                "ORDER BY runs.created_at DESC LIMIT 200"
+                # id DESC tie-breaks same-timestamp rows so the ordering is deterministic.
+                "ORDER BY runs.created_at DESC, runs.id DESC LIMIT 200"
             )
         )
         .grid_pos(layout.place(24, 12))
@@ -92,15 +102,24 @@ def dashboard_builder() -> dashboard.Dashboard:
                 "t.tier AS \"tier\", count(*) AS \"runs\" "
                 "FROM tasks t "
                 "WHERE t.run_config_b64 IS NOT NULL AND $__timeFilter(t.created_at) "
-                "GROUP BY 1, 2 ORDER BY 1",
+                "GROUP BY 1, 2 ORDER BY 1, 2",
                 fmt="time_series",
             )
         )
         .grid_pos(layout.place(24, 7))
     )
 
-    # --- Run detail (only when task_id is set). The `'${task_id}' <> ''` guard short-circuits the
-    # decode when the textbox is empty, so an unset/blank id returns no rows rather than erroring. ---
+    # --- Run detail (only when task_id is set). `${task_id:sqlstring}` interpolates as a
+    # single-quoted, SQL-escaped literal (free-text textbox, so escaping matters); the `<> ''` guard
+    # short-circuits the decode when the textbox is empty, so an unset/blank id returns no rows
+    # rather than erroring. Cell overrides matter here: default table cells collapse multi-line
+    # content to one truncated line, so jsonb_pretty output gets a json-view cell and the ~23KB
+    # prompt a text-wrapped cell — without them the payload is only reachable via Inspect → Data. ---
+    _JSON_CELL = [DynamicConfigValue(id_val="custom.cellOptions", value={"type": "json-view"})]
+    _WRAP_CELL = [
+        DynamicConfigValue(id_val="custom.cellOptions", value={"type": "auto", "wrapText": True})
+    ]
+
     detail_config = (
         table.Panel()
         .title("Run config for $task_id (system_prompt omitted)")
@@ -115,10 +134,11 @@ def dashboard_builder() -> dashboard.Dashboard:
                 "  (convert_from(decode(t.run_config_b64, 'base64'), 'UTF8'))::jsonb "
                 "  - 'system_prompt') AS \"config (no system_prompt)\" "
                 "FROM tasks t "
-                "WHERE '${task_id}' <> '' AND t.id::text = '${task_id}' "
+                "WHERE ${task_id:sqlstring} <> '' AND t.id::text = ${task_id:sqlstring} "
                 "AND t.run_config_b64 IS NOT NULL"
             )
         )
+        .override_by_name("config (no system_prompt)", _JSON_CELL)
         .grid_pos(layout.place(12, 12))
     )
 
@@ -135,10 +155,11 @@ def dashboard_builder() -> dashboard.Dashboard:
             sql(
                 "SELECT jsonb_pretty(t.run_tools) AS \"offered tools\" "
                 "FROM tasks t "
-                "WHERE '${task_id}' <> '' AND t.id::text = '${task_id}' "
+                "WHERE ${task_id:sqlstring} <> '' AND t.id::text = ${task_id:sqlstring} "
                 "AND t.run_tools IS NOT NULL"
             )
         )
+        .override_by_name("offered tools", _JSON_CELL)
         .grid_pos(layout.place(12, 12))
     )
 
@@ -155,10 +176,11 @@ def dashboard_builder() -> dashboard.Dashboard:
                 "SELECT ((convert_from(decode(t.run_config_b64, 'base64'), 'UTF8'))::jsonb "
                 "  ->>'system_prompt') AS \"system_prompt\" "
                 "FROM tasks t "
-                "WHERE '${task_id}' <> '' AND t.id::text = '${task_id}' "
+                "WHERE ${task_id:sqlstring} <> '' AND t.id::text = ${task_id:sqlstring} "
                 "AND t.run_config_b64 IS NOT NULL"
             )
         )
+        .override_by_name("system_prompt", _WRAP_CELL)
         .grid_pos(layout.place(24, 14))
     )
 
