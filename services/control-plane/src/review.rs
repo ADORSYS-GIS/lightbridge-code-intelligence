@@ -168,14 +168,24 @@ pub fn format_prior_reviews(priors: &[PriorReview]) -> Option<String> {
         return None;
     }
 
+    // Two deliberate scoping choices in this wording (both from codex review on #266):
+    // - the no-repeat clause is scoped to the CURRENT COMMIT, matching the finalize dedup's same-head
+    //   scope — on a new head_sha a still-valid prior finding must be RESTATED (anchored to the new
+    //   diff), not suppressed as "already posted";
+    // - retraction is routed to the final VERDICT TEXT, because the `retract_finding` tool only deletes
+    //   findings buffered in the current run (and acks even when nothing matched) — it cannot touch an
+    //   already-posted comment, so a tool-call "retraction" of a prior finding would be an invisible no-op.
     let mut out = String::from(
         "## Prior automated reviews of this pull request (context only — NOT ground truth)\n\n\
          Earlier automated passes are listed below. They may contain **false positives** — treat every \
          prior finding as an UNVERIFIED HYPOTHESIS, not a fact. **Re-derive your review from the diff \
-         first**; then reconcile against these: for each prior finding, either re-derive it from the \
-         code (restate it) or **explicitly retract it** as one you could not reproduce — never inherit \
-         a prior finding without re-verifying it. And do not repeat a finding already posted on this \
-         PR: post only what is new or changed.\n",
+         first**; then reconcile: restate a prior finding only if you re-derived it from the current \
+         code, and **explicitly retract** any prior finding you cannot reproduce — name it in your \
+         final verdict text (tools only edit this run's unposted findings; an already-posted comment \
+         is retracted by saying so in the verdict). Never inherit a prior finding without re-verifying \
+         it. Do not re-post a finding that already stands on the current commit — post only what is \
+         new or changed; if new commits changed the code and a prior finding still holds, restate it \
+         anchored to the current diff.\n",
     );
 
     // The latest review (index 0) in detail; the rest compressed to one line each.
@@ -903,9 +913,21 @@ mod tests {
             block.contains("explicitly retract"),
             "retraction framing present: {block}"
         );
+        // Retraction is routed to the verdict TEXT — the retract_finding tool only edits the current
+        // run's unposted buffer, so a tool-call "retraction" of a prior comment would be a no-op.
         assert!(
-            block.contains("do not repeat a finding already posted"),
-            "dedup-awareness in the prompt: {block}"
+            block.contains("name it in your final verdict text"),
+            "retractions go to the verdict, not the buffered tool: {block}"
+        );
+        // The no-repeat clause is commit-scoped (matches the finalize dedup's same-head scope): on a
+        // new head_sha a still-valid prior finding must be restated, not suppressed.
+        assert!(
+            block.contains("already stands on the current commit"),
+            "dedup-awareness is scoped to the current commit: {block}"
+        );
+        assert!(
+            block.contains("restate it anchored to the current diff"),
+            "still-valid findings are restated on a new commit, not suppressed: {block}"
         );
 
         // Latest review detailed: verdict + `[priority/category] file:line — title` findings.
