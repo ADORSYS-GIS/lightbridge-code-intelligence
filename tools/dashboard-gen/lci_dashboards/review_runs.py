@@ -12,17 +12,20 @@ guess. Projected knobs: `model`, `tier`, `temperature`, `top_p`, `max_tokens`, `
 `context_window`, `stream`.
 
 `decode(..., 'base64')` throws on malformed input; every row here is runner-written so that is
-acceptable, and the detail panels additionally guard on a non-empty `${task_id}` so an unset textbox
-yields no rows rather than a cast/decode error. The detail panels interpolate the textbox via
-Grafana's `:sqlstring` format (a single-quoted, SQL-escaped literal) — deliberately stricter than
-the house `'${var}'` pattern, because this variable is FREE TEXT while the dropdown variables on the
-other dashboards are enum-constrained.
+acceptable, and the detail panels additionally guard on a non-empty `${task_id}` so an unset
+selection yields no rows rather than a cast/decode error. `task_id` is a Postgres QUERY variable — a
+dropdown of recent review runs (id -> a human label of repo #target · tier · time), refreshed on
+time-range change — so the operator picks a run instead of pasting a raw uuid. Because the value is
+now DB-constrained (it can only be an id that the variable query itself emitted), the injection
+surface is effectively removed; the detail panels nonetheless keep interpolating via Grafana's
+`:sqlstring` format (a single-quoted, SQL-escaped literal) as defense-in-depth, and the `<> ''` guard
+still short-circuits the zero-runs case where the dropdown is empty.
 """
 
 from __future__ import annotations
 
 from grafana_foundation_sdk.builders import dashboard, table, timeseries
-from grafana_foundation_sdk.models.dashboard import DynamicConfigValue
+from grafana_foundation_sdk.models.dashboard import DynamicConfigValue, VariableRefresh
 
 from .common import POSTGRES, Layout, sql
 
@@ -49,9 +52,25 @@ _RUNS_CTE = (
 def dashboard_builder() -> dashboard.Dashboard:
     layout = Layout()
 
-    # Paste a task id to light up the three detail panels; empty (the default) renders nothing.
+    # Pick a run to light up the three detail panels; an empty dropdown (no runs in range) renders
+    # nothing. QueryVariable + the __value/__text column convention: __value is the raw task id fed
+    # to the detail panels, __text is the readable label. Refreshed ON_TIME_RANGE_CHANGED so the
+    # list honours the dashboard's time window (the query is $__timeFilter-scoped). A pure-SDK path —
+    # the SDK's QueryVariable already exposes datasource/query/refresh, and passes rawSql through
+    # verbatim, so no post-processing of the model is needed.
     task_id_var = (
-        dashboard.TextBoxVariable("task_id").label("Task ID (run detail)").default_value("")
+        dashboard.QueryVariable("task_id")
+        .label("Task ID (run detail)")
+        .datasource(POSTGRES)
+        .refresh(VariableRefresh.ON_TIME_RANGE_CHANGED)
+        .query(
+            "SELECT t.id::text AS \"__value\", "
+            "coalesce(r.owner || '/' || r.name, t.repository_id::text) || ' #' || t.target_id "
+            "  || ' · ' || t.tier || ' · ' || to_char(t.created_at, 'MM-DD HH24:MI') AS \"__text\" "
+            "FROM tasks t LEFT JOIN repositories r ON r.id = t.repository_id "
+            "WHERE t.run_config_b64 IS NOT NULL AND $__timeFilter(t.created_at) "
+            "ORDER BY t.created_at DESC LIMIT 200"
+        )
     )
 
     runs = (
@@ -60,8 +79,8 @@ def dashboard_builder() -> dashboard.Dashboard:
         .description(
             "Per review run: repository, PR/target, tier, status, and the key knobs projected from "
             "the redacted config blob (run_config_b64) plus the tools offered to the model at turn 0 "
-            "(run_tools). Indexing runs are excluded (they persist neither). Paste a task id into the "
-            "Task ID variable to inspect one run in full below."
+            "(run_tools). Indexing runs are excluded (they persist neither). Pick a run from the "
+            "Task ID dropdown to inspect it in full below."
         )
         .datasource(POSTGRES)
         .with_target(
@@ -109,57 +128,68 @@ def dashboard_builder() -> dashboard.Dashboard:
         .grid_pos(layout.place(24, 7))
     )
 
-    # --- Run detail (only when task_id is set). `${task_id:sqlstring}` interpolates as a
-    # single-quoted, SQL-escaped literal (free-text textbox, so escaping matters); the `<> ''` guard
-    # short-circuits the decode when the textbox is empty, so an unset/blank id returns no rows
-    # rather than erroring. Cell overrides matter here: default table cells collapse multi-line
-    # content to one truncated line, so jsonb_pretty output gets a json-view cell and the ~23KB
-    # prompt a text-wrapped cell — without them the payload is only reachable via Inspect → Data. ---
-    _JSON_CELL = [DynamicConfigValue(id_val="custom.cellOptions", value={"type": "json-view"})]
+    # --- Run detail (only when task_id is set). `${task_id:sqlstring}` interpolates the selected
+    # dropdown value as a single-quoted, SQL-escaped literal; the `<> ''` guard short-circuits the
+    # decode when nothing is selected (empty dropdown), so an unset id returns no rows rather than
+    # erroring. The tools/config panels are DECOMPOSED into flat one-row-per-item tables so they read
+    # without hovering a collapsed json-view cell; only the ~23KB system_prompt still needs a
+    # text-wrapped cell, and the config `value` column gets a wrap override so nested JSON text
+    # (arrays/objects rendered by jsonb_each_text) wraps instead of truncating. ---
     _WRAP_CELL = [
         DynamicConfigValue(id_val="custom.cellOptions", value={"type": "auto", "wrapText": True})
     ]
 
+    # One row per config setting: `jsonb_each_text` flattens the redacted config (minus the giant
+    # system_prompt) into (setting, value) pairs; nested values (the `tools` array, `resilience` /
+    # `extra` objects) render as compact JSON text in their value cell — readable per-row, and the
+    # value column wraps so nothing truncates.
     detail_config = (
         table.Panel()
         .title("Run config for $task_id (system_prompt omitted)")
         .description(
-            "The full redacted ReviewConfig for the pasted task, pretty-printed WITHOUT the ~23KB "
-            "system_prompt (see the next panel for that alone)."
+            "The full redacted ReviewConfig for the selected run, one row per setting, WITHOUT the "
+            "~23KB system_prompt (see the next panel for that alone). Nested values (tools array, "
+            "resilience/extra objects) appear as compact JSON text."
         )
         .datasource(POSTGRES)
         .with_target(
             sql(
-                "SELECT jsonb_pretty("
-                "  (convert_from(decode(t.run_config_b64, 'base64'), 'UTF8'))::jsonb "
-                "  - 'system_prompt') AS \"config (no system_prompt)\" "
-                "FROM tasks t "
-                "WHERE ${task_id:sqlstring} <> '' AND t.id::text = ${task_id:sqlstring} "
-                "AND t.run_config_b64 IS NOT NULL"
+                "WITH cfg AS ("
+                "  SELECT ((convert_from(decode(t.run_config_b64, 'base64'), 'UTF8'))::jsonb "
+                "    - 'system_prompt') AS c "
+                "  FROM tasks t "
+                "  WHERE ${task_id:sqlstring} <> '' AND t.id::text = ${task_id:sqlstring} "
+                "  AND t.run_config_b64 IS NOT NULL"
+                ") "
+                "SELECT kv.key AS \"setting\", kv.value AS \"value\" "
+                "FROM cfg, jsonb_each_text(cfg.c) kv "
+                "ORDER BY kv.key"
             )
         )
-        .override_by_name("config (no system_prompt)", _JSON_CELL)
+        .override_by_name("value", _WRAP_CELL)
         .grid_pos(layout.place(12, 12))
     )
 
+    # One row per offered tool: (tool, source). Default table cells are perfect for these scalar
+    # columns, so no cell override is needed.
     detail_tools = (
         table.Panel()
         .title("Offered tools for $task_id")
         .description(
-            "The exact tool set offered to the model at turn 0 for the pasted task — the per-tier "
-            "allowlist resolved with any MCP-discovered external-knowledge tools. Pretty-printed "
-            "array of {name, source: builtin|mcp}."
+            "The exact tool set offered to the model at turn 0 for the selected run — the per-tier "
+            "allowlist resolved with any MCP-discovered external-knowledge tools. One row per tool: "
+            "name and source (builtin|mcp)."
         )
         .datasource(POSTGRES)
         .with_target(
             sql(
-                "SELECT jsonb_pretty(t.run_tools) AS \"offered tools\" "
-                "FROM tasks t "
+                "SELECT e->>'name' AS \"tool\", e->>'source' AS \"source\" "
+                "FROM tasks t, jsonb_array_elements(t.run_tools) e "
                 "WHERE ${task_id:sqlstring} <> '' AND t.id::text = ${task_id:sqlstring} "
-                "AND t.run_tools IS NOT NULL"
+                "AND t.run_tools IS NOT NULL "
+                "ORDER BY e->>'name'"
             )
         )
-        .override_by_name("offered tools", _JSON_CELL)
         .grid_pos(layout.place(12, 12))
     )
 
