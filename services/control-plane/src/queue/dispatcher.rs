@@ -7,11 +7,13 @@
 //! concurrently without ever claiming the same task. Loop timings come from the file config (else
 //! defaults). The reaper shares this loop (singleton today; idempotent writes keep it correct on N).
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use sqlx::postgres::PgListener;
 use sqlx::PgPool;
 
+use crate::config::ReviewSection;
 use crate::db;
 use crate::integrations::k8s::TaskLauncher;
 use crate::queue::reaper;
@@ -107,6 +109,7 @@ pub async fn run<L: TaskLauncher>(
     owner: String,
     cfg: DispatcherConfig,
     neo4j: Option<std::sync::Arc<neo4rs::Graph>>,
+    review: Arc<ReviewSection>,
 ) -> anyhow::Result<()> {
     let mut listener = PgListener::connect_with(&pool).await?;
     listener.listen(db::TASK_QUEUED_CHANNEL).await?;
@@ -121,7 +124,7 @@ pub async fn run<L: TaskLauncher>(
     tracing::info!(owner, "dispatcher started");
 
     loop {
-        drain(&pool, &launcher, &owner, &cfg).await;
+        drain(&pool, &launcher, &owner, &cfg, &review).await;
 
         // Wait for an enqueue notification, the reap tick, the poll fallback, or shutdown.
         tokio::select! {
@@ -133,7 +136,7 @@ pub async fn run<L: TaskLauncher>(
                 }
             }
             _ = reap_tick.tick() => {
-                if let Err(error) = reaper::reap_once(&pool, &launcher).await {
+                if let Err(error) = reaper::reap_once(&pool, &launcher, &review).await {
                     tracing::error!(%error, "reaper cycle failed");
                 }
                 // Durable backstop for repo data purge (a spawned purge can be lost on restart).
@@ -207,10 +210,16 @@ async fn shutdown_signal() {
 }
 
 /// Claim and dispatch every task that is due right now, then return so the caller can wait.
-async fn drain<L: TaskLauncher>(pool: &PgPool, launcher: &L, owner: &str, cfg: &DispatcherConfig) {
+async fn drain<L: TaskLauncher>(
+    pool: &PgPool,
+    launcher: &L,
+    owner: &str,
+    cfg: &DispatcherConfig,
+    review: &ReviewSection,
+) {
     loop {
         match db::claim_next_task(pool, owner, cfg.claim_lease).await {
-            Ok(Some(task)) => dispatch(pool, launcher, &task, cfg).await,
+            Ok(Some(task)) => dispatch(pool, launcher, &task, cfg, review).await,
             Ok(None) => return,
             Err(error) => {
                 tracing::error!(%error, "failed to claim next task");
@@ -227,6 +236,7 @@ async fn dispatch<L: TaskLauncher>(
     launcher: &L,
     task: &db::ClaimedTask,
     cfg: &DispatcherConfig,
+    review: &ReviewSection,
 ) {
     let started = std::time::Instant::now();
     match launcher.launch(task).await {
@@ -241,6 +251,11 @@ async fn dispatch<L: TaskLauncher>(
                     tracing::error!(%error, task_id = %task.id, job_name, "failed to record job name")
                 }
             }
+            // ADR-0068: 👀 means "seen AND work started" — enqueue it now the agent Job is launched (the
+            // queued→running-and-dispatched transition), not at webhook receipt. Best-effort: a failure
+            // here must never fail the dispatch. PR tasks and @mention-triggered tasks react; the target
+            // is the @mention comment when mention-triggered, else the PR body.
+            react_work_started(pool, task, review).await;
         }
         Err(error) => {
             crate::http::metrics::dispatch_outcome("failed");
@@ -249,5 +264,46 @@ async fn dispatch<L: TaskLauncher>(
                 tracing::error!(%release_error, task_id = %task.id, "failed to requeue task");
             }
         }
+    }
+}
+
+/// Enqueue the 👀 "work started" reaction (ADR-0068) for a just-launched task. It rides the egress
+/// outbox (ADR-0059) like every other reaction; the reconciler posts it. Everything here is best-effort
+/// — the dispatch already succeeded, so a DB/queue hiccup only means the 👀 is missing, never a failed
+/// launch. Who reacts: every PR task, plus any `@mention`-triggered task — a plain-ISSUE mention gets
+/// its 👀 on the triggering comment (removing receipt-time 👀 must not leave issue asks
+/// unacknowledged). Index tasks (no human audience) never react. Needs owner/repo + the trigger comment
+/// id, which the lightweight `ClaimedTask` lacks, so it loads the task context.
+async fn react_work_started(pool: &PgPool, task: &db::ClaimedTask, review: &ReviewSection) {
+    if !review.reactions_enabled() || task.command_text == "index" {
+        return;
+    }
+    let context = match db::get_task_context(pool, task.id).await {
+        Ok(Some(c)) => c,
+        Ok(None) => return,
+        Err(error) => {
+            tracing::warn!(%error, task_id = %task.id, "load context for 👀 failed (non-fatal)");
+            return;
+        }
+    };
+    if context.target_type != "pull_request" && context.trigger_comment_id.is_none() {
+        return; // a non-PR task with no trigger comment has nowhere meaningful to react
+    }
+    let t = crate::outbox::Target {
+        task_id: Some(task.id),
+        installation_id: context.installation_id,
+        owner: &context.owner,
+        repo: &context.name,
+    };
+    if let Err(error) = crate::outbox::enqueue_reaction(
+        pool,
+        &t,
+        context.target_id,
+        "eyes",
+        context.trigger_comment_id,
+    )
+    .await
+    {
+        tracing::warn!(%error, task_id = %task.id, "enqueueing 👀 work-started failed (non-fatal)");
     }
 }

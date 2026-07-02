@@ -207,8 +207,11 @@ async fn handle_pull_request(
                 // ADR-0062: the automatic on-open review is the FAST tier (SAST + a lean diff-only LLM
                 // pass, no retrieval, turn-capped). The deep, repo-aware review is `@mention`-only.
                 tier: "fast".to_string(),
+                // ADR-0068: no trigger comment on the automatic review → the lifecycle reactions land on
+                // the PR body itself.
+                trigger_comment_id: None,
             };
-            create_review_task(state, pool, task, owner, name, delivery_id).await;
+            create_review_task(pool, task, delivery_id).await;
         }
         "closed" => {
             match crate::db::cancel_active_tasks_for_pr(pool, repository_id, pr_number).await {
@@ -399,6 +402,10 @@ async fn handle_issue_comment(
     // review-vs-answer from the text and acts via its tools; the run kind is recorded at finalize
     // (emergent, ADR-0037), not classified here.
     let command_text = command_from_comment(body);
+    // ADR-0068: the id of the comment that @mentioned us — the lifecycle reactions (👀/👍/👎/😕) react
+    // on THIS comment, not the PR body, so the acknowledgment sits on the human's request. Absent on a
+    // malformed payload → `None`, and the reactions fall back to the PR/issue body.
+    let trigger_comment_id = payload["comment"]["id"].as_i64();
     // An @mention is an explicit human command: it must ALWAYS create a task. True webhook
     // redeliveries are already deduped upstream by the `github_deliveries` delivery-id PRIMARY KEY,
     // so content-idempotency adds nothing here — and previously dropped legitimate re-requests when
@@ -418,6 +425,7 @@ async fn handle_issue_comment(
         // ADR-0062: an `@mention` always triggers the DEEP tier — full retrieval, multi-turn — whether
         // the target is a PR (deep review) or an issue (conversational answer).
         tier: "deep".to_string(),
+        trigger_comment_id,
     };
     tracing::info!(
         delivery_id,
@@ -425,55 +433,35 @@ async fn handle_issue_comment(
         kind = target_type,
         "@mention requested"
     );
-    create_explicit_review_task(state, pool, task, owner, name, delivery_id).await;
+    create_explicit_review_task(pool, task, delivery_id).await;
 }
 
-/// Insert an **explicit @mention** task (always lands a row, never content-deduped) and, on insert,
-/// 👀 the PR (spawned so external GitHub calls can't block the webhook's ~10s deadline). The auto
-/// open path uses [`create_review_task`] instead, which keeps content-idempotency.
+/// Insert an **explicit @mention** task (always lands a row, never content-deduped). The auto open path
+/// uses [`create_review_task`] instead, which keeps content-idempotency. No reaction is enqueued here:
+/// ADR-0068 moves 👀 to *work-started* (the dispatcher launching the Job), so receipt no longer reacts.
 async fn create_explicit_review_task(
-    state: &crate::AppState,
     pool: &sqlx::PgPool,
     task: crate::db::NewTask,
-    owner: &str,
-    name: &str,
     delivery_id: &str,
 ) {
-    let (pr, installation_id) = (task.target_id, task.installation_id);
+    let pr = task.target_id;
     match crate::db::create_explicit_task(pool, &task).await {
         Ok(task_id) => {
             crate::http::metrics::task_created();
             tracing::info!(delivery_id, %task_id, pr, "created explicit review task");
-            let state = state.clone();
-            let (owner, name) = (owner.to_string(), name.to_string());
-            tokio::spawn(async move {
-                react_seen(&state, &owner, &name, installation_id, pr).await;
-            });
         }
         Err(error) => tracing::error!(%error, delivery_id, pr, "failed to create explicit task"),
     }
 }
 
-/// Insert a review task and, on a real insert, 👀 the PR (spawned so external GitHub calls can't
-/// block the webhook's ~10s deadline). Shared by the auto-open and manual-mention paths.
-async fn create_review_task(
-    state: &crate::AppState,
-    pool: &sqlx::PgPool,
-    task: crate::db::NewTask,
-    owner: &str,
-    name: &str,
-    delivery_id: &str,
-) {
-    let (pr, installation_id, run_epoch) = (task.target_id, task.installation_id, task.run_epoch);
+/// Insert a review task. Shared by the auto-open and manual-mention paths. No reaction is enqueued here:
+/// ADR-0068 moves 👀 to *work-started* (the dispatcher launching the Job), so receipt no longer reacts.
+async fn create_review_task(pool: &sqlx::PgPool, task: crate::db::NewTask, delivery_id: &str) {
+    let (pr, run_epoch) = (task.target_id, task.run_epoch);
     match crate::db::create_task(pool, &task).await {
         Ok(Some(task_id)) => {
             crate::http::metrics::task_created();
             tracing::info!(delivery_id, %task_id, pr, run_epoch, "created review task");
-            let state = state.clone();
-            let (owner, name) = (owner.to_string(), name.to_string());
-            tokio::spawn(async move {
-                react_seen(&state, &owner, &name, installation_id, pr).await;
-            });
         }
         Ok(None) => tracing::info!(
             delivery_id,
@@ -656,34 +644,6 @@ fn repo_identity(repo: &serde_json::Value) -> Option<(i64, &str, &str)> {
     let full_name = repo["full_name"].as_str()?;
     let (owner, name) = full_name.split_once('/')?;
     Some((id, owner, name))
-}
-
-/// Best-effort 👀 on the PR to acknowledge a review has started. **Enqueues** the reaction to the
-/// egress outbox (ADR-0059) — serve no longer posts; the reconciler delivers it (near-instant via the
-/// NOTIFY). Never fails the webhook: no DB or a queue hiccup is logged and ignored. Keyed per-PR so a
-/// re-review doesn't churn a fresh 👀 (it's already there — the reaction is idempotent on GitHub too).
-async fn react_seen(
-    state: &crate::AppState,
-    owner: &str,
-    repo: &str,
-    installation_id: i64,
-    pr: i64,
-) {
-    if !state.review.reactions_enabled() {
-        return;
-    }
-    let Some(pool) = state.db.as_ref() else {
-        return;
-    };
-    let t = crate::outbox::Target {
-        task_id: None,
-        installation_id,
-        owner,
-        repo,
-    };
-    if let Err(error) = crate::outbox::enqueue_reaction(pool, &t, pr, "eyes").await {
-        tracing::warn!(%error, pr, "enqueueing 👀 failed (non-fatal)");
-    }
 }
 
 fn header(headers: &HeaderMap, name: &str) -> String {

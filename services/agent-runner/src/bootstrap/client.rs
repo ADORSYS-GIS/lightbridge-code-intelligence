@@ -424,13 +424,17 @@ impl ControlPlaneClient {
     }
 
     /// `POST /internal/tasks/{id}/review/finalize` — flush the accumulated buffer as one grouped
-    /// review (ADR-0037). Called once after the agent finishes cleanly.
-    pub async fn finalize_review(&self, task_id: Uuid) -> anyhow::Result<()> {
+    /// review (ADR-0037). `outcome` is how the run ended (`finished` / `exhausted` / `aborted`,
+    /// ADR-0068): the control plane suppresses the post and reacts 👍 ONLY on an explicitly clean
+    /// `finished` with zero findings — an aborted/exhausted run's honest note must still post, never
+    /// masquerade as a clean pass.
+    pub async fn finalize_review(&self, task_id: Uuid, outcome: &str) -> anyhow::Result<()> {
         use anyhow::Context;
         let url = format!("{}/internal/tasks/{task_id}/review/finalize", self.base_url);
         self.http
             .post(&url)
             .bearer_auth(&self.token)
+            .json(&serde_json::json!({ "outcome": outcome }))
             .send()
             .await
             .context("finalizing review")?

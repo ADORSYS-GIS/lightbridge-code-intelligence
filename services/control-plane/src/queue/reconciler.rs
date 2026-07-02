@@ -178,10 +178,20 @@ async fn deliver(
 ) -> anyhow::Result<Option<i64>> {
     match row.kind.as_str() {
         "reaction" => {
-            let issue = payload_i64(&row.payload, "issue")?;
             let content = payload_str(&row.payload, "content")?;
-            app.add_reaction(token, &row.owner, &row.repo, issue, content)
-                .await?;
+            // ADR-0068: when the payload carries a `comment_id`, react on the triggering @mention comment;
+            // otherwise on the PR/issue body (the automatic-review case).
+            match row.payload.get("comment_id").and_then(|x| x.as_i64()) {
+                Some(comment_id) => {
+                    app.add_comment_reaction(token, &row.owner, &row.repo, comment_id, content)
+                        .await?;
+                }
+                None => {
+                    let issue = payload_i64(&row.payload, "issue")?;
+                    app.add_reaction(token, &row.owner, &row.repo, issue, content)
+                        .await?;
+                }
+            }
             Ok(None)
         }
         "reply" => {
@@ -221,8 +231,8 @@ async fn deliver(
 }
 
 /// Post the grouped review and its success side-effects (persist the copy, fetch inline ids, apply
-/// outcome labels + 🎉) — the whole bundle the old synchronous `finalize_review` did, now driven from
-/// the pre-shaped payload.
+/// outcome labels) — the whole bundle the old synchronous `finalize_review` did, now driven from the
+/// pre-shaped payload. The verdict reaction is enqueued separately at finalize (ADR-0068).
 async fn deliver_review(
     pool: &PgPool,
     app: &GithubApp,
@@ -319,14 +329,9 @@ async fn deliver_review(
             tracing::warn!(%error, pr = p.pr, "applying outcome labels failed (non-fatal)");
         }
     }
-    if review.reactions_enabled() {
-        if let Err(error) = app
-            .add_reaction(token, &row.owner, &row.repo, p.pr, "hooray")
-            .await
-        {
-            tracing::warn!(%error, pr = p.pr, "review 🎉 reaction failed (non-fatal)");
-        }
-    }
+    // ADR-0068: the verdict reaction (👎 findings / 👍 clean) is a separate `reaction` intent enqueued at
+    // finalize — a `review` intent is only ever produced when there ARE findings, so the old
+    // unconditional 🎉 here is gone.
     Ok(posted.id)
 }
 

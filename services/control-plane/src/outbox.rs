@@ -38,8 +38,9 @@ pub struct ReviewCommentPayload {
 }
 
 /// The `review` intent: everything the reconciler needs to post the grouped review **and** its success
-/// side-effects (persist the copy, fetch inline ids, apply outcome labels + the 🎉 reaction) without
-/// re-shaping anything.
+/// side-effects (persist the copy, fetch inline ids, apply outcome labels) without re-shaping anything.
+/// The verdict reaction (👎, ADR-0068) is enqueued as a separate `reaction` intent at finalize, not here
+/// — a review intent is only ever produced when there ARE findings.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ReviewPayload {
     pub pr: i64,
@@ -102,16 +103,21 @@ pub async fn enqueue_reply(
     .await
 }
 
-/// Enqueue a lifecycle reaction (👀 `eyes` / 😕 `confused`) — keyed by content so the distinct lifecycle
-/// reactions don't collide (`<task>:reaction:<content>`).
+/// Enqueue a lifecycle reaction (👀 `eyes` / 😕 `confused`, ADR-0068) — keyed by content so the distinct
+/// lifecycle reactions don't collide (`<task>:reaction:<content>`). When `comment_id` is `Some`, the
+/// reconciler reacts on that ISSUE COMMENT (the `@mention` that triggered the task) rather than the
+/// PR/issue body — so an @mention review's acknowledgment lands on the request. The 👍/👎 verdict pair
+/// goes through [`enqueue_verdict_reaction`] instead — a content-scoped key would let a verdict flip
+/// across finalize attempts stack BOTH reactions.
 pub async fn enqueue_reaction(
     pool: &PgPool,
     t: &Target<'_>,
     issue: i64,
     content: &str,
+    comment_id: Option<i64>,
 ) -> Result<bool, sqlx::Error> {
     let key = format!("{}:reaction:{content}", t.key_prefix(issue));
-    let value = json!({ "issue": issue, "content": content });
+    let value = reaction_payload(issue, content, comment_id);
     crate::db::enqueue_github_post(
         pool,
         t.task_id,
@@ -123,6 +129,43 @@ pub async fn enqueue_reaction(
         &key,
     )
     .await
+}
+
+/// Enqueue the ADR-0068 **verdict** reaction (👍 `+1` clean / 👎 `-1` findings) under ONE shared dedup
+/// key — `<task>:reaction:verdict` — with the content only in the payload. A task gets exactly one
+/// verdict: if a re-finalize (crash-then-requeue, or a stray retry against a now-empty buffer) computes a
+/// *different* verdict, the `ON CONFLICT DO NOTHING` makes the first one win instead of leaving both 👍
+/// and 👎 on the trigger.
+pub async fn enqueue_verdict_reaction(
+    pool: &PgPool,
+    t: &Target<'_>,
+    issue: i64,
+    content: &str,
+    comment_id: Option<i64>,
+) -> Result<bool, sqlx::Error> {
+    let key = format!("{}:reaction:verdict", t.key_prefix(issue));
+    let value = reaction_payload(issue, content, comment_id);
+    crate::db::enqueue_github_post(
+        pool,
+        t.task_id,
+        t.installation_id,
+        t.owner,
+        t.repo,
+        "reaction",
+        &value,
+        &key,
+    )
+    .await
+}
+
+/// The `reaction` intent payload (ADR-0068). `comment_id` is included **only when `Some`**, so the
+/// reconciler routes on its presence: present → react on that issue comment (the `@mention` trigger);
+/// absent → react on the PR/issue body. Pure, so the shape is unit-tested without a DB.
+fn reaction_payload(issue: i64, content: &str, comment_id: Option<i64>) -> serde_json::Value {
+    match comment_id {
+        Some(cid) => json!({ "issue": issue, "content": content, "comment_id": cid }),
+        None => json!({ "issue": issue, "content": content }),
+    }
 }
 
 /// Enqueue the ADR-0056 failure notice — one per task (`<task>:failure_notice`). The reconciler re-checks
@@ -145,4 +188,31 @@ pub async fn enqueue_failure_notice(
         &key,
     )
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ADR-0068: the reaction payload carries `comment_id` ONLY when the task was @mention-triggered, so
+    // the reconciler can route on its presence (comment vs PR/issue body). This is the round-trip the
+    // reconciler's `deliver` reads back.
+    #[test]
+    fn reaction_payload_includes_comment_id_only_when_present() {
+        // Mention-triggered: comment_id present → the reconciler reacts on the comment.
+        let with = reaction_payload(7, "eyes", Some(4242));
+        assert_eq!(with["issue"], 7);
+        assert_eq!(with["content"], "eyes");
+        assert_eq!(with["comment_id"], 4242);
+
+        // Auto review: no trigger comment → the key is absent (not null), so `get("comment_id")` → None
+        // and the reconciler falls back to the PR/issue body.
+        let without = reaction_payload(7, "+1", None);
+        assert_eq!(without["issue"], 7);
+        assert_eq!(without["content"], "+1");
+        assert!(
+            without.get("comment_id").is_none(),
+            "comment_id must be absent, not null, so the reconciler routes to the issue body"
+        );
+    }
 }

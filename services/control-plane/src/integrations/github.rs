@@ -396,6 +396,37 @@ impl GithubApp {
         Ok(())
     }
 
+    /// React to an **issue comment** (an `@mention` that triggered a task, ADR-0068) with one of
+    /// GitHub's 8 reaction contents. Distinct from [`add_reaction`] (which targets the PR/issue body)
+    /// because the comment-reactions endpoint is a different path
+    /// (`/issues/comments/{comment_id}/reactions`). Adding the same reaction twice is a GitHub-side
+    /// no-op, so it's safe to retry.
+    pub async fn add_comment_reaction(
+        &self,
+        token: &str,
+        owner: &str,
+        repo: &str,
+        comment_id: i64,
+        content: &str,
+    ) -> anyhow::Result<()> {
+        use anyhow::Context;
+        self.http
+            .post(format!(
+                "https://api.github.com/repos/{owner}/{repo}/issues/comments/{comment_id}/reactions"
+            ))
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Accept", "application/vnd.github+json")
+            .header("User-Agent", "lightbridge-code-intelligence")
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .json(&serde_json::json!({ "content": content }))
+            .send()
+            .await
+            .context("posting comment reaction")?
+            .error_for_status()
+            .context("github rejected the comment reaction")?;
+        Ok(())
+    }
+
     /// Add labels to a PR/issue. GitHub creates any label that doesn't exist yet (default colour),
     /// and adding an already-present label is idempotent.
     pub async fn add_labels(

@@ -323,7 +323,9 @@ async fn run(
             // via posted IDs (ADR-0035).
             match outcome {
                 Ok(review::ReviewOutcome::Finished) => {
-                    client.finalize_review(config.task_id).await?;
+                    // "finished" is the only outcome the control plane may treat as a provably clean
+                    // pass (ADR-0068: zero findings → suppress the post, 👍 only).
+                    client.finalize_review(config.task_id, "finished").await?;
                     "review posted".to_string()
                 }
                 Ok(review::ReviewOutcome::Exhausted) => {
@@ -335,8 +337,10 @@ async fn run(
                         // `@lightbridge` before). So DON'T set a summary here: an exhausted fast pass just
                         // finalizes, and finalize composes the fast body from the task tier + whatever the
                         // run buffered (inline findings still post). A finished fast run is the same — its
-                        // `finish` verdict becomes the summary the fast body wraps.
-                        client.finalize_review(config.task_id).await?;
+                        // `finish` verdict becomes the summary the fast body wraps. The outcome is still
+                        // "exhausted" — honest — so a zero-findings exhausted fast pass POSTS its banner
+                        // review rather than 👍-ing an incomplete pass as clean (ADR-0068).
+                        client.finalize_review(config.task_id, "exhausted").await?;
                         review_detail =
                             Some("fast pass exhausted; framed control-plane-side".to_string());
                         "review posted (fast pass)".to_string()
@@ -350,7 +354,7 @@ async fn run(
                         if let Err(error) = client.set_review_summary(config.task_id, &note).await {
                             tracing::warn!(%error, "setting truncation summary failed (non-fatal)");
                         }
-                        client.finalize_review(config.task_id).await?;
+                        client.finalize_review(config.task_id, "exhausted").await?;
                         review_detail = Some(note);
                         "review posted (truncated at step budget)".to_string()
                     }
@@ -367,7 +371,9 @@ async fn run(
                     if let Err(error) = client.set_review_summary(config.task_id, &note).await {
                         tracing::warn!(%error, "setting abort summary failed (non-fatal)");
                     }
-                    client.finalize_review(config.task_id).await?;
+                    // "aborted" makes the control plane POST the note (never a silent misleading 👍)
+                    // and react 😕 (ADR-0068).
+                    client.finalize_review(config.task_id, "aborted").await?;
                     review_detail = Some(note);
                     "review aborted (note posted)".to_string()
                 }
