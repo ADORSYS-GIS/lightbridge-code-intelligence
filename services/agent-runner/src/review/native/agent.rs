@@ -366,6 +366,46 @@ pub async fn run_native_agent(
     // `review.tools` allowlist is honoured in the wind-down too — a tool the allowlist dropped can't
     // reappear in the tail (gemini review on #237).
     let winddown_defs = winddown_tool_defs(&defs, diff_present);
+
+    // ── Run-level review telemetry (ADR-0034/0062/0066), recorded at run START ──────────────────────
+    // `defs` is now the exact set of tools OFFERED to the model this run: the per-tier allowlist
+    // (ADR-0062) resolved together with the MCP-discovered external-knowledge tools (ADR-0066), after
+    // the diff-present and allowlist gates. Tag each by source from its name (`mcp__` prefix → mcp, else
+    // builtin — cheap, no extra lookup). NOTE: the offered set can still NARROW mid-run (budget-spent
+    // drops + the wind-down tail); those transitions are logged per turn below. This START snapshot is
+    // the authoritative "what did the model get" record — captured before turn 0 so a crashed/aborted
+    // run is still audited.
+    let offered_tools: Vec<serde_json::Value> = defs
+        .iter()
+        .map(|t| {
+            let source = if t.function.name.starts_with(super::tools::MCP_TOOL_PREFIX) {
+                "mcp"
+            } else {
+                "builtin"
+            };
+            serde_json::json!({ "name": t.function.name, "source": source })
+        })
+        .collect();
+    let offered_tool_names: Vec<&str> = defs.iter().map(|t| t.function.name.as_str()).collect();
+    tracing::info!(
+        task_id = %task_id,
+        tier = if review.fast { "fast" } else { "deep" },
+        model = %review.model,
+        tool_count = offered_tool_names.len(),
+        tools = ?offered_tool_names,
+        "review run: offered tools"
+    );
+    // Persist the offered tools + the redacted, base64-encoded resolved config (extends the ADR-0034
+    // telemetry path). Redaction happens INSIDE `redacted_config_b64` — the api_key never reaches the
+    // encoder. Best-effort: a telemetry failure must never fail the review.
+    let offered_tools_json = serde_json::Value::Array(offered_tools);
+    if let Err(error) = client
+        .submit_review_telemetry(task_id, &offered_tools_json, &review.redacted_config_b64())
+        .await
+    {
+        tracing::warn!(%error, task_id = %task_id, "submitting review telemetry failed (non-fatal)");
+    }
+
     let params = ChatParams {
         temperature: review.temperature,
         top_p: review.top_p,
@@ -462,6 +502,13 @@ pub async fn run_native_agent(
     let context_window = review.context_window;
     let mut overflow_finalize = false;
 
+    // Telemetry (ADR-0034/0062/0066): the offered tool set can NARROW mid-run (budget-spent drops + the
+    // wind-down tail). Track the last-offered names so we log a `tracing::info!` only when the set
+    // actually changes from the run-start snapshot recorded above — not once per turn. Seeded with the
+    // full offered set so the first narrowing is what surfaces.
+    let mut prev_offered_tool_names: Vec<String> =
+        offered_tool_names.iter().map(|s| s.to_string()).collect();
+
     // Resolve the reasoning-log cap once (it can't change mid-run): `std::env::var` takes the process
     // env lock on every call, and a review runs many turns. (Gemini/lightbridge review on #220.)
     let reasoning_log_cap = reasoning_log_chars();
@@ -533,6 +580,21 @@ pub async fn run_native_agent(
         } else {
             &defs
         };
+        // Telemetry (ADR-0034/0062/0066): log a change to the offered tool set as it narrows mid-run
+        // (budget drops / wind-down), so the audit trail shows not just what was offered at start but WHEN
+        // a tool was taken away. Only fires on an actual change from the previous turn.
+        let this_turn_names: Vec<String> =
+            turn_defs.iter().map(|t| t.function.name.clone()).collect();
+        if this_turn_names != prev_offered_tool_names {
+            tracing::info!(
+                task_id = %task_id,
+                turn,
+                tool_count = this_turn_names.len(),
+                tools = ?this_turn_names,
+                "review run: offered tools changed"
+            );
+            prev_offered_tool_names = this_turn_names;
+        }
         // FAST tier (ADR-0062): the offered set excludes retrieval/read_file, but a model steered by the
         // shared system prompt may still *emit* calls to them — and the dispatcher would otherwise run any
         // tool by name. So in the fast tier we enforce the offered set: a call to a non-offered tool is

@@ -465,6 +465,33 @@ impl ControlPlaneClient {
         Ok(())
     }
 
+    /// `POST /internal/tasks/{id}/review/telemetry` — record run-level review telemetry at run START
+    /// (ADR-0034/0062/0066): the tool set OFFERED to the model this run (`tools`, each `{name, source}`)
+    /// and the resolved config, **already redacted + base64-encoded by the caller** (the api_key never
+    /// leaves this process in the clear). Best-effort: a failure here must not fail the review.
+    pub async fn submit_review_telemetry(
+        &self,
+        task_id: Uuid,
+        tools: &serde_json::Value,
+        config_b64: &str,
+    ) -> anyhow::Result<()> {
+        use anyhow::Context;
+        let url = format!(
+            "{}/internal/tasks/{task_id}/review/telemetry",
+            self.base_url
+        );
+        self.http
+            .post(&url)
+            .bearer_auth(&self.token)
+            .json(&serde_json::json!({ "tools": tools, "config_b64": config_b64 }))
+            .send()
+            .await
+            .context("submitting review telemetry")?
+            .error_for_status()
+            .context("control plane rejected the review telemetry")?;
+        Ok(())
+    }
+
     /// `POST /internal/tasks/{id}/graph` — submit the structural code graph (Graphify → Neo4j).
     pub async fn submit_graph(&self, task_id: Uuid, batch: GraphBatch) -> anyhow::Result<()> {
         use anyhow::Context;

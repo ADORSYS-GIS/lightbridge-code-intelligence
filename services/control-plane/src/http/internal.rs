@@ -295,6 +295,55 @@ pub async fn ingest_transcript(
     }
 }
 
+/// Body for `POST /internal/tasks/{id}/review/telemetry` — run-level review telemetry submitted at run
+/// START (extends ADR-0034/0017/0060). `tools` is the exact set OFFERED to the model this run (per-tier
+/// allowlist ADR-0062 + MCP-discovered tools ADR-0066), each `{name, source}`; `config_b64` is the
+/// resolved `ReviewConfig` serialized to JSON, **redacted by the runner** (api_key etc. → "[REDACTED]"),
+/// then base64-encoded. The control plane stores both verbatim — it does NOT decode or re-redact.
+#[derive(Debug, Deserialize)]
+pub struct ReviewRunTelemetry {
+    pub tools: serde_json::Value,
+    pub config_b64: String,
+}
+
+/// `POST /internal/tasks/{id}/review/telemetry` — record the offered tools + redacted base64 config for
+/// a review run (ADR-0034/0062/0066). Submitted at run start so a crashed/aborted run still has its
+/// config recorded. One task = one run, so this UPDATEs the task row in place (latest-run-replace).
+/// Indexing runs never call this; their columns stay NULL.
+pub async fn record_review_telemetry(
+    _auth: RunnerAuth,
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(telemetry): Json<ReviewRunTelemetry>,
+) -> Response {
+    let Some(pool) = state.db.as_ref() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "no database").into_response();
+    };
+    // Resolve the task first so an unknown id is a clean 404 rather than an UPDATE that touches no rows
+    // (mirrors `ingest_transcript`).
+    match sqlx::query_scalar::<_, Uuid>("SELECT id FROM tasks WHERE id = $1")
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+    {
+        Ok(Some(_)) => {}
+        Ok(None) => return (StatusCode::NOT_FOUND, "task not found").into_response(),
+        Err(error) => {
+            tracing::error!(%error, task_id = %id, "load task for review telemetry failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "query error").into_response();
+        }
+    }
+    match crate::db::record_review_run_telemetry(pool, id, &telemetry.tools, &telemetry.config_b64)
+        .await
+    {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => {
+            tracing::error!(%error, task_id = %id, "storing review telemetry failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "store error").into_response()
+        }
+    }
+}
+
 /// `POST /internal/tasks/{id}/chunks` — ingest indexed code chunks from the runner.
 ///
 /// The runner submits chunks in batches as it processes files; the control plane writes them to

@@ -24,6 +24,8 @@ reqwest.workspace = true
 uuid.workspace = true
 # Regex selectors for the per-tier `mcp__<server>__<tool>` tool allowlist (ADR-0066).
 regex.workspace = true
+# Base64-encode the redacted resolved review config for the run-level telemetry (ADR-0034/0062/0066).
+base64.workspace = true
 # Tree-sitter syntax-aware chunking (ADR-0010).
 tree-sitter.workspace = true
 tree-sitter-rust.workspace = true

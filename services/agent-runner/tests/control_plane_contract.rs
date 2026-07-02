@@ -4,7 +4,7 @@
 
 use agent_runner::bootstrap::client::ControlPlaneClient;
 use uuid::Uuid;
-use wiremock::matchers::{bearer_token, method, path};
+use wiremock::matchers::{bearer_token, body_json, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 #[tokio::test]
@@ -123,6 +123,36 @@ async fn submit_chunks_posts_batch_with_bearer() {
         )
         .await
         .expect("chunks submitted");
+}
+
+#[tokio::test]
+async fn submit_review_telemetry_posts_tools_and_config_with_bearer() {
+    let server = MockServer::start().await;
+    let task_id = Uuid::nil();
+
+    let tools = serde_json::json!([
+        { "name": "read_file", "source": "builtin" },
+        { "name": "mcp__context7__get_docs", "source": "mcp" },
+    ]);
+    // Pin the wire shape the control plane's `record_review_telemetry` deserializes: `{ tools, config_b64 }`.
+    Mock::given(method("POST"))
+        .and(path(format!("/internal/tasks/{task_id}/review/telemetry")))
+        .and(bearer_token("runner-secret"))
+        .and(body_json(serde_json::json!({
+            "tools": tools,
+            "config_b64": "cfg-b64",
+        })))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = ControlPlaneClient::new(server.uri(), "runner-secret");
+    client
+        .submit_review_telemetry(task_id, &tools, "cfg-b64")
+        .await
+        .expect("telemetry submitted");
+    // `expect(1)` + `body_json` are verified on server drop.
 }
 
 #[tokio::test]

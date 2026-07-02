@@ -764,7 +764,101 @@ impl ReviewConfig {
         }
         Ok(ReviewConfigs { fast, deep })
     }
+
+    /// The resolved config as a JSON object with **every credential-bearing field redacted** — for the
+    /// run-level telemetry (ADR-0034/0062/0066), which base64-encodes this and persists it so a run's
+    /// exact configuration is auditable later.
+    ///
+    /// SECURITY INVARIANT — redact BEFORE encode. Base64 is encoding, not encryption, so the api_key
+    /// must never reach the encoder. `ReviewConfig` deliberately does NOT derive `Serialize`; this is the
+    /// single, explicit serialization path so a future field can't silently leak a secret into the
+    /// audit trail. Redacted here: `api_key` (the only true secret today) and any `extra`/`resilience`
+    /// passthrough field whose key looks credential-shaped (defence in depth — an operator can drop an
+    /// `authorization`/`api_key`/`token`/`secret`/`password` header into `review.extra`). Everything else
+    /// is included in full and IS the point of the audit: model, base_url (not secret), all budget/
+    /// generation knobs, the per-tier tools allowlist, `stream`, and the ~23KB `system_prompt` (prompt
+    /// churn is exactly what the owner wants auditable).
+    pub fn redacted_json(&self) -> serde_json::Value {
+        use serde_json::{json, Value};
+
+        // Redact any passthrough map entry whose key is credential-shaped (case-insensitive substring),
+        // so a secret smuggled through `review.extra` never lands in the audit trail either.
+        let redact_map = |m: &serde_json::Map<String, Value>| -> Value {
+            let mut out = serde_json::Map::with_capacity(m.len());
+            for (k, v) in m {
+                let lk = k.to_ascii_lowercase();
+                let secret_shaped = [
+                    "api_key",
+                    "apikey",
+                    "authorization",
+                    "token",
+                    "secret",
+                    "password",
+                    "bearer",
+                ]
+                .iter()
+                .any(|needle| lk.contains(needle));
+                out.insert(
+                    k.clone(),
+                    if secret_shaped {
+                        Value::String(REDACTED.to_string())
+                    } else {
+                        v.clone()
+                    },
+                );
+            }
+            Value::Object(out)
+        };
+
+        let tools = self.tools.as_ref().map(|sel| {
+            sel.iter()
+                .map(|s| match s {
+                    ReviewToolSelector::Builtin(b) => b.as_str().to_string(),
+                    ReviewToolSelector::Mcp(p) => p.as_str().to_string(),
+                })
+                .collect::<Vec<_>>()
+        });
+
+        json!({
+            "base_url": self.base_url,
+            "api_key": REDACTED,
+            "model": self.model,
+            "system_prompt": self.system_prompt,
+            "max_diff_chars": self.max_diff_chars,
+            "max_turns": self.max_turns,
+            "max_batch_size": self.max_batch_size,
+            "max_files_read": self.max_files_read,
+            "max_searches": self.max_searches,
+            "max_batches": self.max_batches,
+            "context_window": self.context_window,
+            "temperature": self.temperature,
+            "top_p": self.top_p,
+            "max_tokens": self.max_tokens,
+            "extra": redact_map(&self.extra),
+            "stream": self.stream,
+            "resilience": {
+                "request_timeout_secs": self.resilience.request_timeout_secs,
+                "max_retries": self.resilience.max_retries,
+                "circuit_breaker_threshold": self.resilience.circuit_breaker_threshold,
+            },
+            "fast": self.fast,
+            "tier": if self.fast { "fast" } else { "deep" },
+            "tools": tools,
+        })
+    }
+
+    /// The redacted config as a base64-encoded JSON string (ADR-0034/0062/0066). Encodes the output of
+    /// [`redacted_json`], so the api_key is already gone before it reaches the encoder.
+    pub fn redacted_config_b64(&self) -> String {
+        use base64::Engine as _;
+        let json = serde_json::to_vec(&self.redacted_json()).unwrap_or_default();
+        base64::engine::general_purpose::STANDARD.encode(json)
+    }
 }
+
+/// The placeholder a redacted secret is replaced with in the run-config audit trail. A distinctive
+/// sentinel so the redaction test can assert the encoded payload carries it (and not the real value).
+pub const REDACTED: &str = "[REDACTED]";
 
 /// Resolved review configs for both tiers (ADR-0062). The runner picks one per task by its tier; each
 /// is a complete, independent config (own model/gateway/prompt/budget). Either side is `None` when that
@@ -1251,5 +1345,103 @@ mod tests {
             .expect("review enabled");
         assert!(cfg.stream, "review.stream=true is honoured over the env");
         std::fs::remove_file(&prompt).ok();
+    }
+
+    /// A fully-populated `ReviewConfig` for the redaction tests — a real-looking api_key, a
+    /// secret-shaped `extra` passthrough entry, and both selector kinds in the tools allowlist.
+    fn sample_config_with_secrets() -> ReviewConfig {
+        let mut extra = serde_json::Map::new();
+        extra.insert("reasoning_effort".to_string(), serde_json::json!("high"));
+        // A credential smuggled through the passthrough map: must also be redacted (defence in depth).
+        extra.insert(
+            "Authorization".to_string(),
+            serde_json::json!("Bearer super-secret-extra-token"),
+        );
+        let tools = vec![
+            ReviewToolSelector::Builtin(ReviewTool::AddReviewComment),
+            serde_json::from_value::<ReviewToolSelector>(serde_json::json!("mcp__context7__.*"))
+                .expect("valid mcp selector"),
+        ];
+        ReviewConfig {
+            base_url: "https://gateway.internal/v1".to_string(),
+            api_key: "sk-live-DEADBEEF-do-not-leak".to_string(),
+            model: "adorsys-reviewer".to_string(),
+            system_prompt: "You are a careful reviewer. Only claim what the diff proves."
+                .to_string(),
+            max_diff_chars: 60_000,
+            max_turns: 40,
+            max_batch_size: 8,
+            max_files_read: 50,
+            max_searches: 30,
+            max_batches: 12,
+            context_window: Some(128_000),
+            temperature: Some(0.2),
+            top_p: None,
+            max_tokens: Some(4096),
+            extra,
+            stream: true,
+            resilience: ResilienceConfig::default(),
+            fast: false,
+            tools: Some(tools),
+        }
+    }
+
+    /// SECURITY: the base64 run-config audit payload must NEVER contain the api_key value (base64 is
+    /// encoding, not encryption — redaction happens before the encode). It must also redact a
+    /// credential smuggled through `review.extra`, and it must round-trip decode to a JSON object that
+    /// carries the redaction sentinel plus the non-secret knobs (model, prompt, budgets, tools).
+    #[test]
+    fn redacted_config_never_leaks_the_api_key() {
+        use base64::Engine as _;
+        let cfg = sample_config_with_secrets();
+        let b64 = cfg.redacted_config_b64();
+
+        // The encoded payload must not carry the secret in any form.
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(&b64)
+            .expect("valid base64");
+        let decoded_str = String::from_utf8(decoded).expect("utf8");
+        assert!(
+            !b64.contains(
+                &base64::engine::general_purpose::STANDARD.encode(cfg.api_key.as_bytes())
+            ),
+            "the api_key must not survive base64 encoding"
+        );
+        assert!(
+            !decoded_str.contains(&cfg.api_key),
+            "the decoded payload must not contain the api_key value"
+        );
+        assert!(
+            !decoded_str.contains("super-secret-extra-token"),
+            "a credential smuggled through review.extra must also be redacted"
+        );
+
+        // Round-trip decode: the audit payload is the resolved config with secrets redacted.
+        let value: serde_json::Value = serde_json::from_str(&decoded_str).expect("valid json");
+        assert_eq!(value["api_key"], serde_json::json!(REDACTED));
+        assert_eq!(value["extra"]["Authorization"], serde_json::json!(REDACTED));
+        // The non-secret knobs ARE recorded — this is the point of the audit trail.
+        assert_eq!(value["model"], serde_json::json!("adorsys-reviewer"));
+        assert_eq!(
+            value["extra"]["reasoning_effort"],
+            serde_json::json!("high")
+        );
+        assert_eq!(
+            value["base_url"],
+            serde_json::json!("https://gateway.internal/v1")
+        );
+        assert_eq!(value["stream"], serde_json::json!(true));
+        assert_eq!(value["tier"], serde_json::json!("deep"));
+        assert!(
+            value["system_prompt"]
+                .as_str()
+                .unwrap()
+                .contains("careful reviewer"),
+            "the system prompt is captured verbatim (prompt churn is auditable)"
+        );
+        // The per-tier tools allowlist is recorded by selector string (builtin name + mcp regex).
+        let tools = value["tools"].as_array().expect("tools array");
+        assert_eq!(tools[0], serde_json::json!("add_review_comment"));
+        assert_eq!(tools[1], serde_json::json!("mcp__context7__.*"));
     }
 }
