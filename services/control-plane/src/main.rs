@@ -543,6 +543,7 @@ async fn run_dispatcher(state: AppState) -> anyhow::Result<()> {
         owner,
         dispatcher_config,
         state.neo4j.clone(),
+        state.review.clone(),
     )
     .await
 }

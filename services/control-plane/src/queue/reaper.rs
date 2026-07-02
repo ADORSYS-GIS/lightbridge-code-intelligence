@@ -72,7 +72,11 @@ fn requeue_backoff(attempts: i32) -> Duration {
 }
 
 /// Reconcile every stuck (`running`, lease-expired) task once against its Job's real state.
-pub async fn reap_once<L: TaskLauncher>(pool: &PgPool, launcher: &L) -> anyhow::Result<()> {
+pub async fn reap_once<L: TaskLauncher>(
+    pool: &PgPool,
+    launcher: &L,
+    review: &crate::config::ReviewSection,
+) -> anyhow::Result<()> {
     let candidates = db::list_reapable_tasks(pool, REAP_BATCH).await?;
     if candidates.is_empty() {
         return Ok(());
@@ -129,10 +133,10 @@ pub async fn reap_once<L: TaskLauncher>(pool: &PgPool, launcher: &L) -> anyhow::
                 if marked.is_ok() {
                     crate::http::metrics::reap_outcome("failed");
                     tracing::error!(task_id = %task.id, attempts = task.attempts, "reaper: stuck task exhausted retries; marked failed");
-                    // The uncatchable-kill notice (ADR-0057), now via the egress outbox (ADR-0059): the
-                    // keyless dispatcher can't POST, but it CAN write an intent row — the reconciler
-                    // delivers it. No sweep, no settle buffer.
-                    enqueue_reaper_failure_notice(pool, task.id).await;
+                    // The uncatchable-kill notice (ADR-0057) + the 😕 lifecycle reaction (ADR-0068), both
+                    // via the egress outbox (ADR-0059): the keyless dispatcher can't POST, but it CAN
+                    // write intent rows — the reconciler delivers them. No sweep, no settle buffer.
+                    enqueue_reaper_failure_notice(pool, task.id, review).await;
                 }
                 marked.map(|_| ())
             }
@@ -180,10 +184,16 @@ async fn delete_dead_job<L: TaskLauncher>(launcher: &L, task: &db::ReapableTask)
     }
 }
 
-/// Enqueue the ADR-0056 failure notice for a reaper-failed PR task (ADR-0059 egress outbox). A non-PR
-/// task (e.g. an index run) has no audience, so it's skipped. Best-effort: any error is logged. The
-/// `failure_notice` dedup_key means a task that was *also* runner-reported-failed isn't double-notified.
-async fn enqueue_reaper_failure_notice(pool: &sqlx::PgPool, task_id: uuid::Uuid) {
+/// Enqueue the ADR-0056 failure notice + the 😕 lifecycle reaction (ADR-0068) for a reaper-failed PR
+/// task (ADR-0059 egress outbox). A non-PR task (e.g. an index run) has no audience, so it's skipped.
+/// Best-effort: any error is logged. The `failure_notice` / `<task>:reaction:confused` dedup_keys mean a
+/// task that was *also* runner-reported-failed isn't double-notified or double-reacted — this mirrors
+/// serve's `handle_review_failure` for the uncatchable-kill path where no status report ever arrives.
+async fn enqueue_reaper_failure_notice(
+    pool: &sqlx::PgPool,
+    task_id: uuid::Uuid,
+    review: &crate::config::ReviewSection,
+) {
     let context = match db::get_task_context(pool, task_id).await {
         Ok(Some(c)) if c.target_type == "pull_request" => c,
         _ => return,
@@ -194,6 +204,20 @@ async fn enqueue_reaper_failure_notice(pool: &sqlx::PgPool, task_id: uuid::Uuid)
         owner: &context.owner,
         repo: &context.name,
     };
+    if review.reactions_enabled() {
+        // 😕 on the trigger: the @mention comment when mention-triggered, else the PR body.
+        if let Err(error) = crate::outbox::enqueue_reaction(
+            pool,
+            &t,
+            context.target_id,
+            "confused",
+            context.trigger_comment_id,
+        )
+        .await
+        {
+            tracing::warn!(%error, task_id = %task_id, "reaper: enqueueing 😕 failed (non-fatal)");
+        }
+    }
     if let Err(error) = crate::outbox::enqueue_failure_notice(pool, &t, context.target_id).await {
         tracing::warn!(%error, task_id = %task_id, "reaper: enqueueing failure notice failed (non-fatal)");
     }
@@ -316,6 +340,7 @@ mod tests {
                 head_sha: Some("head1".to_string()),
                 run_epoch: 0,
                 tier: "deep".to_string(),
+                trigger_comment_id: None,
             },
         )
         .await
@@ -350,7 +375,9 @@ mod tests {
         let id = stuck_running_task(&pool).await;
         let launcher = FakeLauncher::new(JobLiveness::Failed);
 
-        reap_once(&pool, &launcher).await.unwrap();
+        reap_once(&pool, &launcher, &crate::config::ReviewSection::default())
+            .await
+            .unwrap();
 
         assert_eq!(status_of(&pool, id).await, "queued", "requeued for retry");
         assert_eq!(
@@ -366,7 +393,9 @@ mod tests {
         let id = stuck_running_task(&pool).await;
         let launcher = FakeLauncher::new(JobLiveness::Active);
 
-        reap_once(&pool, &launcher).await.unwrap();
+        reap_once(&pool, &launcher, &crate::config::ReviewSection::default())
+            .await
+            .unwrap();
 
         assert_eq!(status_of(&pool, id).await, "running", "still running");
         assert!(
@@ -387,7 +416,9 @@ mod tests {
         let id = stuck_running_task(&pool).await;
         let launcher = FakeLauncher::new(JobLiveness::Succeeded);
 
-        reap_once(&pool, &launcher).await.unwrap();
+        reap_once(&pool, &launcher, &crate::config::ReviewSection::default())
+            .await
+            .unwrap();
 
         assert_eq!(
             status_of(&pool, id).await,

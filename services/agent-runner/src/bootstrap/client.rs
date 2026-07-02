@@ -35,9 +35,10 @@ pub struct TaskContext {
     /// (ADR-0025). Defaults to `false` (index) if an older control plane omits the field.
     #[serde(default)]
     pub repo_indexed: bool,
-    /// The agent's own prior review of this target, pre-formatted by the control plane (A, #137). Present
-    /// only on a re-review where an earlier review exists; injected into the prompt so the run reconciles
-    /// with its past output instead of contradicting itself. Defaults to `None` (blind re-review, the old
+    /// The agent's own prior reviews of this target, pre-formatted by the control plane (ADR-0040 +
+    /// ADR-0065). Present only on a re-review where an earlier review exists; injected as explicitly
+    /// UNTRUSTED context so the run re-derives from the diff, then reconciles — retracting prior findings
+    /// it cannot reproduce rather than restating them. Defaults to `None` (blind re-review, the old
     /// behavior) if an older control plane omits the field.
     #[serde(default)]
     pub prior_reviews: Option<String>,
@@ -424,13 +425,17 @@ impl ControlPlaneClient {
     }
 
     /// `POST /internal/tasks/{id}/review/finalize` — flush the accumulated buffer as one grouped
-    /// review (ADR-0037). Called once after the agent finishes cleanly.
-    pub async fn finalize_review(&self, task_id: Uuid) -> anyhow::Result<()> {
+    /// review (ADR-0037). `outcome` is how the run ended (`finished` / `exhausted` / `aborted`,
+    /// ADR-0068): the control plane suppresses the post and reacts 👍 ONLY on an explicitly clean
+    /// `finished` with zero findings — an aborted/exhausted run's honest note must still post, never
+    /// masquerade as a clean pass.
+    pub async fn finalize_review(&self, task_id: Uuid, outcome: &str) -> anyhow::Result<()> {
         use anyhow::Context;
         let url = format!("{}/internal/tasks/{task_id}/review/finalize", self.base_url);
         self.http
             .post(&url)
             .bearer_auth(&self.token)
+            .json(&serde_json::json!({ "outcome": outcome }))
             .send()
             .await
             .context("finalizing review")?

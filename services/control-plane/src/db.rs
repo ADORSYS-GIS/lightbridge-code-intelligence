@@ -159,6 +159,58 @@ pub async fn upsert_review(
     .map(|_| ())
 }
 
+/// Persist the silent-clean review copy (ADR-0068) **without clobbering** — `ON CONFLICT DO NOTHING`.
+/// The clean path must never overwrite a row the reconciler wrote for a *posted* review (that would null
+/// `github_review_id` and break the ADR-0035 feedback join); a re-run of the clean path itself is a
+/// no-op (same content). Contrast [`upsert_review`], which the reconciler uses at drain time where
+/// replacing on a re-post is the point.
+#[allow(clippy::too_many_arguments)]
+pub async fn insert_review_if_absent(
+    pool: &PgPool,
+    task_id: Uuid,
+    summary: &str,
+    body: &str,
+    inline_count: i32,
+    deferred_count: i32,
+    out_of_scope_count: i32,
+    findings: &Value,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO reviews \
+         (task_id, summary, body, inline_count, deferred_count, out_of_scope_count, findings) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7) \
+         ON CONFLICT (task_id) DO NOTHING",
+    )
+    .bind(task_id)
+    .bind(summary)
+    .bind(body)
+    .bind(inline_count)
+    .bind(deferred_count)
+    .bind(out_of_scope_count)
+    .bind(findings)
+    .execute(pool)
+    .await
+    .map(|_| ())
+}
+
+/// Whether this task already has a review going to (or on) GitHub: a `review` intent in the egress
+/// outbox (ANY status — even a dead-lettered one means the run had findings, so a later re-finalize
+/// against the cleared buffer must not re-read as "clean") or a persisted review that was actually
+/// posted (`github_review_id` set by the reconciler). The ADR-0068 silent-clean branch gates on this so
+/// a re-finalize can't clobber a real review with a 👍-and-nothing.
+pub async fn has_review_intent_or_posted_review(
+    pool: &PgPool,
+    task_id: Uuid,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (SELECT 1 FROM github_outbox WHERE task_id = $1 AND kind = 'review') \
+              OR EXISTS (SELECT 1 FROM reviews WHERE task_id = $1 AND github_review_id IS NOT NULL)",
+    )
+    .bind(task_id)
+    .fetch_one(pool)
+    .await
+}
+
 /// The persisted review for a task, or `None` if none was recorded (e.g. an older run, an index task,
 /// or a review that failed to post).
 pub async fn get_review(pool: &PgPool, task_id: Uuid) -> Result<Option<ReviewRow>, sqlx::Error> {
@@ -168,32 +220,122 @@ pub async fn get_review(pool: &PgPool, task_id: Uuid) -> Result<Option<ReviewRow
         .await
 }
 
-/// The summary + findings of the most recent prior review on the same target (A, #137) — used to feed a
-/// re-review its own past output so it reconciles instead of starting blind. Joins `reviews` to `tasks`
-/// to match the same `(repository_id, target_type, target_id)` as the current task, excluding the
-/// current task itself, newest first. Returns `None` when this target has no earlier posted review
-/// (e.g. the first review on a freshly opened PR). Best-effort context: the caller treats a query error
-/// as "no prior review" so a DB hiccup degrades to the old blind re-review rather than failing the task.
-pub async fn latest_prior_review_for_target(
+/// How many prior reviews of a target to carry into a re-review's context (ADR-0040 + ADR-0065). The
+/// latest is rendered in detail and the rest compressed; this bounds the DB read and the block. A PR
+/// re-reviewed dozens of times keeps only the most recent slice — older passes are the least relevant.
+const PRIOR_REVIEWS_CAP: i64 = 20;
+
+/// **All** prior reviews of the same target (ADR-0040 + ADR-0065), newest first, as
+/// `(ordinal, summary, findings)` — used to feed a re-review its own past output so it
+/// re-derives-then-reconciles instead of anchoring on a single prior verdict. `ordinal` is the review's
+/// **true 1-based chronological position** (1 = the first review ever posted on this target), computed
+/// with a window function over the FULL prior set *before* the `LIMIT` — so "review #1" stays the first
+/// review even once a PR accumulates more than [`PRIOR_REVIEWS_CAP`] priors, and the labels never shift
+/// between runs. `ORDER BY created_at DESC, task_id DESC` carries a unique tie-breaker so the "latest"
+/// pick is deterministic even on equal timestamps. Joins `reviews` to `tasks` to match the same
+/// `(repository_id, target_type, target_id)` as the current task, excluding the current task itself.
+/// Returns an empty vec when this target has no earlier posted review (e.g. the first review on a freshly
+/// opened PR). Best-effort context: the caller treats a query error as "no prior reviews" so a DB hiccup
+/// degrades to the old blind re-review rather than failing the task. Capped at [`PRIOR_REVIEWS_CAP`].
+pub async fn all_prior_reviews_for_target(
     pool: &PgPool,
     repository_id: i64,
     target_type: &str,
     target_id: i64,
     current_task_id: Uuid,
-) -> Result<Option<(String, Value)>, sqlx::Error> {
-    sqlx::query_as::<_, (String, Value)>(
-        "SELECT r.summary, r.findings \
-         FROM reviews r JOIN tasks t ON t.id = r.task_id \
-         WHERE t.repository_id = $1 AND t.target_type = $2 AND t.target_id = $3 \
-           AND r.task_id <> $4 \
-         ORDER BY r.created_at DESC \
-         LIMIT 1",
+) -> Result<Vec<(i64, String, Value)>, sqlx::Error> {
+    sqlx::query_as::<_, (i64, String, Value)>(
+        "SELECT ordinal, summary, findings FROM ( \
+             SELECT r.summary, r.findings, r.created_at, r.task_id, \
+                    ROW_NUMBER() OVER (ORDER BY r.created_at ASC, r.task_id ASC) AS ordinal \
+             FROM reviews r JOIN tasks t ON t.id = r.task_id \
+             WHERE t.repository_id = $1 AND t.target_type = $2 AND t.target_id = $3 \
+               AND r.task_id <> $4 \
+         ) prior \
+         ORDER BY created_at DESC, task_id DESC \
+         LIMIT $5",
     )
     .bind(repository_id)
     .bind(target_type)
     .bind(target_id)
     .bind(current_task_id)
-    .fetch_optional(pool)
+    .bind(PRIOR_REVIEWS_CAP)
+    .fetch_all(pool)
+    .await
+}
+
+/// Whether ANY prior review of this target (any commit, excluding the current task) carried at least one
+/// finding — the ADR-0065 × ADR-0068 composition gate for the silent-clean path: full silence (👍 only,
+/// no post) is only honest when there is nothing to reconcile. When prior findings exist and the current
+/// run re-derived none, the verdict must POST so the retractions (which the prompt contract routes into
+/// the verdict text) are visible on the PR. Type-guarded (`jsonb_typeof = 'array'`) so a legacy malformed
+/// findings blob reads as "no findings" instead of erroring the whole gate.
+pub async fn target_has_prior_findings(
+    pool: &PgPool,
+    repository_id: i64,
+    target_type: &str,
+    target_id: i64,
+    current_task_id: Uuid,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS ( \
+             SELECT 1 FROM reviews r JOIN tasks t ON t.id = r.task_id \
+             WHERE t.repository_id = $1 AND t.target_type = $2 AND t.target_id = $3 \
+               AND r.task_id <> $4 \
+               AND jsonb_typeof(r.findings) = 'array' AND jsonb_array_length(r.findings) > 0 \
+         )",
+    )
+    .bind(repository_id)
+    .bind(target_type)
+    .bind(target_id)
+    .bind(current_task_id)
+    .fetch_one(pool)
+    .await
+}
+
+/// The `findings` JSON arrays already posted — or **queued for posting** — by prior Lightbridge reviews
+/// on the **same head_sha** as the current run (ADR-0065, Option B — finalize dedup). We match on
+/// head_sha, not just the target, because line numbers drift across commits: a `(file, line, title)`
+/// dedup key is only safe within one commit.
+///
+/// Two sources, unioned:
+/// - `reviews` — reviews the reconciler already delivered (persisted at post time, ADR-0035);
+/// - `github_outbox` `review`-kind rows still `pending` — a review **enqueued but not yet posted**
+///   (reconciler backoff, or two rapid re-reviews racing finalize). Without these, the second finalize
+///   wouldn't see the first run's findings and would double-post; their findings ride in the payload
+///   (`payload->'findings_json'`, baked at produce time per ADR-0059). `posted` rows are skipped — the
+///   reconciler persists them into `reviews` on delivery, so the first arm already covers them.
+///
+/// Excludes the current task in both arms (a re-finalize must not dedup against its own in-flight
+/// review). Returns one `Value` (a findings array) per prior review; the caller flattens them into a set
+/// of normalized keys. Best-effort: a query error is treated by the caller as "nothing posted yet" (no
+/// dedup), never fatal.
+pub async fn posted_findings_for_head(
+    pool: &PgPool,
+    repository_id: i64,
+    target_type: &str,
+    target_id: i64,
+    head_sha: &str,
+    current_task_id: Uuid,
+) -> Result<Vec<Value>, sqlx::Error> {
+    sqlx::query_scalar::<_, Value>(
+        "SELECT r.findings \
+         FROM reviews r JOIN tasks t ON t.id = r.task_id \
+         WHERE t.repository_id = $1 AND t.target_type = $2 AND t.target_id = $3 \
+           AND t.head_sha = $4 AND r.task_id <> $5 \
+         UNION ALL \
+         SELECT o.payload->'findings_json' \
+         FROM github_outbox o JOIN tasks t ON t.id = o.task_id \
+         WHERE o.kind = 'review' AND o.status = 'pending' \
+           AND t.repository_id = $1 AND t.target_type = $2 AND t.target_id = $3 \
+           AND t.head_sha = $4 AND o.task_id <> $5",
+    )
+    .bind(repository_id)
+    .bind(target_type)
+    .bind(target_id)
+    .bind(head_sha)
+    .bind(current_task_id)
+    .fetch_all(pool)
     .await
 }
 
@@ -947,6 +1089,10 @@ pub struct NewTask {
     /// turn, no retrieval) or `"deep"` (`@mention` — full retrieval, multi-turn). The runner reads it
     /// from the task context. Index tasks don't set it (the column defaults to `deep`, ignored).
     pub tier: String,
+    /// GitHub id of the `@mention` comment that triggered this task (ADR-0068), so the lifecycle
+    /// reactions target the triggering comment. `None` for the automatic `pull_request opened` review
+    /// (no trigger comment → the reactions land on the PR body) and for index tasks.
+    pub trigger_comment_id: Option<i64>,
 }
 
 /// A task claimed by the dispatcher for execution (the subset needed to launch its Job).
@@ -1034,8 +1180,8 @@ pub async fn create_task(pool: &PgPool, task: &NewTask) -> Result<Option<Uuid>, 
     let id = Uuid::new_v4();
     let inserted: Option<(Uuid, String)> = sqlx::query_as(&format!(
         "INSERT INTO tasks (id, repository_id, installation_id, github_delivery_id, target_type, \
-         target_id, command_text, base_sha, head_sha, run_epoch, tier, status) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, {INITIAL_TASK_STATUS_SQL}) \
+         target_id, command_text, base_sha, head_sha, run_epoch, tier, trigger_comment_id, status) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, {INITIAL_TASK_STATUS_SQL}) \
          ON CONFLICT (repository_id, target_type, target_id, command_text, head_sha, run_epoch) \
          DO NOTHING \
          RETURNING id, status"
@@ -1051,6 +1197,7 @@ pub async fn create_task(pool: &PgPool, task: &NewTask) -> Result<Option<Uuid>, 
     .bind(&task.head_sha)
     .bind(task.run_epoch)
     .bind(&task.tier)
+    .bind(task.trigger_comment_id)
     .fetch_optional(pool)
     .await?;
 
@@ -1083,8 +1230,8 @@ pub async fn create_explicit_task(pool: &PgPool, task: &NewTask) -> Result<Uuid,
         let id = Uuid::new_v4();
         let result = sqlx::query_as::<_, (Uuid, String)>(&format!(
             "INSERT INTO tasks (id, repository_id, installation_id, github_delivery_id, target_type, \
-             target_id, command_text, base_sha, head_sha, tier, run_epoch, status) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, \
+             target_id, command_text, base_sha, head_sha, tier, trigger_comment_id, run_epoch, status) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, \
                (SELECT COALESCE(MAX(run_epoch), -1) + 1 FROM tasks \
                 WHERE repository_id = $2 AND target_type = $5 AND target_id = $6 \
                   AND command_text = $7 AND head_sha IS NOT DISTINCT FROM $9), \
@@ -1101,6 +1248,7 @@ pub async fn create_explicit_task(pool: &PgPool, task: &NewTask) -> Result<Uuid,
         .bind(&task.base_sha)
         .bind(&task.head_sha)
         .bind(&task.tier)
+        .bind(task.trigger_comment_id)
         .fetch_one(pool)
         .await;
         match result {
@@ -1722,6 +1870,9 @@ pub struct TaskContextRow {
     pub tier: String,
     pub base_sha: Option<String>,
     pub head_sha: Option<String>,
+    /// The `@mention` comment that triggered this task (ADR-0068), or `None` for the automatic
+    /// `pull_request opened` review. When `Some`, the lifecycle reactions target this comment.
+    pub trigger_comment_id: Option<i64>,
 }
 
 /// Load a task's execution context, or `None` if no such task exists. INNER JOIN on `repositories`:
@@ -1732,7 +1883,8 @@ pub async fn get_task_context(
 ) -> Result<Option<TaskContextRow>, sqlx::Error> {
     sqlx::query_as::<_, TaskContextRow>(
         "SELECT t.id, t.repository_id, t.installation_id, r.owner, r.name, r.default_branch, \
-                t.target_type, t.target_id, t.command_text, t.kind, t.tier, t.base_sha, t.head_sha \
+                t.target_type, t.target_id, t.command_text, t.kind, t.tier, t.base_sha, t.head_sha, \
+                t.trigger_comment_id \
          FROM tasks t JOIN repositories r ON r.id = t.repository_id \
          WHERE t.id = $1",
     )
@@ -2029,6 +2181,7 @@ mod tests {
             head_sha: Some(head.to_string()),
             run_epoch: 0,
             tier: "fast".to_string(),
+            trigger_comment_id: None,
         }
     }
 
@@ -2224,6 +2377,156 @@ mod tests {
         );
     }
 
+    /// ADR-0068: the verdict path. A clean review enqueues a 👍 reaction targeting the @mention comment
+    /// (a `comment_id` in the payload) and — crucially — **no** `review` intent, so the reconciler posts
+    /// nothing but the reaction. A review with findings enqueues 👎 on the PR body (no `comment_id`).
+    /// Both verdicts share ONE dedup key per task (`<task>:reaction:verdict`), so a verdict flip across
+    /// finalize attempts can never stack 👍 AND 👎 — the first verdict wins.
+    #[sqlx::test]
+    async fn verdict_reaction_targets_trigger_and_clean_pass_enqueues_no_review(pool: PgPool) {
+        let repo_id = seed(&pool).await;
+        let clean = create_task(&pool, &pr_task(repo_id, "clean"))
+            .await
+            .unwrap()
+            .expect("clean task");
+        let dirty = create_task(&pool, &pr_task(repo_id, "dirty"))
+            .await
+            .unwrap()
+            .expect("dirty task");
+
+        // Clean pass: 👍 on the @mention comment, no review intent.
+        let t_clean = crate::outbox::Target {
+            task_id: Some(clean),
+            installation_id: 99,
+            owner: "o",
+            repo: "r",
+        };
+        crate::outbox::enqueue_verdict_reaction(&pool, &t_clean, 7, "+1", Some(555))
+            .await
+            .unwrap();
+        // A re-finalize that flips the verdict (e.g. a stray retry against the cleared buffer) is a
+        // no-op: one shared `verdict` key per task, first verdict wins.
+        assert!(
+            !crate::outbox::enqueue_verdict_reaction(&pool, &t_clean, 7, "-1", Some(555))
+                .await
+                .unwrap(),
+            "a flipped verdict on the same task must not enqueue a second reaction"
+        );
+
+        // Findings: 👎 on the PR body (no comment_id).
+        let t_dirty = crate::outbox::Target {
+            task_id: Some(dirty),
+            installation_id: 99,
+            owner: "o",
+            repo: "r",
+        };
+        crate::outbox::enqueue_verdict_reaction(&pool, &t_dirty, 8, "-1", None)
+            .await
+            .unwrap();
+
+        let rows = claim_outbox_batch(&pool, 10).await.unwrap();
+        // Only the two reaction intents exist — the clean pass enqueued NO review, and the verdict
+        // flip did not add a third row.
+        assert_eq!(rows.len(), 2, "two reactions, NO review intent, no dup");
+        assert!(
+            rows.iter().all(|r| r.kind == "reaction"),
+            "the clean pass posts a reaction only — never a review"
+        );
+
+        let clean_row = rows.iter().find(|r| r.task_id == Some(clean)).unwrap();
+        assert_eq!(clean_row.payload["content"], "+1", "first verdict (👍) won");
+        assert_eq!(
+            clean_row.payload["comment_id"], 555,
+            "clean 👍 targets the @mention comment (ADR-0068)"
+        );
+
+        let dirty_row = rows.iter().find(|r| r.task_id == Some(dirty)).unwrap();
+        assert_eq!(dirty_row.payload["content"], "-1", "findings → 👎");
+        assert!(
+            dirty_row.payload.get("comment_id").is_none(),
+            "an auto review's 👎 targets the PR body, not a comment"
+        );
+    }
+
+    /// ADR-0068 re-finalize safety: the silent-clean guard trips on a `review` intent OR an
+    /// actually-posted review, and the clean-path persist never clobbers a posted row (it would null
+    /// `github_review_id` and break the ADR-0035 feedback join).
+    #[sqlx::test]
+    async fn silent_clean_guard_and_insert_if_absent_protect_a_posted_review(pool: PgPool) {
+        let repo_id = seed(&pool).await;
+        let task = create_task(&pool, &pr_task(repo_id, "h"))
+            .await
+            .unwrap()
+            .expect("task");
+        let findings = serde_json::json!([]);
+
+        // Nothing yet → the clean branch may proceed.
+        assert!(!has_review_intent_or_posted_review(&pool, task)
+            .await
+            .unwrap());
+
+        // A silent-clean persisted row (no github_review_id) does NOT trip the guard — re-running the
+        // clean path is harmless (insert-if-absent no-ops, verdict key no-ops).
+        insert_review_if_absent(&pool, task, "clean", "body", 0, 0, 0, &findings)
+            .await
+            .unwrap();
+        assert!(!has_review_intent_or_posted_review(&pool, task)
+            .await
+            .unwrap());
+
+        // The reconciler upserts the POSTED copy (github_review_id set) → guard trips…
+        upsert_review(
+            &pool,
+            task,
+            "found things",
+            "body",
+            2,
+            0,
+            0,
+            &findings,
+            Some("https://github.com/o/r/pull/7#pullrequestreview-9"),
+            Some(9),
+        )
+        .await
+        .unwrap();
+        assert!(has_review_intent_or_posted_review(&pool, task)
+            .await
+            .unwrap());
+
+        // …and a late clean-path insert is a no-op: the posted row keeps its github_review_id.
+        insert_review_if_absent(&pool, task, "clean", "body", 0, 0, 0, &findings)
+            .await
+            .unwrap();
+        let row = get_review(&pool, task).await.unwrap().expect("review row");
+        assert_eq!(
+            row.github_review_id,
+            Some(9),
+            "insert-if-absent must never clobber the posted review"
+        );
+        assert_eq!(row.inline_count, 2, "posted counts survive");
+
+        // A pending `review` intent alone (no reviews row yet) also trips the guard.
+        let task2 = create_task(&pool, &pr_task(repo_id, "h2"))
+            .await
+            .unwrap()
+            .expect("task2");
+        enqueue_github_post(
+            &pool,
+            Some(task2),
+            99,
+            "o",
+            "r",
+            "review",
+            &serde_json::json!({}),
+            "t2:review",
+        )
+        .await
+        .unwrap();
+        assert!(has_review_intent_or_posted_review(&pool, task2)
+            .await
+            .unwrap());
+    }
+
     /// #219 review: the failure-notice gate must treat a still-in-flight review intent as "responding",
     /// so a transiently-backing-off review doesn't let a misleading apology race ahead of it — but a
     /// dead-lettered (`failed`) review must NOT suppress the notice (then the review truly won't land).
@@ -2281,6 +2584,7 @@ mod tests {
             head_sha: None,
             run_epoch: 0,
             tier: "deep".to_string(),
+            trigger_comment_id: None,
         };
         let issue_id = create_task(&pool, &issue)
             .await
@@ -2349,6 +2653,7 @@ mod tests {
             head_sha: Some(head.to_string()),
             run_epoch: 0, // ignored by create_explicit_task — the INSERT computes the epoch
             tier: "deep".to_string(),
+            trigger_comment_id: None,
         };
 
         let first = create_explicit_task(&pool, &mention("h1")).await.unwrap();
@@ -2540,6 +2845,7 @@ mod tests {
                     head_sha: None,
                     run_epoch: 0,
                     tier: "deep".to_string(),
+                    trigger_comment_id: None,
                 },
             )
             .await
@@ -2797,23 +3103,95 @@ mod tests {
         assert!(get_review(&pool, Uuid::new_v4()).await.unwrap().is_none());
     }
 
-    /// A (#137): a re-review on the same target finds the earlier review's summary + findings, scoped to
-    /// the same `(repository_id, target_type, target_id)` and excluding the current task.
+    /// ADR-0065 × ADR-0068 composition gate: the silent-clean path is only allowed when NO prior review
+    /// of this target carried findings. Empty-findings priors don't count; the current task's own review
+    /// doesn't count; a prior with findings on ANY commit does (retractions must be visible).
     #[sqlx::test]
-    async fn latest_prior_review_is_target_scoped_and_excludes_current(pool: PgPool) {
+    async fn target_has_prior_findings_gates_on_nonempty_prior_findings(pool: PgPool) {
         let repo_id = seed(&pool).await;
-        // Two tasks on the SAME PR (#7), different heads — the original review and the re-review.
-        let first = create_task(&pool, &pr_task(repo_id, "h1"))
+        let prior = create_task(&pool, &pr_task(repo_id, "h1"))
             .await
             .unwrap()
             .unwrap();
-        let rereview = create_task(&pool, &pr_task(repo_id, "h2"))
+        let current = create_task(&pool, &pr_task(repo_id, "h2"))
             .await
             .unwrap()
             .unwrap();
 
-        let findings = serde_json::json!([{ "file": "a.rs", "line": 3, "priority": "P1",
+        // No prior review at all → no prior findings.
+        assert!(
+            !target_has_prior_findings(&pool, repo_id, "pull_request", 7, current)
+                .await
+                .unwrap()
+        );
+
+        // A prior CLEAN review (empty findings array) still doesn't gate — nothing to retract.
+        upsert_review(
+            &pool,
+            prior,
+            "clean",
+            "b",
+            0,
+            0,
+            0,
+            &serde_json::json!([]),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            !target_has_prior_findings(&pool, repo_id, "pull_request", 7, current)
+                .await
+                .unwrap(),
+            "an empty findings array is not a prior finding"
+        );
+
+        // A prior review WITH findings (any commit — h1 vs the current h2) gates the silence.
+        let f = serde_json::json!([{ "file": "a.rs", "line": 3, "title": "leak", "body": "b" }]);
+        upsert_review(&pool, prior, "one P1", "b", 1, 0, 0, &f, None, None)
+            .await
+            .unwrap();
+        assert!(
+            target_has_prior_findings(&pool, repo_id, "pull_request", 7, current)
+                .await
+                .unwrap(),
+            "prior findings on any commit force the verdict to post"
+        );
+
+        // The current task's own persisted review never counts as a prior.
+        assert!(
+            !target_has_prior_findings(&pool, repo_id, "pull_request", 7, prior)
+                .await
+                .unwrap(),
+            "a task is never its own prior"
+        );
+    }
+
+    /// ADR-0040 + ADR-0065: a re-review on the same target finds ALL earlier reviews (newest first),
+    /// each carrying its TRUE chronological ordinal (1 = the first review ever), scoped to the same
+    /// `(repository_id, target_type, target_id)` and excluding the current task.
+    #[sqlx::test]
+    async fn all_prior_reviews_are_target_scoped_ordered_and_exclude_current(pool: PgPool) {
+        let repo_id = seed(&pool).await;
+        // Three tasks on the SAME PR (#7): two prior reviews and the current re-review.
+        let first = create_task(&pool, &pr_task(repo_id, "h1"))
+            .await
+            .unwrap()
+            .unwrap();
+        let second = create_task(&pool, &pr_task(repo_id, "h2"))
+            .await
+            .unwrap()
+            .unwrap();
+        let rereview = create_task(&pool, &pr_task(repo_id, "h3"))
+            .await
+            .unwrap()
+            .unwrap();
+
+        let f1 = serde_json::json!([{ "file": "a.rs", "line": 3, "priority": "P1",
             "category": "quality", "title": "leak", "body": "b" }]);
+        let f2 = serde_json::json!([{ "file": "b.rs", "line": 9, "priority": "P2",
+            "category": "style", "title": "nit", "body": "b" }]);
         upsert_review(
             &pool,
             first,
@@ -2822,37 +3200,198 @@ mod tests {
             1,
             0,
             0,
-            &findings,
+            &f1,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        upsert_review(
+            &pool,
+            second,
+            "second verdict",
+            "body",
+            1,
+            0,
+            0,
+            &f2,
             None,
             None,
         )
         .await
         .unwrap();
 
-        // The re-review sees the first review (excludes itself, which has no review yet).
-        let prior = latest_prior_review_for_target(&pool, repo_id, "pull_request", 7, rereview)
-            .await
-            .unwrap()
-            .expect("prior review found");
-        assert_eq!(prior.0, "first verdict");
-        assert_eq!(prior.1[0]["title"], "leak");
+        // Force distinct, ordered timestamps: two upserts in one fast test can land in the same
+        // microsecond, and the query's tie-breaker (task_id) is a random UUID — deterministic for the
+        // QUERY but not for this test's expectation of "first before second".
+        sqlx::query(
+            "UPDATE reviews SET created_at = created_at - interval '1 minute' WHERE task_id = $1",
+        )
+        .bind(first)
+        .execute(&pool)
+        .await
+        .unwrap();
 
-        // From the first task's own perspective there is no *other* review → None.
-        assert!(
-            latest_prior_review_for_target(&pool, repo_id, "pull_request", 7, first)
-                .await
-                .unwrap()
-                .is_none(),
-            "a task is never its own prior review"
-        );
+        // The re-review sees BOTH priors, newest first (second before first), excluding itself — and
+        // each carries its true chronological ordinal (window over the full set, not the fetched slice).
+        let priors = all_prior_reviews_for_target(&pool, repo_id, "pull_request", 7, rereview)
+            .await
+            .unwrap();
+        assert_eq!(priors.len(), 2, "both prior reviews returned");
+        assert_eq!(priors[0].1, "second verdict", "newest first");
+        assert_eq!(priors[0].0, 2, "the newest review is chronologically #2");
+        assert_eq!(priors[1].1, "first verdict");
+        assert_eq!(priors[1].0, 1, "the oldest review is chronologically #1");
+        assert_eq!(priors[0].2[0]["title"], "nit");
+
+        // From the first task's own perspective its own review is excluded → only the second remains,
+        // and its ordinal is computed over the remaining set visible to that task.
+        let from_first = all_prior_reviews_for_target(&pool, repo_id, "pull_request", 7, first)
+            .await
+            .unwrap();
+        assert_eq!(from_first.len(), 1, "a task is never its own prior review");
+        assert_eq!(from_first[0].1, "second verdict");
 
         // A different target on the same repo doesn't leak across.
         assert!(
-            latest_prior_review_for_target(&pool, repo_id, "pull_request", 999, rereview)
+            all_prior_reviews_for_target(&pool, repo_id, "pull_request", 999, rereview)
                 .await
                 .unwrap()
-                .is_none(),
+                .is_empty(),
             "scoped to the target id"
+        );
+    }
+
+    /// ADR-0065 (Option B): the finalize dedup source — findings already posted on the SAME head_sha,
+    /// excluding the current task. A prior review on a *different* head_sha is not returned (line drift).
+    #[sqlx::test]
+    async fn posted_findings_for_head_is_head_scoped_and_excludes_current(pool: PgPool) {
+        let repo_id = seed(&pool).await;
+        let prior_same_head = create_task(&pool, &pr_task(repo_id, "same"))
+            .await
+            .unwrap()
+            .unwrap();
+        let prior_other_head = create_task(&pool, &pr_task(repo_id, "other"))
+            .await
+            .unwrap()
+            .unwrap();
+        // The current re-review shares head_sha "same" with `prior_same_head` (a new run_epoch).
+        let current = create_task(
+            &pool,
+            &NewTask {
+                run_epoch: 1,
+                ..pr_task(repo_id, "same")
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        let f_same =
+            serde_json::json!([{ "file": "a.rs", "line": 3, "title": "leak", "body": "b" }]);
+        let f_other =
+            serde_json::json!([{ "file": "b.rs", "line": 9, "title": "other", "body": "b" }]);
+        upsert_review(
+            &pool,
+            prior_same_head,
+            "v",
+            "b",
+            1,
+            0,
+            0,
+            &f_same,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        upsert_review(
+            &pool,
+            prior_other_head,
+            "v",
+            "b",
+            1,
+            0,
+            0,
+            &f_other,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let posted = posted_findings_for_head(&pool, repo_id, "pull_request", 7, "same", current)
+            .await
+            .unwrap();
+        assert_eq!(posted.len(), 1, "only the same-head prior is returned");
+        assert_eq!(posted[0][0]["title"], "leak");
+
+        // The current task never dedups against its own (not-yet-posted) review.
+        upsert_review(&pool, current, "v", "b", 1, 0, 0, &f_same, None, None)
+            .await
+            .unwrap();
+        let posted = posted_findings_for_head(&pool, repo_id, "pull_request", 7, "same", current)
+            .await
+            .unwrap();
+        assert_eq!(
+            posted.len(),
+            1,
+            "still only the *other* task's review, not its own"
+        );
+
+        // A review ENQUEUED but not yet delivered (pending `github_outbox` row — reconciler backoff, or
+        // two rapid re-reviews racing finalize) also counts: its findings ride the payload JSON.
+        let queued_same_head = create_task(
+            &pool,
+            &NewTask {
+                run_epoch: 2,
+                ..pr_task(repo_id, "same")
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let payload = serde_json::json!({
+            "pr": 7, "body": "b", "summary": "v", "comments": [],
+            "inline_n": 1, "deferred_n": 0, "out_of_scope_n": 0,
+            "findings_json": [{ "file": "q.rs", "line": 5, "title": "queued finding", "body": "b" }],
+            "label_findings": true, "label_error": false
+        });
+        enqueue_github_post(
+            &pool,
+            Some(queued_same_head),
+            99,
+            "acme",
+            "rocket",
+            "review",
+            &payload,
+            &format!("{queued_same_head}:review"),
+        )
+        .await
+        .unwrap();
+        let posted = posted_findings_for_head(&pool, repo_id, "pull_request", 7, "same", current)
+            .await
+            .unwrap();
+        assert_eq!(posted.len(), 2, "pending outbox review counts as posted");
+        assert!(
+            posted.iter().any(|arr| arr[0]["title"] == "queued finding"),
+            "the queued review's findings come from the outbox payload"
+        );
+
+        // Once delivered (`posted`), the outbox arm skips it — the reconciler persists it into
+        // `reviews` at that point, so the first arm covers it without double-counting.
+        sqlx::query("UPDATE github_outbox SET status = 'posted' WHERE task_id = $1")
+            .bind(queued_same_head)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let posted = posted_findings_for_head(&pool, repo_id, "pull_request", 7, "same", current)
+            .await
+            .unwrap();
+        assert_eq!(
+            posted.len(),
+            1,
+            "a delivered outbox row no longer contributes (reviews row takes over)"
         );
     }
 
@@ -3117,6 +3656,7 @@ mod tests {
                 head_sha: Some("head2".to_string()),
                 run_epoch: 0,
                 tier: "deep".to_string(),
+                trigger_comment_id: Some(918_273),
             },
         )
         .await
@@ -3128,6 +3668,13 @@ mod tests {
         assert_eq!(
             deep_ctx.tier, "deep",
             "an @mention review is the DEEP tier (ADR-0062)"
+        );
+        // ADR-0068: the trigger comment id round-trips through create → get_task_context, so the
+        // lifecycle reactions can target the @mention comment.
+        assert_eq!(
+            deep_ctx.trigger_comment_id,
+            Some(918_273),
+            "the @mention trigger comment id is persisted and loaded (ADR-0068)"
         );
 
         assert!(

@@ -160,12 +160,15 @@ pub async fn get_context(
         .unwrap_or(None)
         .is_some();
 
-    // Prior-review context (A, #137): on a re-review, feed the agent its own most recent review of this
-    // target so it reconciles instead of contradicting itself across runs. Only for `review` kind (an
-    // `ask` reply or an `index` run has nothing to reconcile). Best-effort: a lookup error degrades to a
-    // blind re-review (the old behavior), never a failed task.
+    // Prior-review context (ADR-0040 + ADR-0065): on a re-review, feed the agent ALL its prior reviews of
+    // this target so it re-derives-then-reconciles instead of anchoring on a single verdict. Only for
+    // `review` kind (an `ask` reply or an `index` run has nothing to reconcile). Best-effort: a lookup
+    // error degrades to a blind re-review (the old behavior), never a failed task. The DB returns the
+    // reviews newest-first, each carrying its TRUE chronological ordinal (computed by a window function
+    // over the full prior set BEFORE the fetch cap, so "review #1" is always the first review ever posted
+    // on this target and the labels never shift between runs once a PR exceeds the cap).
     let prior_reviews = if context.kind == "review" {
-        match crate::db::latest_prior_review_for_target(
+        match crate::db::all_prior_reviews_for_target(
             pool,
             context.repository_id,
             &context.target_type,
@@ -174,10 +177,18 @@ pub async fn get_context(
         )
         .await
         {
-            Ok(Some((summary, findings))) => {
-                crate::review::format_prior_review(&summary, &findings)
+            Ok(rows) if !rows.is_empty() => {
+                let priors: Vec<crate::review::PriorReview> = rows
+                    .into_iter()
+                    .map(|(ordinal, summary, findings)| crate::review::PriorReview {
+                        ordinal: ordinal.max(1) as usize,
+                        summary,
+                        findings,
+                    })
+                    .collect();
+                crate::review::format_prior_reviews(&priors)
             }
-            Ok(None) => None,
+            Ok(_) => None,
             Err(error) => {
                 tracing::warn!(%error, task_id = %id, "prior-review lookup failed (non-fatal)");
                 None
@@ -735,9 +746,15 @@ fn parse_knowledge_tool_name(name: &str) -> Option<(&str, &str)> {
 // Per-call diff validation is done runner-side (it holds the diff); the flush re-validates here
 // authoritatively via `crate::review::validate`.
 
-/// Default summary for a run that produced no findings (and the empty-run backstop), so an
-/// `@mention`-triggered review is never a silent hang (ADR-0037).
+/// Default summary for a run that produced no findings (and the empty-run backstop). Persisted to the
+/// `reviews` row so prior-review context + the console always have a verdict, even when ADR-0068
+/// suppresses the GitHub post (the 👍 reaction is the whole GitHub response).
 const DEFAULT_CLEAN_SUMMARY: &str = "No issues found — the change looks good.";
+
+/// GitHub reaction contents for the ADR-0068 verdict: 👍 (`+1`) on a clean pass, 👎 (`-1`) when findings
+/// were posted. (GitHub's reaction set has no ❌; 👎 is the agreed stand-in for "changes requested".)
+const REACTION_CLEAN: &str = "+1";
+const REACTION_FINDINGS: &str = "-1";
 
 /// Body for `POST /internal/tasks/{id}/review/inline` (`add_review_comment`).
 #[derive(Debug, Deserialize)]
@@ -894,17 +911,89 @@ fn posts_pr_review(
     target_type == "pull_request" && (has_inline || has_summary || buffer_empty)
 }
 
+/// Optional finalize request body: the runner-reported run outcome (ADR-0068). `finished` = the agent
+/// called `finish` (a trustworthy verdict); `exhausted` = it ran out of turn budget; `aborted` = it
+/// couldn't complete (findings cleared, an honest note buffered as the summary). Absent/unknown (e.g. an
+/// older runner mid-rolling-deploy) is treated as "not provably clean".
+#[derive(Debug, Default, Deserialize)]
+pub struct FinalizeBody {
+    #[serde(default)]
+    pub outcome: Option<String>,
+}
+
+/// How a PR-review finalize responds on GitHub (ADR-0068), derived from the run outcome, the finding
+/// count, and the reactions toggle. Pure, so the whole matrix is unit-tested without the DB/outbox.
+#[derive(Debug, PartialEq, Eq)]
+struct FinalizePolicy {
+    /// Suppress the review post entirely — the silent clean pass, where 👍 is the whole response.
+    suppress_clean_post: bool,
+    /// The verdict reaction to enqueue (`+1` clean / `-1` findings), if any.
+    verdict: Option<&'static str>,
+    /// 😕 for an aborted run: it posts an honest "couldn't complete" note, not a verdict.
+    react_confused: bool,
+}
+
+/// ADR-0068 policy: suppress-and-👍 ONLY on an explicitly clean finish (`outcome == "finished"`, zero
+/// findings) while reactions are enabled. Everything else fails OPEN to the old visible behavior — an
+/// aborted run posts its honest note (+😕, no verdict: its summary is an apology, not a verdict), an
+/// exhausted zero-findings run posts its budget note (no verdict: the pass was incomplete, "clean so
+/// far" must not read as "clean"), and a missing/unknown outcome posts. With reactions disabled nothing
+/// is suppressed (the 👍 could never compensate) and no reaction is enqueued.
+fn finalize_policy(
+    outcome: Option<&str>,
+    has_findings: bool,
+    reactions_enabled: bool,
+) -> FinalizePolicy {
+    let finished = outcome == Some("finished");
+    let aborted = outcome == Some("aborted");
+    FinalizePolicy {
+        suppress_clean_post: finished && !has_findings && reactions_enabled,
+        verdict: if !reactions_enabled || aborted {
+            None
+        } else if has_findings {
+            Some(REACTION_FINDINGS)
+        } else if finished {
+            Some(REACTION_CLEAN)
+        } else {
+            None // exhausted/unknown with zero findings: incomplete, so no verdict either way
+        },
+        react_confused: reactions_enabled && aborted,
+    }
+}
+
+/// The summary that is posted AND persisted for a review (pure, unit-tested). The model's own verdict
+/// always wins. Without one, an **all-deduped** run (ADR-0065: every finding it re-derived was already
+/// posted on this commit, `deduped_n > 0`, nothing kept) gets a truthful "no NEW findings" note — never
+/// [`DEFAULT_CLEAN_SUMMARY`], which would misrepresent (and persist, poisoning later prior-review
+/// context) a "found the same issues again" run as clean. A genuinely clean run keeps the default.
+fn effective_summary(real_summary: Option<&str>, deduped_n: usize, all_deduped: bool) -> String {
+    match real_summary {
+        Some(s) => s.to_string(),
+        None if all_deduped => {
+            format!("No new findings — {deduped_n} prior finding(s) on this commit still stand.")
+        }
+        None => DEFAULT_CLEAN_SUMMARY.to_string(),
+    }
+}
+
 /// `POST /internal/tasks/{id}/review/finalize` — flush the accumulated buffer (ADR-0037). Posts the
 /// inline findings + summary as **one grouped PR review** (re-validated against the diff here, the
 /// authority), consolidates buffered replies into **one** thread comment, records the emergent run
-/// kind, and clears the buffer. An empty run still posts a default "no issues found" review so an
-/// `@mention` is never silent. The buffer is cleared at the end regardless, so a finished run can't
-/// re-post on a stray retry.
+/// kind, and clears the buffer. An **explicitly clean** pass (`outcome: "finished"`, zero findings)
+/// posts NO review — the 👍 verdict reaction is the whole GitHub response (ADR-0068) — but still
+/// persists the review row; aborted/exhausted/unknown outcomes post as before. The buffer is cleared at
+/// the end regardless, so a finished run can't re-post on a stray retry.
 pub async fn finalize_review(
     _auth: RunnerAuth,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
+    body: axum::body::Bytes,
 ) -> Response {
+    // Lenient body parse: the outcome is advisory. An empty body (an older runner) or junk JSON reads
+    // as "no outcome" → fail open to posting (never a silent 👍 on an unproven run).
+    let outcome: Option<String> = serde_json::from_slice::<FinalizeBody>(&body)
+        .ok()
+        .and_then(|b| b.outcome);
     let Some(pool) = state.db.as_ref() else {
         return (StatusCode::SERVICE_UNAVAILABLE, "no database").into_response();
     };
@@ -990,9 +1079,10 @@ pub async fn finalize_review(
         }
     }
 
-    // 2) Inline findings + summary → ONE review intent (PR targets only). Always enqueued when a review
-    // is due — including the empty-buffer backstop (a default clean review) and a summary-only verdict —
-    // so an @mention review never goes silent. (`has_inline` / `post_pr_review` computed above.)
+    // 2) Inline findings + summary → ONE review intent (PR targets only), PLUS the verdict reaction.
+    // ADR-0068: only a run with findings enqueues a review; a clean pass suppresses the post (👍 only) but
+    // still persists the review row and reacts. `post_pr_review` (computed above) still gates the whole
+    // block — a pure @mention question posts neither. (`has_inline` computed above.)
     let mut queued_review = false;
     if post_pr_review {
         let pr = context.target_id;
@@ -1011,15 +1101,69 @@ pub async fn finalize_review(
                 resources: Vec::new(),
             })
             .collect();
+
+        // Cross-run dedup (ADR-0065, Option B): a re-review must not re-post a finding already sitting on
+        // this PR from a prior Lightbridge review. Drop findings whose normalized `(file, line, title)`
+        // key matches one already posted — or already QUEUED in the outbox — on the SAME head_sha (line
+        // numbers drift across commits, so a key match is only trustworthy within one commit). Sourced
+        // from our own persisted `reviews` + pending `github_outbox` review rows (ADR-0035/0059), not the
+        // GitHub API. Best-effort: a lookup error means "nothing posted yet" → no dedup, never a failed
+        // finalize. The prompt-side re-derive-then-retract framing (Option C) reduces re-emission
+        // upstream; this is the deterministic backstop.
+        //
+        // `pre_dedup_n` is captured FIRST: the ADR-0068 verdict (👍/👎) must reflect the run's TRUE
+        // finding count. A run whose findings were all dedup-suppressed still FOUND them — it is not a
+        // clean pass and must never 👍/suppress; only the POSTING is deduped (ADR-0065 composition).
+        let pre_dedup_n = findings.len();
+        let (findings, deduped_n) = match context.head_sha.as_deref() {
+            Some(head) => {
+                let posted_keys: std::collections::HashSet<(String, u32, String)> =
+                    match crate::db::posted_findings_for_head(
+                        pool,
+                        context.repository_id,
+                        &context.target_type,
+                        context.target_id,
+                        head,
+                        id,
+                    )
+                    .await
+                    {
+                        Ok(arrays) => arrays
+                            .into_iter()
+                            .flat_map(|arr| {
+                                serde_json::from_value::<Vec<crate::review::Finding>>(arr)
+                                    .unwrap_or_default()
+                            })
+                            .map(|f| crate::review::dedup_key(&f.file, f.line, &f.title))
+                            .collect(),
+                        Err(error) => {
+                            tracing::warn!(%error, task_id = %id, "posted-findings lookup failed (non-fatal, no dedup)");
+                            std::collections::HashSet::new()
+                        }
+                    };
+                crate::review::dedup_against_posted(findings, &posted_keys)
+            }
+            None => (findings, 0),
+        };
+        if deduped_n > 0 {
+            tracing::info!(
+                task_id = %id, deduped_n,
+                "re-review dedup: dropped findings already posted on this head_sha (ADR-0065)"
+            );
+        }
         // The model's `finish` verdict, if it produced one. `None` = an exhausted/clean pass (no
         // verdict) — the FAST body then shows its banner alone, while the DEEP body / stored copy fall
-        // back to the default so the verdict is never empty.
+        // back to the default so the verdict is never empty. EXCEPTION (ADR-0065 × ADR-0068): when
+        // dedup dropped every finding and the model set no verdict, the stored/posted summary is a
+        // truthful "no NEW findings" note — never `DEFAULT_CLEAN_SUMMARY`, which would misrepresent a
+        // "found the same issues again" run as clean.
         let real_summary = pending
             .summary
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty());
-        let summary = real_summary.unwrap_or(DEFAULT_CLEAN_SUMMARY).to_string();
+        let all_deduped = deduped_n > 0 && findings.is_empty();
+        let summary = effective_summary(real_summary, deduped_n, all_deduped);
 
         // The PR-diff fetch is a READ done at produce time (ADR-0059: shaping is the producer's job).
         let commentable: std::collections::HashMap<String, std::collections::BTreeSet<u32>> =
@@ -1055,10 +1199,17 @@ pub async fn finalize_review(
         // exists control-plane-side; the runner hardcoded the wrong `@lightbridge`). The stored `summary`
         // (re-injected as prior-review context on a later run) stays the verdict/default; only the posted
         // body differs. DEEP keeps the full authoritative review body.
+        // On an all-deduped run the FAST banner must not stand alone — the truthful "no NEW findings"
+        // note is the whole point of the post, so it rides as the fast body's verdict too.
+        let fast_summary = if all_deduped {
+            Some(summary.as_str())
+        } else {
+            real_summary
+        };
         let body = if context.tier == "fast" {
             crate::review::render_fast_body(
                 state.app_handle.as_str(),
-                real_summary,
+                fast_summary,
                 &validated.deferred,
                 &validated.out_of_scope,
             )
@@ -1079,32 +1230,175 @@ pub async fn finalize_review(
             validated.deferred.len() as i32,
             validated.out_of_scope.len() as i32,
         );
-        let payload = crate::outbox::ReviewPayload {
-            pr,
-            body,
-            summary,
-            comments,
-            inline_n,
-            deferred_n,
-            out_of_scope_n,
-            findings_json,
-            label_findings,
-            label_error,
+        // ADR-0068: an EXPLICITLY clean pass (`outcome: "finished"`, zero findings, reactions on) posts
+        // NO review — the 👍 reaction is the whole GitHub response. The review row is still persisted
+        // (below) so prior-review context + the console keep the verdict. Aborted (honest "couldn't
+        // complete" note), exhausted (budget note), and missing/unknown outcomes all still POST — a run
+        // that didn't provably finish clean must never masquerade as 👍.
+        //
+        // ADR-0065 composition: the verdict is computed from the PRE-dedup count — a run whose findings
+        // were all already posted (deduped) is NOT clean; it posts the truthful note (shaped above) and
+        // reacts 👎, never 👍/suppress. Only the inline COMMENTS are deduped.
+        let has_findings = pre_dedup_n > 0;
+        let policy = finalize_policy(
+            outcome.as_deref(),
+            has_findings,
+            state.review.reactions_enabled(),
+        );
+
+        // ADR-0065 composition, second gate: full silence is only honest when there is NOTHING to
+        // reconcile — no prior posted findings on this target. When priors exist and this run re-derived
+        // zero findings, the priors were (implicitly or explicitly) retracted, and per the prompt
+        // contract the retractions live in the verdict text — so the verdict must POST (👍 still rides
+        // from the zero pre-dedup count). Fail open to posting: an errored lookup must never silence a
+        // verdict that might carry retractions.
+        let suppress_clean = if policy.suppress_clean_post {
+            match crate::db::target_has_prior_findings(
+                pool,
+                context.repository_id,
+                &context.target_type,
+                context.target_id,
+                id,
+            )
+            .await
+            {
+                Ok(true) => {
+                    tracing::info!(
+                        task_id = %id,
+                        "clean pass with prior findings on this target: posting the verdict (retraction visibility, ADR-0065)"
+                    );
+                    false
+                }
+                Ok(false) => true,
+                Err(error) => {
+                    tracing::warn!(%error, task_id = %id, "prior-findings check failed (non-fatal): posting instead of suppressing");
+                    false
+                }
+            }
+        } else {
+            false
         };
 
-        match crate::outbox::enqueue_review(pool, &t, &payload).await {
-            Ok(_) => {
-                queued_review = true;
-                tracing::info!(task_id = %id, inline = inline_n, deferred = deferred_n, out_of_scope = out_of_scope_n, "review queued for egress");
-                // Drop the inline + summary rows now the intent is durably queued, so a re-finalize
-                // doesn't re-shape (the dedup_key would no-op the re-enqueue anyway).
-                let _ = crate::db::clear_pending_action(pool, id, "inline").await;
-                let _ = crate::db::clear_pending_action(pool, id, "summary").await;
+        if suppress_clean {
+            // Idempotency guard: a `review` intent (any status) or an actually-posted review means this
+            // is a re-finalize racing a real review (e.g. crash-after-finalize → requeue, buffer already
+            // cleared reads as "clean"). No-op rather than 👍-ing over — or clobbering — the real thing.
+            match crate::db::has_review_intent_or_posted_review(pool, id).await {
+                Ok(true) => {
+                    tracing::info!(
+                        task_id = %id,
+                        "re-finalize: a review intent/post already exists; skipping the silent-clean path"
+                    );
+                }
+                Ok(false) => {
+                    // Persist the verdict FIRST and fail loudly BEFORE the buffer is cleared: this row
+                    // feeds later re-review context, and on the silent path nothing else records the run —
+                    // a swallowed error here would lose the verdict forever. A 500 makes the runner's
+                    // finalize retry re-persist (insert-if-absent + the verdict dedup key are idempotent).
+                    if let Err(error) = crate::db::insert_review_if_absent(
+                        pool,
+                        id,
+                        &summary,
+                        &body,
+                        0,
+                        0,
+                        0,
+                        &findings_json,
+                    )
+                    .await
+                    {
+                        tracing::error!(%error, task_id = %id, "persisting silent clean review failed");
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "could not persist review",
+                        )
+                            .into_response();
+                    }
+                    // The 👍 is the ONLY GitHub response on this path, so its enqueue is fatal too.
+                    if let Err(error) = crate::outbox::enqueue_verdict_reaction(
+                        pool,
+                        &t,
+                        context.target_id,
+                        REACTION_CLEAN,
+                        context.trigger_comment_id,
+                    )
+                    .await
+                    {
+                        tracing::error!(%error, task_id = %id, "enqueueing clean 👍 failed");
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "could not queue reaction",
+                        )
+                            .into_response();
+                    }
+                    tracing::info!(task_id = %id, "clean pass: no findings → suppressing review post, 👍 only (ADR-0068)");
+                }
+                Err(error) => {
+                    tracing::error!(%error, task_id = %id, "silent-clean idempotency check failed");
+                    return (StatusCode::INTERNAL_SERVER_ERROR, "query error").into_response();
+                }
             }
-            Err(error) => {
-                tracing::error!(%error, task_id = %id, "enqueueing review failed");
-                return (StatusCode::INTERNAL_SERVER_ERROR, "could not queue review")
-                    .into_response();
+            let _ = crate::db::clear_pending_action(pool, id, "inline").await;
+            let _ = crate::db::clear_pending_action(pool, id, "summary").await;
+        } else {
+            let payload = crate::outbox::ReviewPayload {
+                pr,
+                body,
+                summary,
+                comments,
+                inline_n,
+                deferred_n,
+                out_of_scope_n,
+                findings_json,
+                label_findings,
+                label_error,
+            };
+            match crate::outbox::enqueue_review(pool, &t, &payload).await {
+                Ok(_) => {
+                    queued_review = true;
+                    tracing::info!(task_id = %id, inline = inline_n, deferred = deferred_n, out_of_scope = out_of_scope_n, "review queued for egress");
+                    // Drop the inline + summary rows now the intent is durably queued, so a re-finalize
+                    // doesn't re-shape (the dedup_key would no-op the re-enqueue anyway).
+                    let _ = crate::db::clear_pending_action(pool, id, "inline").await;
+                    let _ = crate::db::clear_pending_action(pool, id, "summary").await;
+                }
+                Err(error) => {
+                    tracing::error!(%error, task_id = %id, "enqueueing review failed");
+                    return (StatusCode::INTERNAL_SERVER_ERROR, "could not queue review")
+                        .into_response();
+                }
+            }
+            // ADR-0068 verdict reaction on the trigger: 👎 for findings (pre-dedup — an all-deduped run
+            // reacts 👎 with its truthful note), or 👍 for a clean finish that still posts because prior
+            // findings exist on this target (retraction visibility, ADR-0065 composition). Best-effort:
+            // the review itself is queued, the reaction is cosmetic.
+            if let Some(content) = policy.verdict {
+                if let Err(error) = crate::outbox::enqueue_verdict_reaction(
+                    pool,
+                    &t,
+                    context.target_id,
+                    content,
+                    context.trigger_comment_id,
+                )
+                .await
+                {
+                    tracing::warn!(%error, task_id = %id, content, "enqueueing verdict reaction failed (non-fatal)");
+                }
+            }
+            // An aborted run posted an apology, not a verdict → 😕 (same dedup key as the failure-path
+            // 😕, so a run that also reports `failed` isn't double-reacted).
+            if policy.react_confused {
+                if let Err(error) = crate::outbox::enqueue_reaction(
+                    pool,
+                    &t,
+                    context.target_id,
+                    "confused",
+                    context.trigger_comment_id,
+                )
+                .await
+                {
+                    tracing::warn!(%error, task_id = %id, "enqueueing aborted 😕 failed (non-fatal)");
+                }
             }
         }
     }
@@ -1162,7 +1456,8 @@ pub async fn set_status(
             }
             // A terminal failure gets 😕 + a fallback "review failed, retry" comment on the PR when the
             // review never finalized (ADR-0056), so the author isn't left in silence. Success is
-            // acknowledged by the review post (🎉) in `finalize_review`, so we don't double-react here.
+            // acknowledged by the verdict reaction (👍/👎, ADR-0068) in `finalize_review`, so we don't
+            // double-react here.
             if matches!(update.status.as_str(), "failed" | "timed_out") {
                 let state = state.clone();
                 let pool = pool.clone();
@@ -1224,8 +1519,15 @@ async fn handle_review_failure(state: &AppState, pool: &sqlx::PgPool, id: Uuid) 
         repo: &context.name,
     };
     if state.review.reactions_enabled() {
-        if let Err(error) =
-            crate::outbox::enqueue_reaction(pool, &t, context.target_id, "confused").await
+        // ADR-0068: retarget 😕 to the @mention comment when the task was mention-triggered.
+        if let Err(error) = crate::outbox::enqueue_reaction(
+            pool,
+            &t,
+            context.target_id,
+            "confused",
+            context.trigger_comment_id,
+        )
+        .await
         {
             tracing::warn!(%error, task_id = %id, "enqueueing failure reaction failed (non-fatal)");
         }
@@ -1263,6 +1565,132 @@ mod tests {
         // A non-PR (issue) target is never a PR review → the reply is the content, kept.
         assert!(!posts_pr_review("issue", true, true, false));
         assert!(!posts_pr_review("issue", false, false, false));
+    }
+
+    // ADR-0068 policy matrix. Suppress-and-👍 ONLY on an explicitly clean finish; every other outcome
+    // fails open to posting. (❌ has no GitHub reaction; 👎 is the agreed stand-in.)
+    #[test]
+    fn finalize_policy_suppresses_only_an_explicit_clean_finish() {
+        // The one silent case: finished + zero findings + reactions on → suppress, 👍.
+        let p = finalize_policy(Some("finished"), false, true);
+        assert!(p.suppress_clean_post);
+        assert_eq!(p.verdict, Some("+1"));
+        assert!(!p.react_confused);
+
+        // Finished with findings → post + 👎.
+        let p = finalize_policy(Some("finished"), true, true);
+        assert!(!p.suppress_clean_post);
+        assert_eq!(p.verdict, Some("-1"));
+    }
+
+    #[test]
+    fn finalize_policy_aborted_posts_the_note_with_confused_not_a_verdict() {
+        // The runner's Aborted path buffers "Couldn't complete this review: …" as the summary and
+        // reports succeeded — it must POST that note (never a silent misleading 👍) and react 😕.
+        let p = finalize_policy(Some("aborted"), false, true);
+        assert!(!p.suppress_clean_post, "an aborted run is not a clean pass");
+        assert_eq!(p.verdict, None, "an apology is not a verdict");
+        assert!(p.react_confused);
+    }
+
+    #[test]
+    fn finalize_policy_exhausted_zero_findings_posts_budget_note_without_verdict() {
+        // Deep-tier Exhausted sets the "⚠️ Review hit its step budget…" summary; "clean so far" from an
+        // incomplete pass must not read as "clean" → post, no verdict reaction either way.
+        let p = finalize_policy(Some("exhausted"), false, true);
+        assert!(!p.suppress_clean_post);
+        assert_eq!(p.verdict, None);
+        assert!(!p.react_confused);
+        // Exhausted WITH findings still posts them → 👎 (real findings were posted).
+        let p = finalize_policy(Some("exhausted"), true, true);
+        assert!(!p.suppress_clean_post);
+        assert_eq!(p.verdict, Some("-1"));
+    }
+
+    #[test]
+    fn finalize_policy_missing_or_unknown_outcome_fails_open_to_posting() {
+        // An older runner (rolling deploy) sends no outcome → the old visible behavior: post, and no
+        // 👍 (the run isn't provably a clean finish).
+        let p = finalize_policy(None, false, true);
+        assert!(!p.suppress_clean_post);
+        assert_eq!(p.verdict, None);
+        let p = finalize_policy(Some("gibberish"), false, true);
+        assert!(!p.suppress_clean_post);
+        assert_eq!(p.verdict, None);
+    }
+
+    #[test]
+    fn finalize_policy_reactions_disabled_never_suppresses_and_never_reacts() {
+        // review.reactions=false: the 👍 could never compensate for a suppressed post, so the clean
+        // review posts exactly as before ADR-0068 — and no reaction of any kind is enqueued.
+        let p = finalize_policy(Some("finished"), false, false);
+        assert!(
+            !p.suppress_clean_post,
+            "suppression without the compensating 👍 would be total silence"
+        );
+        assert_eq!(p.verdict, None);
+        let p = finalize_policy(Some("finished"), true, false);
+        assert_eq!(p.verdict, None);
+        let p = finalize_policy(Some("aborted"), false, false);
+        assert!(!p.react_confused);
+    }
+
+    // ADR-0065 × ADR-0068 composition: the verdict reads the PRE-dedup finding count, the post reads
+    // the POST-dedup set. A run whose findings were ALL dedup-suppressed is not clean — it posts a
+    // truthful "no NEW findings" note and reacts 👎, never 👍/suppress.
+    #[test]
+    fn all_deduped_run_posts_truthful_note_with_findings_verdict_not_clean() {
+        // `has_findings` fed to the policy is pre-dedup (5 found, 5 dropped): 👎 + no suppression.
+        let p = finalize_policy(Some("finished"), true, true);
+        assert!(
+            !p.suppress_clean_post,
+            "an all-deduped run must stay visible"
+        );
+        assert_eq!(p.verdict, Some(REACTION_FINDINGS), "👎 from the true count");
+
+        // And the body it posts (no model verdict) is the truthful note — never the clean default.
+        let s = effective_summary(None, 5, true);
+        assert_eq!(
+            s,
+            "No new findings — 5 prior finding(s) on this commit still stand."
+        );
+        assert!(
+            !s.contains(DEFAULT_CLEAN_SUMMARY),
+            "a dedup-suppressed run must never read (or persist) as clean"
+        );
+    }
+
+    #[test]
+    fn effective_summary_keeps_model_verdict_and_clean_default() {
+        // The model's own verdict always wins, even on an all-deduped run.
+        assert_eq!(
+            effective_summary(Some("Both P1s still stand; see prior comments."), 5, true),
+            "Both P1s still stand; see prior comments."
+        );
+        // A genuinely clean run (nothing found, nothing deduped) keeps the default.
+        assert_eq!(effective_summary(None, 0, false), DEFAULT_CLEAN_SUMMARY);
+        // Partial dedup (some findings survive) also keeps the default when the model set no verdict —
+        // the surviving findings carry the review; the summary is not the dedup note.
+        assert_eq!(effective_summary(None, 3, false), DEFAULT_CLEAN_SUMMARY);
+    }
+
+    // Zero findings re-derived + prior findings exist on the target → the finalize handler's
+    // `target_has_prior_findings` gate flips `suppress_clean_post` OFF so the verdict (which carries the
+    // retractions per the prompt contract) POSTS — while the 👍 still rides from the zero pre-dedup
+    // count. Full silence stays reserved for a clean finish with NO priors. The DB half of the gate is
+    // covered by `db::tests::target_has_prior_findings_*`; this pins the policy half.
+    #[test]
+    fn clean_finish_verdict_is_thumbs_up_whether_posted_or_suppressed() {
+        let p = finalize_policy(Some("finished"), false, true);
+        assert_eq!(
+            p.verdict,
+            Some(REACTION_CLEAN),
+            "zero pre-dedup findings on a finish → 👍, posted or not"
+        );
+        assert!(
+            p.suppress_clean_post,
+            "the policy half still asks for silence; the prior-findings gate decides (handler-side)"
+        );
     }
 
     #[test]
