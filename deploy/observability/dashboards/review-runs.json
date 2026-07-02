@@ -1,0 +1,221 @@
+{
+  "annotations": {},
+  "description": "Per-run audit of the review agent: for each review run, the tools offered to the model and the resolved (redacted) config it ran with. Sourced from tasks.run_tools / tasks.run_config_b64 (migration 0023).",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "panels": [
+    {
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "${DS_POSTGRES}"
+      },
+      "description": "Per review run: repository, PR/target, tier, status, and the key knobs projected from the redacted config blob (run_config_b64) plus the tools offered to the model at turn 0 (run_tools). Indexing runs are excluded (they persist neither). Paste a task id into the Task ID variable to inspect one run in full below.",
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 12,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "options": null,
+      "repeatDirection": "h",
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "${DS_POSTGRES}"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "WITH runs AS (  SELECT t.id, t.created_at, t.repository_id, t.target_type, t.target_id,          t.tier, t.status, t.run_tools,          (convert_from(decode(t.run_config_b64, 'base64'), 'UTF8'))::jsonb AS cfg   FROM tasks t   WHERE t.run_config_b64 IS NOT NULL AND $__timeFilter(t.created_at)) SELECT runs.created_at AS \"created\", coalesce(r.owner || '/' || r.name, runs.repository_id::text) AS \"repository\", runs.target_type AS \"target\", runs.target_id AS \"number\", runs.tier, runs.status, runs.cfg->>'model' AS \"model\", runs.cfg->>'temperature' AS \"temp\", runs.cfg->>'top_p' AS \"top_p\", runs.cfg->>'max_tokens' AS \"max_tokens\", runs.cfg->>'max_turns' AS \"max_turns\", runs.cfg->>'context_window' AS \"ctx_window\", runs.cfg->>'stream' AS \"stream\", coalesce(jsonb_array_length(runs.run_tools), 0) AS \"offered\", (SELECT string_agg(e->>'name', ', ' ORDER BY e->>'name')  FROM jsonb_array_elements(runs.run_tools) e) AS \"offered tools\", runs.id AS \"task id\" FROM runs LEFT JOIN repositories r ON r.id = runs.repository_id ORDER BY runs.created_at DESC LIMIT 200",
+          "refId": "A"
+        }
+      ],
+      "title": "Review runs",
+      "transformations": [],
+      "transparent": false,
+      "type": "table"
+    },
+    {
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "${DS_POSTGRES}"
+      },
+      "description": "Review runs started per interval, split by tier (fast / deep).",
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 24,
+        "x": 0,
+        "y": 12
+      },
+      "options": null,
+      "repeatDirection": "h",
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "${DS_POSTGRES}"
+          },
+          "editorMode": "code",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT $__timeGroupAlias(t.created_at, $__interval), t.tier AS \"tier\", count(*) AS \"runs\" FROM tasks t WHERE t.run_config_b64 IS NOT NULL AND $__timeFilter(t.created_at) GROUP BY 1, 2 ORDER BY 1",
+          "refId": "A"
+        }
+      ],
+      "title": "Review runs by tier",
+      "transformations": [],
+      "transparent": false,
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "${DS_POSTGRES}"
+      },
+      "description": "The full redacted ReviewConfig for the pasted task, pretty-printed WITHOUT the ~23KB system_prompt (see the next panel for that alone).",
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 12,
+        "w": 12,
+        "x": 0,
+        "y": 19
+      },
+      "options": null,
+      "repeatDirection": "h",
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "${DS_POSTGRES}"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT jsonb_pretty(  (convert_from(decode(t.run_config_b64, 'base64'), 'UTF8'))::jsonb   - 'system_prompt') AS \"config (no system_prompt)\" FROM tasks t WHERE '${task_id}' <> '' AND t.id::text = '${task_id}' AND t.run_config_b64 IS NOT NULL",
+          "refId": "A"
+        }
+      ],
+      "title": "Run config for $task_id (system_prompt omitted)",
+      "transformations": [],
+      "transparent": false,
+      "type": "table"
+    },
+    {
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "${DS_POSTGRES}"
+      },
+      "description": "The exact tool set offered to the model at turn 0 for the pasted task \u2014 the per-tier allowlist resolved with any MCP-discovered external-knowledge tools. Pretty-printed array of {name, source: builtin|mcp}.",
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 12,
+        "w": 12,
+        "x": 12,
+        "y": 19
+      },
+      "options": null,
+      "repeatDirection": "h",
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "${DS_POSTGRES}"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT jsonb_pretty(t.run_tools) AS \"offered tools\" FROM tasks t WHERE '${task_id}' <> '' AND t.id::text = '${task_id}' AND t.run_tools IS NOT NULL",
+          "refId": "A"
+        }
+      ],
+      "title": "Offered tools for $task_id",
+      "transformations": [],
+      "transparent": false,
+      "type": "table"
+    },
+    {
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "${DS_POSTGRES}"
+      },
+      "description": "The verbatim reviewer system_prompt this run was configured with \u2014 the exact ~23KB of guidance the model received, decoded from the redacted config blob.",
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 14,
+        "w": 24,
+        "x": 0,
+        "y": 31
+      },
+      "options": null,
+      "repeatDirection": "h",
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "${DS_POSTGRES}"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT ((convert_from(decode(t.run_config_b64, 'base64'), 'UTF8'))::jsonb   ->>'system_prompt') AS \"system_prompt\" FROM tasks t WHERE '${task_id}' <> '' AND t.id::text = '${task_id}' AND t.run_config_b64 IS NOT NULL",
+          "refId": "A"
+        }
+      ],
+      "title": "System prompt for $task_id",
+      "transformations": [],
+      "transparent": false,
+      "type": "table"
+    }
+  ],
+  "refresh": "1m",
+  "schemaVersion": 36,
+  "style": "dark",
+  "tags": [
+    "lightbridge",
+    "generated"
+  ],
+  "templating": {
+    "list": [
+      {
+        "auto": false,
+        "auto_count": 30,
+        "auto_min": "10s",
+        "hide": 0,
+        "id": "00000000-0000-0000-0000-000000000000",
+        "includeAll": false,
+        "label": "Task ID (run detail)",
+        "multi": false,
+        "name": "task_id",
+        "query": "",
+        "skipUrlSync": false,
+        "type": "textbox"
+      }
+    ]
+  },
+  "time": {
+    "from": "now-7d",
+    "to": "now"
+  },
+  "timezone": "browser",
+  "title": "Lightbridge \u2014 Review runs",
+  "uid": "lci-review-runs"
+}
