@@ -264,6 +264,35 @@ pub async fn all_prior_reviews_for_target(
     .await
 }
 
+/// Whether ANY prior review of this target (any commit, excluding the current task) carried at least one
+/// finding — the ADR-0065 × ADR-0068 composition gate for the silent-clean path: full silence (👍 only,
+/// no post) is only honest when there is nothing to reconcile. When prior findings exist and the current
+/// run re-derived none, the verdict must POST so the retractions (which the prompt contract routes into
+/// the verdict text) are visible on the PR. Type-guarded (`jsonb_typeof = 'array'`) so a legacy malformed
+/// findings blob reads as "no findings" instead of erroring the whole gate.
+pub async fn target_has_prior_findings(
+    pool: &PgPool,
+    repository_id: i64,
+    target_type: &str,
+    target_id: i64,
+    current_task_id: Uuid,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS ( \
+             SELECT 1 FROM reviews r JOIN tasks t ON t.id = r.task_id \
+             WHERE t.repository_id = $1 AND t.target_type = $2 AND t.target_id = $3 \
+               AND r.task_id <> $4 \
+               AND jsonb_typeof(r.findings) = 'array' AND jsonb_array_length(r.findings) > 0 \
+         )",
+    )
+    .bind(repository_id)
+    .bind(target_type)
+    .bind(target_id)
+    .bind(current_task_id)
+    .fetch_one(pool)
+    .await
+}
+
 /// The `findings` JSON arrays already posted — or **queued for posting** — by prior Lightbridge reviews
 /// on the **same head_sha** as the current run (ADR-0065, Option B — finalize dedup). We match on
 /// head_sha, not just the target, because line numbers drift across commits: a `(file, line, title)`
@@ -3072,6 +3101,71 @@ mod tests {
         );
 
         assert!(get_review(&pool, Uuid::new_v4()).await.unwrap().is_none());
+    }
+
+    /// ADR-0065 × ADR-0068 composition gate: the silent-clean path is only allowed when NO prior review
+    /// of this target carried findings. Empty-findings priors don't count; the current task's own review
+    /// doesn't count; a prior with findings on ANY commit does (retractions must be visible).
+    #[sqlx::test]
+    async fn target_has_prior_findings_gates_on_nonempty_prior_findings(pool: PgPool) {
+        let repo_id = seed(&pool).await;
+        let prior = create_task(&pool, &pr_task(repo_id, "h1"))
+            .await
+            .unwrap()
+            .unwrap();
+        let current = create_task(&pool, &pr_task(repo_id, "h2"))
+            .await
+            .unwrap()
+            .unwrap();
+
+        // No prior review at all → no prior findings.
+        assert!(
+            !target_has_prior_findings(&pool, repo_id, "pull_request", 7, current)
+                .await
+                .unwrap()
+        );
+
+        // A prior CLEAN review (empty findings array) still doesn't gate — nothing to retract.
+        upsert_review(
+            &pool,
+            prior,
+            "clean",
+            "b",
+            0,
+            0,
+            0,
+            &serde_json::json!([]),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            !target_has_prior_findings(&pool, repo_id, "pull_request", 7, current)
+                .await
+                .unwrap(),
+            "an empty findings array is not a prior finding"
+        );
+
+        // A prior review WITH findings (any commit — h1 vs the current h2) gates the silence.
+        let f = serde_json::json!([{ "file": "a.rs", "line": 3, "title": "leak", "body": "b" }]);
+        upsert_review(&pool, prior, "one P1", "b", 1, 0, 0, &f, None, None)
+            .await
+            .unwrap();
+        assert!(
+            target_has_prior_findings(&pool, repo_id, "pull_request", 7, current)
+                .await
+                .unwrap(),
+            "prior findings on any commit force the verdict to post"
+        );
+
+        // The current task's own persisted review never counts as a prior.
+        assert!(
+            !target_has_prior_findings(&pool, repo_id, "pull_request", 7, prior)
+                .await
+                .unwrap(),
+            "a task is never its own prior"
+        );
     }
 
     /// ADR-0040 + ADR-0065: a re-review on the same target finds ALL earlier reviews (newest first),

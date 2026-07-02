@@ -95,16 +95,29 @@ What ships instead:
 This refines — does not revert — ADR-0040: prior reviews are still injected; their framing (untrusted
 hypotheses, re-derive-first) and their *output* (deduped at finalize) are now constrained.
 
+**Composition with ADR-0068 (reaction-driven lifecycle).** The verdict reaction is computed from the
+**pre-dedup** finding count and the posting from the **post-dedup** set: a run whose findings were all
+dedup-suppressed is *not* clean — it posts a truthful *"no new findings — N prior finding(s) on this
+commit still stand"* note (never the clean default, which would also poison later prior-review context)
+and reacts 👎. The fully-silent 👍 path additionally requires that **no prior review of the target
+carried findings**: when priors exist and a run re-derives zero findings, the verdict posts (👍 still
+rides) so the retractions — which the prompt contract routes into the verdict text — stay visible on
+the PR. Aborted/exhausted semantics are ADR-0068's, unchanged.
+
 ### Consequences
 
-- **Good** — a re-review on an unchanged commit posts a one-line verdict + a link, not 5 duplicate comments.
-- **Good** — overlapping findings across commits are deduped, not stacked.
-- **Good** — the agent can drop a prior false positive (C), which "reconcile, don't contradict" discouraged.
-- **Good** — saves a full agent run when nothing changed (A).
-- **Bad / watch** — "meaningfully changed" is `head_sha`-based; a force-rerun keyword is needed for "re-review
-  anyway" (e.g. after a model/prompt change). The dedup key (B) must normalize whitespace/wording so trivial
-  re-phrasings still match.
-- **Neutral** — needs the prior review's `head_sha` + its posted comments, both already persisted.
+- **Good** — a re-review on an unchanged commit posts only what is NEW; an all-deduped run posts a
+  truthful one-line "no new findings, N still stand" note + 👎, not 5 duplicate comments.
+- **Good** — same-commit findings are deduped at finalize (persisted `reviews` + pending outbox rows),
+  not stacked; the dedup key normalizes whitespace + case so trivial re-phrasings still match.
+- **Good** — the agent can drop a prior false positive (C), which "reconcile, don't contradict"
+  discouraged — and its retractions stay visible (the silent-👍 path requires a prior-findings-free target).
+- **Good** — every invocation runs fully (A dropped): a non-deterministic reviewer's second look can
+  surface genuinely-new findings on the same commit instead of being short-circuited away.
+- **Bad / watch** — a re-run on unchanged code still pays for a full agent run (accepted: correctness is
+  enforced at the output, not by skipping). Dedup is same-`head_sha` only, so a re-phrased finding on a
+  NEW commit can still repost — the prompt's commit-scoped no-repeat clause is the only guard there.
+- **Neutral** — needs the prior reviews' findings + `head_sha`, both already persisted (no migration).
 
 ## Pros and Cons of the Options
 
