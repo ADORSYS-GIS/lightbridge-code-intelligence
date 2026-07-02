@@ -428,6 +428,28 @@ pub async fn get_transcript(
     .await
 }
 
+/// Record a review run's telemetry (extends ADR-0034/0017/0060) on the task row: the tool set OFFERED
+/// to the model this run (`run_tools`, a `[{name, source}]` array) and the resolved, **already-redacted +
+/// base64-encoded** `ReviewConfig` (`run_config_b64`). The runner submits both at run START, so a
+/// crashed/aborted run still has its config recorded. One task = one run, so this is a plain UPDATE in
+/// place (latest-run-replace semantics, matching how the transcript is replaced per run). Indexing runs
+/// never call this, so their columns stay NULL. Returns whether a row was updated — `false` means the
+/// task id is unknown, so the caller can 404 without a separate existence SELECT (gemini review on #270).
+pub async fn record_review_run_telemetry(
+    pool: &PgPool,
+    task_id: Uuid,
+    run_tools: &Value,
+    run_config_b64: &str,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query("UPDATE tasks SET run_tools = $2, run_config_b64 = $3 WHERE id = $1")
+        .bind(task_id)
+        .bind(run_tools)
+        .bind(run_config_b64)
+        .execute(pool)
+        .await
+        .map(|r| r.rows_affected() > 0)
+}
+
 // ── ADR-0035 review feedback (poll reactions on our comments) ───────────────────────────────────
 
 /// A comment we created at write-back, recorded so the poller knows what to poll. `kind` selects the
@@ -3614,6 +3636,85 @@ mod tests {
         let rows = get_transcript(&pool, task_id).await.unwrap();
         assert_eq!(rows.len(), 1, "replaced, not appended");
         assert_eq!(rows[0].content.as_deref(), Some("done"));
+    }
+
+    /// ADR-0034/0062/0066: a review run records its offered tools + redacted base64 config on the task
+    /// row at run start; a re-run overwrites in place (one task = one run). A brand-new task starts NULL.
+    #[sqlx::test]
+    async fn review_run_telemetry_records_and_replaces(pool: PgPool) {
+        let repo_id = seed(&pool).await;
+        let task_id = create_task(&pool, &pr_task(repo_id, "h1"))
+            .await
+            .unwrap()
+            .unwrap();
+
+        // A fresh task has no run telemetry.
+        let (tools, cfg): (Option<Value>, Option<String>) =
+            sqlx::query_as("SELECT run_tools, run_config_b64 FROM tasks WHERE id = $1")
+                .bind(task_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(tools.is_none() && cfg.is_none(), "starts NULL");
+
+        let offered = json!([
+            { "name": "read_file", "source": "builtin" },
+            { "name": "mcp__context7__get_docs", "source": "mcp" },
+        ]);
+        let updated = record_review_run_telemetry(&pool, task_id, &offered, "cnfg-b64-v1")
+            .await
+            .unwrap();
+        assert!(updated, "an existing task reports rows_affected > 0");
+        // Unknown id → no row touched, reported as `false` (the handler's 404 signal — no pre-SELECT).
+        let updated = record_review_run_telemetry(&pool, Uuid::new_v4(), &offered, "cnfg-b64-x")
+            .await
+            .unwrap();
+        assert!(!updated, "an unknown task id reports no row updated");
+        let (tools, cfg): (Option<Value>, Option<String>) =
+            sqlx::query_as("SELECT run_tools, run_config_b64 FROM tasks WHERE id = $1")
+                .bind(task_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(tools.as_ref().unwrap()[1]["source"], json!("mcp"));
+        assert_eq!(cfg.as_deref(), Some("cnfg-b64-v1"));
+
+        // A re-run (retry) overwrites in place — latest run wins.
+        record_review_run_telemetry(&pool, task_id, &json!([]), "cnfg-b64-v2")
+            .await
+            .unwrap();
+        let (tools, cfg): (Option<Value>, Option<String>) =
+            sqlx::query_as("SELECT run_tools, run_config_b64 FROM tasks WHERE id = $1")
+                .bind(task_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(tools.as_ref().unwrap().as_array().unwrap().len(), 0);
+        assert_eq!(
+            cfg.as_deref(),
+            Some("cnfg-b64-v2"),
+            "replaced, not appended"
+        );
+    }
+
+    /// An INDEXING run never submits review telemetry, so its `tasks` row keeps both columns NULL.
+    #[sqlx::test]
+    async fn index_run_records_no_review_telemetry(pool: PgPool) {
+        let repo_id = seed(&pool).await;
+        let index_task = create_index_task(&pool, repo_id, 99)
+            .await
+            .unwrap()
+            .expect("index task");
+        let (tools, cfg): (Option<Value>, Option<String>) =
+            sqlx::query_as("SELECT run_tools, run_config_b64 FROM tasks WHERE id = $1")
+                .bind(index_task)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(
+            tools.is_none() && cfg.is_none(),
+            "an index run leaves the review-telemetry columns NULL"
+        );
     }
 
     /// The runner's task context joins repository identity onto the task, and returns `None` for an

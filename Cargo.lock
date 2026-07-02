@@ -7,6 +7,7 @@ name = "agent-runner"
 version = "0.1.1"
 dependencies = [
  "anyhow",
+ "base64",
  "futures",
  "lightbridge-config",
  "regex",
@@ -22,6 +23,7 @@ dependencies = [
  "tree-sitter-python",
  "tree-sitter-rust",
  "tree-sitter-typescript",
+ "url",
  "uuid",
  "wiremock",
 ]

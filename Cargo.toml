@@ -80,10 +80,13 @@ tree-sitter-typescript = "0.23"
 tree-sitter-python = "0.23"
 # Regex selectors for the per-tier tool allowlist's `mcp__<server>__<tool>` patterns (ADR-0066).
 regex = "1"
+# Run-config audit trail (ADR-0034/0062/0066): base64 for the redacted-config encoding; url to strip
+# userinfo/query credentials from the persisted base_url. (base64 is also used by control-plane tests.)
+base64 = "0.22"
+url = "2"
 
 # --- Dev / test only ---
 tempfile = "3"
 rsa = "0.9"
 rand = "0.8"
-base64 = "0.22"
 wiremock = "0.6"

@@ -282,6 +282,12 @@ fn app(state: AppState) -> Router {
             "/internal/tasks/{id}/transcript",
             post(internal::ingest_transcript),
         )
+        // Run-level review telemetry (ADR-0034/0062/0066): the runner submits the offered tool set +
+        // the redacted, base64-encoded resolved config at run START (a crashed run still records it).
+        .route(
+            "/internal/tasks/{id}/review/telemetry",
+            post(internal::record_review_telemetry),
+        )
         // ADR-0037 mediated write actions: the native agent buffers findings/replies/summary, then
         // flushes them as one grouped review on finalize.
         .route(
