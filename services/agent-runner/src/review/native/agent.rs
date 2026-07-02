@@ -137,6 +137,24 @@ fn winddown_tool_defs(base: &[ToolDef], diff_present: bool) -> Vec<ToolDef> {
         .collect()
 }
 
+/// The tool set turn 0 will ACTUALLY offer — the run-start telemetry snapshot (ADR-0034/0062/0066)
+/// must match the loop's own `turn_defs` selection, not the assembled `defs`. The one divergence: a
+/// FAST run WITHOUT an explicit `review.tools` allowlist never offers `defs` — every turn runs on the
+/// wind-down write/finish set (see the turn_defs selection in `run_native_agent`), so snapshotting
+/// `defs` there would record retrieval/read_file/MCP tools the model is never given (and the mid-run
+/// "offered tools changed" log would fire spuriously on turn 1).
+fn run_start_tool_defs<'a>(
+    review: &ReviewConfig,
+    defs: &'a [ToolDef],
+    winddown_defs: &'a [ToolDef],
+) -> &'a [ToolDef] {
+    if review.fast && review.tools.is_none() {
+        winddown_defs
+    } else {
+        defs
+    }
+}
+
 /// Enter wind-down once the conversation reaches this fraction of the configured context window
 /// (ADR-0045), leaving headroom for estimator error and the final verdict turn.
 const WINDDOWN_TOKEN_FRACTION: f64 = 0.75;
@@ -368,14 +386,16 @@ pub async fn run_native_agent(
     let winddown_defs = winddown_tool_defs(&defs, diff_present);
 
     // ── Run-level review telemetry (ADR-0034/0062/0066), recorded at run START ──────────────────────
-    // `defs` is now the exact set of tools OFFERED to the model this run: the per-tier allowlist
-    // (ADR-0062) resolved together with the MCP-discovered external-knowledge tools (ADR-0066), after
-    // the diff-present and allowlist gates. Tag each by source from its name (`mcp__` prefix → mcp, else
-    // builtin — cheap, no extra lookup). NOTE: the offered set can still NARROW mid-run (budget-spent
-    // drops + the wind-down tail); those transitions are logged per turn below. This START snapshot is
-    // the authoritative "what did the model get" record — captured before turn 0 so a crashed/aborted
-    // run is still audited.
-    let offered_tools: Vec<serde_json::Value> = defs
+    // The snapshot is what turn 0 will ACTUALLY offer (`run_start_tool_defs`) — the per-tier allowlist
+    // (ADR-0062) resolved with the MCP-discovered external-knowledge tools (ADR-0066), after the
+    // diff-present/allowlist gates AND the fast-no-allowlist wind-down substitution, so the audit row
+    // never claims tools the loop withholds. Tag each by source from its name (`mcp__` prefix → mcp,
+    // else builtin — cheap, no extra lookup). NOTE: the offered set can still NARROW mid-run
+    // (budget-spent drops + the wind-down tail); those transitions are logged per turn below. This
+    // START snapshot is the authoritative "what did the model get" record — captured before turn 0 so
+    // a crashed/aborted run is still audited.
+    let start_defs = run_start_tool_defs(review, &defs, &winddown_defs);
+    let offered_tools: Vec<serde_json::Value> = start_defs
         .iter()
         .map(|t| {
             let source = if t.function.name.starts_with(super::tools::MCP_TOOL_PREFIX) {
@@ -386,7 +406,10 @@ pub async fn run_native_agent(
             serde_json::json!({ "name": t.function.name, "source": source })
         })
         .collect();
-    let offered_tool_names: Vec<&str> = defs.iter().map(|t| t.function.name.as_str()).collect();
+    let offered_tool_names: Vec<&str> = start_defs
+        .iter()
+        .map(|t| t.function.name.as_str())
+        .collect();
     tracing::info!(
         task_id = %task_id,
         tier = if review.fast { "fast" } else { "deep" },
@@ -504,8 +527,8 @@ pub async fn run_native_agent(
 
     // Telemetry (ADR-0034/0062/0066): the offered tool set can NARROW mid-run (budget-spent drops + the
     // wind-down tail). Track the last-offered names so we log a `tracing::info!` only when the set
-    // actually changes from the run-start snapshot recorded above — not once per turn. Seeded with the
-    // full offered set so the first narrowing is what surfaces.
+    // actually changes — not once per turn. Seeded with the run-start snapshot (what turn 0 actually
+    // offers), so only a REAL narrowing surfaces.
     let mut prev_offered_tool_names: Vec<String> =
         offered_tool_names.iter().map(|s| s.to_string()).collect();
 
@@ -582,18 +605,22 @@ pub async fn run_native_agent(
         };
         // Telemetry (ADR-0034/0062/0066): log a change to the offered tool set as it narrows mid-run
         // (budget drops / wind-down), so the audit trail shows not just what was offered at start but WHEN
-        // a tool was taken away. Only fires on an actual change from the previous turn.
-        let this_turn_names: Vec<String> =
-            turn_defs.iter().map(|t| t.function.name.clone()).collect();
-        if this_turn_names != prev_offered_tool_names {
+        // a tool was taken away. Compare WITHOUT allocating (the common per-turn case is "unchanged");
+        // clone the names only on an actual change (gemini review on #270).
+        let offered_changed = turn_defs.len() != prev_offered_tool_names.len()
+            || turn_defs
+                .iter()
+                .zip(prev_offered_tool_names.iter())
+                .any(|(t, prev)| t.function.name != *prev);
+        if offered_changed {
+            prev_offered_tool_names = turn_defs.iter().map(|t| t.function.name.clone()).collect();
             tracing::info!(
                 task_id = %task_id,
                 turn,
-                tool_count = this_turn_names.len(),
-                tools = ?this_turn_names,
+                tool_count = prev_offered_tool_names.len(),
+                tools = ?prev_offered_tool_names,
                 "review run: offered tools changed"
             );
-            prev_offered_tool_names = this_turn_names;
         }
         // FAST tier (ADR-0062): the offered set excludes retrieval/read_file, but a model steered by the
         // shared system prompt may still *emit* calls to them — and the dispatcher would otherwise run any
@@ -2133,6 +2160,43 @@ mod tests {
             .collect();
         assert!(!no_diff.iter().any(|n| n == ADD_REVIEW_COMMENT));
         assert!(no_diff.iter().any(|n| n == ADD_COMMENT));
+    }
+
+    // The run-start telemetry snapshot (ADR-0034) must match what turn 0 ACTUALLY offers: a FAST run
+    // WITHOUT an explicit allowlist runs on the wind-down write/finish set every turn, so snapshotting
+    // the assembled `defs` there would record retrieval/read_file/MCP tools the model never gets (and
+    // trip a spurious "offered tools changed" log on turn 1). With an allowlist — or on deep — the
+    // snapshot is `defs` itself.
+    #[test]
+    fn run_start_snapshot_matches_the_fast_no_allowlist_offered_set() {
+        let defs = tool_defs();
+        let winddown = winddown_tool_defs(&defs, true);
+
+        // FAST + no allowlist → the wind-down set is what turn 0 offers.
+        let mut fast_no_allowlist = review_config("http://unused/v1".to_string());
+        fast_no_allowlist.fast = true;
+        let start = run_start_tool_defs(&fast_no_allowlist, &defs, &winddown);
+        let names: Vec<&str> = start.iter().map(|t| t.function.name.as_str()).collect();
+        assert!(
+            !names.contains(&super::super::tools::READ_FILE)
+                && !names.contains(&super::super::tools::VECTOR_SEMANTIC_SEARCH),
+            "fast-no-allowlist must NOT claim investigation tools were offered: {names:?}"
+        );
+        assert!(names.contains(&FINISH) && names.contains(&ADD_REVIEW_COMMENT));
+
+        // FAST + explicit allowlist → `defs` (already allowlist-restricted) is authoritative.
+        let mut fast_allowlisted = review_config("http://unused/v1".to_string());
+        fast_allowlisted.fast = true;
+        fast_allowlisted.tools = Some(vec![crate::bootstrap::config::ReviewToolSelector::Builtin(
+            crate::bootstrap::config::ReviewTool::Finish,
+        )]);
+        let start = run_start_tool_defs(&fast_allowlisted, &defs, &winddown);
+        assert_eq!(start.len(), defs.len(), "allowlisted fast snapshots defs");
+
+        // DEEP → `defs`.
+        let deep = review_config("http://unused/v1".to_string());
+        let start = run_start_tool_defs(&deep, &defs, &winddown);
+        assert_eq!(start.len(), defs.len(), "deep snapshots defs");
     }
 
     // Wind-down is derived from the (possibly allowlist-restricted) base, NOT the global surface — so a

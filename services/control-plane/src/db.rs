@@ -433,20 +433,21 @@ pub async fn get_transcript(
 /// base64-encoded** `ReviewConfig` (`run_config_b64`). The runner submits both at run START, so a
 /// crashed/aborted run still has its config recorded. One task = one run, so this is a plain UPDATE in
 /// place (latest-run-replace semantics, matching how the transcript is replaced per run). Indexing runs
-/// never call this, so their columns stay NULL.
+/// never call this, so their columns stay NULL. Returns whether a row was updated — `false` means the
+/// task id is unknown, so the caller can 404 without a separate existence SELECT (gemini review on #270).
 pub async fn record_review_run_telemetry(
     pool: &PgPool,
     task_id: Uuid,
     run_tools: &Value,
     run_config_b64: &str,
-) -> Result<(), sqlx::Error> {
+) -> Result<bool, sqlx::Error> {
     sqlx::query("UPDATE tasks SET run_tools = $2, run_config_b64 = $3 WHERE id = $1")
         .bind(task_id)
         .bind(run_tools)
         .bind(run_config_b64)
         .execute(pool)
         .await
-        .map(|_| ())
+        .map(|r| r.rows_affected() > 0)
 }
 
 // ── ADR-0035 review feedback (poll reactions on our comments) ───────────────────────────────────
@@ -3660,9 +3661,15 @@ mod tests {
             { "name": "read_file", "source": "builtin" },
             { "name": "mcp__context7__get_docs", "source": "mcp" },
         ]);
-        record_review_run_telemetry(&pool, task_id, &offered, "cnfg-b64-v1")
+        let updated = record_review_run_telemetry(&pool, task_id, &offered, "cnfg-b64-v1")
             .await
             .unwrap();
+        assert!(updated, "an existing task reports rows_affected > 0");
+        // Unknown id → no row touched, reported as `false` (the handler's 404 signal — no pre-SELECT).
+        let updated = record_review_run_telemetry(&pool, Uuid::new_v4(), &offered, "cnfg-b64-x")
+            .await
+            .unwrap();
+        assert!(!updated, "an unknown task id reports no row updated");
         let (tools, cfg): (Option<Value>, Option<String>) =
             sqlx::query_as("SELECT run_tools, run_config_b64 FROM tasks WHERE id = $1")
                 .bind(task_id)

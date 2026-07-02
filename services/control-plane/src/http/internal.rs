@@ -319,24 +319,14 @@ pub async fn record_review_telemetry(
     let Some(pool) = state.db.as_ref() else {
         return (StatusCode::SERVICE_UNAVAILABLE, "no database").into_response();
     };
-    // Resolve the task first so an unknown id is a clean 404 rather than an UPDATE that touches no rows
-    // (mirrors `ingest_transcript`).
-    match sqlx::query_scalar::<_, Uuid>("SELECT id FROM tasks WHERE id = $1")
-        .bind(id)
-        .fetch_optional(pool)
-        .await
-    {
-        Ok(Some(_)) => {}
-        Ok(None) => return (StatusCode::NOT_FOUND, "task not found").into_response(),
-        Err(error) => {
-            tracing::error!(%error, task_id = %id, "load task for review telemetry failed");
-            return (StatusCode::INTERNAL_SERVER_ERROR, "query error").into_response();
-        }
-    }
+    // No existence pre-check: unlike the transcript's per-row INSERTs (where an unknown id would be a
+    // foreign-key 500), this is a single UPDATE — rows_affected == 0 IS the clean 404 signal, one
+    // round-trip total (gemini review on #270).
     match crate::db::record_review_run_telemetry(pool, id, &telemetry.tools, &telemetry.config_b64)
         .await
     {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => (StatusCode::NOT_FOUND, "task not found").into_response(),
         Err(error) => {
             tracing::error!(%error, task_id = %id, "storing review telemetry failed");
             (StatusCode::INTERNAL_SERVER_ERROR, "store error").into_response()
