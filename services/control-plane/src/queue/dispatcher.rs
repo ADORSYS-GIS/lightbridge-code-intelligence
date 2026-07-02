@@ -30,6 +30,11 @@ const DEFAULT_PRUNE_INTERVAL_SECS: u64 = 600;
 /// month so a post-mortem can still read them.
 const DEFAULT_OUTBOX_POSTED_RETENTION_DAYS: i64 = 7;
 const DEFAULT_OUTBOX_FAILED_RETENTION_DAYS: i64 = 30;
+/// The data-purge backstop is a rare recovery net (a spawned purge lost to a restart), so it runs on
+/// its own slow tick — 10 min — instead of riding the ~30s reaper cadence. Its "which disabled repos
+/// still have data?" scan probes `code_chunks` once per ever-disabled repo, which is cheap warm but
+/// costs real I/O cold; every-30s was pure waste for a check whose answer is almost always "none".
+const DEFAULT_PURGE_RECONCILE_INTERVAL_SECS: u64 = 600;
 
 /// Tunable dispatcher loop timings.
 #[derive(Debug, Clone, Copy)]
@@ -46,6 +51,9 @@ pub struct DispatcherConfig {
     /// How often the index sweeper prunes stale `(repo, commit)` index snapshots (ADR-0052). The
     /// outbox sweeper (ADR-0059) shares this same GC tick.
     pub prune_interval: Duration,
+    /// How often the durable data-purge backstop re-checks for `disabled` repos with leftover index
+    /// data. A rare recovery net, so it runs on its own slow tick, not the reaper cadence.
+    pub purge_reconcile_interval: Duration,
     /// Days a delivered (`posted`) `github_outbox` row is kept before the outbox sweeper prunes it.
     pub outbox_posted_retention_days: i64,
     /// Days a dead-lettered (`failed`) `github_outbox` row is kept — longer, for inspection.
@@ -82,6 +90,10 @@ impl DispatcherConfig {
             prune_interval: secs(
                 section.and_then(|s| s.prune_interval_seconds),
                 DEFAULT_PRUNE_INTERVAL_SECS,
+            ),
+            purge_reconcile_interval: secs(
+                section.and_then(|s| s.purge_reconcile_interval_seconds),
+                DEFAULT_PURGE_RECONCILE_INTERVAL_SECS,
             ),
             outbox_posted_retention_days: days(
                 section.and_then(|s| s.outbox_posted_retention_days),
@@ -121,6 +133,13 @@ pub async fn run<L: TaskLauncher>(
     // keep-set-guarded, so it stays correct even if more than one replica runs it.
     let mut prune_tick = tokio::time::interval(cfg.prune_interval);
     prune_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Durable data-purge backstop (Epic #75) on its own slow tick — not the ~30s reaper cadence. Its
+    // "disabled repos still holding index data?" scan is idempotent and almost always finds nothing,
+    // so re-running it every 30s was steady waste (and I/O-costly when its index pages fell cold).
+    // The first `tick()` fires immediately, so a purge lost to a restart is still caught promptly at
+    // startup — exactly the case this backstop exists for.
+    let mut purge_tick = tokio::time::interval(cfg.purge_reconcile_interval);
+    purge_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     tracing::info!(owner, "dispatcher started");
 
     loop {
@@ -139,8 +158,17 @@ pub async fn run<L: TaskLauncher>(
                 if let Err(error) = reaper::reap_once(&pool, &launcher, &review).await {
                     tracing::error!(%error, "reaper cycle failed");
                 }
-                // Durable backstop for repo data purge (a spawned purge can be lost on restart).
-                crate::queue::lifecycle::reconcile_purges(&pool, neo4j.as_deref()).await;
+            }
+            _ = purge_tick.tick() => {
+                // Durable backstop for repo data purge (a spawned purge can be lost on restart). Runs
+                // OFF the loop like the prune sweeps: its listing scan is cheap warm but I/O-heavy cold,
+                // and it must never add head-of-line latency to task dispatch. Idempotent + status-
+                // guarded, so an occasional overlap is harmless.
+                let pool = pool.clone();
+                let neo4j = neo4j.clone();
+                tokio::spawn(async move {
+                    crate::queue::lifecycle::reconcile_purges(&pool, neo4j.as_deref()).await;
+                });
             }
             _ = prune_tick.tick() => {
                 // Storage GC shares this tick. Every sweep runs OFF the loop so a large prune never adds
@@ -305,5 +333,48 @@ async fn react_work_started(pool: &PgPool, task: &db::ClaimedTask, review: &Revi
     .await
     {
         tracing::warn!(%error, task_id = %task.id, "enqueueing 👀 work-started failed (non-fatal)");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::DispatcherSection;
+
+    // The purge backstop runs on its own slow tick, decoupled from the ~30s reaper cadence: it
+    // defaults to 10 min and is independent of `reap_interval`. (Guards the fix for the every-30s
+    // slow-statement churn from `list_disabled_repos_needing_purge`.)
+    #[test]
+    fn purge_reconcile_interval_defaults_to_ten_minutes_independent_of_reaping() {
+        let cfg = DispatcherConfig::default();
+        assert_eq!(cfg.purge_reconcile_interval, Duration::from_secs(600));
+        assert_eq!(cfg.reap_interval, Duration::from_secs(30));
+        assert_ne!(
+            cfg.purge_reconcile_interval, cfg.reap_interval,
+            "the purge backstop must not ride the reaper's fast cadence"
+        );
+    }
+
+    // The interval is operator-tunable via config (like the other dispatcher timings), and a zero
+    // falls back to the default rather than busy-looping the backstop.
+    #[test]
+    fn purge_reconcile_interval_is_config_overridable_and_zero_falls_back() {
+        let overridden = DispatcherConfig::from_file(Some(&DispatcherSection {
+            purge_reconcile_interval_seconds: Some(120),
+            ..Default::default()
+        }));
+        assert_eq!(
+            overridden.purge_reconcile_interval,
+            Duration::from_secs(120)
+        );
+
+        let zeroed = DispatcherConfig::from_file(Some(&DispatcherSection {
+            purge_reconcile_interval_seconds: Some(0),
+            ..Default::default()
+        }));
+        assert_eq!(
+            zeroed.purge_reconcile_interval,
+            Duration::from_secs(DEFAULT_PURGE_RECONCILE_INTERVAL_SECS)
+        );
     }
 }

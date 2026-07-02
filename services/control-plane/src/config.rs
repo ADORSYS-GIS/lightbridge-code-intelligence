@@ -174,6 +174,11 @@ pub struct DispatcherSection {
     /// sweeper (ADR-0059) shares this same GC tick.
     #[serde(default, deserialize_with = "lightbridge_config::de::opt_u64")]
     pub prune_interval_seconds: Option<u64>,
+    /// How often the durable data-purge backstop re-checks for `disabled` repos with leftover index
+    /// data (Epic #75). A rare recovery net (the prompt path is the spawned purge on disable/deny), so
+    /// it runs on its own slow tick rather than the ~30s reaper cadence. Default 600.
+    #[serde(default, deserialize_with = "lightbridge_config::de::opt_u64")]
+    pub purge_reconcile_interval_seconds: Option<u64>,
     /// Days a delivered (`posted`) `github_outbox` row is kept before the outbox sweeper prunes it
     /// (ADR-0059). Default 7.
     #[serde(default, deserialize_with = "lightbridge_config::de::opt_i64")]

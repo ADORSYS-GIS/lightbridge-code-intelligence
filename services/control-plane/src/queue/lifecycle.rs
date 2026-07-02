@@ -12,9 +12,10 @@ use sqlx::PgPool;
 
 use crate::AppState;
 
-/// Purge all index data for a repository. Best-effort across stores: a failure in one (e.g. Neo4j
-/// down) is logged and the rest still run, since this is reconciled on the next removal anyway. Safe
-/// to run repeatedly (every delete is idempotent).
+/// Purge all index data for a repository. Best-effort, but ordered for self-healing: the Neo4j
+/// graph goes first and a graph failure keeps the Postgres markers (`code_chunks`/`repo_index`) in
+/// place, so the reconcile backstop — which probes only Postgres — re-lists the repo and retries.
+/// Safe to run repeatedly (every delete is idempotent).
 pub async fn purge_repository_data(
     pool: &PgPool,
     neo4j: Option<&neo4rs::Graph>,
@@ -45,6 +46,24 @@ pub async fn purge_repository_data(
             0
         }
     };
+    // Neo4j first, Postgres markers last: `list_disabled_repos_needing_purge` probes only Postgres
+    // (`code_chunks`/`repo_index`), so a purge that dies after the markers are gone — the detached
+    // task aborted at an await point on shutdown, or the graph delete erroring — would leave graph
+    // data orphaned FOREVER (the backstop can't see it). Deleting the graph before the markers, and
+    // keeping the markers when the graph delete fails, makes any interrupted purge self-heal: the
+    // leftover Postgres rows get the repo re-listed and re-purged (every delete is idempotent).
+    let nodes = match neo4j {
+        Some(graph) => {
+            match crate::integrations::neo4j::delete_repo_graph(graph, repository_id).await {
+                Ok(nodes) => nodes,
+                Err(error) => {
+                    tracing::warn!(%error, repository_id, "purge: delete graph failed; keeping Postgres markers so the backstop retries");
+                    return;
+                }
+            }
+        }
+        None => 0,
+    };
     let chunks = crate::db::delete_code_chunks_for_repo(pool, repository_id)
         .await
         .unwrap_or_else(|error| {
@@ -54,15 +73,6 @@ pub async fn purge_repository_data(
     let _ = crate::db::delete_repo_index_rows(pool, repository_id)
         .await
         .map_err(|error| tracing::warn!(%error, repository_id, "purge: delete repo_index failed"));
-    let nodes = match neo4j {
-        Some(graph) => crate::integrations::neo4j::delete_repo_graph(graph, repository_id)
-            .await
-            .unwrap_or_else(|error| {
-                tracing::warn!(%error, repository_id, "purge: delete graph failed");
-                0
-            }),
-        None => 0,
-    };
     tracing::info!(
         repository_id,
         cancelled_tasks = cancelled,
