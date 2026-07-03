@@ -19,8 +19,11 @@
 # ── Stage 1: build the Rust runner ──────────────────────────────────────────────────────────────
 FROM rust:1-slim-bookworm AS builder
 WORKDIR /build
+# Every workspace member's manifest must be present for cargo to load the workspace, even when
+# building a single package — hence `clients` (the `lci` TUI) is copied too though it isn't built here.
 COPY Cargo.toml Cargo.lock ./
 COPY services services
+COPY clients clients
 COPY xtask xtask
 # Copy the runner out before the cached target dir vanishes.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \

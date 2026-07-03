@@ -1,7 +1,8 @@
 # ADR-0063: CLI-only repository approval (retire the web approval gate)
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-06-28
+- **Amended:** 2026-07-03
 - **Deciders:** @stephane-segning
 
 ## Context and Problem Statement
@@ -42,7 +43,42 @@ declarative). A best satisfies the drivers: it reuses [ADR-0023](0023-db-backed-
 (no new trust path), keeps approval an explicit, audited human action, and — together with
 [ADR-0064](0064-observability-via-grafana-behind-caddy-oauth2.md) — lets `apps/web` be **deleted**.
 
-This ADR is **Proposed** — open for discussion, especially A-vs-B (imperative CLI vs declarative GitOps).
+This ADR is now **Accepted** — see the 2026-07-03 amendment below for the as-built refinements. The
+imperative-vs-GitOps tension (A vs B) is recorded as an unresolved consequence, not a blocker: B remains
+the likely long-term home if approvals should become declarative.
+
+### Amendment (2026-07-03) — as-built refinements
+
+The client shipped as `clients/lci` (binary `lci`, ratatui). Three refinements to the original decision,
+none of which change the trust boundary or reuse of [ADR-0014](0014-keycloak-oidc-resource-server.md)/[ADR-0023](0023-db-backed-rbac.md)
+authz:
+
+1. **An interactive ratatui TUI, not a bare imperative CLI.** Rather than one-shot `list`/`approve`/`deny`
+   subcommands, `lci` is a small terminal app with two views — **Repositories** (approve/deny, capability-gated
+   on the token's `repo:approve`/`repo:deny`) and **Runs** (watch active review/index tasks, cancel with
+   `task:cancel`). The operator lives in a terminal and watches runs as often as they approve; a TUI serves
+   both without a second tool. The endpoints called are exactly the ones the web consumed
+   (`/admin/repositories`, `.../approve`, `.../deny`, `/tasks`, `/tasks/{id}/cancel`, `/me`).
+
+2. **Authorization-Code + PKCE with a loopback `127.0.0.1` redirect, not the device-code flow** originally
+   chosen in Option A. Rationale: it **reuses the web's existing PKCE public-client pattern**
+   ([ADR-0014](0014-keycloak-oidc-resource-server.md); the web's `lightbridge-web` client is already a
+   `standardFlowEnabled`, `pkce.code.challenge.method=S256` public client), so no new Keycloak flow needs to
+   be enabled or reasoned about; there is **no device-code polling**; and the terminal UX is better because a
+   browser is available on the operator's laptop (we print the authorize URL *and* auto-open it, then catch
+   the redirect on a one-shot loopback listener). PKCE is hand-rolled (`base64url(sha256(verifier))` + plain
+   token POSTs) — no `oauth2` crate — to keep the dependency surface minimal.
+
+3. **Token cached as JSON in the OS config dir with silent refresh.** The token lives at
+   `<config_dir>/token.json` (`ProjectDirs::from("fyi","camer","lci")`), written `0600`, storing an
+   **absolute** `expires_at` (computed from `expires_in` at fetch time). Startup uses a fresh cached token,
+   else a `grant_type=refresh_token` exchange, else interactive login; a background task refreshes within ~60s
+   of expiry and surfaces a "re-auth needed" state in the status bar on failure rather than crashing. A new
+   Keycloak **public** client `lightbridge-cli` (loopback redirect URIs, same audience/permissions scopes as
+   `lightbridge-web`) is required before it authenticates against prod — see `clients/lci/README.md`.
+
+The **imperative-vs-GitOps (Option B)** tension is **unchanged**: `lci` is still an imperative state change,
+and B remains noted as the declarative long-term option.
 
 ### Consequences
 

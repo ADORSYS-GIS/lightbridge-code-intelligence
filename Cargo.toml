@@ -4,7 +4,7 @@
 # `xtask` is the build/CI automation entrypoint invoked from the justfile.
 [workspace]
 resolver = "2"
-members = ["services/config", "services/control-plane", "services/agent-runner", "xtask"]
+members = ["services/config", "services/control-plane", "services/agent-runner", "clients/lci", "xtask"]
 
 [workspace.package]
 edition = "2021"

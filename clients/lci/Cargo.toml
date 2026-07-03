@@ -1,0 +1,36 @@
+# `lci` — the operator's terminal admin client (ADR-0063). An interactive ratatui TUI that
+# authenticates to Keycloak via Authorization-Code + PKCE over a loopback redirect, then talks to the
+# control plane's permission-gated admin API to approve/deny repositories and watch running tasks.
+[package]
+name = "lci"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "lci"
+path = "src/main.rs"
+
+[dependencies]
+# --- Reused from the workspace (versions + features pinned in the root manifest) ---
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+reqwest.workspace = true
+url.workspace = true
+time.workspace = true
+base64.workspace = true
+sha2.workspace = true
+rand.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+futures.workspace = true
+
+# --- Crate-local (terminal UI + OS integration). Hand-rolled OAuth, so NO `oauth2` crate. ---
+ratatui = "0.29"
+crossterm = { version = "0.28", features = ["event-stream"] }
+directories = "6"
+open = "5"
