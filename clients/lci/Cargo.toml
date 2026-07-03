@@ -36,3 +36,5 @@ directories = "6"
 open = "5"
 # Correct terminal display width for status-bar/segment truncation (matches ratatui 0.29's own dep).
 unicode-width = "0.2"
+# Pretty panic + error reports (restored terminal first — see tui::terminal::restore + main).
+color-eyre = "0.6"

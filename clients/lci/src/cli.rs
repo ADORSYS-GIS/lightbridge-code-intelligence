@@ -70,7 +70,13 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Parsed> {
             "--logout" => command = Command::Logout,
             "--help" | "-h" => command = Command::Help,
             "--render" => {
-                let screen = take_value(&mut iter, "--render")?;
+                // The value is optional: `--render` alone (or `--render list`) means "list the valid
+                // screen names and exit 0" — far friendlier than the old "needs a value" error. A
+                // value that looks like the next flag (`--foo`) is NOT consumed as the screen name.
+                let screen = match iter.peek() {
+                    Some(next) if !next.starts_with("--") => iter.next().unwrap(),
+                    _ => "list".to_string(),
+                };
                 render.get_or_insert_with(RenderSpec::default).screen = screen;
             }
             "--width" => {
@@ -146,10 +152,12 @@ THEME:
     (midnight | terminal | nord). Cycle it at runtime with the `t` key.
 
 DEV / REVIEW:
-    --render <screen>     draw a screen to text via a headless backend and print it
+    --render [screen]     draw a screen to text via a headless backend and print it
                           (no auth, no network — seeded fake data). Screens:
-                          repos | runs | confirm | help | empty | too-small.
-                          Tune with --width, --height, --theme.
+                          repos | runs | detail | transcript | confirm | help |
+                          empty | small. `--render` with no name (or `--render list`)
+                          prints the valid names and exits. Tune with --width,
+                          --height, --theme (e.g. lci --render detail --width 120).
 
 Config precedence (low → high): defaults < ~/.config/lci/config.toml < env < flags.";
 
@@ -230,5 +238,33 @@ mod tests {
     fn rejects_unknown_and_bad_port() {
         assert!(parse(["--nope".to_string()]).is_err());
         assert!(parse(["--port".to_string(), "abc".to_string()]).is_err());
+    }
+
+    #[test]
+    fn render_with_no_value_becomes_list_not_an_error() {
+        // `--render` alone must NOT error "needs a value"; it parses as the `list` screen.
+        match parse_str(&["--render"]).command {
+            Command::Render(spec) => assert_eq!(spec.screen, "list"),
+            other => panic!("expected Render(list), got {other:?}"),
+        }
+        // `--render` followed by another flag also lists (the flag is not consumed as the name).
+        let p = parse_str(&["--render", "--width", "100"]);
+        match p.command {
+            Command::Render(spec) => {
+                assert_eq!(spec.screen, "list");
+                assert_eq!(spec.width, 100, "--width still parsed");
+            }
+            other => panic!("expected Render(list) with width, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn render_accepts_detail_and_transcript_screens() {
+        for name in ["detail", "transcript", "list"] {
+            match parse_str(&["--render", name]).command {
+                Command::Render(spec) => assert_eq!(spec.screen, name),
+                other => panic!("expected Render({name}), got {other:?}"),
+            }
+        }
     }
 }
