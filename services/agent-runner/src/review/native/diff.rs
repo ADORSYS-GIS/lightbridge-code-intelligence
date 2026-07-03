@@ -24,32 +24,40 @@
 use crate::clone::PrDiff;
 
 /// One file's slice of a unified diff: its repo-relative path and the raw `diff --git …` block (header +
-/// hunks) exactly as git emitted it, kept as a byte-length-bearing borrow into the original diff.
+/// hunks) exactly as git emitted it — both borrowed from the original diff (no per-file allocation).
 struct FileSection<'a> {
-    path: String,
+    path: &'a str,
     text: &'a str,
     low_signal: bool,
 }
 
-/// The outcome of packing a PR diff into the prompt budget, file-boundary aware.
-pub struct RenderedDiff {
+/// The outcome of packing a PR diff into the prompt budget, file-boundary aware. Paths borrow from the
+/// diff (`'a`) — the caller stringifies them into the prompt immediately, so no ownership is needed.
+pub struct RenderedDiff<'a> {
     /// The diff text to paste into the prompt: whole per-file sections, source first, within budget.
     pub text: String,
     /// Source files whose diff didn't fit the budget and were dropped. The important coverage signal —
     /// the model is told these changes exist but were not shown, so it can't be confidently wrong about
     /// them. Repo-relative paths, in diff order.
-    pub omitted_for_budget: Vec<String>,
+    pub omitted_for_budget: Vec<&'a str>,
     /// Files set aside as low-signal generated/lock noise and listed rather than rendered (unless the PR
     /// changed nothing else). Repo-relative paths, in diff order.
-    pub low_signal: Vec<String>,
+    pub low_signal: Vec<&'a str>,
 }
 
 /// Whether a path is generated / lock-file noise that carries little review signal per byte, so it's
 /// deprioritised out of the rendered diff (still disclosed in the file list). Matched on the normalised
 /// (forward-slash) path so `a\b\Cargo.lock` classifies the same as `a/b/Cargo.lock`.
 fn is_low_signal_path(path: &str) -> bool {
-    let p = path.replace('\\', "/");
-    let name = p.rsplit('/').next().unwrap_or(&p);
+    // Only allocate to normalise when a backslash is actually present (Windows-style paths are rare).
+    let normalized;
+    let p = if path.contains('\\') {
+        normalized = path.replace('\\', "/");
+        normalized.as_str()
+    } else {
+        path
+    };
+    let name = p.rsplit('/').next().unwrap_or(p);
 
     // Exact lock / dependency-manifest files across ecosystems.
     const LOCK_FILES: &[&str] = &[
@@ -75,29 +83,41 @@ fn is_low_signal_path(path: &str) -> bool {
     NOISE_SUFFIXES.iter().any(|s| name.ends_with(s))
 }
 
-/// The repo-relative path a `diff --git …` section is about. Prefers the `+++ b/…` header (present and
-/// unquoted for adds/modifies), falls back to `--- a/…` (deletions have `+++ /dev/null`), and finally to
-/// the `diff --git a/… b/…` line for binary sections that carry neither. Returns `None` only for a
-/// malformed section, which the caller renders under a placeholder path rather than dropping.
-fn section_path(section: &str) -> Option<String> {
+/// The repo-relative path a `diff --git …` section is about. Prefers the `+++ b/…` header (present for
+/// adds/modifies), falls back to `--- a/…` (deletions have `+++ /dev/null`), and finally to the
+/// `diff --git a/… b/…` line for binary / pure-rename / mode-only sections that carry no `+++`/`---`.
+///
+/// Git leaves ASCII paths unquoted — including ones with **spaces** (it just appends a tab, which
+/// `.trim()` drops) — but C-quotes names with non-ASCII/control bytes under `core.quotePath=true`
+/// (default): `+++ "b/caf\303\251.rs"`. We strip the surrounding quotes for a readable label; the octal
+/// escapes remain (unescaping needs allocation and this string is display/coverage-only, never used to
+/// match against the real file list). Returns `None` only for a malformed section, which the caller
+/// renders under a `(diff)` placeholder rather than dropping.
+fn section_path(section: &str) -> Option<&str> {
     for line in section.lines() {
         if let Some(rest) = line.strip_prefix("+++ b/") {
             if rest != "dev/null" {
-                return Some(rest.trim().to_string());
+                return Some(rest.trim());
             }
         } else if let Some(rest) = line.strip_prefix("--- a/") {
             if rest != "dev/null" {
-                return Some(rest.trim().to_string());
+                return Some(rest.trim());
             }
+        } else if let Some(rest) = line.strip_prefix("+++ \"b/") {
+            return Some(rest.trim().trim_end_matches('"'));
+        } else if let Some(rest) = line.strip_prefix("--- \"a/") {
+            return Some(rest.trim().trim_end_matches('"'));
         }
     }
-    // Binary files (`Binary files a/x and b/y differ`) carry no +++/--- lines; parse the git header.
-    // `diff --git a/<p> b/<p>` — take the ` b/` tail (paths equal except on a rename; the new name is
-    // the one under review).
+    // No +++/--- lines (binary / pure rename / mode-only): parse the git header. Take the ` b/` tail
+    // (paths equal except on a rename; the new name is the one under review), quoted variant first.
     let header = section.lines().next()?;
     let rest = header.strip_prefix("diff --git ")?;
-    let b = rest.find(" b/").map(|i| &rest[i + 3..])?;
-    Some(b.trim().to_string())
+    if let Some(i) = rest.find(" \"b/") {
+        return Some(rest[i + 4..].trim().trim_end_matches('"'));
+    }
+    let i = rest.find(" b/")?;
+    Some(rest[i + 3..].trim())
 }
 
 /// Split a unified diff into per-file sections at `diff --git` boundaries. Any preamble before the first
@@ -116,7 +136,7 @@ fn split_sections(diff: &str) -> Vec<FileSection<'_>> {
     if starts.is_empty() {
         // No recognisable headers: treat the whole diff as one anonymous section (still packed/capped).
         return vec![FileSection {
-            path: section_path(diff).unwrap_or_else(|| "(diff)".to_string()),
+            path: section_path(diff).unwrap_or("(diff)"),
             text: diff,
             low_signal: false,
         }];
@@ -127,8 +147,8 @@ fn split_sections(diff: &str) -> Vec<FileSection<'_>> {
         let begin = if i == 0 { 0 } else { start };
         let end = starts.get(i + 1).copied().unwrap_or(diff.len());
         let text = &diff[begin..end];
-        let path = section_path(&diff[start..end]).unwrap_or_else(|| "(diff)".to_string());
-        let low_signal = is_low_signal_path(&path);
+        let path = section_path(&diff[start..end]).unwrap_or("(diff)");
+        let low_signal = is_low_signal_path(path);
         sections.push(FileSection {
             path,
             text,
@@ -158,7 +178,7 @@ fn truncate_on_boundary(s: &str, max: usize) -> &str {
 /// then they're the diff (packed within budget) so the prompt isn't empty. A single section larger than
 /// the whole budget is boundary-truncated (only when it would otherwise be the first thing shown) so one
 /// huge file can't blank the diff; it's still flagged as omitted so the model knows it's partial.
-pub fn render_diff_for_prompt(pr: &PrDiff, max: usize) -> RenderedDiff {
+pub fn render_diff_for_prompt(pr: &PrDiff, max: usize) -> RenderedDiff<'_> {
     let sections = split_sections(&pr.diff);
 
     let (source, low_signal): (Vec<&FileSection>, Vec<&FileSection>) =
@@ -171,14 +191,14 @@ pub fn render_diff_for_prompt(pr: &PrDiff, max: usize) -> RenderedDiff {
     } else {
         source.clone()
     };
-    let mut low_signal_listed: Vec<String> = if source.is_empty() {
+    let mut low_signal_listed: Vec<&str> = if source.is_empty() {
         Vec::new()
     } else {
-        low_signal.iter().map(|s| s.path.clone()).collect()
+        low_signal.iter().map(|s| s.path).collect()
     };
 
     let mut text = String::new();
-    let mut omitted_for_budget: Vec<String> = Vec::new();
+    let mut omitted_for_budget: Vec<&str> = Vec::new();
     for sec in &render_order {
         // `<=`: a section exactly filling the remaining budget still fits.
         if text.len() + sec.text.len() <= max {
@@ -187,9 +207,9 @@ pub fn render_diff_for_prompt(pr: &PrDiff, max: usize) -> RenderedDiff {
             // Nothing rendered yet and even this first section overflows: show as much of it as the
             // budget allows (boundary-safe) rather than emitting an empty diff, and flag it as partial.
             text.push_str(truncate_on_boundary(sec.text, max));
-            omitted_for_budget.push(sec.path.clone());
+            omitted_for_budget.push(sec.path);
         } else {
-            omitted_for_budget.push(sec.path.clone());
+            omitted_for_budget.push(sec.path);
         }
     }
 
@@ -255,13 +275,36 @@ mod tests {
     #[test]
     fn extracts_path_for_add_delete_and_binary_sections() {
         let add = "diff --git a/src/new.rs b/src/new.rs\nnew file mode 100644\n--- /dev/null\n+++ b/src/new.rs\n@@ -0,0 +1,1 @@\n+x\n";
-        assert_eq!(section_path(add).as_deref(), Some("src/new.rs"));
+        assert_eq!(section_path(add), Some("src/new.rs"));
 
         let del = "diff --git a/src/old.rs b/src/old.rs\ndeleted file mode 100644\n--- a/src/old.rs\n+++ /dev/null\n@@ -1 +0,0 @@\n-x\n";
-        assert_eq!(section_path(del).as_deref(), Some("src/old.rs"));
+        assert_eq!(section_path(del), Some("src/old.rs"));
 
         let bin = "diff --git a/assets/logo.png b/assets/logo.png\nBinary files a/assets/logo.png and b/assets/logo.png differ\n";
-        assert_eq!(section_path(bin).as_deref(), Some("assets/logo.png"));
+        assert_eq!(section_path(bin), Some("assets/logo.png"));
+
+        // A path with a space is left UNQUOTED by git (it just appends a tab, which `.trim()` drops) —
+        // so the plain `+++ b/` branch already handles it.
+        let spaced = "diff --git a/src/spa ce.rs b/src/spa ce.rs\nindex 1..2 100644\n--- a/src/spa ce.rs\t\n+++ b/src/spa ce.rs\t\n@@ -1 +1 @@\n-x\n+y\n";
+        assert_eq!(section_path(spaced), Some("src/spa ce.rs"));
+    }
+
+    // Quoted paths (git C-quotes non-ASCII/control bytes under core.quotePath=true, the default) must not
+    // collapse to the `(diff)` placeholder — that mislabels the coverage disclosure AND would classify a
+    // quoted lockfile as source, re-triggering the very budget-waste this module prevents (adversarial +
+    // gemini review of PR #275). The octal escapes are left in (display-only); the surrounding quotes go.
+    #[test]
+    fn extracts_quoted_non_ascii_paths_from_header_and_marker() {
+        // Add: quoted `+++ "b/…"` marker present.
+        let add = "diff --git \"a/src/caf\\303\\251.rs\" \"b/src/caf\\303\\251.rs\"\nnew file mode 100644\n--- /dev/null\n+++ \"b/src/caf\\303\\251.rs\"\n@@ -0,0 +1 @@\n+x\n";
+        assert_eq!(section_path(add), Some("src/caf\\303\\251.rs"));
+
+        // Binary quoted: no `+++`/`---`, parsed from the `diff --git … "b/…"` header.
+        let bin = "diff --git \"a/img/na\\303\\257ve.png\" \"b/img/na\\303\\257ve.png\"\nBinary files a/x and b/y differ\n";
+        assert_eq!(section_path(bin), Some("img/na\\303\\257ve.png"));
+
+        // A quoted lockfile (unicode-named parent dir) still classifies as low-signal via its ASCII base.
+        assert!(is_low_signal_path("src/caf\\303\\251/Cargo.lock"));
     }
 
     #[test]
@@ -286,11 +329,12 @@ mod tests {
         let diff = format!("{a}{b}{c}");
         // Budget for two whole sections but not the third.
         let max = a.len() + b.len() + 1;
-        let out = render_diff_for_prompt(&pr(&diff, &["src/a.rs", "src/b.rs", "src/c.rs"]), max);
+        let input = pr(&diff, &["src/a.rs", "src/b.rs", "src/c.rs"]);
+        let out = render_diff_for_prompt(&input, max);
         // Whole files only — never a partial hunk.
         assert!(out.text.contains("src/a.rs") && out.text.contains("src/b.rs"));
         assert!(!out.text.contains("+line 0 in src/c.rs"));
-        assert_eq!(out.omitted_for_budget, vec!["src/c.rs".to_string()]);
+        assert_eq!(out.omitted_for_budget, vec!["src/c.rs"]);
         assert!(out.low_signal.is_empty());
     }
 
@@ -303,7 +347,8 @@ mod tests {
         let diff = format!("{lock}{src}");
         // Budget fits the source but NOT the lock — the old byte-cut would spend it all on the lock.
         let max = src.len() + 50;
-        let out = render_diff_for_prompt(&pr(&diff, &["Cargo.lock", "src/auth/store.rs"]), max);
+        let input = pr(&diff, &["Cargo.lock", "src/auth/store.rs"]);
+        let out = render_diff_for_prompt(&input, max);
         assert!(
             out.text.contains("src/auth/store.rs"),
             "source file must be rendered"
@@ -312,14 +357,15 @@ mod tests {
             !out.text.contains("Cargo.lock"),
             "lockfile must not be rendered"
         );
-        assert_eq!(out.low_signal, vec!["Cargo.lock".to_string()]);
+        assert_eq!(out.low_signal, vec!["Cargo.lock"]);
         assert!(out.omitted_for_budget.is_empty());
     }
 
     #[test]
     fn renders_lockfile_only_pr_so_the_diff_is_not_blank() {
         let lock = section("Cargo.lock", 3);
-        let out = render_diff_for_prompt(&pr(&lock, &["Cargo.lock"]), lock.len() + 10);
+        let input = pr(&lock, &["Cargo.lock"]);
+        let out = render_diff_for_prompt(&input, lock.len() + 10);
         assert!(out.text.contains("Cargo.lock"));
         assert!(out.low_signal.is_empty());
         assert!(out.omitted_for_budget.is_empty());
@@ -329,19 +375,21 @@ mod tests {
     fn a_single_oversized_file_is_boundary_truncated_not_blanked() {
         let big = section("src/huge.rs", 100);
         let max = big.len() / 2;
-        let out = render_diff_for_prompt(&pr(&big, &["src/huge.rs"]), max);
+        let input = pr(&big, &["src/huge.rs"]);
+        let out = render_diff_for_prompt(&input, max);
         assert!(
             !out.text.is_empty(),
             "must show a partial rather than nothing"
         );
         assert!(out.text.len() <= max);
-        assert_eq!(out.omitted_for_budget, vec!["src/huge.rs".to_string()]);
+        assert_eq!(out.omitted_for_budget, vec!["src/huge.rs"]);
     }
 
     #[test]
     fn whole_diff_under_budget_renders_verbatim() {
         let a = section("src/a.rs", 2);
-        let out = render_diff_for_prompt(&pr(&a, &["src/a.rs"]), a.len() + 1000);
+        let input = pr(&a, &["src/a.rs"]);
+        let out = render_diff_for_prompt(&input, a.len() + 1000);
         assert_eq!(out.text, a);
         assert!(out.omitted_for_budget.is_empty());
         assert!(out.low_signal.is_empty());
