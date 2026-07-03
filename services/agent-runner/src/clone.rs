@@ -134,7 +134,9 @@ async fn merge_base_or_deepen(dir: &Path, base: &str, head: &str, token: &str) -
         .await
         .is_err()
         {
-            continue; // best-effort — try the next depth (or fall through to the base-tip fallback)
+            // A fetch failure (network / expired creds / unreachable ref) is persistent — a deeper
+            // fetch would fail the same way, each burning another timeout. Stop and take the fallback.
+            break;
         }
         if let Some(mb) = merge_base(dir, base, head, token).await {
             return mb;
