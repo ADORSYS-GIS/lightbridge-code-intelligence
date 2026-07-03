@@ -37,12 +37,113 @@ your scrollback is untouched.
 | `a`            | approve the selected repository (needs `repo:approve`)    |
 | `d`            | deny the selected repository (needs `repo:deny`; purges its index) |
 | `c`            | cancel the selected run (needs `task:cancel`)             |
+| `t`            | cycle the color theme (midnight → terminal → nord)        |
 | `?`            | toggle the help overlay                                   |
 
-Approve / deny / cancel each ask for confirmation (`Enter`/`y` to confirm, `Esc`/`n` to cancel). Actions
-you lack the permission for are refused with a toast; the status bar shows your identity, effective
-capabilities, the API host, and a token-expiry countdown (plus a "re-auth needed" indicator if a
-background refresh fails).
+Approve / deny / cancel each open a **confirm dialog** with two buttons. Focus starts on the safe
+**Cancel** button (a reflexive `Enter` never fires a destructive action); `←`/`→`/`Tab` move focus
+between the buttons, `Enter` presses the focused one, `y` accepts regardless of focus, `Esc`/`n` cancel.
+Actions you lack the permission for are dimmed in the header keymenu and refused with a toast. The header
+shows your identity, effective capabilities, the API host, a connection dot, and a token-expiry countdown
+(which turns **amber under two minutes**, plus a "re-auth needed" state if a background refresh fails).
+
+## Look & themes
+
+The interface is a k9s-/opencode-inspired layout: a fixed **header** (a `▍ LCI` wordmark, a `key: value`
+context block, and a right-aligned keymenu), a **pill-tab bar** (the active view gets an accent
+background), a bordered **content table** (bold header, an accent selection cursor, semantic status
+colors — with short human labels like `indexing`/`done` so the STATUS column never truncates mid-word —
+and right-aligned numeric/age columns), and a **status bar** (filter + a braille spinner while fetching,
+a semantic-colored auto-dismissing toast, and a key hint). The status bar segments are content-sized and
+truncate with an ellipsis (`…`) rather than a hard cut, so nothing clips mid-word on narrow terminals.
+Empty states are inline status lines, not centered placards.
+
+Three built-in themes ship, cyclable at runtime with `t` and selectable up-front via the `LCI_THEME` env
+var or `theme =` in `config.toml`:
+
+| Theme        | Feel                                                                             |
+| ------------ | -------------------------------------------------------------------------------- |
+| `midnight`   | **default** — Tokyo-Night-ish warm dark (purple accent, warm-orange brand)       |
+| `terminal`   | transparent background — colors from your terminal's own 16 ANSI slots           |
+| `nord`       | cool, muted arctic palette                                                       |
+
+```bash
+LCI_THEME=nord cargo run -p lci        # start in the nord theme
+```
+
+### Screens (rendered to text)
+
+These are produced by the hidden dev/review affordance `lci --render <screen>` (no auth, no network —
+seeded fake data), which draws a screen through ratatui's `TestBackend` and prints the buffer. Handy for
+reviewing the layout in a PR or a terminal-less CI. Screens: `repos | runs | confirm | help | empty |
+too-small`; tune with `--width`, `--height`, `--theme`.
+
+Repositories (`lci --render repos --width 80 --height 24`):
+
+```text
+ ▍ LCI                    Host:  code-intelligence-api.a            <a> approve
+ Lightbridge Code         User:  operator                              <d> deny
+ Intelligence             Perms: approve / deny / cancel             <c> cancel
+                          Token: 5m00s   ● connected                  <t> theme
+                                                                       <?> help
+
+  Repositories (5)   Runs (0)
+╭▐ Repositories ▌ 5  [pending]─────────────────────────────────────────────────╮
+│ REPOSITORY              STATUS       TASKS          LAST TASK APPROVED BY    │
+│▌vymalo/lightbridge-code pending         12   2026-07-02 09:55 —              │
+│ vymalo/ai-helm          approved        48   2026-07-02 09:55 operator       │
+│ adorsys-gis/ai-governan pending          0                  — —              │
+│ vymalo/home-os          disabled         3   2026-07-02 09:55 operator       │
+│ vymalo/eaig             approved        21   2026-07-02 09:55 alice          │
+╰──────────────────────────────────────────────────────────────────────────────╯
+ filter: pending                            j/k move · f filter · r refresh · q…
+```
+
+Runs (`lci --render runs --width 80 --height 24`) — the STATUS column uses short labels
+(`waiting_for_index` → `indexing`, `succeeded` → `done`) so it never truncates mid-word:
+
+```text
+  Repositories (0)   Runs (5)
+╭▐ Runs ▌ 5  [all]─────────────────────────────────────────────────────────────╮
+│ STATUS           REPOSITORY       TARGET       KIND        AGE JOB           │
+│▌running          vymalo/lightbrid PR #128      review       1m review-9f2a   │
+│ queued           vymalo/ai-helm   PR #44       review      20s —             │
+│ indexing         adorsys-gis/ai-g issue #12    review       8s —             │
+│ done             vymalo/eaig      PR #301      review       1h review-77c1   │
+│ failed           vymalo/home-os   PR #9        review       2h review-4d0e   │
+╰──────────────────────────────────────────────────────────────────────────────╯
+ filter: all                                j/k move · f active/all · r refresh…
+```
+
+The approve confirm dialog (`lci --render confirm`), affirmative button focused:
+
+```text
+╭▐ Repositories ▌ 5  [pending]─────────────────────────────────────────────────╮
+│ REPOSITORY     ╭ Confirm ───────────────────────────────────╮ APPROVED BY    │
+│▌vymalo/lightbri│                                            │ —              │
+│ vymalo/ai-helm │ Approve vymalo/lightbridge-code-intelligen │ operator       │
+│ adorsys-gis/ai-│                                            │ —              │
+│ vymalo/home-os │    Opens the gate and triggers indexing.   │ operator       │
+│ vymalo/eaig    │                                            │ alice          │
+│                │           › Approve ‹     Cancel           │                │
+│                ╰────────────────────────────────────────────╯                │
+╰──────────────────────────────────────────────────────────────────────────────╯
+```
+
+Empty state (`lci --render empty`) — an inline status line inside the frame:
+
+```text
+╭▐ Repositories ▌ 0  [pending]─────────────────────────────────────────────────╮
+│ • no pending repositories — press f to change the filter, r to refresh       │
+╰──────────────────────────────────────────────────────────────────────────────╯
+```
+
+Too-small terminal (`lci --render too-small --width 40 --height 10`) — a graceful line, never a panic:
+
+```text
+           terminal too small
+              need ≥ 60×15
+```
 
 ## Configuration
 
@@ -55,6 +156,7 @@ Precedence, lowest → highest: **built-in defaults < `config.toml` < environmen
 | OIDC client id | `lightbridge-cli`                                  | `OIDC_CLIENT_ID`     | `--client-id`  |
 | Redirect port  | `8765`                                             | `LCI_REDIRECT_PORT`  | `--port`       |
 | Scope          | `openid profile email` (fixed)                     | —                    | —              |
+| Theme          | `midnight`                                         | `LCI_THEME`          | — (`t` at runtime) |
 
 The optional config file lives at `<config_dir>/config.toml` (e.g. macOS
 `~/Library/Application Support/fyi.camer.lci/config.toml`, Linux `~/.config/lci/config.toml`):
@@ -64,6 +166,7 @@ api_url   = "https://code-intelligence-api.ai.camer.digital"
 issuer    = "https://auth.verif.fyi/realms/camer-digital"
 client_id = "lightbridge-cli"
 port      = 8765
+theme     = "midnight"   # midnight | terminal | nord
 ```
 
 The cached token is written to `<config_dir>/token.json` with `0600` permissions. It stores an absolute

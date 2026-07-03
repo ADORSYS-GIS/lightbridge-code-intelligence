@@ -4,6 +4,7 @@
 //! reads it.
 
 use crate::api::{Me, RepositoryRow, TaskRow};
+use crate::theme::{ButtonKind, Theme, ThemeKind};
 use std::time::{Duration, Instant};
 
 /// The two operator views.
@@ -69,11 +70,27 @@ pub enum ToastKind {
     Error,
 }
 
-/// A pending confirmation prompt (`a`/`d`/`c` ask before acting).
+/// A pending confirmation prompt (`a`/`d`/`c` ask before acting). Carries which of the two buttons
+/// currently has focus so the renderer can highlight it and Enter picks the right choice.
 #[derive(Debug, Clone)]
 pub struct Confirm {
+    /// The target described in a full sentence (e.g. "Approve vymalo/lci?").
     pub prompt: String,
+    /// A one-line consequence note shown under the prompt (may be empty).
+    pub detail: String,
+    /// The verb + kind for the affirmative button (e.g. "Approve", Primary).
+    pub verb: String,
+    pub verb_kind: ButtonKind,
     pub action: PendingAction,
+    /// Which button is focused. `true` = the affirmative button, `false` = Cancel.
+    pub confirm_focused: bool,
+}
+
+impl Confirm {
+    /// Move focus to the other button (Left/Right/Tab all toggle between exactly two).
+    pub fn toggle_focus(&mut self) {
+        self.confirm_focused = !self.confirm_focused;
+    }
 }
 
 /// The action a confirmation will trigger once accepted.
@@ -101,6 +118,13 @@ pub struct App {
     pub toast: Option<Toast>,
     pub confirm: Option<Confirm>,
     pub show_help: bool,
+
+    /// The active color theme (cyclable at runtime with `t`).
+    pub theme_kind: ThemeKind,
+    /// A monotonically advancing frame counter, so the loading spinner animates across redraws.
+    pub spinner_frame: usize,
+    /// True while a background fetch is in flight (drives the status-bar spinner).
+    pub loading: bool,
 
     /// Absolute token expiry (unix seconds) for the countdown; `None` until known.
     pub token_expires_at: Option<i64>,
@@ -130,6 +154,7 @@ impl App {
         api_host: String,
         token_expires_at: i64,
         refresh_token: Option<String>,
+        theme_kind: ThemeKind,
     ) -> Self {
         Self {
             view: View::Repositories,
@@ -144,6 +169,9 @@ impl App {
             toast: None,
             confirm: None,
             show_help: false,
+            theme_kind,
+            spinner_frame: 0,
+            loading: false,
             token_expires_at: Some(token_expires_at),
             reauth_needed: false,
             refresh_token,
@@ -317,19 +345,74 @@ impl App {
         false
     }
 
-    /// Ask the operator to confirm the given action (guards approve/deny/cancel).
-    pub fn ask_confirm(&mut self, prompt: impl Into<String>, action: PendingAction) {
+    /// Ask the operator to confirm the given action (guards approve/deny/cancel). Focus defaults to
+    /// the safe **Cancel** button, so a reflexive Enter never fires a destructive action.
+    pub fn ask_confirm(
+        &mut self,
+        prompt: impl Into<String>,
+        detail: impl Into<String>,
+        verb: impl Into<String>,
+        verb_kind: ButtonKind,
+        action: PendingAction,
+    ) {
         self.confirm = Some(Confirm {
             prompt: prompt.into(),
+            detail: detail.into(),
+            verb: verb.into(),
+            verb_kind,
             action,
+            confirm_focused: false,
         });
         self.mark_dirty();
     }
-    /// Take the pending action if confirmed (Enter/y); clears the prompt either way.
+
+    /// Move focus between the confirm dialog's two buttons (Left/Right/Tab).
+    pub fn confirm_toggle_focus(&mut self) {
+        if let Some(c) = &mut self.confirm {
+            c.toggle_focus();
+            self.mark_dirty();
+        }
+    }
+
+    /// Resolve the confirm dialog by pressing the focused button (Enter). Returns the action only if
+    /// the affirmative button had focus; clears the prompt either way.
+    pub fn resolve_confirm_focused(&mut self) -> Option<PendingAction> {
+        self.mark_dirty();
+        let confirm = self.confirm.take()?;
+        confirm.confirm_focused.then_some(confirm.action)
+    }
+
+    /// Resolve the confirm dialog explicitly (Esc = decline, `y` = accept regardless of focus).
     pub fn resolve_confirm(&mut self, accepted: bool) -> Option<PendingAction> {
         self.mark_dirty();
         let confirm = self.confirm.take()?;
         accepted.then_some(confirm.action)
+    }
+
+    // --- theme + spinner ---
+    /// The resolved palette for the active theme.
+    pub fn theme(&self) -> Theme {
+        Theme::from_kind(self.theme_kind)
+    }
+    /// Cycle to the next built-in theme (the `t` key).
+    pub fn cycle_theme(&mut self) {
+        self.theme_kind = self.theme_kind.next();
+        self.toast_info(format!("theme: {}", self.theme_kind.name()));
+        self.mark_dirty();
+    }
+    /// Advance the spinner animation by one step (called on the UI tick).
+    pub fn tick_spinner(&mut self) {
+        if self.loading {
+            self.spinner_frame = self.spinner_frame.wrapping_add(1);
+            self.mark_dirty();
+        }
+    }
+    /// Flag whether a fetch is in flight (drives the status-bar spinner).
+    pub fn set_loading(&mut self, loading: bool) {
+        if self.loading != loading {
+            self.loading = loading;
+            self.mark_dirty();
+        }
     }
 }
 
@@ -373,6 +456,7 @@ mod tests {
             "api.test".into(),
             0,
             Some("rt-0".into()),
+            ThemeKind::Midnight,
         )
     }
 
@@ -421,20 +505,65 @@ mod tests {
         assert_eq!(a.repo_selected, 0, "selection reclamped after data shrank");
     }
 
+    fn ask_approve(a: &mut App) {
+        a.ask_confirm(
+            "Approve o/r5?",
+            "opens the gate",
+            "Approve",
+            ButtonKind::Primary,
+            PendingAction::Approve(5),
+        );
+    }
+
     #[test]
     fn confirm_returns_action_only_when_accepted() {
         let mut a = app();
-        a.ask_confirm("approve?", PendingAction::Approve(5));
+        ask_approve(&mut a);
         assert!(a.confirm.is_some());
         let action = a.resolve_confirm(false);
         assert!(action.is_none(), "declined confirm yields no action");
         assert!(a.confirm.is_none(), "prompt cleared on decline");
 
-        a.ask_confirm("approve?", PendingAction::Approve(5));
+        ask_approve(&mut a);
         match a.resolve_confirm(true) {
             Some(PendingAction::Approve(5)) => {}
             other => panic!("expected Approve(5), got {other:?}"),
         }
+    }
+
+    #[test]
+    fn confirm_defaults_to_cancel_and_enter_respects_focus() {
+        let mut a = app();
+        ask_approve(&mut a);
+        // Focus defaults to the safe Cancel button: a reflexive Enter must NOT act.
+        assert!(
+            !a.confirm.as_ref().unwrap().confirm_focused,
+            "focus starts on Cancel"
+        );
+        assert!(
+            a.resolve_confirm_focused().is_none(),
+            "Enter on Cancel declines"
+        );
+
+        // Move focus to the affirmative button, then Enter acts.
+        ask_approve(&mut a);
+        a.confirm_toggle_focus();
+        assert!(a.confirm.as_ref().unwrap().confirm_focused);
+        match a.resolve_confirm_focused() {
+            Some(PendingAction::Approve(5)) => {}
+            other => panic!("expected Approve(5) after focusing the button, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cycle_theme_advances_and_wraps() {
+        let mut a = app();
+        assert_eq!(a.theme_kind, ThemeKind::Midnight);
+        a.cycle_theme();
+        assert_eq!(a.theme_kind, ThemeKind::Terminal);
+        a.cycle_theme();
+        a.cycle_theme();
+        assert_eq!(a.theme_kind, ThemeKind::Midnight, "wraps back");
     }
 
     #[test]

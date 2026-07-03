@@ -23,6 +23,31 @@ pub enum Command {
     Logout,
     /// `--help`/`-h`: print usage and exit.
     Help,
+    /// `--render <screen>`: render a screen to text via a headless backend and print it. A hidden dev
+    /// affordance for reviewing the TUI without a real terminal (and for snapshot tests). Needs no
+    /// auth and makes no network calls — it draws seeded fake data.
+    Render(RenderSpec),
+}
+
+/// The parameters of a `--render` invocation.
+#[derive(Debug, PartialEq, Clone)]
+pub struct RenderSpec {
+    /// Which screen to draw (see [`crate::render::Screen`]).
+    pub screen: String,
+    pub width: u16,
+    pub height: u16,
+    pub theme: String,
+}
+
+impl Default for RenderSpec {
+    fn default() -> Self {
+        Self {
+            screen: "repos".to_string(),
+            width: 80,
+            height: 24,
+            theme: "midnight".to_string(),
+        }
+    }
 }
 
 /// The parsed invocation: a command plus any connection-flag overrides.
@@ -36,6 +61,7 @@ pub struct Parsed {
 pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Parsed> {
     let mut command = Command::Run { force_login: false };
     let mut flags = Flags::default();
+    let mut render: Option<RenderSpec> = None;
     let mut iter = args.into_iter().peekable();
 
     while let Some(arg) = iter.next() {
@@ -43,6 +69,26 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Parsed> {
             "login" => command = Command::Run { force_login: true },
             "--logout" => command = Command::Logout,
             "--help" | "-h" => command = Command::Help,
+            "--render" => {
+                let screen = take_value(&mut iter, "--render")?;
+                render.get_or_insert_with(RenderSpec::default).screen = screen;
+            }
+            "--width" => {
+                let raw = take_value(&mut iter, "--width")?;
+                render.get_or_insert_with(RenderSpec::default).width = raw
+                    .parse()
+                    .map_err(|_| anyhow::anyhow!("--width must be a number, got `{raw}`"))?;
+            }
+            "--height" => {
+                let raw = take_value(&mut iter, "--height")?;
+                render.get_or_insert_with(RenderSpec::default).height = raw
+                    .parse()
+                    .map_err(|_| anyhow::anyhow!("--height must be a number, got `{raw}`"))?;
+            }
+            "--theme" => {
+                let val = take_value(&mut iter, "--theme")?;
+                render.get_or_insert_with(RenderSpec::default).theme = val;
+            }
             "--api-url" => flags.api_url = Some(take_value(&mut iter, "--api-url")?),
             "--issuer" => flags.issuer = Some(take_value(&mut iter, "--issuer")?),
             "--client-id" => flags.client_id = Some(take_value(&mut iter, "--client-id")?),
@@ -68,6 +114,11 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Parsed> {
         }
     }
 
+    // `--render` (with its optional `--width/--height/--theme`) supersedes the default Run command.
+    if let Some(spec) = render {
+        command = Command::Render(spec);
+    }
+
     Ok(Parsed { command, flags })
 }
 
@@ -89,6 +140,16 @@ OPTIONS:
     --client-id <ID>      OIDC public client id         (env OIDC_CLIENT_ID)
     --port <PORT>         loopback redirect port        (env LCI_REDIRECT_PORT)
     -h, --help            print this help
+
+THEME:
+    Set the color theme with the LCI_THEME env var or `theme =` in config.toml
+    (midnight | terminal | nord). Cycle it at runtime with the `t` key.
+
+DEV / REVIEW:
+    --render <screen>     draw a screen to text via a headless backend and print it
+                          (no auth, no network — seeded fake data). Screens:
+                          repos | runs | confirm | help | empty | too-small.
+                          Tune with --width, --height, --theme.
 
 Config precedence (low → high): defaults < ~/.config/lci/config.toml < env < flags.";
 
@@ -135,6 +196,34 @@ mod tests {
         let p = parse_str(&["--api-url", "https://a.test", "--port=9999"]);
         assert_eq!(p.flags.api_url.as_deref(), Some("https://a.test"));
         assert_eq!(p.flags.redirect_port, Some(9999));
+    }
+
+    #[test]
+    fn parses_render_with_dimensions_and_theme() {
+        let p = parse_str(&[
+            "--render", "confirm", "--width", "100", "--height", "30", "--theme", "nord",
+        ]);
+        match p.command {
+            Command::Render(spec) => {
+                assert_eq!(spec.screen, "confirm");
+                assert_eq!(spec.width, 100);
+                assert_eq!(spec.height, 30);
+                assert_eq!(spec.theme, "nord");
+            }
+            other => panic!("expected Render, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn render_defaults_when_only_screen_given() {
+        match parse_str(&["--render", "help"]).command {
+            Command::Render(spec) => {
+                assert_eq!(spec.screen, "help");
+                assert_eq!((spec.width, spec.height), (80, 24));
+                assert_eq!(spec.theme, "midnight");
+            }
+            other => panic!("expected Render, got {other:?}"),
+        }
     }
 
     #[test]

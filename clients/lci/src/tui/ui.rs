@@ -1,402 +1,785 @@
-//! Pure rendering: given an [`App`], draw the current frame. No I/O, no state mutation. Design goal
-//! is calm and uncluttered — a thin title bar, a single content table, semantic status colors, and a
-//! one-line key hint.
+//! Pure rendering: given an [`App`], draw the current frame. No I/O, no state mutation.
+//!
+//! The look is k9s- and opencode-inspired: a fixed header (logo + context block + keymenu), a
+//! pill-tab bar, a bordered content table with semantic status coloring and an accent selection
+//! cursor, and a status/footer bar with a live spinner + toast. Every color comes from the active
+//! [`Theme`] — there are no hardcoded `Color::`s here. The governing discipline: accent only for
+//! interactive/selected elements, status in semantic colors, metadata muted, most text in the
+//! default foreground.
 
 use super::app::{App, ToastKind, View};
 use crate::api::TaskRow;
+use crate::theme::{status_label, ButtonKind, Theme};
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState};
+use ratatui::style::{Modifier, Style};
+use ratatui::text::{Line, Span, Text};
+use ratatui::widgets::{
+    Block, BorderType, Borders, Cell, Clear, Paragraph, Row, Table, TableState,
+};
 use ratatui::Frame;
 use time::OffsetDateTime;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-/// Muted chrome color for borders/labels.
-const CHROME: Color = Color::DarkGray;
+/// The braille spinner cycle (8 frames), width-1 each.
+const SPINNER: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
+
+/// Minimum usable terminal size; below this we render a single graceful line instead of a clipped
+/// mess.
+const MIN_WIDTH: u16 = 60;
+const MIN_HEIGHT: u16 = 15;
 
 /// Draw one frame.
 pub fn draw(f: &mut Frame, app: &App) {
+    let theme = app.theme();
+    let area = f.area();
+
+    // Paint the whole surface with the theme background first (a no-op for the `terminal` theme,
+    // which uses `Color::Reset`).
+    f.render_widget(
+        Block::default().style(theme.text().bg(theme.background)),
+        area,
+    );
+
+    if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
+        draw_too_small(f, area, &theme);
+        return;
+    }
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1), // title / tabs
-            Constraint::Min(3),    // content
-            Constraint::Length(1), // status bar
-            Constraint::Length(1), // key hint / toast
+            Constraint::Length(6), // header (logo + context + keymenu)
+            Constraint::Length(1), // tab bar
+            Constraint::Min(3),    // framed content
+            Constraint::Length(1), // status / footer bar
         ])
-        .split(f.area());
+        .split(area);
 
-    draw_title(f, chunks[0], app);
+    draw_header(f, chunks[0], app, &theme);
+    draw_tabs(f, chunks[1], app, &theme);
     match app.view {
-        View::Repositories => draw_repositories(f, chunks[1], app),
-        View::Runs => draw_runs(f, chunks[1], app),
+        View::Repositories => draw_repositories(f, chunks[2], app, &theme),
+        View::Runs => draw_runs(f, chunks[2], app, &theme),
     }
-    draw_status(f, chunks[2], app);
-    draw_footer(f, chunks[3], app);
+    draw_status(f, chunks[3], app, &theme);
 
     if let Some(confirm) = &app.confirm {
-        draw_confirm(f, &confirm.prompt);
+        draw_confirm(f, confirm, &theme);
     }
     if app.show_help {
-        draw_help(f);
+        draw_help(f, &theme);
     }
 }
 
-/// Title bar with the two tabs and a subtle app label.
-fn draw_title(f: &mut Frame, area: Rect, app: &App) {
-    let tab = |name: &str, active: bool| {
-        if active {
-            Span::styled(
-                format!(" {name} "),
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            )
-        } else {
-            Span::styled(format!(" {name} "), Style::default().fg(Color::Gray))
-        }
-    };
-    let line = Line::from(vec![
-        Span::styled(
-            " lci ",
+/// The graceful fallback for a terminal too small to lay out.
+fn draw_too_small(f: &mut Frame, area: Rect, theme: &Theme) {
+    let msg = Paragraph::new(vec![
+        Line::from(Span::styled(
+            "terminal too small",
             Style::default()
-                .fg(Color::White)
+                .fg(theme.error)
                 .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled("· ", Style::default().fg(CHROME)),
-        tab("1 Repositories", app.view == View::Repositories),
-        Span::raw(" "),
-        tab("2 Runs", app.view == View::Runs),
-    ]);
-    f.render_widget(Paragraph::new(line), area);
+        )),
+        Line::from(Span::styled(
+            format!("need ≥ {MIN_WIDTH}×{MIN_HEIGHT}"),
+            theme.muted_text(),
+        )),
+    ])
+    .alignment(Alignment::Center);
+    f.render_widget(msg, area);
 }
 
+// --- header -------------------------------------------------------------------------------------
+
+/// The header: a `▍ LCI` logo on the left, a k9s-style context block in the center, and a keymenu on
+/// the right — all on the surface fill.
+fn draw_header(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
+    f.render_widget(Block::default().style(theme.surface_style()), area);
+
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Length(26), // logo
+            Constraint::Min(24),    // context block
+            Constraint::Length(24), // keymenu
+        ])
+        .split(area);
+
+    draw_logo(f, cols[0], theme);
+    draw_context(f, cols[1], app, theme);
+    draw_keymenu(f, cols[2], app, theme);
+}
+
+/// The compact `▍ LCI` wordmark + subtitle. Top-aligned so the wordmark sits on the header's first
+/// row, level with `Host:` and the keymenu (an earlier leading blank made the top row look lopsided).
+fn draw_logo(f: &mut Frame, area: Rect, theme: &Theme) {
+    let brand = Style::default()
+        .fg(theme.brand)
+        .add_modifier(Modifier::BOLD);
+    let lines = vec![
+        Line::from(vec![Span::styled("▍ ", brand), Span::styled("LCI", brand)]),
+        Line::from(Span::styled("Lightbridge Code", theme.muted_text())),
+        Line::from(Span::styled("Intelligence", theme.muted_text())),
+    ];
+    f.render_widget(
+        Paragraph::new(lines).style(theme.surface_style()),
+        pad_left(area, 1),
+    );
+}
+
+/// The k9s-style `key: value` context block.
+fn draw_context(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
+    let identity = app.me.as_ref().map(|m| m.identity()).unwrap_or("unknown");
+    let perms = app
+        .me
+        .as_ref()
+        .map(|m| perm_summary(&m.permissions))
+        .unwrap_or_else(|| "—".into());
+
+    let kv = |k: &str, v: Span<'static>| -> Line<'static> {
+        Line::from(vec![Span::styled(format!("{k:<7}"), theme.muted_text()), v])
+    };
+
+    // Connection dot: ok (info) normally, warning if a re-auth is pending.
+    let (dot_color, dot_label) = if app.reauth_needed {
+        (theme.warning, "reauth needed")
+    } else {
+        (theme.success, "connected")
+    };
+
+    let lines = vec![
+        kv("Host:", Span::styled(app.api_host.clone(), theme.text())),
+        kv(
+            "User:",
+            Span::styled(
+                identity.to_string(),
+                Style::default()
+                    .fg(theme.accent)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ),
+        kv("Perms:", Span::styled(perms, theme.text())),
+        Line::from(vec![
+            Span::styled(format!("{:<7}", "Token:"), theme.muted_text()),
+            token_span(app, theme),
+            Span::raw("   "),
+            Span::styled("● ", Style::default().fg(dot_color)),
+            Span::styled(dot_label.to_string(), theme.muted_text()),
+        ]),
+    ];
+    f.render_widget(Paragraph::new(lines).style(theme.surface_style()), area);
+}
+
+/// The right-aligned keymenu: `<key> label`, key in accent. Actions the caller can't perform are
+/// dimmed.
+fn draw_keymenu(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
+    let entry = |key: &str, label: &str, enabled: bool| -> Line<'static> {
+        let (key_style, label_style) = if enabled {
+            (
+                Style::default()
+                    .fg(theme.accent)
+                    .add_modifier(Modifier::BOLD),
+                theme.text(),
+            )
+        } else {
+            (theme.muted_text(), theme.muted_text())
+        };
+        Line::from(vec![
+            Span::styled(format!("<{key}> "), key_style),
+            Span::styled(label.to_string(), label_style),
+        ])
+    };
+
+    // Gate approve/deny/cancel on the token's capabilities.
+    let a = app.can_approve();
+    let d = app.can_deny();
+    let c = app.can_cancel();
+
+    let lines = vec![
+        entry("a", "approve", a),
+        entry("d", "deny", d),
+        entry("c", "cancel", c),
+        entry("t", "theme", true),
+        entry("?", "help", true),
+    ];
+    f.render_widget(
+        Paragraph::new(lines)
+            .alignment(Alignment::Right)
+            .style(theme.surface_style()),
+        pad_right(area, 1),
+    );
+}
+
+// --- tab bar ------------------------------------------------------------------------------------
+
+/// The pill-tab bar: active tab gets an accent background, inactive tabs muted on the surface.
+fn draw_tabs(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
+    f.render_widget(Block::default().style(theme.surface_style()), area);
+
+    let pill = |label: String, active: bool| -> Vec<Span<'static>> {
+        if active {
+            vec![Span::styled(
+                format!(" {label} "),
+                Style::default()
+                    .fg(theme.on_accent())
+                    .bg(theme.accent)
+                    .add_modifier(Modifier::BOLD),
+            )]
+        } else {
+            vec![Span::styled(
+                format!(" {label} "),
+                Style::default().fg(theme.muted).bg(theme.surface),
+            )]
+        }
+    };
+
+    let mut spans = vec![Span::raw(" ")];
+    spans.extend(pill(
+        format!("Repositories ({})", app.repos.len()),
+        app.view == View::Repositories,
+    ));
+    spans.push(Span::styled(" ", theme.surface_style()));
+    spans.extend(pill(
+        format!("Runs ({})", app.tasks.len()),
+        app.view == View::Runs,
+    ));
+    f.render_widget(
+        Paragraph::new(Line::from(spans)).style(theme.surface_style()),
+        area,
+    );
+}
+
+// --- content tables -----------------------------------------------------------------------------
+
 /// Repositories table.
-fn draw_repositories(f: &mut Frame, area: Rect, app: &App) {
+fn draw_repositories(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     let header = Row::new(vec![
         Cell::from("REPOSITORY"),
         Cell::from("STATUS"),
-        Cell::from("TASKS"),
-        Cell::from("LAST TASK"),
+        Cell::from(Line::from("TASKS").alignment(Alignment::Right)),
+        Cell::from(Line::from("LAST TASK").alignment(Alignment::Right)),
         Cell::from("APPROVED BY"),
     ])
-    .style(Style::default().fg(CHROME).add_modifier(Modifier::BOLD));
+    .style(theme.header_style());
 
     let rows: Vec<Row> = app
         .repos
         .iter()
         .map(|r| {
             Row::new(vec![
-                Cell::from(format!("{}/{}", r.owner, r.name)),
-                Cell::from(Span::styled(r.status.clone(), status_style(&r.status))),
-                Cell::from(r.task_count.to_string()),
-                Cell::from(fmt_ts(r.last_task_at)),
-                Cell::from(r.approved_by.clone().unwrap_or_else(|| "—".into())),
+                Cell::from(Span::styled(
+                    format!("{}/{}", r.owner, r.name),
+                    theme.text(),
+                )),
+                Cell::from(Span::styled(
+                    status_label(&r.status).to_string(),
+                    Style::default()
+                        .fg(theme.status_color(&r.status))
+                        .add_modifier(Modifier::BOLD),
+                )),
+                Cell::from(Line::from(r.task_count.to_string()).alignment(Alignment::Right)),
+                Cell::from(
+                    Line::from(Span::styled(fmt_ts(r.last_task_at), theme.muted_text()))
+                        .alignment(Alignment::Right),
+                ),
+                Cell::from(Span::styled(
+                    r.approved_by.clone().unwrap_or_else(|| "—".into()),
+                    theme.muted_text(),
+                )),
             ])
         })
         .collect();
 
-    let title = format!(
-        " Repositories · filter: {} ({} shown) ",
-        app.repo_filter.label(),
-        app.repos.len()
-    );
     let widths = [
         Constraint::Percentage(40),
         Constraint::Length(10),
         Constraint::Length(7),
-        Constraint::Length(20),
+        Constraint::Length(18),
         Constraint::Percentage(20),
     ];
+    let filter_chip = status_chip(app.repo_filter.label(), theme);
+    let title = title_line("Repositories", app.repos.len(), Some(filter_chip), theme);
     let table = Table::new(rows, widths)
         .header(header)
-        .block(bordered(&title))
-        .row_highlight_style(selected_style())
-        .highlight_symbol("▏");
+        .row_highlight_style(theme.selected_row_style())
+        .highlight_symbol("▌");
 
-    let mut state = TableState::default();
-    if !app.repos.is_empty() {
-        state.select(Some(app.repo_selected));
-    }
     render_table_or_empty(
         f,
         area,
         table,
-        &mut state,
+        app.repo_selected,
         app.repos.is_empty(),
-        &title,
+        title,
         empty_repos_hint(app),
+        theme,
     );
 }
 
 /// Runs table.
-fn draw_runs(f: &mut Frame, area: Rect, app: &App) {
+fn draw_runs(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     let header = Row::new(vec![
         Cell::from("STATUS"),
         Cell::from("REPOSITORY"),
         Cell::from("TARGET"),
         Cell::from("KIND"),
-        Cell::from("AGE"),
+        Cell::from(Line::from("AGE").alignment(Alignment::Right)),
         Cell::from("JOB"),
     ])
-    .style(Style::default().fg(CHROME).add_modifier(Modifier::BOLD));
+    .style(theme.header_style());
 
     let visible = app.visible_tasks();
     let rows: Vec<Row> = visible
         .iter()
         .map(|t| {
             Row::new(vec![
-                Cell::from(Span::styled(t.status.clone(), status_style(&t.status))),
-                Cell::from(repo_label(t)),
-                Cell::from(target_label(t)),
-                Cell::from(t.kind.clone()),
-                Cell::from(age(t.created_at)),
-                Cell::from(t.job_name.clone().unwrap_or_else(|| "—".into())),
+                Cell::from(Span::styled(
+                    status_label(&t.status).to_string(),
+                    Style::default()
+                        .fg(theme.status_color(&t.status))
+                        .add_modifier(Modifier::BOLD),
+                )),
+                Cell::from(Span::styled(repo_label(t), theme.text())),
+                Cell::from(Span::styled(target_label(t), theme.text())),
+                Cell::from(Span::styled(t.kind.clone(), theme.muted_text())),
+                Cell::from(
+                    Line::from(Span::styled(age(t.created_at), theme.muted_text()))
+                        .alignment(Alignment::Right),
+                ),
+                Cell::from(Span::styled(
+                    t.job_name.clone().unwrap_or_else(|| "—".into()),
+                    theme.muted_text(),
+                )),
             ])
         })
         .collect();
 
+    let widths = [
+        Constraint::Length(16),
+        Constraint::Percentage(30),
+        Constraint::Length(12),
+        Constraint::Length(8),
+        Constraint::Length(6),
+        Constraint::Percentage(20),
+    ];
     let filter = if app.runs_active_only {
         "active"
     } else {
         "all"
     };
-    let title = format!(" Runs · filter: {} ({} shown) ", filter, visible.len());
-    let widths = [
-        Constraint::Length(17),
-        Constraint::Percentage(30),
-        Constraint::Length(14),
-        Constraint::Length(8),
-        Constraint::Length(8),
-        Constraint::Percentage(20),
-    ];
+    let filter_chip = status_chip(filter, theme);
+    let title = title_line("Runs", visible.len(), Some(filter_chip), theme);
     let table = Table::new(rows, widths)
         .header(header)
-        .block(bordered(&title))
-        .row_highlight_style(selected_style())
-        .highlight_symbol("▏");
+        .row_highlight_style(theme.selected_row_style())
+        .highlight_symbol("▌");
 
-    let mut state = TableState::default();
-    if !visible.is_empty() {
-        state.select(Some(app.run_selected));
-    }
     render_table_or_empty(
         f,
         area,
         table,
-        &mut state,
+        app.run_selected,
         visible.is_empty(),
-        &title,
-        "No runs match the current filter. Press f to show all, r to refresh.".into(),
+        title,
+        "no runs match the current filter — press f to show all, r to refresh".into(),
+        theme,
     );
 }
 
-/// Render the table, or an inline empty-status line inside the same bordered block if there are no
-/// rows (empty states are status lines, not centered placards).
+/// Render the table, or an inline muted status line inside the same bordered block when there are no
+/// rows (empty states are inline status lines, not centered placards).
 #[allow(clippy::too_many_arguments)]
 fn render_table_or_empty(
     f: &mut Frame,
     area: Rect,
     table: Table,
-    state: &mut TableState,
+    selected: usize,
     is_empty: bool,
-    title: &str,
+    title: Line<'static>,
     hint: String,
+    theme: &Theme,
 ) {
+    let block = bordered(title, theme);
     if is_empty {
-        let para = Paragraph::new(Line::from(Span::styled(
-            hint,
-            Style::default().fg(Color::Gray),
-        )))
-        .block(bordered(title));
-        f.render_widget(para, area);
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+        let para = Paragraph::new(Line::from(vec![
+            Span::styled("• ", theme.muted_text()),
+            Span::styled(hint, theme.muted_text()),
+        ]));
+        f.render_widget(para, pad_left(inner, 1));
     } else {
-        f.render_stateful_widget(table, area, state);
+        let table = table.block(block);
+        let mut state = TableState::default();
+        state.select(Some(selected));
+        f.render_stateful_widget(table, area, &mut state);
     }
 }
 
-/// Status bar: identity, permissions summary, token countdown, host, re-auth flag.
-fn draw_status(f: &mut Frame, area: Rect, app: &App) {
-    let identity = app.me.as_ref().map(|m| m.identity()).unwrap_or("unknown");
-    let perms = app
-        .me
-        .as_ref()
-        .map(|m| perm_summary(&m.permissions))
-        .unwrap_or_default();
+// --- status / footer bar ------------------------------------------------------------------------
 
+/// The full-width status bar: LEFT filter + spinner, CENTER toast, RIGHT key hint.
+///
+/// The three segments are sized to their content — the side segments take exactly what they need
+/// (clamped so they never starve each other), and the center toast takes the remainder — instead of
+/// rigid percentages that hard-cut a longer hint/toast at 80 cols (gemini). Any segment that still
+/// can't fit is truncated with an ellipsis rather than clipped mid-glyph.
+fn draw_status(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
+    f.render_widget(Block::default().style(theme.surface_style()), area);
+
+    // LEFT text: " ⠹ filter: pending" (spinner only while loading).
+    let filter = match app.view {
+        View::Repositories => format!("filter: {}", app.repo_filter.label()),
+        View::Runs => format!(
+            "filter: {}",
+            if app.runs_active_only {
+                "active"
+            } else {
+                "all"
+            }
+        ),
+    };
+    let spinner = if app.loading {
+        format!("{} ", SPINNER[app.spinner_frame % SPINNER.len()])
+    } else {
+        String::new()
+    };
+    let left_text = format!(" {spinner}{filter}");
+
+    // RIGHT text: the key hint (trailing space keeps it off the edge).
+    let hint = match app.view {
+        View::Repositories => "j/k move · f filter · r refresh · q quit ",
+        View::Runs => "j/k move · f active/all · r refresh · q quit ",
+    };
+
+    // Give the side segments what their content needs, but never more than ~45% each so a very long
+    // one can't crowd the other out; the center takes whatever remains for the toast.
+    let side_cap = (area.width as usize * 45 / 100).max(1);
+    let left_w = display_width(&left_text).min(side_cap) as u16;
+    let right_w = display_width(hint).min(side_cap) as u16;
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Length(left_w),
+            Constraint::Min(0),
+            Constraint::Length(right_w),
+        ])
+        .split(area);
+
+    // LEFT.
+    let left_line = Line::from(Span::styled(
+        truncate_ellipsis(&left_text, cols[0].width as usize),
+        theme.muted_text(),
+    ));
+    f.render_widget(
+        Paragraph::new(left_line).style(theme.surface_style()),
+        cols[0],
+    );
+
+    // CENTER: the latest toast, semantic-colored, centered, truncated to the remaining width.
+    if let Some(toast) = &app.toast {
+        let color = match toast.kind {
+            ToastKind::Info => theme.info,
+            ToastKind::Success => theme.success,
+            ToastKind::Error => theme.error,
+        };
+        let glyph = match toast.kind {
+            ToastKind::Info => "•",
+            ToastKind::Success => "✓",
+            ToastKind::Error => "✗",
+        };
+        let text = truncate_ellipsis(&format!("{glyph} {}", toast.text), cols[1].width as usize);
+        let line = Line::from(Span::styled(
+            text,
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ))
+        .alignment(Alignment::Center);
+        f.render_widget(Paragraph::new(line).style(theme.surface_style()), cols[1]);
+    }
+
+    // RIGHT: the key hint, right-aligned, truncated to its segment.
+    let right_line = Line::from(Span::styled(
+        truncate_ellipsis(hint, cols[2].width as usize),
+        theme.muted_text(),
+    ))
+    .alignment(Alignment::Right);
+    f.render_widget(
+        Paragraph::new(right_line).style(theme.surface_style()),
+        cols[2],
+    );
+}
+
+// --- overlays -----------------------------------------------------------------------------------
+
+/// The centered confirm dialog with two button-styled choices.
+fn draw_confirm(f: &mut Frame, confirm: &super::app::Confirm, theme: &Theme) {
+    let area = centered_rect(58, 34, f.area());
+    f.render_widget(Clear, area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme.border_focus))
+        .style(Style::default().bg(theme.surface))
+        .title(Span::styled(
+            " Confirm ",
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    // Split into the message area and a bottom row for the buttons.
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(pad_left(pad_right(inner, 1), 1));
+
+    let text = Text::from(vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            confirm.prompt.clone(),
+            Style::default()
+                .fg(theme.foreground)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(confirm.detail.clone(), theme.muted_text())),
+    ]);
+    f.render_widget(
+        Paragraph::new(text)
+            .alignment(Alignment::Center)
+            .style(Style::default().bg(theme.surface)),
+        rows[0],
+    );
+
+    // Buttons: the affirmative (verb) and a Cancel. The focused one gets ›‹ markers + a solid fill.
+    let affirmative = button_span(
+        &confirm.verb,
+        confirm.confirm_focused,
+        confirm.verb_kind,
+        theme,
+    );
+    let cancel = button_span(
+        "Cancel",
+        !confirm.confirm_focused,
+        ButtonKind::Neutral,
+        theme,
+    );
+    let mut btn_spans = vec![Span::raw(" ")];
+    btn_spans.extend(affirmative);
+    btn_spans.push(Span::styled("   ", Style::default().bg(theme.surface)));
+    btn_spans.extend(cancel);
+    f.render_widget(
+        Paragraph::new(Line::from(btn_spans).alignment(Alignment::Center))
+            .style(Style::default().bg(theme.surface)),
+        rows[1],
+    );
+}
+
+/// A single button rendered as `‹ Label ›` (focused) / `  Label  ` (unfocused).
+fn button_span(label: &str, focused: bool, kind: ButtonKind, theme: &Theme) -> Vec<Span<'static>> {
+    let style = theme.button(focused, kind);
+    let text = if focused {
+        format!("› {label} ‹")
+    } else {
+        format!("  {label}  ")
+    };
+    vec![Span::styled(text, style)]
+}
+
+/// The help overlay: a two-column keybinding grid with accent section headers.
+fn draw_help(f: &mut Frame, theme: &Theme) {
+    let area = centered_rect(64, 72, f.area());
+    f.render_widget(Clear, area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme.border_focus))
+        .style(Style::default().bg(theme.surface))
+        .title(Span::styled(
+            " Help · lci ",
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let section = |title: &str| -> Line<'static> {
+        Line::from(Span::styled(
+            title.to_string(),
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+        ))
+    };
+    let row = |key: &str, label: &str| -> Line<'static> {
+        Line::from(vec![
+            Span::styled(
+                format!("  {key:<14}"),
+                Style::default()
+                    .fg(theme.secondary)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(label.to_string(), theme.text()),
+        ])
+    };
+
+    let lines = vec![
+        section("Navigation"),
+        row("Tab / 1 / 2", "switch view (Repositories / Runs)"),
+        row("↑/↓ or j/k", "move the selection"),
+        row("r", "refresh now"),
+        row("f", "cycle filter"),
+        Line::from(""),
+        section("Actions"),
+        row("a", "approve the selected repository"),
+        row("d", "deny the selected repository (purges its index)"),
+        row("c", "cancel the selected run"),
+        Line::from(""),
+        section("Appearance & misc"),
+        row("t", "cycle the color theme"),
+        row("?", "toggle this help"),
+        row("q / Esc", "quit"),
+        Line::from(""),
+        Line::from(Span::styled(
+            "  Actions are gated by your token permissions.",
+            theme.muted_text(),
+        )),
+    ];
+    f.render_widget(
+        Paragraph::new(lines).style(Style::default().bg(theme.surface)),
+        pad_left(inner, 1),
+    );
+}
+
+// --- small helpers ------------------------------------------------------------------------------
+
+/// A k9s-style content title: `▐ Name ▌` + a count badge + an optional filter chip.
+fn title_line(
+    name: &str,
+    count: usize,
+    chip: Option<Vec<Span<'static>>>,
+    theme: &Theme,
+) -> Line<'static> {
     let mut spans = vec![
         Span::styled(
-            format!(" {identity} "),
+            format!("▐ {name} ▌"),
             Style::default()
-                .fg(Color::Black)
-                .bg(Color::Green)
+                .fg(theme.accent)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::raw(" "),
-        Span::styled(perms, Style::default().fg(Color::Gray)),
-        Span::styled("  ·  ", Style::default().fg(CHROME)),
         Span::styled(
-            format!("host {}", app.api_host),
-            Style::default().fg(Color::Gray),
+            format!(" {count} "),
+            Style::default().fg(theme.on_accent()).bg(theme.secondary),
         ),
-        Span::styled("  ·  ", Style::default().fg(CHROME)),
-        token_span(app),
     ];
-    if app.reauth_needed {
-        spans.push(Span::styled("  ·  ", Style::default().fg(CHROME)));
-        spans.push(Span::styled(
-            "⚠ re-auth needed (lci login)",
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-        ));
+    if let Some(chip) = chip {
+        spans.push(Span::raw(" "));
+        spans.extend(chip);
     }
-    f.render_widget(Paragraph::new(Line::from(spans)), area);
+    Line::from(spans)
 }
 
-/// The token expiry countdown span, colored by urgency.
-fn token_span(app: &App) -> Span<'static> {
+/// A `[label]` filter chip in warning color (matches the k9s "active filter" affordance).
+fn status_chip(label: &str, theme: &Theme) -> Vec<Span<'static>> {
+    vec![Span::styled(
+        format!("[{label}]"),
+        Style::default()
+            .fg(theme.warning)
+            .add_modifier(Modifier::BOLD),
+    )]
+}
+
+/// A bordered content block carrying a rich title line.
+fn bordered(title: Line<'static>, theme: &Theme) -> Block<'static> {
+    Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme.border))
+        .style(Style::default().bg(theme.background))
+        .title(title)
+}
+
+/// The token expiry countdown span, colored by urgency (warning under 2 min).
+fn token_span(app: &App, theme: &Theme) -> Span<'static> {
     let Some(exp) = app.token_expires_at else {
-        return Span::styled("token …", Style::default().fg(Color::Gray));
+        return Span::styled("…", theme.muted_text());
     };
     let now = crate::auth::now_unix();
     let remaining = exp - now;
-    let (text, color) = if remaining <= 0 {
-        ("token expired".to_string(), Color::Red)
-    } else {
-        let mins = remaining / 60;
-        let secs = remaining % 60;
-        let color = if remaining < 60 {
-            Color::Yellow
-        } else {
-            Color::Gray
-        };
-        (format!("token {mins}m{secs:02}s"), color)
-    };
-    Span::styled(text, Style::default().fg(color))
-}
-
-/// Footer: a transient toast if present, else the contextual key hint.
-fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
-    if let Some(toast) = &app.toast {
-        let color = match toast.kind {
-            ToastKind::Info => Color::Cyan,
-            ToastKind::Success => Color::Green,
-            ToastKind::Error => Color::Red,
-        };
-        let line = Line::from(Span::styled(
-            format!(" {}", toast.text),
-            Style::default().fg(color).add_modifier(Modifier::BOLD),
-        ));
-        f.render_widget(Paragraph::new(line), area);
-        return;
+    if remaining <= 0 {
+        return Span::styled(
+            "expired",
+            Style::default()
+                .fg(theme.error)
+                .add_modifier(Modifier::BOLD),
+        );
     }
-    let hint = match app.view {
-        View::Repositories => {
-            " q quit · Tab/1/2 view · j/k move · a approve · d deny · f filter · r refresh · ? help"
-        }
-        View::Runs => {
-            " q quit · Tab/1/2 view · j/k move · c cancel · f active/all · r refresh · ? help"
-        }
+    let mins = remaining / 60;
+    let secs = remaining % 60;
+    let color = if remaining < 120 {
+        theme.warning
+    } else {
+        theme.foreground
     };
-    f.render_widget(
-        Paragraph::new(Line::from(Span::styled(hint, Style::default().fg(CHROME)))),
-        area,
-    );
+    Span::styled(format!("{mins}m{secs:02}s"), Style::default().fg(color))
 }
 
-/// A centered confirmation modal.
-fn draw_confirm(f: &mut Frame, prompt: &str) {
-    let area = centered_rect(60, 20, f.area());
-    f.render_widget(Clear, area);
-    let text = vec![
-        Line::from(Span::styled(
-            prompt.to_string(),
-            Style::default().add_modifier(Modifier::BOLD),
-        )),
-        Line::from(""),
-        Line::from(Span::styled(
-            "Enter / y to confirm · Esc / n to cancel",
-            Style::default().fg(Color::Gray),
-        )),
-    ];
-    let para = Paragraph::new(text).alignment(Alignment::Center).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Yellow))
-            .title(" Confirm "),
-    );
-    f.render_widget(para, area);
+/// Trim `n` columns from the left of a rect (for padding text off the border).
+fn pad_left(area: Rect, n: u16) -> Rect {
+    let n = n.min(area.width);
+    Rect {
+        x: area.x + n,
+        width: area.width - n,
+        ..area
+    }
 }
 
-/// The help overlay.
-fn draw_help(f: &mut Frame) {
-    let area = centered_rect(60, 60, f.area());
-    f.render_widget(Clear, area);
-    let lines = vec![
-        Line::from(Span::styled(
-            "lci — keybindings",
-            Style::default().add_modifier(Modifier::BOLD),
-        )),
-        Line::from(""),
-        Line::from("  q / Esc      quit"),
-        Line::from("  Tab / 1 / 2  switch view"),
-        Line::from("  ↑/↓ or j/k   move selection"),
-        Line::from("  r            refresh now"),
-        Line::from("  f            cycle filter (repos) / active-all (runs)"),
-        Line::from("  a            approve selected repository"),
-        Line::from("  d            deny selected repository"),
-        Line::from("  c            cancel selected run"),
-        Line::from("  ?            toggle this help"),
-        Line::from(""),
-        Line::from(Span::styled(
-            "  Actions gated by your token permissions.",
-            Style::default().fg(Color::Gray),
-        )),
-    ];
-    let para = Paragraph::new(lines).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(CHROME))
-            .title(" Help "),
-    );
-    f.render_widget(para, area);
+/// Trim `n` columns from the right of a rect.
+fn pad_right(area: Rect, n: u16) -> Rect {
+    let n = n.min(area.width);
+    Rect {
+        width: area.width - n,
+        ..area
+    }
 }
 
-// --- small helpers ---
-
-fn bordered(title: &str) -> Block<'_> {
-    Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(CHROME))
-        .title(title.to_string())
+/// The terminal display width of a string (double-width CJK/emoji count as 2, control chars as 0).
+fn display_width(s: &str) -> usize {
+    UnicodeWidthStr::width(s)
 }
 
-fn selected_style() -> Style {
-    Style::default()
-        .bg(Color::Rgb(40, 44, 52))
-        .add_modifier(Modifier::BOLD)
+/// Truncate `s` to at most `max` display columns, appending an ellipsis `…` when it doesn't fit
+/// (rather than a hard mid-glyph cut). Width-correct: a truncated string plus the `…` never exceeds
+/// `max` columns.
+fn truncate_ellipsis(s: &str, max: usize) -> String {
+    if max == 0 {
+        return String::new();
+    }
+    if display_width(s) <= max {
+        return s.to_string();
+    }
+    // Reserve one column for the ellipsis, then take whole characters up to that budget.
+    let budget = max.saturating_sub(1);
+    let mut out = String::new();
+    let mut used = 0usize;
+    for ch in s.chars() {
+        let w = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if used + w > budget {
+            break;
+        }
+        out.push(ch);
+        used += w;
+    }
+    out.push('…');
+    out
 }
 
-/// Semantic color for a repo/task status word.
-fn status_style(status: &str) -> Style {
-    let color = match status {
-        "pending" | "waiting_for_index" | "queued" | "received" => Color::Yellow,
-        "approved" | "succeeded" => Color::Green,
-        "disabled" | "failed" | "timed_out" | "cancelled" => Color::Red,
-        "running" | "posting_result" => Color::Cyan,
-        _ => Color::Gray,
-    };
-    Style::default().fg(color)
-}
-
-fn empty_repos_hint(app: &App) -> String {
-    format!(
-        "No {} repositories. Press f to change the filter, r to refresh.",
-        app.repo_filter.label()
-    )
-}
-
-/// A compact permissions summary for the status bar (count + the action verbs we care about).
+/// A compact permissions summary (the action verbs the operator holds).
 fn perm_summary(perms: &[String]) -> String {
     let mut verbs = Vec::new();
     for cap in ["repo:approve", "repo:deny", "task:cancel"] {
@@ -405,10 +788,17 @@ fn perm_summary(perms: &[String]) -> String {
         }
     }
     if verbs.is_empty() {
-        format!("{} perms (read-only)", perms.len())
+        format!("{} (read-only)", perms.len())
     } else {
-        format!("can: {}", verbs.join("/"))
+        verbs.join(" / ")
     }
+}
+
+fn empty_repos_hint(app: &App) -> String {
+    format!(
+        "no {} repositories — press f to change the filter, r to refresh",
+        app.repo_filter.label()
+    )
 }
 
 fn repo_label(t: &TaskRow) -> String {
@@ -418,7 +808,7 @@ fn repo_label(t: &TaskRow) -> String {
     }
 }
 
-/// A `#PR`/`#issue` style target label.
+/// A `PR #12` / `issue #7` style target label.
 fn target_label(t: &TaskRow) -> String {
     let sigil = match t.target_type.as_str() {
         "pull_request" => "PR",
@@ -429,7 +819,7 @@ fn target_label(t: &TaskRow) -> String {
     format!("{sigil} #{}", t.target_id)
 }
 
-/// A human age like `3m`, `2h`, `5d` from a creation timestamp.
+/// A human age like `3m`, `2h`, `5d`.
 fn age(created: OffsetDateTime) -> String {
     let secs = (crate::auth::now_unix() - created.unix_timestamp()).max(0);
     if secs < 60 {
@@ -443,7 +833,7 @@ fn age(created: OffsetDateTime) -> String {
     }
 }
 
-/// Format an optional rfc3339 timestamp as a compact `YYYY-MM-DD HH:MM`, or `—`.
+/// Format an optional rfc3339 timestamp as `YYYY-MM-DD HH:MM`, or `—`.
 fn fmt_ts(ts: Option<OffsetDateTime>) -> String {
     match ts {
         Some(t) => format!(
@@ -481,6 +871,7 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::theme::ThemeKind;
 
     fn task(status: &str, target_type: &str, target_id: i64) -> TaskRow {
         TaskRow {
@@ -515,14 +906,6 @@ mod tests {
     }
 
     #[test]
-    fn status_colors_are_semantic() {
-        assert_eq!(status_style("approved").fg, Some(Color::Green));
-        assert_eq!(status_style("pending").fg, Some(Color::Yellow));
-        assert_eq!(status_style("failed").fg, Some(Color::Red));
-        assert_eq!(status_style("running").fg, Some(Color::Cyan));
-    }
-
-    #[test]
     fn perm_summary_lists_capabilities() {
         let s = perm_summary(&["repo:approve".into(), "repo:deny".into()]);
         assert!(s.contains("approve"));
@@ -535,5 +918,70 @@ mod tests {
     fn fmt_ts_handles_none() {
         assert_eq!(fmt_ts(None), "—");
         assert!(fmt_ts(Some(OffsetDateTime::UNIX_EPOCH)).starts_with("1970-01-01"));
+    }
+
+    #[test]
+    fn pad_helpers_never_overflow_on_tiny_rects() {
+        let tiny = Rect {
+            x: 0,
+            y: 0,
+            width: 0,
+            height: 1,
+        };
+        // Must not panic / underflow when asked to pad more than the width.
+        assert_eq!(pad_left(tiny, 5).width, 0);
+        assert_eq!(pad_right(tiny, 5).width, 0);
+    }
+
+    #[test]
+    fn truncate_ellipsis_fits_within_the_budget() {
+        // Fits untouched.
+        assert_eq!(truncate_ellipsis("hello", 10), "hello");
+        assert_eq!(truncate_ellipsis("hello", 5), "hello");
+        // Too long → ellipsis, and the result never exceeds the column budget.
+        let out = truncate_ellipsis("j/k move · f filter · r refresh · q quit", 12);
+        assert!(display_width(&out) <= 12, "stays within budget: {out:?}");
+        assert!(out.ends_with('…'));
+        // Degenerate budgets don't panic.
+        assert_eq!(truncate_ellipsis("anything", 0), "");
+        assert_eq!(display_width(&truncate_ellipsis("anything", 1)), 1);
+    }
+
+    #[test]
+    fn status_bar_hint_is_not_hard_cut_at_80_cols() {
+        use crate::render::{render_to_string, Screen};
+        use crate::theme::ThemeKind;
+        // The old rigid 30/40/30 split hard-cut the hint; now the last visible glyph before the edge
+        // is an ellipsis, never a mid-word slice.
+        let s = render_to_string(Screen::Repos, 80, 24, ThemeKind::Midnight);
+        let last = s.lines().last().unwrap_or_default();
+        assert!(
+            last.contains('…'),
+            "narrow status bar ends the hint with an ellipsis, got: {last:?}"
+        );
+    }
+
+    #[test]
+    fn draws_every_screen_at_many_sizes_without_panicking() {
+        use crate::render::{render_to_string, Screen};
+        let screens = [
+            Screen::Repos,
+            Screen::Runs,
+            Screen::Confirm,
+            Screen::Help,
+            Screen::Empty,
+            Screen::TooSmall,
+        ];
+        // A spread of sizes including the too-small regime and both required review sizes.
+        let sizes = [(80, 24), (120, 40), (60, 15), (40, 10), (200, 60)];
+        for screen in screens {
+            for theme in [ThemeKind::Midnight, ThemeKind::Terminal, ThemeKind::Nord] {
+                for (w, h) in sizes {
+                    // Just exercising the render path — a panic here fails the test.
+                    let out = render_to_string(screen, w, h, theme);
+                    assert!(!out.is_empty(), "{screen:?} @ {w}x{h} produced no output");
+                }
+            }
+        }
     }
 }

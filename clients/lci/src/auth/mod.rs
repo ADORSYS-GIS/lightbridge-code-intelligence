@@ -402,6 +402,7 @@ mod tests {
             client_id: "lightbridge-cli".into(),
             redirect_port: 8765,
             scope: "openid profile email".into(),
+            theme: "midnight".into(),
         }
     }
 
