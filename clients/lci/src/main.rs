@@ -70,9 +70,13 @@ async fn main() -> color_eyre::Result<()> {
 
     let force_login = matches!(parsed.command, Command::Run { force_login: true });
 
-    // Shared HTTP client (rustls via the workspace reqwest feature set).
+    // Shared HTTP client (rustls via the workspace reqwest feature set). A per-request timeout
+    // bounds EVERY call (auth, list, detail + live-tail): without it, a stalled control plane would
+    // let detached request tasks + sockets pile up — the 2.5s tail poll and 5s list refresh keep
+    // spawning while the old ones hang. 10s is generous for these small JSON GETs.
     let http = reqwest::Client::builder()
         .user_agent(concat!("lci/", env!("CARGO_PKG_VERSION")))
+        .timeout(std::time::Duration::from_secs(10))
         .build()
         .wrap_err("building HTTP client")?;
 

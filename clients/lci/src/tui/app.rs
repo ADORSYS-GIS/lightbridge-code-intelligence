@@ -139,6 +139,12 @@ pub struct DetailState {
     pub live: bool,
     /// Set when the caller lacks `review:read`: we skip the fetch and show an inline notice instead.
     pub permission_denied: bool,
+    /// True while a live-tail fetch is outstanding. Guards the ~2.5s poll so a slow/hung backend can't
+    /// accumulate overlapping requests (a fresh `get_task`+`get_transcript` pair would otherwise be
+    /// spawned every tick regardless of whether the last one returned). Set on spawn, cleared when the
+    /// `Msg::DetailTail` result lands. The per-request timeout is the hard backstop; this avoids even
+    /// queuing the redundant work.
+    pub tail_in_flight: bool,
 }
 
 impl DetailState {
@@ -159,12 +165,14 @@ impl DetailState {
             autoscroll: true,
             new_since_scroll: 0,
             permission_denied: !can_read,
+            tail_in_flight: false,
         }
     }
 
-    /// Whether the detail poll should run: the task is still live and we're allowed to read it.
+    /// Whether the live-tail poll should spawn *now*: the task is still live, we're allowed to read
+    /// it, and no tail fetch is already outstanding (the in-flight guard).
     pub fn should_poll(&self) -> bool {
-        self.live && !self.permission_denied
+        self.live && !self.permission_denied && !self.tail_in_flight
     }
 
     /// The maximum valid scroll offset given the last-known content + viewport sizes.
@@ -818,6 +826,8 @@ mod tests {
             repo_name: Some("lci".into()),
             job_name: Some("review-abc".into()),
             error_detail: None,
+            base_sha: Some("a1b2c3d4e5f6".into()),
+            head_sha: Some("e4f5a6b7c8d9".into()),
         }
     }
 
@@ -919,6 +929,29 @@ mod tests {
     }
 
     #[test]
+    fn detail_tail_in_flight_guard_gates_polling() {
+        let mut d = DetailState::new(task_row("running"), true);
+        // Live + readable + no fetch outstanding → poll.
+        assert!(d.should_poll(), "first tick may poll");
+
+        // Simulate a spawn: the guard is set, so the next tick must NOT poll again.
+        d.tail_in_flight = true;
+        assert!(
+            !d.should_poll(),
+            "in-flight guard blocks a second overlapping poll"
+        );
+
+        // When the result lands the guard clears and polling resumes.
+        d.tail_in_flight = false;
+        assert!(d.should_poll(), "cleared guard re-enables polling");
+
+        // A terminal status stops polling regardless of the guard.
+        d.tail_in_flight = false;
+        d.set_task(task_row("succeeded"));
+        assert!(!d.should_poll(), "terminal status stops the tail");
+    }
+
+    #[test]
     fn detail_set_task_flips_live_off_on_terminal_status() {
         let mut d = DetailState::new(task_row("running"), true);
         assert!(d.live);
@@ -968,6 +1001,8 @@ mod tests {
             repo_name: None,
             job_name: None,
             error_detail: None,
+            base_sha: None,
+            head_sha: None,
         };
         let done = TaskRow {
             status: "succeeded".into(),

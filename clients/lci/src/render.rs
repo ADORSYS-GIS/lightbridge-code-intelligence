@@ -204,6 +204,8 @@ fn sample_tasks() -> Vec<TaskRow> {
             repo_name: Some(name.into()),
             job_name: job.map(String::from),
             error_detail: None,
+            base_sha: None,
+            head_sha: None,
         }
     };
     vec![
@@ -286,7 +288,10 @@ fn sample_detail_task(status: &str, age_secs: i64) -> TaskRow {
         repo_owner: Some("vymalo".into()),
         repo_name: Some("lightbridge-code-intelligence".into()),
         job_name: Some("review-9f2a".into()),
-        error_detail: None,
+        error_detail: matches!(status, "failed" | "timed_out")
+            .then(|| "agent runner exited 137 (OOM-killed) after 2 tool calls".to_string()),
+        base_sha: Some("a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4".into()),
+        head_sha: Some("e4f5a6b7c8d90e1f2a3b4c5d6e7f8091a2b3c4d5".into()),
     }
 }
 
@@ -443,6 +448,12 @@ mod tests {
         assert!(s.contains("PR #128"), "target");
         assert!(s.contains("done"), "status short label for succeeded");
         assert!(s.contains("● done"), "terminal live badge");
+        // The base→head short SHAs render (7-char each) — not the old `—→—` placeholder.
+        assert!(s.contains("a1b2c3d→e4f5a6b"), "short base→head SHAs:\n{s}");
+        assert!(
+            !s.contains("—→—"),
+            "no SHA placeholder now the fields exist"
+        );
         // Review panel.
         assert!(s.contains("Review"), "review panel");
         assert!(s.contains("inline"), "finding tally");

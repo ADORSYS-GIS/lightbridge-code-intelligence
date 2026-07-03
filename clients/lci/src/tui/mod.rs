@@ -115,9 +115,12 @@ pub async fn run(
 
             // --- live-tail poll for an open detail page (status + transcript) ---
             _ = detail_poll.tick() => {
-                if let Some(d) = app.detail.as_ref() {
+                // `should_poll` includes the in-flight guard, so a slow backend can't stack polls.
+                if let Some(d) = app.detail.as_mut() {
                     if d.should_poll() {
-                        spawn_detail_tail(d.task_id, &api, &tx);
+                        let id = d.task_id;
+                        d.tail_in_flight = true;
+                        spawn_detail_tail(id, &api, &tx);
                     }
                 }
             }
@@ -251,10 +254,14 @@ fn handle_key(
         // Enter / l / → opens the selected run's detail page (Runs view only).
         KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right if app.view == View::Runs => {
             app.open_detail();
-            if let Some(d) = app.detail.as_ref() {
-                if !d.permission_denied {
-                    spawn_detail_fetch(d.task_id, app, api, tx);
-                }
+            // Read the target out of the immutable borrow, then fetch (spawn needs `&mut app`).
+            let target = app
+                .detail
+                .as_ref()
+                .filter(|d| !d.permission_denied)
+                .map(|d| d.task_id);
+            if let Some(id) = target {
+                spawn_detail_fetch(id, app, api, tx);
             }
         }
         KeyCode::Char('r') => {
@@ -524,22 +531,36 @@ fn spawn_refresh_current_view(app: &App, api: &ApiClient, tx: &mpsc::UnboundedSe
                 let _ = tx.send(Msg::Tasks(result));
             });
         }
-        // The detail page refreshes via its own tail poll; a manual `r`/view-refresh re-fetches all
-        // three (task + review + transcript) so a fresh review shows up too.
+        // The detail page refreshes primarily via its own tail poll; the periodic list refresh also
+        // re-fetches all three (task + review + transcript) so a freshly-posted review shows up. This
+        // path is `&App`, so it spawns the fetch directly (no loading-flag flip — the tail already
+        // keeps the page live); the interactive open/`r` paths go through `spawn_detail_fetch`.
         View::Detail => {
-            if let Some(d) = app.detail.as_ref() {
-                if !d.permission_denied {
-                    spawn_detail_fetch(d.task_id, app, &api, &tx);
-                }
+            if let Some(id) = app
+                .detail
+                .as_ref()
+                .filter(|d| !d.permission_denied)
+                .map(|d| d.task_id)
+            {
+                tokio::spawn(async move {
+                    let (task, review, transcript) =
+                        tokio::join!(api.get_task(id), api.get_review(id), api.get_transcript(id));
+                    let _ = tx.send(Msg::Detail {
+                        task_id: id,
+                        task,
+                        review,
+                        transcript,
+                    });
+                });
             }
         }
     }
 }
 
-/// Spawn the full detail fetch: task metadata + review (404→None) + transcript, all for `id`. Sets
-/// the loading flag; the result posts back as `Msg::Detail`.
-fn spawn_detail_fetch(id: Uuid, app: &App, api: &ApiClient, tx: &mpsc::UnboundedSender<Msg>) {
-    let _ = app; // reserved for future per-fetch UI state; kept for a uniform call shape.
+/// Spawn the full detail fetch: task metadata + review (404→None) + transcript, all for `id`. Flips
+/// the loading flag on (the status-bar spinner) — cleared when the `Msg::Detail` result is folded in.
+fn spawn_detail_fetch(id: Uuid, app: &mut App, api: &ApiClient, tx: &mpsc::UnboundedSender<Msg>) {
+    app.set_loading(true);
     let (api, tx) = (api.clone(), tx.clone());
     tokio::spawn(async move {
         // Run the three fetches concurrently — they're independent GETs.
@@ -709,8 +730,12 @@ fn apply_msg(app: &mut App, msg: Msg) -> FollowUp {
             transcript,
         } => {
             let Some(d) = app.detail.as_mut().filter(|d| d.task_id == task_id) else {
+                // Page closed/replaced while the tail was in flight — nothing to clear (a fresh page
+                // has its own `tail_in_flight = false`).
                 return FollowUp::None;
             };
+            // Clear the in-flight guard so the next tick may poll again.
+            d.tail_in_flight = false;
             if let Ok(t) = task {
                 d.set_task(t);
             }

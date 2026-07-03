@@ -111,6 +111,12 @@ pub struct TaskRow {
     pub job_name: Option<String>,
     #[serde(default)]
     pub error_detail: Option<String>,
+    /// The diff range the run reviewed (mirrors `db::TaskRow`). `None` on rows the server wrote before
+    /// the columns existed, and on non-PR runs; the detail view renders them as `base→head`.
+    #[serde(default)]
+    pub base_sha: Option<String>,
+    #[serde(default)]
+    pub head_sha: Option<String>,
 }
 
 impl TaskRow {
@@ -433,7 +439,9 @@ mod tests {
             "repo_owner": "vymalo",
             "repo_name": "lightbridge-code-intelligence",
             "job_name": "review-abc",
-            "error_detail": null
+            "error_detail": null,
+            "base_sha": "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4",
+            "head_sha": "e4f5a6b7c8d90e1f2a3b4c5d6e7f8091a2b3c4d5"
         }]"#;
         let rows: Vec<TaskRow> = serde_json::from_str(json).unwrap();
         let t = &rows[0];
@@ -441,6 +449,14 @@ mod tests {
         assert!(t.is_active());
         assert_eq!(t.target_id, 128);
         assert_eq!(t.repo_owner.as_deref(), Some("vymalo"));
+        assert_eq!(
+            t.base_sha.as_deref(),
+            Some("a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4")
+        );
+        assert_eq!(
+            t.head_sha.as_deref(),
+            Some("e4f5a6b7c8d90e1f2a3b4c5d6e7f8091a2b3c4d5")
+        );
 
         let done = TaskRow {
             status: "succeeded".into(),

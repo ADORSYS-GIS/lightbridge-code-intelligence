@@ -415,13 +415,19 @@ fn draw_detail(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         return;
     };
 
-    // Meta 8 rows (6 inner k/v rows), review 4 rows, transcript takes the rest. The two upper panels
-    // are fixed; the transcript flexes. `Min(3)` guards a graceful degrade on short terminals — at the
-    // 80×24 review size this sums exactly to the content area with no overflow.
+    // Meta 8 rows (6 inner k/v rows: the right column's sha/created/started/completed/duration/job).
+    // On a failed/timed-out run we add a row (→9) so the error-detail line has its own row instead of
+    // overwriting `job`. Review 4 rows; transcript takes the rest. `Min(3)` guards a graceful degrade
+    // on short terminals — at the 80×24 review size the non-error case sums exactly to the content area.
+    let meta_height = if matches!(d.task.status.as_str(), "failed" | "timed_out") {
+        9
+    } else {
+        8
+    };
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(8),
+            Constraint::Length(meta_height),
             Constraint::Length(4),
             Constraint::Min(3),
         ])
@@ -437,7 +443,7 @@ fn short_id(id: uuid::Uuid) -> String {
     id.simple().to_string()[..8].to_string()
 }
 
-/// 7-char short SHA (or `—`). Placeholder: TaskRow doesn't carry SHAs today; kept for when it does.
+/// 7-char short SHA (or `—` when the side is absent — e.g. a non-PR run, or an older row).
 fn short_sha(sha: Option<&str>) -> String {
     match sha {
         Some(s) if s.len() >= 7 => s[..7].to_string(),
@@ -507,7 +513,11 @@ fn draw_detail_meta(f: &mut Frame, area: Rect, d: &DetailState, theme: &Theme) {
         kv(
             "sha",
             Span::styled(
-                format!("{}→{}", short_sha(None), short_sha(None)),
+                format!(
+                    "{}→{}",
+                    short_sha(t.base_sha.as_deref()),
+                    short_sha(t.head_sha.as_deref())
+                ),
                 theme.muted_text(),
             ),
         ),
@@ -713,9 +723,11 @@ fn draw_detail_transcript(f: &mut Frame, area: Rect, d: &DetailState, theme: &Th
     d.record_geometry(total, text_area.height);
 
     if d.permission_denied {
+        // The full `review:read` explanation is shown once, in the review panel above; here we keep a
+        // short, distinct hidden-marker so the two panels don't stack the identical sentence.
         let para = Paragraph::new(Line::from(Span::styled(
-            "insufficient permission (review:read) to view run detail",
-            Style::default().fg(theme.warning),
+            "— transcript hidden (needs review:read) —",
+            theme.muted_text(),
         )));
         f.render_widget(para, text_area);
         return;
@@ -1437,6 +1449,8 @@ mod tests {
             repo_name: Some("lci".into()),
             job_name: None,
             error_detail: None,
+            base_sha: None,
+            head_sha: None,
         }
     }
 
@@ -1444,6 +1458,79 @@ mod tests {
     fn target_labels_are_readable() {
         assert_eq!(target_label(&task("running", "pull_request", 12)), "PR #12");
         assert_eq!(target_label(&task("running", "issue", 7)), "issue #7");
+    }
+
+    #[test]
+    fn short_sha_truncates_to_seven_and_falls_back() {
+        assert_eq!(short_sha(Some("a1b2c3d4e5f6")), "a1b2c3d");
+        assert_eq!(
+            short_sha(Some("abc")),
+            "abc",
+            "shorter-than-7 passes through"
+        );
+        assert_eq!(short_sha(None), "—", "absent side renders as —");
+    }
+
+    /// Draw an [`App`] in the detail view to a plain-text buffer (styling dropped), for asserting the
+    /// meta/error layout without the `--render` seed screens. Uses the real `open_detail` path.
+    fn draw_detail_to_string(task: TaskRow, w: u16, h: u16) -> String {
+        use crate::api::{Claims, Me};
+        use crate::tui::app::{App, View};
+        use ratatui::{backend::TestBackend, Terminal};
+        let me = Me {
+            claims: Claims {
+                sub: "s".into(),
+                email: None,
+                preferred_username: Some("op".into()),
+                name: None,
+                exp: Some(crate::auth::now_unix() + 300),
+            },
+            permissions: vec!["review:read".into(), "task:read".into()],
+        };
+        let mut app = App::new(
+            me,
+            "api.test".into(),
+            crate::auth::now_unix() + 300,
+            Some("rt".into()),
+            ThemeKind::Midnight,
+        );
+        // Open the detail page through the real path: a selected Runs row → open_detail.
+        app.set_view(View::Runs);
+        app.runs_active_only = false; // so a terminal (failed) task is visible + selectable
+        app.set_tasks(vec![task]);
+        app.open_detail();
+        assert_eq!(app.view, View::Detail, "detail opened via the real path");
+        if let Some(d) = app.detail.as_mut() {
+            d.review_loaded = true;
+            d.transcript_loaded = true;
+        }
+        let backend = TestBackend::new(w, h);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal.draw(|f| draw(f, &app)).expect("draw");
+        let buffer = terminal.backend().buffer();
+        let mut out = String::new();
+        for y in 0..h {
+            for x in 0..w {
+                out.push_str(buffer[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    #[test]
+    fn failed_run_shows_error_without_hiding_the_job_row() {
+        let mut t = task("failed", "pull_request", 128);
+        t.job_name = Some("review-4d0e".into());
+        t.error_detail = Some("agent runner exited 137 (OOM-killed)".into());
+        t.base_sha = Some("a1b2c3d4e5".into());
+        t.head_sha = Some("e4f5a6b7c8".into());
+        let s = draw_detail_to_string(t, 100, 26);
+        // The meta panel grew by a row on failure, so BOTH the job and the error line are visible.
+        assert!(s.contains("review-4d0e"), "job row not overwritten:\n{s}");
+        assert!(s.contains("OOM-killed"), "error detail shown:\n{s}");
+        // And the SHAs render (7-char short) rather than the old placeholder.
+        assert!(s.contains("a1b2c3d→e4f5a6b"), "short SHAs rendered:\n{s}");
     }
 
     #[test]

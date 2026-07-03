@@ -178,7 +178,7 @@ transcript carries a scrollbar and, while live, a `▼ N new` badge when you've 
 
   Repositories (0)   Runs (5)  ▸  Run Detail
 ╭▐ Run 3f2504e0 ▌ ● done───────────────────────────────────────────────────────╮
-│ status    done                          sha       —→—                        │
+│ status    done                          sha       a1b2c3d→e4f5a6b            │
 │ repo      vymalo/lightbridge-code-intellcreated   2026-07-03 08:43           │
 │ target    PR #128                       started   2026-07-03 08:43           │
 │ kind      review                        completed 2026-07-03 09:43           │
@@ -203,7 +203,7 @@ shows the "no review recorded (yet)" line:
 ```text
   Repositories (0)   Runs (5)  ▸  Run Detail
 ╭▐ Run 3f2504e0 ▌ ● live───────────────────────────────────────────────────────────────────────────────────────────────╮
-│ status    running                                            sha       —→—                                           │
+│ status    running                                            sha       a1b2c3d→e4f5a6b                               │
 │ repo      vymalo/lightbridge-code-intelligence               created   2026-07-03 09:42                              │
 │ target    PR #128                                            started   2026-07-03 09:42                              │
 │ kind      review                                             completed —                                             │
