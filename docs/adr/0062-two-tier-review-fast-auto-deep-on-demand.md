@@ -176,3 +176,40 @@ doesn't know): ship the **runner image**
 carrying `review.<tier>.tools` first, then the **ai-helm** chart (renders the field + the second prompt
 file), then the **ai-helm-values** that set them. The fast prompt alone needs no new runner (it rides the
 existing `system_prompt_file`); only the `tools` field gates on the new image.
+
+## Amendment (2026-07-03) — file-boundary diff packing + coverage disclosure
+
+**Problem.** The diff pasted into the prompt was capped by a single **byte cut**
+(`truncate_on_boundary(&pr.diff, review.max_diff_chars)`, default 60 000). On a large PR this sliced
+mid-file with no awareness of file boundaries, and rendered files in raw `git diff` order — so a lockfile
+ahead of source burned budget before any code was shown, and everything past the cut was silently absent
+with nothing telling the model. Observed on
+[vymalo#274](https://github.com/vymalo/lightbridge-code-intelligence/pull/274#discussion_r3518142422): a
+132 KB diff was cut at byte 60 000, exactly **278 bytes before** `pub fn set_owner_only`, whose call site
+*was* visible — so the fast pass honestly (but wrongly, on the fast tier's own contract) filed a **P1**
+asking to "verify" a definition it was simply never given, while ~55 % of the PR (all of `tui/*`, `cli.rs`,
+`config.rs`, `main.rs`, the ADR) never entered the prompt. `Cargo.lock` had eaten the first 12.6 KB.
+
+**Change** (runner-only; `services/agent-runner/src/review/native/diff.rs`, a pure, unit-tested module —
+no config, chart, or control-plane change):
+
+1. **Truncate on file boundaries, not bytes.** The diff is split into per-file `diff --git …` sections and
+   packed **whole** until the next won't fit. A file is shown completely or listed as not-shown — never cut
+   mid-hunk. A single section larger than the whole budget is boundary-truncated only when it would
+   otherwise blank the diff.
+2. **Deprioritise generated / lock-file noise.** Lockfiles (`Cargo.lock`, `pnpm-lock.yaml`, `go.sum`, …),
+   `*.min.js`, `*.map`, `*.snap`, etc. are set aside and *listed* rather than rendered, freeing the budget
+   for source. (A PR that changes *only* such files still renders them, so the diff isn't blank.)
+3. **Disclose coverage in the prompt.** Files not shown — both the noise list and any source omitted for
+   budget — are named in an explicit block, with the instruction: *you have not seen these changes; do not
+   raise a finding about them; if a visible line depends on one, treat it as an unverifiable question (at
+   most P2), not a defect; state in your verdict which files you could not review.* This both stops the P1
+   misfire and lets the model's own verdict (which flows into `render_fast_body` / `render_body`) carry
+   honest coverage into the posted review — no cross-service plumbing.
+
+**Deliberately not done here:** a *deterministic* coverage line rendered control-plane-side. It would need
+a dedicated coverage field threaded runner → control-plane → DB → `render_*_body` (the summary upsert key
+is shared with the model's `finish` verdict, so setting one clobbers the other), a meaningfully larger
+change touching the ADR-0068 finalize path. The prompt-side disclosure above covers the observed failure;
+the deterministic line is a follow-up if the model-authored coverage statement proves unreliable in
+practice.

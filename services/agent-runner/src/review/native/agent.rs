@@ -1125,12 +1125,32 @@ fn build_messages(
                     .collect::<Vec<_>>()
                     .join("\n"),
             ));
+            // File-boundary packing (ADR-0062): whole per-file sections, source first, lock/generated
+            // noise deprioritised — never a mid-hunk byte cut. A byte cut on PR #274 hid a function
+            // definition whose call site *was* visible, so the pass filed a P1 on code it never saw, while
+            // 55% of the PR (every file past the cut) was silently absent. Anything not shown is disclosed
+            // below so the model states honest coverage and can't fault unseen code.
+            let rendered = super::diff::render_diff_for_prompt(pr, review.max_diff_chars);
             user.push_str("\n\nUnified diff (review ONLY lines this diff changes):\n```diff\n");
-            user.push_str(truncate_on_boundary(&pr.diff, review.max_diff_chars));
-            if pr.diff.len() > review.max_diff_chars {
-                user.push_str("\n… [diff truncated; review the hunks shown above] …");
-            }
+            user.push_str(&rendered.text);
             user.push_str("\n```");
+            if !rendered.low_signal.is_empty() {
+                user.push_str(&format!(
+                    "\n\nAlso changed but NOT shown above (generated/lock files — low review signal): {}.",
+                    rendered.low_signal.join(", ")
+                ));
+            }
+            if !rendered.omitted_for_budget.is_empty() {
+                user.push_str(&format!(
+                    "\n\n⚠️ {} changed file(s) did NOT fit the prompt budget and are NOT shown above: {}. \
+                     You have not seen these changes — do NOT raise a finding about their contents, and do \
+                     NOT assume they are correct or incorrect. If a line you *can* see depends on one of \
+                     them, treat that as an unverifiable question (at most P2), not a defect. State plainly \
+                     in your verdict which files you could not review.",
+                    rendered.omitted_for_budget.len(),
+                    rendered.omitted_for_budget.join(", ")
+                ));
+            }
         }
         None => user.push_str(
             "\n\nNo diff is available for this run; answer or review against the working tree and \
@@ -1455,6 +1475,59 @@ mod tests {
         assert!(
             !user.contains("previous review"),
             "no prior-review block on a first review: {user}"
+        );
+    }
+
+    // Coverage disclosure (ADR-0062, PR #274): when the diff doesn't fit the budget, the prompt must (a)
+    // render whole source files, (b) list lock/generated files as not-shown, and (c) name the source
+    // files it omitted with the "don't fault unseen code" guardrail — so the model never files a P1 about
+    // code it was never given.
+    #[test]
+    fn build_messages_discloses_files_not_shown_in_the_prompt() {
+        let mut review = review_config("http://unused/v1".to_string());
+        let file = |path: &str, n: usize| {
+            let mut s = format!(
+                "diff --git a/{path} b/{path}\nnew file mode 100644\n--- /dev/null\n+++ b/{path}\n@@ -0,0 +1,{n} @@\n",
+            );
+            for i in 0..n {
+                s.push_str(&format!("+line {i} of {path}\n"));
+            }
+            s
+        };
+        let lock = file("Cargo.lock", 120);
+        let a = file("src/auth/store.rs", 8);
+        let b = file("src/tui/ui.rs", 8);
+        let diff = format!("{lock}{a}{b}");
+        // Budget fits exactly one source file, not both — and never the lockfile.
+        review.max_diff_chars = a.len() + 20;
+        let pr = PrDiff {
+            diff,
+            files: vec![
+                "Cargo.lock".to_string(),
+                "src/auth/store.rs".to_string(),
+                "src/tui/ui.rs".to_string(),
+            ],
+        };
+        let msgs = build_messages(&review, "review", Some(&pr), None, None, None, None);
+        let user = msgs[1].content.as_deref().expect("user content");
+
+        assert!(
+            user.contains("+line 0 of src/auth/store.rs"),
+            "the first source file renders whole: {user}"
+        );
+        assert!(
+            !user.contains("+line 0 of Cargo.lock"),
+            "the lockfile is never rendered into the diff"
+        );
+        assert!(
+            user.contains("generated/lock files") && user.contains("Cargo.lock"),
+            "lockfile is disclosed as not-shown: {user}"
+        );
+        assert!(
+            user.contains("did NOT fit the prompt budget")
+                && user.contains("src/tui/ui.rs")
+                && user.contains("at most P2"),
+            "budget-omitted source file is disclosed with the P2 guardrail: {user}"
         );
     }
 

@@ -12,4 +12,5 @@
 
 pub mod agent;
 pub mod chat;
+pub mod diff;
 pub mod tools;
