@@ -239,6 +239,22 @@ impl Theme {
     }
 }
 
+/// A short, human display label for a task/repo status, so the STATUS column never truncates
+/// mid-word (`waiting_for_index` → `indexing`, `posting_result` → `posting`). The raw status is
+/// still what feeds [`Theme::status_color`] — this only changes what's *shown*. Unknown statuses
+/// pass through unchanged.
+pub fn status_label(status: &str) -> &str {
+    match status {
+        "waiting_for_index" => "indexing",
+        "posting_result" => "posting",
+        "succeeded" => "done",
+        "timed_out" => "timed-out",
+        // Already short and clear: running, queued, received, failed, cancelled, pending, approved,
+        // disabled.
+        other => other,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -268,6 +284,48 @@ mod tests {
         for kind in ThemeKind::ALL {
             assert!(seen.contains(&kind), "cycle visits {kind:?}");
         }
+    }
+
+    #[test]
+    fn status_labels_are_short_and_never_mid_word() {
+        // The long ones get shortened...
+        assert_eq!(status_label("waiting_for_index"), "indexing");
+        assert_eq!(status_label("posting_result"), "posting");
+        assert_eq!(status_label("succeeded"), "done");
+        assert_eq!(status_label("timed_out"), "timed-out");
+        // ...the already-short ones pass through...
+        assert_eq!(status_label("running"), "running");
+        assert_eq!(status_label("failed"), "failed");
+        assert_eq!(status_label("cancelled"), "cancelled");
+        // ...and unknowns are untouched.
+        assert_eq!(status_label("who-knows"), "who-knows");
+        // Every label fits the 16-col Runs STATUS column with room to spare.
+        for raw in [
+            "running",
+            "queued",
+            "waiting_for_index",
+            "posting_result",
+            "received",
+            "succeeded",
+            "failed",
+            "timed_out",
+            "cancelled",
+        ] {
+            assert!(
+                status_label(raw).chars().count() <= 12,
+                "label for {raw} fits the column"
+            );
+        }
+    }
+
+    #[test]
+    fn status_color_keyed_on_raw_status_unchanged() {
+        // The label must NOT change what color a status renders — color still keys on the raw value.
+        let t = Theme::from_kind(ThemeKind::Midnight);
+        assert_eq!(t.status_color("waiting_for_index"), t.secondary);
+        assert_eq!(t.status_color("posting_result"), t.info);
+        assert_eq!(t.status_color("succeeded"), t.success);
+        assert_eq!(t.status_color("timed_out"), t.error);
     }
 
     #[test]

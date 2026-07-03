@@ -9,7 +9,7 @@
 
 use super::app::{App, ToastKind, View};
 use crate::api::TaskRow;
-use crate::theme::{ButtonKind, Theme};
+use crate::theme::{status_label, ButtonKind, Theme};
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
@@ -18,6 +18,7 @@ use ratatui::widgets::{
 };
 use ratatui::Frame;
 use time::OffsetDateTime;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// The braille spinner cycle (8 frames), width-1 each.
 const SPINNER: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
@@ -109,13 +110,13 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     draw_keymenu(f, cols[2], app, theme);
 }
 
-/// The compact `▍ LCI` wordmark + subtitle + a connection dot.
+/// The compact `▍ LCI` wordmark + subtitle. Top-aligned so the wordmark sits on the header's first
+/// row, level with `Host:` and the keymenu (an earlier leading blank made the top row look lopsided).
 fn draw_logo(f: &mut Frame, area: Rect, theme: &Theme) {
     let brand = Style::default()
         .fg(theme.brand)
         .add_modifier(Modifier::BOLD);
     let lines = vec![
-        Line::from(""),
         Line::from(vec![Span::styled("▍ ", brand), Span::styled("LCI", brand)]),
         Line::from(Span::styled("Lightbridge Code", theme.muted_text())),
         Line::from(Span::styled("Intelligence", theme.muted_text())),
@@ -271,7 +272,7 @@ fn draw_repositories(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
                     theme.text(),
                 )),
                 Cell::from(Span::styled(
-                    r.status.clone(),
+                    status_label(&r.status).to_string(),
                     Style::default()
                         .fg(theme.status_color(&r.status))
                         .add_modifier(Modifier::BOLD),
@@ -333,7 +334,7 @@ fn draw_runs(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         .map(|t| {
             Row::new(vec![
                 Cell::from(Span::styled(
-                    t.status.clone(),
+                    status_label(&t.status).to_string(),
                     Style::default()
                         .fg(theme.status_color(&t.status))
                         .add_modifier(Modifier::BOLD),
@@ -418,28 +419,16 @@ fn render_table_or_empty(
 // --- status / footer bar ------------------------------------------------------------------------
 
 /// The full-width status bar: LEFT filter + spinner, CENTER toast, RIGHT key hint.
+///
+/// The three segments are sized to their content — the side segments take exactly what they need
+/// (clamped so they never starve each other), and the center toast takes the remainder — instead of
+/// rigid percentages that hard-cut a longer hint/toast at 80 cols (gemini). Any segment that still
+/// can't fit is truncated with an ellipsis rather than clipped mid-glyph.
 fn draw_status(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     f.render_widget(Block::default().style(theme.surface_style()), area);
 
-    let cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(30),
-            Constraint::Percentage(40),
-            Constraint::Percentage(30),
-        ])
-        .split(area);
-
-    // LEFT: current filter + a braille spinner while a fetch is in flight.
-    let mut left = vec![Span::raw(" ")];
-    if app.loading {
-        left.push(Span::styled(
-            SPINNER[app.spinner_frame % SPINNER.len()],
-            Style::default().fg(theme.accent),
-        ));
-        left.push(Span::raw(" "));
-    }
-    let filter_label = match app.view {
+    // LEFT text: " ⠹ filter: pending" (spinner only while loading).
+    let filter = match app.view {
         View::Repositories => format!("filter: {}", app.repo_filter.label()),
         View::Runs => format!(
             "filter: {}",
@@ -450,13 +439,44 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
             }
         ),
     };
-    left.push(Span::styled(filter_label, theme.muted_text()));
+    let spinner = if app.loading {
+        format!("{} ", SPINNER[app.spinner_frame % SPINNER.len()])
+    } else {
+        String::new()
+    };
+    let left_text = format!(" {spinner}{filter}");
+
+    // RIGHT text: the key hint (trailing space keeps it off the edge).
+    let hint = match app.view {
+        View::Repositories => "j/k move · f filter · r refresh · q quit ",
+        View::Runs => "j/k move · f active/all · r refresh · q quit ",
+    };
+
+    // Give the side segments what their content needs, but never more than ~45% each so a very long
+    // one can't crowd the other out; the center takes whatever remains for the toast.
+    let side_cap = (area.width as usize * 45 / 100).max(1);
+    let left_w = display_width(&left_text).min(side_cap) as u16;
+    let right_w = display_width(hint).min(side_cap) as u16;
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Length(left_w),
+            Constraint::Min(0),
+            Constraint::Length(right_w),
+        ])
+        .split(area);
+
+    // LEFT.
+    let left_line = Line::from(Span::styled(
+        truncate_ellipsis(&left_text, cols[0].width as usize),
+        theme.muted_text(),
+    ));
     f.render_widget(
-        Paragraph::new(Line::from(left)).style(theme.surface_style()),
+        Paragraph::new(left_line).style(theme.surface_style()),
         cols[0],
     );
 
-    // CENTER: the latest toast, semantic-colored.
+    // CENTER: the latest toast, semantic-colored, centered, truncated to the remaining width.
     if let Some(toast) = &app.toast {
         let color = match toast.kind {
             ToastKind::Info => theme.info,
@@ -468,27 +488,23 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
             ToastKind::Success => "✓",
             ToastKind::Error => "✗",
         };
-        let line = Line::from(vec![
-            Span::styled(format!("{glyph} "), Style::default().fg(color)),
-            Span::styled(
-                toast.text.clone(),
-                Style::default().fg(color).add_modifier(Modifier::BOLD),
-            ),
-        ])
+        let text = truncate_ellipsis(&format!("{glyph} {}", toast.text), cols[1].width as usize);
+        let line = Line::from(Span::styled(
+            text,
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ))
         .alignment(Alignment::Center);
         f.render_widget(Paragraph::new(line).style(theme.surface_style()), cols[1]);
     }
 
-    // RIGHT: a compact context key hint.
-    let hint = match app.view {
-        View::Repositories => "j/k move · f filter · r refresh · q quit ",
-        View::Runs => "j/k move · f active/all · r refresh · q quit ",
-    };
+    // RIGHT: the key hint, right-aligned, truncated to its segment.
+    let right_line = Line::from(Span::styled(
+        truncate_ellipsis(hint, cols[2].width as usize),
+        theme.muted_text(),
+    ))
+    .alignment(Alignment::Right);
     f.render_widget(
-        Paragraph::new(
-            Line::from(Span::styled(hint, theme.muted_text())).alignment(Alignment::Right),
-        )
-        .style(theme.surface_style()),
+        Paragraph::new(right_line).style(theme.surface_style()),
         cols[2],
     );
 }
@@ -732,6 +748,37 @@ fn pad_right(area: Rect, n: u16) -> Rect {
     }
 }
 
+/// The terminal display width of a string (double-width CJK/emoji count as 2, control chars as 0).
+fn display_width(s: &str) -> usize {
+    UnicodeWidthStr::width(s)
+}
+
+/// Truncate `s` to at most `max` display columns, appending an ellipsis `…` when it doesn't fit
+/// (rather than a hard mid-glyph cut). Width-correct: a truncated string plus the `…` never exceeds
+/// `max` columns.
+fn truncate_ellipsis(s: &str, max: usize) -> String {
+    if max == 0 {
+        return String::new();
+    }
+    if display_width(s) <= max {
+        return s.to_string();
+    }
+    // Reserve one column for the ellipsis, then take whole characters up to that budget.
+    let budget = max.saturating_sub(1);
+    let mut out = String::new();
+    let mut used = 0usize;
+    for ch in s.chars() {
+        let w = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if used + w > budget {
+            break;
+        }
+        out.push(ch);
+        used += w;
+    }
+    out.push('…');
+    out
+}
+
 /// A compact permissions summary (the action verbs the operator holds).
 fn perm_summary(perms: &[String]) -> String {
     let mut verbs = Vec::new();
@@ -884,6 +931,34 @@ mod tests {
         // Must not panic / underflow when asked to pad more than the width.
         assert_eq!(pad_left(tiny, 5).width, 0);
         assert_eq!(pad_right(tiny, 5).width, 0);
+    }
+
+    #[test]
+    fn truncate_ellipsis_fits_within_the_budget() {
+        // Fits untouched.
+        assert_eq!(truncate_ellipsis("hello", 10), "hello");
+        assert_eq!(truncate_ellipsis("hello", 5), "hello");
+        // Too long → ellipsis, and the result never exceeds the column budget.
+        let out = truncate_ellipsis("j/k move · f filter · r refresh · q quit", 12);
+        assert!(display_width(&out) <= 12, "stays within budget: {out:?}");
+        assert!(out.ends_with('…'));
+        // Degenerate budgets don't panic.
+        assert_eq!(truncate_ellipsis("anything", 0), "");
+        assert_eq!(display_width(&truncate_ellipsis("anything", 1)), 1);
+    }
+
+    #[test]
+    fn status_bar_hint_is_not_hard_cut_at_80_cols() {
+        use crate::render::{render_to_string, Screen};
+        use crate::theme::ThemeKind;
+        // The old rigid 30/40/30 split hard-cut the hint; now the last visible glyph before the edge
+        // is an ellipsis, never a mid-word slice.
+        let s = render_to_string(Screen::Repos, 80, 24, ThemeKind::Midnight);
+        let last = s.lines().last().unwrap_or_default();
+        assert!(
+            last.contains('…'),
+            "narrow status bar ends the hint with an ellipsis, got: {last:?}"
+        );
     }
 
     #[test]

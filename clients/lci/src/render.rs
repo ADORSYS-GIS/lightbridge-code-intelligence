@@ -110,7 +110,7 @@ fn seeded_app(screen: Screen, theme: ThemeKind) -> App {
 
 /// A fixed timestamp so snapshots are deterministic.
 fn fixed_ts() -> OffsetDateTime {
-    OffsetDateTime::from_unix_timestamp(1_751_450_130).unwrap() // 2025-07-02T10:15:30Z
+    OffsetDateTime::from_unix_timestamp(1_782_986_130).unwrap() // 2026-07-02T09:55:30Z
 }
 
 fn sample_repos() -> Vec<RepositoryRow> {
@@ -329,6 +329,13 @@ mod tests {
         assert!(s.contains("running"));
         assert!(s.contains("failed"));
         assert!(s.contains("PR #128"));
+        // The STATUS column uses short labels — no mid-word truncation of the long ones.
+        assert!(s.contains("indexing"), "waiting_for_index → indexing");
+        assert!(s.contains("done"), "succeeded → done");
+        assert!(
+            !s.contains("waiting_for_inde"),
+            "no mid-word cut of waiting_for_index"
+        );
     }
 
     #[test]
