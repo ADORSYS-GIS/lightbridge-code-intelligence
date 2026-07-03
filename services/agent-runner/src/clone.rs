@@ -51,27 +51,36 @@ pub async fn checkout(ctx: &TaskContext, workdir: &str) -> anyhow::Result<PathBu
     Ok(dir)
 }
 
-/// The PR's change set: the unified diff (base→head) and the list of changed file paths. Used to
+/// The PR's change set: the unified diff (merge-base→head) and the list of changed file paths. Used to
 /// scope the review to *what the PR actually changed* rather than auditing the whole repository.
 pub struct PrDiff {
-    /// `git diff <base>..<head>` output (unified, no color).
+    /// `git diff <merge-base>..<head>` output (unified, no color).
     pub diff: String,
     /// Paths (repo-root-relative) that the PR touches — the only files a finding may land on.
     pub files: Vec<String>,
 }
 
-/// Compute the PR diff between the task's base and head commits in `checkout`.
+/// Compute the PR diff for the task in `checkout`, scoped to what the PR itself changed.
 ///
-/// Best-effort: returns `None` when we lack both SHAs, they're equal, the base commit isn't present
-/// (its fetch is itself best-effort in [`checkout`]), or git produces an empty diff — in every such
-/// case the caller falls back to an unscoped review rather than failing the task.
+/// We diff `head` against the **merge-base** of base and head (three-dot semantics — exactly what
+/// GitHub's "Files changed" tab shows), NOT against the base branch tip. `base_sha` is the base
+/// *branch tip* (from the webhook `pull_request.base.sha` / the `pulls/{n}` API), which drifts forward
+/// as other PRs merge into the base branch. A plain two-dot `base..head` then renders every commit that
+/// landed on base *after this PR forked* as a spurious deletion — the review then describes a change the
+/// PR never made (vymalo#275: #274 merged into `main` between fork and review, so the two-dot diff
+/// "deleted" all of #274's files and the fast pass reviewed the inverse of the wrong PR).
+///
+/// Best-effort: returns `None` when we lack both SHAs, they're equal, the commits aren't present (their
+/// fetch is itself best-effort in [`checkout`]), or git produces an empty diff — in every such case the
+/// caller falls back to an unscoped review rather than failing the task.
 pub async fn pr_diff(checkout: &Path, ctx: &TaskContext) -> Option<PrDiff> {
     let base = ctx.base_sha.as_deref()?;
     let head = ctx.head_sha.as_deref()?;
     if base == head {
         return None;
     }
-    let range = format!("{base}..{head}");
+    let diff_from = merge_base_or_deepen(checkout, base, head, &ctx.token).await;
+    let range = format!("{diff_from}..{head}");
 
     let patch = match git(checkout, &["diff", "--no-color", &range], &ctx.token).await {
         Ok(out) => out,
@@ -98,6 +107,56 @@ pub async fn pr_diff(checkout: &Path, ctx: &TaskContext) -> Option<PrDiff> {
         .collect();
 
     Some(PrDiff { diff, files })
+}
+
+/// The commit to diff `head` against: the merge-base of `base` and `head` when we can find it, else
+/// `base` itself (the old two-dot behaviour — correct whenever `base` is already an ancestor of `head`,
+/// wrong only when it isn't; the fallback is therefore never worse than before).
+///
+/// The checkout is shallow ([`checkout`] fetches each ref at `--depth 1`), so the common ancestor is
+/// usually absent and `git merge-base` fails outright. We deepen both tips (bounded, exponentially) and
+/// retry until it resolves. A fork point deeper than the cap — or a network hiccup mid-deepen — falls
+/// back to `base`. The common case (a PR whose branch forked recently) resolves on the first deepen.
+async fn merge_base_or_deepen(dir: &Path, base: &str, head: &str, token: &str) -> String {
+    if let Some(mb) = merge_base(dir, base, head, token).await {
+        return mb;
+    }
+    // Absolute depths (not `--deepen` increments): re-fetching the same SHAs at a larger depth extends
+    // the shallow history in place. Both tips are deepened together so the ancestor can appear on either.
+    // Start small — a PR's fork point is almost always a handful of commits back — and grow only if the
+    // first steps don't reach it, so the common case pays one cheap fetch, not a 1024-deep one.
+    for depth in ["16", "64", "256", "1024"] {
+        if git(
+            dir,
+            &["fetch", "--depth", depth, "origin", base, head],
+            token,
+        )
+        .await
+        .is_err()
+        {
+            // A fetch failure (network / expired creds / unreachable ref) is persistent — a deeper
+            // fetch would fail the same way, each burning another timeout. Stop and take the fallback.
+            break;
+        }
+        if let Some(mb) = merge_base(dir, base, head, token).await {
+            return mb;
+        }
+    }
+    tracing::warn!(
+        base,
+        head,
+        "no merge-base found after deepening; diffing against the base tip (the diff may include \
+         base-branch commits not from this PR)"
+    );
+    base.to_string()
+}
+
+/// `git merge-base base head`, or `None` when git can't compute one — no common ancestor in the shallow
+/// history yet (exit 1), or any other git error. A blank result (shouldn't happen on success) is `None`.
+async fn merge_base(dir: &Path, base: &str, head: &str, token: &str) -> Option<String> {
+    let out = git(dir, &["merge-base", base, head], token).await.ok()?;
+    let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!sha.is_empty()).then_some(sha)
 }
 
 /// Run a `git` subcommand in `dir`, returning an error whose message has `token` redacted.
@@ -155,5 +214,84 @@ mod tests {
     #[test]
     fn scrub_is_a_noop_for_empty_token() {
         assert_eq!(scrub("nothing to hide", ""), "nothing to hide");
+    }
+
+    // Reproduces the vymalo#275 shape in a real local repo: the base branch advances past the PR's fork
+    // point (another PR merged into base after this one branched). The fix must diff `head` against the
+    // MERGE-BASE (showing only the PR's own change), never the base tip (which two-dots the base-only
+    // commit into a spurious deletion). Local repo has full history, so merge-base resolves on the fast
+    // path — this pins the correctness, not the deepening glue (which needs a remote).
+    #[tokio::test]
+    async fn diffs_against_merge_base_not_the_drifted_base_tip() {
+        use std::process::Command;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let git_run = |args: &[&str]| {
+            let ok = Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(["-c", "user.email=t@t.co", "-c", "user.name=t"])
+                .args(args)
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "git {args:?} failed");
+        };
+        let rev = |r: &str| {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(["rev-parse", r])
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+
+        git_run(&["init", "-q", "-b", "main"]);
+        // The fork point — the true merge-base.
+        std::fs::write(dir.join("root.txt"), "root\n").unwrap();
+        git_run(&["add", "-A"]);
+        git_run(&["commit", "-qm", "root"]);
+        let root = rev("HEAD");
+        // Base branch advances after the fork: another PR (à la #274) lands `landed.txt`.
+        std::fs::write(dir.join("landed.txt"), "landed on base\n").unwrap();
+        git_run(&["add", "-A"]);
+        git_run(&["commit", "-qm", "base advanced"]);
+        let base = rev("HEAD");
+        // This PR forks from `root` and adds its own file.
+        git_run(&["checkout", "-q", "-b", "pr", &root]);
+        std::fs::write(dir.join("feature.rs"), "the PR\n").unwrap();
+        git_run(&["add", "-A"]);
+        git_run(&["commit", "-qm", "the PR"]);
+        let head = rev("HEAD");
+
+        // Merge-base resolves to the fork point, and that's what we diff from.
+        assert_eq!(
+            merge_base(dir, &base, &head, "").await.as_deref(),
+            Some(root.as_str())
+        );
+        assert_eq!(merge_base_or_deepen(dir, &base, &head, "").await, root);
+
+        let names = |range: String| async move {
+            let out = git(dir, &["diff", "--name-only", "-z", &range], "")
+                .await
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).replace('\0', " ")
+        };
+
+        // The fix: only the PR's own file, never the base-only file.
+        let fixed = names(format!("{root}..{head}")).await;
+        assert!(fixed.contains("feature.rs"), "PR file present: {fixed:?}");
+        assert!(
+            !fixed.contains("landed.txt"),
+            "base-only file must NOT appear in the PR diff: {fixed:?}"
+        );
+
+        // Sanity: the old two-dot `base..head` DID surface the base-only file (as a deletion) — the bug.
+        let buggy = names(format!("{base}..{head}")).await;
+        assert!(
+            buggy.contains("landed.txt"),
+            "two-dot base..head reproduces the bug (base-only file leaks in): {buggy:?}"
+        );
     }
 }
