@@ -11,6 +11,8 @@ mod api;
 mod auth;
 mod cli;
 mod config;
+mod render;
+mod theme;
 mod tui;
 
 use anyhow::{Context, Result};
@@ -34,6 +36,12 @@ async fn main() -> Result<()> {
 
     if parsed.command == Command::Help {
         println!("{}", cli::USAGE);
+        return Ok(());
+    }
+
+    // A hidden dev/review affordance: render a screen to text and exit. No auth, no network.
+    if let Command::Render(spec) = &parsed.command {
+        render::run(spec)?;
         return Ok(());
     }
 
@@ -80,6 +88,7 @@ async fn main() -> Result<()> {
     );
 
     // --- Enter the TUI (terminal restore guaranteed by tui::run's guard) ---
+    let theme_kind = theme::ThemeKind::from_name(&cfg.theme);
     tui::run(
         api,
         me,
@@ -87,6 +96,7 @@ async fn main() -> Result<()> {
         cfg,
         http,
         token.refresh_token.clone(),
+        theme_kind,
     )
     .await?;
 

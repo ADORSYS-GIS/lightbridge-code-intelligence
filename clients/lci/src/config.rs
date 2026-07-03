@@ -20,6 +20,9 @@ pub const DEFAULT_REDIRECT_PORT: u16 = 8765;
 /// NOT request an audience here (Keycloak rejects an unknown `aud` in the request).
 pub const DEFAULT_SCOPE: &str = "openid profile email";
 
+/// Default color theme. Override with `LCI_THEME` or `theme =` in `config.toml`.
+pub const DEFAULT_THEME: &str = "midnight";
+
 /// Fully-resolved settings the rest of the app runs against.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -28,6 +31,9 @@ pub struct Config {
     pub client_id: String,
     pub redirect_port: u16,
     pub scope: String,
+    /// The active theme name (`midnight` | `terminal` | `nord`); an unknown value falls back to the
+    /// default in [`crate::theme::ThemeKind::from_name`].
+    pub theme: String,
 }
 
 /// The optional TOML file at `<config_dir>/config.toml`. Every field is optional — a missing file or
@@ -38,6 +44,7 @@ struct FileConfig {
     issuer: Option<String>,
     client_id: Option<String>,
     port: Option<u16>,
+    theme: Option<String>,
 }
 
 impl Config {
@@ -87,6 +94,10 @@ impl Config {
             .or_else(|| env_nonempty("LCI_REDIRECT_PORT").and_then(|s| s.parse().ok()))
             .or(file.port)
             .unwrap_or(DEFAULT_REDIRECT_PORT);
+        // Theme has no flag (it's cyclable at runtime with `t`); env > file > default.
+        let theme = env_nonempty("LCI_THEME")
+            .or(file.theme)
+            .unwrap_or_else(|| DEFAULT_THEME.to_string());
 
         Ok(Self {
             // Trim a trailing slash so `{base}/path` joins cleanly.
@@ -95,6 +106,7 @@ impl Config {
             client_id,
             redirect_port,
             scope: DEFAULT_SCOPE.to_string(),
+            theme,
         })
     }
 
@@ -149,6 +161,7 @@ mod toml_min {
                 "api_url" => cfg.api_url = Some(value),
                 "issuer" => cfg.issuer = Some(value),
                 "client_id" => cfg.client_id = Some(value),
+                "theme" => cfg.theme = Some(value),
                 "port" => {
                     cfg.port = Some(
                         value
@@ -197,6 +210,7 @@ mod tests {
             client_id: DEFAULT_CLIENT_ID.to_string(),
             redirect_port: DEFAULT_REDIRECT_PORT,
             scope: DEFAULT_SCOPE.to_string(),
+            theme: DEFAULT_THEME.to_string(),
         };
         assert_eq!(cfg.redirect_uri(), "http://127.0.0.1:8765/callback");
     }
@@ -214,6 +228,12 @@ mod tests {
         assert_eq!(cfg.client_id.as_deref(), Some("lightbridge-cli"));
         assert_eq!(cfg.port, Some(9000));
         assert_eq!(cfg.issuer, None);
+    }
+
+    #[test]
+    fn toml_min_parses_theme() {
+        let cfg = toml_min::parse(r#"theme = "nord""#).expect("parses");
+        assert_eq!(cfg.theme.as_deref(), Some("nord"));
     }
 
     #[test]

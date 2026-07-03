@@ -4,9 +4,9 @@
 //! Networking never runs on the render path: key actions spawn tasks that post their result back
 //! over the channel, so the UI stays responsive.
 
-mod app;
+pub(crate) mod app;
 mod terminal;
-mod ui;
+pub(crate) mod ui;
 
 pub use app::App;
 
@@ -48,9 +48,10 @@ pub async fn run(
     cfg: Config,
     http: reqwest::Client,
     refresh_token: Option<String>,
+    theme_kind: crate::theme::ThemeKind,
 ) -> Result<()> {
     let mut guard = TerminalGuard::enter()?;
-    let mut app = App::new(me, api.host(), token_expires_at, refresh_token);
+    let mut app = App::new(me, api.host(), token_expires_at, refresh_token, theme_kind);
 
     let (tx, mut rx) = mpsc::unbounded_channel::<Msg>();
     let mut input = EventStream::new();
@@ -59,6 +60,7 @@ pub async fn run(
     let mut ui_tick = tokio::time::interval(Duration::from_millis(250));
 
     // Kick the initial data + a token-refresh watchdog state.
+    app.set_loading(true);
     spawn_refresh_current_view(&app, &api, &tx);
     let mut last_refresh_attempt = Instant::now();
 
@@ -81,13 +83,15 @@ pub async fn run(
 
             // --- periodic auto-refresh of the active view ---
             _ = refresh_timer.tick() => {
+                app.set_loading(true);
                 spawn_refresh_current_view(&app, &api, &tx);
                 maybe_spawn_token_refresh(&mut app, &cfg, &http, &tx, &mut last_refresh_attempt);
             }
 
-            // --- lightweight UI tick (toast expiry + token countdown redraw) ---
+            // --- lightweight UI tick (toast expiry + spinner + token countdown redraw) ---
             _ = ui_tick.tick() => {
                 app.tick_toast(Instant::now());
+                app.tick_spinner();
                 // The token countdown changes every second; keep it live.
                 app.mark_dirty();
             }
@@ -123,10 +127,24 @@ pub async fn run(
 
 /// Translate a keypress into a state change and/or a spawned request.
 fn handle_key(app: &mut App, key: KeyEvent, api: &ApiClient, tx: &mpsc::UnboundedSender<Msg>) {
-    // A pending confirmation captures Enter/y/Esc/n first.
+    // A pending confirmation captures navigation + Enter/y/Esc/n first. Left/Right/Tab move focus
+    // between the two buttons; Enter fires whichever is focused; `y` is a power-user accept regardless
+    // of focus; Esc/`n` decline.
     if app.confirm.is_some() {
         match key.code {
-            KeyCode::Enter | KeyCode::Char('y') => {
+            KeyCode::Left
+            | KeyCode::Right
+            | KeyCode::Tab
+            | KeyCode::Char('h')
+            | KeyCode::Char('l') => {
+                app.confirm_toggle_focus();
+            }
+            KeyCode::Enter => {
+                if let Some(action) = app.resolve_confirm_focused() {
+                    dispatch_action(app, action, api, tx);
+                }
+            }
+            KeyCode::Char('y') => {
                 if let Some(action) = app.resolve_confirm(true) {
                     dispatch_action(app, action, api, tx);
                 }
@@ -176,6 +194,7 @@ fn handle_key(app: &mut App, key: KeyEvent, api: &ApiClient, tx: &mpsc::Unbounde
             app.cycle_filter();
             spawn_refresh_current_view(app, api, tx);
         }
+        KeyCode::Char('t') => app.cycle_theme(),
         KeyCode::Char('a') => request_approve(app),
         KeyCode::Char('d') => request_deny(app),
         KeyCode::Char('c') => request_cancel(app),
@@ -195,7 +214,10 @@ fn request_approve(app: &mut App) {
     if let Some(repo) = app.selected_repo() {
         let (id, label) = (repo.id, format!("{}/{}", repo.owner, repo.name));
         app.ask_confirm(
-            format!("Approve {label}? This opens the gate and triggers indexing."),
+            format!("Approve {label}?"),
+            "Opens the gate and triggers indexing.",
+            "Approve",
+            crate::theme::ButtonKind::Primary,
             PendingAction::Approve(id),
         );
     }
@@ -213,7 +235,10 @@ fn request_deny(app: &mut App) {
     if let Some(repo) = app.selected_repo() {
         let (id, label) = (repo.id, format!("{}/{}", repo.owner, repo.name));
         app.ask_confirm(
-            format!("Deny {label}? This disables it and PURGES its index data."),
+            format!("Deny {label}?"),
+            "Disables it and PURGES its index data.",
+            "Deny",
+            crate::theme::ButtonKind::Danger,
             PendingAction::Deny(id),
         );
     }
@@ -233,8 +258,22 @@ fn request_cancel(app: &mut App) {
             app.toast_error("that run is already finished");
             return;
         }
-        let id = task.id;
-        app.ask_confirm(format!("Cancel run {id}?"), PendingAction::Cancel(id));
+        let (id, label) = (task.id, target_label_for(task));
+        app.ask_confirm(
+            format!("Cancel the {label} run?"),
+            "Signals the running task to stop.",
+            "Cancel run",
+            crate::theme::ButtonKind::Danger,
+            PendingAction::Cancel(id),
+        );
+    }
+}
+
+/// A compact human label for a task target, reused in the cancel confirm sentence.
+fn target_label_for(t: &TaskRow) -> String {
+    match (&t.repo_owner, &t.repo_name) {
+        (Some(o), Some(n)) => format!("{o}/{n}"),
+        _ => format!("repo#{}", t.repository_id),
     }
 }
 
@@ -354,18 +393,22 @@ enum FollowUp {
 fn apply_msg(app: &mut App, msg: Msg) -> FollowUp {
     match msg {
         Msg::Repos(Ok(repos)) => {
+            app.set_loading(false);
             app.set_repos(repos);
             FollowUp::None
         }
         Msg::Repos(Err(e)) => {
+            app.set_loading(false);
             app.toast_error(format!("repos: {e}"));
             FollowUp::None
         }
         Msg::Tasks(Ok(tasks)) => {
+            app.set_loading(false);
             app.set_tasks(tasks);
             FollowUp::None
         }
         Msg::Tasks(Err(e)) => {
+            app.set_loading(false);
             app.toast_error(format!("runs: {e}"));
             FollowUp::None
         }
@@ -427,7 +470,13 @@ mod tests {
             permissions: vec!["repo:approve".into(), "task:cancel".into()],
         };
         // Seeded with the ORIGINAL session refresh token.
-        App::new(me, "api.test".into(), 1_000, Some("rt-original".into()))
+        App::new(
+            me,
+            "api.test".into(),
+            1_000,
+            Some("rt-original".into()),
+            crate::theme::ThemeKind::Midnight,
+        )
     }
 
     fn stored(access: &str, refresh: Option<&str>, expires_at: i64) -> auth::StoredToken {
