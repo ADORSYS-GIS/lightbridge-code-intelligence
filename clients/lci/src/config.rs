@@ -48,17 +48,30 @@ struct FileConfig {
 }
 
 impl Config {
-    /// OS config directory for this app (`ProjectDirs::from("fyi","camer","lci")`). Used for both the
-    /// optional `config.toml` and the token cache.
-    pub fn project_dir() -> Result<PathBuf> {
-        let dirs = ProjectDirs::from("fyi", "camer", "lci")
-            .context("could not determine an OS config directory for lci")?;
-        Ok(dirs.config_dir().to_path_buf())
+    /// The app's `ProjectDirs` (`from("fyi","camer","lci")`). The single source for both the config
+    /// and data locations, so they stay platform-correct.
+    fn project_dirs() -> Result<ProjectDirs> {
+        ProjectDirs::from("fyi", "camer", "lci")
+            .context("could not determine the OS directories for lci")
     }
 
-    /// The token-cache path (`<config_dir>/token.json`).
+    /// OS **config** directory (`config_dir()`) — home of the user-editable `config.toml`. Per the
+    /// ratatui config-directories recipe, config lives here and the token cache does NOT (it's a
+    /// secret/cache, not config), so the two are split across `config_dir` / `data_dir`.
+    pub fn config_dir() -> Result<PathBuf> {
+        Ok(Self::project_dirs()?.config_dir().to_path_buf())
+    }
+
+    /// OS **data** directory (`data_dir()`) — home of the token cache. Splitting it out of the config
+    /// dir means editing/removing `config.toml` never disturbs the cached session, and vice-versa.
+    pub fn data_dir() -> Result<PathBuf> {
+        Ok(Self::project_dirs()?.data_dir().to_path_buf())
+    }
+
+    /// The token-cache path (`<data_dir>/token.json`). Written atomically + `0600` by
+    /// [`crate::auth::store::save`] — that hardening is unchanged by the dir split.
     pub fn token_path() -> Result<PathBuf> {
-        Ok(Self::project_dir()?.join("token.json"))
+        Ok(Self::data_dir()?.join("token.json"))
     }
 
     /// The loopback redirect URI derived from the configured port.
@@ -113,7 +126,7 @@ impl Config {
     /// Read + parse `config.toml` if present. A parse error is surfaced (so a typo isn't silently
     /// ignored); a missing file returns `None`.
     fn load_file() -> Option<FileConfig> {
-        let path = Self::project_dir().ok()?.join("config.toml");
+        let path = Self::config_dir().ok()?.join("config.toml");
         let raw = std::fs::read_to_string(&path).ok()?;
         match toml_min::parse(&raw) {
             Ok(cfg) => Some(cfg),
@@ -239,5 +252,20 @@ mod tests {
     #[test]
     fn toml_min_rejects_unknown_key() {
         assert!(toml_min::parse("nope = 1").is_err());
+    }
+
+    #[test]
+    fn config_and_token_live_in_distinct_dirs() {
+        // The recipe split: config.toml under config_dir, token.json under data_dir. On most
+        // platforms these differ; assert the token path lands under the data dir and is token.json.
+        let data = Config::data_dir().expect("data dir resolves");
+        let token = Config::token_path().expect("token path resolves");
+        assert!(
+            token.starts_with(&data),
+            "token cache lives under the data dir"
+        );
+        assert_eq!(token.file_name().unwrap(), "token.json");
+        // The config dir is resolvable too (home of config.toml).
+        assert!(Config::config_dir().is_ok());
     }
 }

@@ -13,6 +13,7 @@
 use anyhow::{anyhow, Context, Result};
 use reqwest::StatusCode;
 use serde::Deserialize;
+use serde_json::Value;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -122,6 +123,51 @@ impl TaskRow {
     }
 }
 
+/// A persisted review for a run (`GET /tasks/{id}/review`). Mirrors `db::ReviewRow`. The endpoint
+/// 404s when no review was recorded (older run, index task, or a review that never posted) — the
+/// client maps that to `None` rather than an error.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ReviewRow {
+    pub task_id: Uuid,
+    pub summary: String,
+    pub body: String,
+    pub inline_count: i32,
+    pub deferred_count: i32,
+    pub out_of_scope_count: i32,
+    /// The structured findings blob (shape varies by run); kept as raw JSON — the detail view only
+    /// shows the tally, not the raw findings.
+    #[serde(default)]
+    pub findings: Value,
+    #[serde(default)]
+    pub review_url: Option<String>,
+    #[serde(default)]
+    pub github_review_id: Option<i64>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: OffsetDateTime,
+}
+
+/// One agent turn from `GET /tasks/{id}/transcript` (ADR-0034). Mirrors `db::TranscriptRow`. Ordered
+/// by `seq`. `model` is accepted if the server sends it (forward-compatible; today's row omits it).
+#[derive(Debug, Clone, Deserialize)]
+pub struct TranscriptRow {
+    pub seq: i32,
+    pub role: String,
+    #[serde(default)]
+    pub content: Option<String>,
+    #[serde(default)]
+    pub tool_calls: Option<Value>,
+    #[serde(default)]
+    pub tool_name: Option<String>,
+    #[serde(default)]
+    pub prompt_tokens: Option<i64>,
+    #[serde(default)]
+    pub completion_tokens: Option<i64>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: OffsetDateTime,
+}
+
 /// Thin authenticated client over the control-plane base URL.
 ///
 /// The bearer is a **shared, swappable** cell (`Arc<RwLock<String>>`) read fresh per request, so a
@@ -207,6 +253,34 @@ impl ApiClient {
             StatusCode::CONFLICT => Err(anyhow!("task already finished — nothing to cancel")),
             other => Err(map_status(other, "cancel task")),
         }
+    }
+
+    /// `GET /tasks/{id}` — the full metadata for one task (needs `task:read`).
+    pub async fn get_task(&self, id: Uuid) -> Result<TaskRow> {
+        self.get_json(&format!("/tasks/{id}")).await
+    }
+
+    /// `GET /tasks/{id}/review` — the persisted review, or `None` when the server 404s (no review
+    /// recorded yet). Gated server-side on `review:read`. Other failures propagate as errors.
+    pub async fn get_review(&self, id: Uuid) -> Result<Option<ReviewRow>> {
+        let path = format!("/tasks/{id}/review");
+        let url = format!("{}{}", self.base, path);
+        let resp = self
+            .http
+            .get(&url)
+            .bearer_auth(self.bearer().await)
+            .send()
+            .await
+            .with_context(|| format!("GET {url}"))?;
+        if resp.status() == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        self.decode::<ReviewRow>(resp, &path).await.map(Some)
+    }
+
+    /// `GET /tasks/{id}/transcript` — the ordered agent turns (may be empty). Gated on `review:read`.
+    pub async fn get_transcript(&self, id: Uuid) -> Result<Vec<TranscriptRow>> {
+        self.get_json(&format!("/tasks/{id}/transcript")).await
     }
 
     /// Shared GET → JSON with status-mapped errors.
@@ -373,6 +447,65 @@ mod tests {
             ..t.clone()
         };
         assert!(!done.is_active());
+    }
+
+    #[test]
+    fn parses_review_row_fixture() {
+        let json = r#"{
+            "task_id": "3f2504e0-4f89-41d3-9a0c-0305e82c3301",
+            "summary": "LGTM overall; two nits and one deferred concern.",
+            "body": "Review body text (markdown).",
+            "inline_count": 2,
+            "deferred_count": 1,
+            "out_of_scope_count": 0,
+            "findings": {"inline": [{"path": "a.rs"}]},
+            "review_url": "https://github.com/vymalo/lci/pull/128#pullrequestreview-1",
+            "github_review_id": 987654,
+            "created_at": "2026-07-02T09:12:00Z"
+        }"#;
+        let r: ReviewRow = serde_json::from_str(json).unwrap();
+        assert_eq!(r.inline_count, 2);
+        assert_eq!(r.deferred_count, 1);
+        assert_eq!(r.out_of_scope_count, 0);
+        assert!(r.review_url.is_some());
+        assert_eq!(r.github_review_id, Some(987654));
+        assert!(r.summary.contains("LGTM"));
+    }
+
+    #[test]
+    fn parses_transcript_rows_fixture_ordered_by_seq() {
+        // Note: the server's TranscriptRow omits `model` today; our struct tolerates it either way.
+        let json = r#"[
+            {
+                "seq": 0,
+                "role": "assistant",
+                "content": "Let me look at the diff.",
+                "tool_calls": null,
+                "tool_name": null,
+                "prompt_tokens": 1200,
+                "completion_tokens": 48,
+                "created_at": "2026-07-02T09:10:00Z"
+            },
+            {
+                "seq": 1,
+                "role": "tool",
+                "content": null,
+                "tool_calls": {"name": "read_file", "args": {"path": "src/main.rs"}},
+                "tool_name": "read_file",
+                "prompt_tokens": null,
+                "completion_tokens": null,
+                "model": "some-model",
+                "created_at": "2026-07-02T09:10:03Z"
+            }
+        ]"#;
+        let rows: Vec<TranscriptRow> = serde_json::from_str(json).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].seq, 0);
+        assert_eq!(rows[0].role, "assistant");
+        assert_eq!(rows[0].prompt_tokens, Some(1200));
+        assert_eq!(rows[1].tool_name.as_deref(), Some("read_file"));
+        assert_eq!(rows[1].model.as_deref(), Some("some-model"));
+        assert!(rows[1].content.is_none());
     }
 
     #[test]

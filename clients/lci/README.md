@@ -2,13 +2,16 @@
 
 An interactive terminal client (binary `lci`) for the operator of a Lightbridge Code Intelligence
 deployment. It replaces the web console's approval gate ([ADR-0063](../../docs/adr/0063-cli-only-repository-approval.md))
-with two views:
+with three views:
 
 - **Repositories** — list repos and **approve** / **deny** them (capability-gated on your token).
 - **Runs** — watch active review/index tasks and **cancel** a running one.
+- **Run Detail** — open a run (Enter on a Runs row) to see its full metadata, the posted review, and a
+  **live-tailing transcript** (the agent's activity log), with autoscroll, a scrollbar, and mouse
+  wheel support.
 
 It authenticates to Keycloak with **OAuth 2.0 Authorization-Code + PKCE over a loopback redirect**,
-caches the token in your OS config dir, and refreshes it silently. It talks only to the existing
+caches the token in your OS data dir, and refreshes it silently. It talks only to the existing
 permission-gated control-plane endpoints — no new server surface, no new trust path.
 
 ## Running
@@ -27,17 +30,34 @@ your scrollback is untouched.
 
 ## Keybindings
 
+### List views (Repositories / Runs)
+
 | Key            | Action                                                    |
 | -------------- | --------------------------------------------------------- |
 | `q` / `Esc`    | quit                                                      |
 | `Tab` / `1` / `2` | switch view (Repositories / Runs)                      |
 | `↑`/`↓` or `j`/`k` | move the selection                                    |
+| `Enter` / `l` / `→` | **open the selected run's detail page** (Runs only) |
 | `r`            | refresh now                                               |
 | `f`            | cycle filter (repos: all/pending/approved/disabled; runs: active/all) |
 | `a`            | approve the selected repository (needs `repo:approve`)    |
 | `d`            | deny the selected repository (needs `repo:deny`; purges its index) |
 | `c`            | cancel the selected run (needs `task:cancel`)             |
 | `t`            | cycle the color theme (midnight → terminal → nord)        |
+| `m`            | toggle mouse capture (see below)                          |
+| `?`            | toggle the help overlay                                   |
+
+### Run Detail view (the log tail)
+
+| Key            | Action                                                    |
+| -------------- | --------------------------------------------------------- |
+| `Esc` / `h` / `←` | back to the Runs list                                  |
+| `↑`/`↓` or `j`/`k` | scroll the transcript a line                          |
+| `PgUp` / `PgDn` | scroll a page                                            |
+| `g` / `Home`   | jump to the top                                           |
+| `G` / `End`    | jump to the bottom and **re-engage the live tail**        |
+| `r`            | manual refresh (re-fetches metadata + review + transcript) |
+| `m`            | toggle mouse capture                                       |
 | `?`            | toggle the help overlay                                   |
 
 Approve / deny / cancel each open a **confirm dialog** with two buttons. Focus starts on the safe
@@ -46,6 +66,34 @@ between the buttons, `Enter` presses the focused one, `y` accepts regardless of 
 Actions you lack the permission for are dimmed in the header keymenu and refused with a toast. The header
 shows your identity, effective capabilities, the API host, a connection dot, and a token-expiry countdown
 (which turns **amber under two minutes**, plus a "re-auth needed" state if a background refresh fails).
+
+### Run Detail & the live transcript tail
+
+Press `Enter` (or `l` / `→`) on a Runs row to open its **detail page**: a **meta** panel (id, status,
+repo, target, kind, command, timestamps + a computed duration, job, and — on a failed run — the error
+detail), a **review** panel (the summary + a colored `inline N · deferred N · out-of-scope N` tally +
+the review permalink, or an inline "no review recorded (yet)"), and a large **transcript** panel — the
+agent's activity log, rendered newest-at-bottom with a scrollbar.
+
+While the run is **active** (received/queued/waiting-for-index/running/posting-result) the page polls
+every ~2.5s and **auto-scrolls** to the bottom as new turns arrive (a `● live` badge shows in the
+header). Scroll up and autoscroll disengages — your position is **held** and a `▼ N new` badge counts
+the unseen turns; `G`/`End` jumps to the bottom and re-engages the tail. Once the run reaches a terminal
+status the badge flips to `● done` / `● failed` and polling stops. The review + transcript are gated on
+the `review:read` capability; without it the page shows an inline "insufficient permission (review:read)"
+notice instead of fetching.
+
+> **Scope note:** this tails the agent **transcript** (the activity log) via the existing API, not raw
+> container/pod logs — the control plane exposes no `/logs` endpoint. A real container-log tail would
+> need a new `GET /tasks/{id}/logs` endpoint + serve-role RBAC (a possible follow-up).
+
+### Mouse & text selection
+
+Mouse capture is **on** by default, so the scroll wheel drives the focused pane (the transcript in the
+detail view; the table elsewhere). Capture, however, disables your terminal's **native text selection**
+— so press **`m`** to toggle it off when you want to select/copy text (the status bar shows `mouse:on` /
+`mouse:off`), and `m` again to turn it back on. Capture is always disabled again on exit (including the
+panic/error path), so it never leaks into your shell.
 
 ## Look & themes
 
@@ -75,8 +123,10 @@ LCI_THEME=nord cargo run -p lci        # start in the nord theme
 
 These are produced by the hidden dev/review affordance `lci --render <screen>` (no auth, no network —
 seeded fake data), which draws a screen through ratatui's `TestBackend` and prints the buffer. Handy for
-reviewing the layout in a PR or a terminal-less CI. Screens: `repos | runs | confirm | help | empty |
-too-small`; tune with `--width`, `--height`, `--theme`.
+reviewing the layout in a PR or a terminal-less CI. Screens: `repos`, `runs`, `detail`, `transcript`,
+`confirm`, `help`, `empty`, `small`; tune with `--width`, `--height`, `--theme`. Run `lci --render`
+with no name (or `lci --render list`) to print the valid names; an unknown name errors with that same
+list. Example: `lci --render detail --width 120 --theme nord`.
 
 Repositories (`lci --render repos --width 80 --height 24`):
 
@@ -113,6 +163,69 @@ Runs (`lci --render runs --width 80 --height 24`) — the STATUS column uses sho
 │ failed           vymalo/home-os   PR #9        review       2h review-4d0e   │
 ╰──────────────────────────────────────────────────────────────────────────────╯
  filter: all                                j/k move · f active/all · r refresh…
+```
+
+Run Detail — a completed run with a review (`lci --render detail --width 80 --height 24`). The three
+panels (meta / review / transcript) share collapsed borders so they read as one continuous page; the
+transcript carries a scrollbar and, while live, a `▼ N new` badge when you've scrolled up:
+
+```text
+ ▍ LCI                    Host:  code-intelligence-api.a             <↵/l> open
+ Lightbridge Code         User:  operator                            <Esc> back
+ Intelligence             Perms: approve / deny / cancel               <G> tail
+                          Token: 5m00s   ● connected                  <m> mouse
+                                                                       <?> help
+
+  Repositories (0)   Runs (5)  ▸  Run Detail
+╭▐ Run 3f2504e0 ▌ ● done───────────────────────────────────────────────────────╮
+│ status    done                          sha       —→—                        │
+│ repo      vymalo/lightbridge-code-intellcreated   2026-07-03 08:43           │
+│ target    PR #128                       started   2026-07-03 08:43           │
+│ kind      review                        completed 2026-07-03 09:43           │
+│ command   review                        duration  59m55s                     │
+│                                         job       review-9f2a                │
+╰──────────────────────────────────────────────────────────────────────────────╯
+│▐ Review ▌                                                                    │
+│ Solid change; two inline nits and one deferred concern about retry backoff.  │
+│ inline 2  ·  deferred 1  ·  out-of-scope 0                                   │
+╰──────────────────────────────────────────────────────────────────────────────╯
+│▐ Transcript ▌ 4                                                              │
+│ #0  assistant  ↑1240 ↓58                                                    █│
+│ Starting the review. Let me read the diff and the surrounding files to groun║│
+╰──────────────────────────────────────────────────────────────────────────────╯
+ mouse:on · static                          j/k scroll · G bottom · m mouse · r…
+```
+
+Run Detail while live-tailing — an active run, no review yet (`lci --render transcript --width 120
+--height 40`). The header shows `● live`, the transcript title shows `tailing`, and the review panel
+shows the "no review recorded (yet)" line:
+
+```text
+  Repositories (0)   Runs (5)  ▸  Run Detail
+╭▐ Run 3f2504e0 ▌ ● live───────────────────────────────────────────────────────────────────────────────────────────────╮
+│ status    running                                            sha       —→—                                           │
+│ repo      vymalo/lightbridge-code-intelligence               created   2026-07-03 09:42                              │
+│ target    PR #128                                            started   2026-07-03 09:42                              │
+│ kind      review                                             completed —                                             │
+│ command   review                                             duration  1m30s                                         │
+│                                                              job       review-9f2a                                   │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+│▐ Review ▌                                                                                                            │
+│ • no review recorded (yet)                                                                                           │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+│▐ Transcript ▌ 4  tailing                                                                                             │
+│ #0  assistant  ↑1240 ↓58                                                                                            █│
+│ Starting the review. Let me read the diff and the surrounding files to ground the findings.                         █│
+│                                                                                                                     █│
+│ #1  tool                                                                                                            █│
+│   ⚙ read_file {end, path, start}                                                                                    █│
+│ #2  tool                                                                                                            █│
+│   ⚙ search_code {k, query}                                                                                          █│
+│ #3  assistant  ↑2980 ↓211                                                                                           █│
+│ Two small nits (naming + an unused import) and one deferred concern: the retry loop has no jittered backoff, which c█│
+│ n thundering-herd the IdP. Posting the review.                                                                      ║│
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+ mouse:on · tail                                                  j/k scroll · G bottom · m mouse · r refresh · Esc bac…
 ```
 
 The approve confirm dialog (`lci --render confirm`), affirmative button focused:
@@ -169,8 +282,12 @@ port      = 8765
 theme     = "midnight"   # midnight | terminal | nord
 ```
 
-The cached token is written to `<config_dir>/token.json` with `0600` permissions. It stores an absolute
-`expires_at`; token values are never logged.
+Following the ratatui config-directories recipe, config and the token cache live in **separate**
+locations: `config.toml` in the OS **config** dir, and the cached token in the OS **data** dir
+(`<data_dir>/token.json`, e.g. macOS `~/Library/Application Support/fyi.camer.lci/token.json`, Linux
+`~/.local/share/lci/token.json`), written `0600` via an atomic create-`0600`-then-rename (never a
+world-readable window). The token stores an absolute `expires_at`; token values are never logged.
+Editing or deleting `config.toml` never disturbs the cached session, and vice-versa.
 
 ## Keycloak setup (operator, one-time)
 
@@ -272,7 +389,10 @@ web client's audience + permissions scopes, or inline the mappers as `protocolMa
 
 - **Hand-rolled OAuth** — PKCE is `base64url(sha256(verifier))` and the code/token exchange is a plain
   reqwest POST, so there's no `oauth2` crate dependency. See `src/auth/`.
-- **Terminal safety** — a panic hook *and* a `Drop` guard both restore the terminal (leave the alternate
-  screen, disable raw mode, show the cursor), so a crash never leaves your terminal wrecked.
+- **Terminal safety + pretty reports** — `main` installs **color-eyre**'s panic + error hooks, then a
+  panic hook *and* a `Drop` guard both restore the terminal first (disable raw mode, leave the alternate
+  screen, **disable mouse capture**, show the cursor). So a panic or error yields a clean, readable
+  color-eyre report instead of a corrupted terminal — and mouse capture never leaks into your shell.
 - **No blocking on the render path** — every network call runs on a spawned task and posts its result
-  back over a channel; the UI stays responsive and auto-refreshes the active view every 5s.
+  back over a channel; the UI stays responsive and auto-refreshes the active view every 5s. The detail
+  page's live tail polls every ~2.5s on its own timer, only while it's open and the run is still active.

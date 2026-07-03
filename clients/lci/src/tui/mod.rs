@@ -10,19 +10,27 @@ pub(crate) mod ui;
 
 pub use app::App;
 
-use crate::api::{ApiClient, Me, RepositoryRow, TaskRow};
+use crate::api::{ApiClient, Me, RepositoryRow, ReviewRow, TaskRow, TranscriptRow};
 use crate::auth::{self, EXPIRY_SKEW_SECS};
 use crate::config::Config;
 use anyhow::Result;
 use app::{PendingAction, View};
-use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
+};
+use crossterm::execute;
 use futures::StreamExt;
 use std::time::{Duration, Instant};
 use terminal::TerminalGuard;
 use tokio::sync::mpsc;
+use uuid::Uuid;
 
 /// Auto-refresh cadence.
 const REFRESH_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Live-tail poll cadence for the open detail page (2–3s per the ticket). Faster than the list
+/// refresh so a running agent's new turns show promptly.
+const DETAIL_POLL_INTERVAL: Duration = Duration::from_millis(2500);
 
 /// A result posted back from a spawned async request task.
 enum Msg {
@@ -37,6 +45,20 @@ enum Msg {
     Cancelled(Result<()>),
     /// Background refresh produced a new token (or failed → set the re-auth flag).
     TokenRefreshed(Result<auth::StoredToken>),
+    /// A detail-page fetch resolved (task metadata + review + transcript), carrying the task id it
+    /// was fetched for so a stale result for a closed/other page is ignored.
+    Detail {
+        task_id: Uuid,
+        task: Result<TaskRow>,
+        review: Result<Option<ReviewRow>>,
+        transcript: Result<Vec<TranscriptRow>>,
+    },
+    /// A lighter live-tail poll: just the task status + transcript (no review re-fetch).
+    DetailTail {
+        task_id: Uuid,
+        task: Result<TaskRow>,
+        transcript: Result<Vec<TranscriptRow>>,
+    },
 }
 
 /// Run the TUI until the operator quits. `api` is already authenticated; `me` and `token_expires_at`
@@ -58,6 +80,8 @@ pub async fn run(
     let mut refresh_timer = tokio::time::interval(REFRESH_INTERVAL);
     // The first tick fires immediately; we also kick an initial load below.
     let mut ui_tick = tokio::time::interval(Duration::from_millis(250));
+    // The live-tail poll for an open detail page (fires only while one is open + still live).
+    let mut detail_poll = tokio::time::interval(DETAIL_POLL_INTERVAL);
 
     // Kick the initial data + a token-refresh watchdog state.
     app.set_loading(true);
@@ -73,8 +97,9 @@ pub async fn run(
             maybe_event = input.next() => {
                 match maybe_event {
                     Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
-                        handle_key(&mut app, key, &api, &tx);
+                        handle_key(&mut app, key, &api, &tx, &mut guard);
                     }
+                    Some(Ok(Event::Mouse(m))) => handle_mouse(&mut app, m),
                     Some(Ok(Event::Resize(_, _))) => app.mark_dirty(),
                     Some(Err(_)) | None => break, // input stream closed
                     _ => {}
@@ -86,6 +111,15 @@ pub async fn run(
                 app.set_loading(true);
                 spawn_refresh_current_view(&app, &api, &tx);
                 maybe_spawn_token_refresh(&mut app, &cfg, &http, &tx, &mut last_refresh_attempt);
+            }
+
+            // --- live-tail poll for an open detail page (status + transcript) ---
+            _ = detail_poll.tick() => {
+                if let Some(d) = app.detail.as_ref() {
+                    if d.should_poll() {
+                        spawn_detail_tail(d.task_id, &api, &tx);
+                    }
+                }
             }
 
             // --- lightweight UI tick (toast expiry + spinner + token countdown redraw) ---
@@ -118,15 +152,30 @@ pub async fn run(
         }
         if app.take_dirty() {
             guard.terminal.draw(|f| ui::draw(f, &app))?;
+            // The detail renderer measured the transcript geometry into `DetailState`'s cells during
+            // the draw; reconcile the scroll offset (autoscroll pin / clamp) now. If it moved, a
+            // follow-up redraw shows the corrected position without waiting for the next event.
+            if let Some(d) = app.detail.as_mut() {
+                if d.sync_after_render() {
+                    guard.terminal.draw(|f| ui::draw(f, &app))?;
+                }
+            }
         }
     }
 
-    // `guard` drops here → terminal restored.
+    // `guard` drops here → terminal restored (mouse capture disabled included).
     Ok(())
 }
 
-/// Translate a keypress into a state change and/or a spawned request.
-fn handle_key(app: &mut App, key: KeyEvent, api: &ApiClient, tx: &mpsc::UnboundedSender<Msg>) {
+/// Translate a keypress into a state change and/or a spawned request. `guard` is threaded so the `m`
+/// mouse-toggle can enable/disable crossterm capture on the live terminal.
+fn handle_key(
+    app: &mut App,
+    key: KeyEvent,
+    api: &ApiClient,
+    tx: &mpsc::UnboundedSender<Msg>,
+    guard: &mut TerminalGuard,
+) {
     // A pending confirmation captures navigation + Enter/y/Esc/n first. Left/Right/Tab move focus
     // between the two buttons; Enter fires whichever is focused; `y` is a power-user accept regardless
     // of focus; Esc/`n` decline.
@@ -169,6 +218,19 @@ fn handle_key(app: &mut App, key: KeyEvent, api: &ApiClient, tx: &mpsc::Unbounde
         return;
     }
 
+    // `m` toggles mouse capture from any view (so the operator can grab native text selection).
+    if key.code == KeyCode::Char('m') {
+        let enabled = app.toggle_mouse();
+        set_mouse_capture(guard, enabled);
+        return;
+    }
+
+    // The detail page has its own key map (scroll + back); handle it before the list keys.
+    if app.view == View::Detail {
+        handle_detail_key(app, key, api, tx);
+        return;
+    }
+
     match key.code {
         KeyCode::Char('q') | KeyCode::Esc => app.should_quit = true,
         KeyCode::Char('?') => app.toggle_help(),
@@ -186,6 +248,15 @@ fn handle_key(app: &mut App, key: KeyEvent, api: &ApiClient, tx: &mpsc::Unbounde
         }
         KeyCode::Down | KeyCode::Char('j') => app.select_next(),
         KeyCode::Up | KeyCode::Char('k') => app.select_prev(),
+        // Enter / l / → opens the selected run's detail page (Runs view only).
+        KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right if app.view == View::Runs => {
+            app.open_detail();
+            if let Some(d) = app.detail.as_ref() {
+                if !d.permission_denied {
+                    spawn_detail_fetch(d.task_id, app, api, tx);
+                }
+            }
+        }
         KeyCode::Char('r') => {
             app.toast_info("refreshing…");
             spawn_refresh_current_view(app, api, tx);
@@ -200,6 +271,124 @@ fn handle_key(app: &mut App, key: KeyEvent, api: &ApiClient, tx: &mpsc::Unbounde
         KeyCode::Char('c') => request_cancel(app),
         _ => {}
     }
+}
+
+/// The detail page's key map: scroll the transcript, jump top/bottom (re-engaging the live tail),
+/// refresh, and back out to the Runs list.
+fn handle_detail_key(
+    app: &mut App,
+    key: KeyEvent,
+    api: &ApiClient,
+    tx: &mpsc::UnboundedSender<Msg>,
+) {
+    // A page = the transcript viewport height; fall back to a sensible default if not yet measured.
+    let page = app
+        .detail
+        .as_ref()
+        .map(|d| d.viewport_lines.get().max(1))
+        .unwrap_or(10);
+
+    // Scroll actions mutate only `app.detail`; do them in a scoped borrow so the `app.*` calls
+    // (mark_dirty / close_detail / toasts) below don't collide with a held `&mut d`.
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('h') | KeyCode::Left | KeyCode::Char('q') => {
+            app.close_detail();
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if let Some(d) = app.detail.as_mut() {
+                d.scroll_down(1);
+            }
+            app.mark_dirty();
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            if let Some(d) = app.detail.as_mut() {
+                d.scroll_up(1);
+            }
+            app.mark_dirty();
+        }
+        KeyCode::PageDown => {
+            if let Some(d) = app.detail.as_mut() {
+                d.scroll_down(page);
+            }
+            app.mark_dirty();
+        }
+        KeyCode::PageUp => {
+            if let Some(d) = app.detail.as_mut() {
+                d.scroll_up(page);
+            }
+            app.mark_dirty();
+        }
+        KeyCode::Char('g') | KeyCode::Home => {
+            if let Some(d) = app.detail.as_mut() {
+                d.scroll_top();
+            }
+            app.mark_dirty();
+        }
+        KeyCode::Char('G') | KeyCode::End => {
+            if let Some(d) = app.detail.as_mut() {
+                d.scroll_bottom();
+            }
+            app.mark_dirty();
+        }
+        KeyCode::Char('?') => app.toggle_help(),
+        KeyCode::Char('t') => app.cycle_theme(),
+        KeyCode::Char('r') => {
+            let target = app
+                .detail
+                .as_ref()
+                .filter(|d| !d.permission_denied)
+                .map(|d| d.task_id);
+            app.toast_info("refreshing…");
+            if let Some(id) = target {
+                spawn_detail_fetch(id, app, api, tx);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Handle a mouse event: wheel scroll drives the focused scrollable pane (the transcript in detail
+/// view; otherwise the list selection). A left click on a Runs row selects it.
+fn handle_mouse(app: &mut App, m: crossterm::event::MouseEvent) {
+    match m.kind {
+        MouseEventKind::ScrollDown => match app.view {
+            View::Detail => {
+                if let Some(d) = app.detail.as_mut() {
+                    d.scroll_down(3);
+                    app.mark_dirty();
+                }
+            }
+            _ => app.select_next(),
+        },
+        MouseEventKind::ScrollUp => match app.view {
+            View::Detail => {
+                if let Some(d) = app.detail.as_mut() {
+                    d.scroll_up(3);
+                    app.mark_dirty();
+                }
+            }
+            _ => app.select_prev(),
+        },
+        MouseEventKind::Down(MouseButton::Left) => {
+            // Nice-to-have: a left click on the Runs list opens the row under the cursor's detail.
+            // We keep it minimal — a click just selects the nearest row by not changing selection
+            // (row-precise hit-testing needs the table's layout rects, which we don't thread here).
+            // Left intentionally as a no-op to avoid a janky half-feature.
+        }
+        _ => {}
+    }
+}
+
+/// Enable or disable crossterm mouse capture on the live terminal to match the app's toggle. Failure
+/// is non-fatal (best-effort, like restore) — the toast already told the operator the intended state.
+fn set_mouse_capture(guard: &mut TerminalGuard, enabled: bool) {
+    use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
+    let backend = guard.terminal.backend_mut();
+    let _ = if enabled {
+        execute!(backend, EnableMouseCapture)
+    } else {
+        execute!(backend, DisableMouseCapture)
+    };
 }
 
 /// `a` on Repositories → confirm approve (gated by `repo:approve`).
@@ -335,7 +524,47 @@ fn spawn_refresh_current_view(app: &App, api: &ApiClient, tx: &mpsc::UnboundedSe
                 let _ = tx.send(Msg::Tasks(result));
             });
         }
+        // The detail page refreshes via its own tail poll; a manual `r`/view-refresh re-fetches all
+        // three (task + review + transcript) so a fresh review shows up too.
+        View::Detail => {
+            if let Some(d) = app.detail.as_ref() {
+                if !d.permission_denied {
+                    spawn_detail_fetch(d.task_id, app, &api, &tx);
+                }
+            }
+        }
     }
+}
+
+/// Spawn the full detail fetch: task metadata + review (404→None) + transcript, all for `id`. Sets
+/// the loading flag; the result posts back as `Msg::Detail`.
+fn spawn_detail_fetch(id: Uuid, app: &App, api: &ApiClient, tx: &mpsc::UnboundedSender<Msg>) {
+    let _ = app; // reserved for future per-fetch UI state; kept for a uniform call shape.
+    let (api, tx) = (api.clone(), tx.clone());
+    tokio::spawn(async move {
+        // Run the three fetches concurrently — they're independent GETs.
+        let (task, review, transcript) =
+            tokio::join!(api.get_task(id), api.get_review(id), api.get_transcript(id),);
+        let _ = tx.send(Msg::Detail {
+            task_id: id,
+            task,
+            review,
+            transcript,
+        });
+    });
+}
+
+/// Spawn the lighter live-tail poll: task status + transcript only (no review re-fetch).
+fn spawn_detail_tail(id: Uuid, api: &ApiClient, tx: &mpsc::UnboundedSender<Msg>) {
+    let (api, tx) = (api.clone(), tx.clone());
+    tokio::spawn(async move {
+        let (task, transcript) = tokio::join!(api.get_task(id), api.get_transcript(id));
+        let _ = tx.send(Msg::DetailTail {
+            task_id: id,
+            task,
+            transcript,
+        });
+    });
 }
 
 /// If the token is within the skew window and we have a usable refresh token, spawn a background
@@ -429,6 +658,66 @@ fn apply_msg(app: &mut App, msg: Msg) -> FollowUp {
         }
         Msg::Cancelled(Err(e)) => {
             app.toast_error(format!("cancel failed: {e}"));
+            FollowUp::None
+        }
+        Msg::Detail {
+            task_id,
+            task,
+            review,
+            transcript,
+        } => {
+            app.set_loading(false);
+            // Ignore a result for a page the operator has since closed or replaced.
+            if app.detail.as_ref().map(|d| d.task_id) != Some(task_id) {
+                return FollowUp::None;
+            }
+            // Fold into the detail state in a scoped borrow, collecting any error text to toast after.
+            let mut errors: Vec<String> = Vec::new();
+            if let Some(d) = app.detail.as_mut() {
+                if let Ok(t) = task {
+                    d.set_task(t);
+                }
+                match review {
+                    Ok(r) => {
+                        d.review = r;
+                        d.review_loaded = true;
+                    }
+                    Err(e) => {
+                        d.review_loaded = true;
+                        errors.push(format!("review: {e}"));
+                    }
+                }
+                match transcript {
+                    Ok(rows) => {
+                        d.merge_transcript(rows);
+                    }
+                    Err(e) => {
+                        d.transcript_loaded = true;
+                        errors.push(format!("transcript: {e}"));
+                    }
+                }
+            }
+            if let Some(e) = errors.into_iter().next() {
+                app.toast_error(e);
+            }
+            app.mark_dirty();
+            FollowUp::None
+        }
+        Msg::DetailTail {
+            task_id,
+            task,
+            transcript,
+        } => {
+            let Some(d) = app.detail.as_mut().filter(|d| d.task_id == task_id) else {
+                return FollowUp::None;
+            };
+            if let Ok(t) = task {
+                d.set_task(t);
+            }
+            if let Ok(rows) = transcript {
+                d.merge_transcript(rows);
+            }
+            app.mark_dirty();
             FollowUp::None
         }
         Msg::TokenRefreshed(Ok(token)) => {

@@ -1,4 +1,5 @@
-//! The on-disk token cache: a single `token.json` in the OS config dir, written `0600`.
+//! The on-disk token cache: a single `token.json` in the OS **data** dir (per the ratatui
+//! config-directories recipe — the token is a secret/cache, not user config), written `0600`.
 //!
 //! We persist `expires_at` as an **absolute** unix timestamp (computed from `expires_in` at fetch
 //! time) so a stale process clock across restarts can't be tricked into using an expired token.
