@@ -1,0 +1,223 @@
+//! Resolved runtime configuration for the client.
+//!
+//! Precedence (lowest → highest): built-in defaults → `~/.config/lci/config.toml` → environment
+//! variables → CLI flags. Only the four connection settings are file/env-overridable; everything
+//! else is a compile-time default. No secrets live here — the token cache is [`crate::auth`]'s job.
+
+use anyhow::{Context, Result};
+use directories::ProjectDirs;
+use std::path::PathBuf;
+
+/// Default control-plane base URL (prod). Override with `CONTROL_PLANE_URL`.
+pub const DEFAULT_API_URL: &str = "https://code-intelligence-api.ai.camer.digital";
+/// Default OIDC issuer (Keycloak realm). Override with `OIDC_ISSUER`.
+pub const DEFAULT_ISSUER: &str = "https://auth.verif.fyi/realms/camer-digital";
+/// Default public client id. Override with `OIDC_CLIENT_ID`.
+pub const DEFAULT_CLIENT_ID: &str = "lightbridge-cli";
+/// Default loopback redirect port. Override with `LCI_REDIRECT_PORT`.
+pub const DEFAULT_REDIRECT_PORT: u16 = 8765;
+/// OAuth scopes we request. The realm's audience mapper adds the `code-intelligence` audience; we do
+/// NOT request an audience here (Keycloak rejects an unknown `aud` in the request).
+pub const DEFAULT_SCOPE: &str = "openid profile email";
+
+/// Fully-resolved settings the rest of the app runs against.
+#[derive(Debug, Clone)]
+pub struct Config {
+    pub api_url: String,
+    pub issuer: String,
+    pub client_id: String,
+    pub redirect_port: u16,
+    pub scope: String,
+}
+
+/// The optional TOML file at `<config_dir>/config.toml`. Every field is optional — a missing file or
+/// a missing key just leaves the built-in default (then env, then flags) in place.
+#[derive(Debug, Default, serde::Deserialize)]
+struct FileConfig {
+    api_url: Option<String>,
+    issuer: Option<String>,
+    client_id: Option<String>,
+    port: Option<u16>,
+}
+
+impl Config {
+    /// OS config directory for this app (`ProjectDirs::from("fyi","camer","lci")`). Used for both the
+    /// optional `config.toml` and the token cache.
+    pub fn project_dir() -> Result<PathBuf> {
+        let dirs = ProjectDirs::from("fyi", "camer", "lci")
+            .context("could not determine an OS config directory for lci")?;
+        Ok(dirs.config_dir().to_path_buf())
+    }
+
+    /// The token-cache path (`<config_dir>/token.json`).
+    pub fn token_path() -> Result<PathBuf> {
+        Ok(Self::project_dir()?.join("token.json"))
+    }
+
+    /// The loopback redirect URI derived from the configured port.
+    pub fn redirect_uri(&self) -> String {
+        format!("http://127.0.0.1:{}/callback", self.redirect_port)
+    }
+
+    /// Resolve config with the documented precedence. `flags` carries anything the arg parser
+    /// captured; `None` fields fall through to env → file → default.
+    pub fn resolve(flags: &Flags) -> Result<Self> {
+        let file = Self::load_file().unwrap_or_default();
+
+        let api_url = flags
+            .api_url
+            .clone()
+            .or_else(|| env_nonempty("CONTROL_PLANE_URL"))
+            .or(file.api_url)
+            .unwrap_or_else(|| DEFAULT_API_URL.to_string());
+        let issuer = flags
+            .issuer
+            .clone()
+            .or_else(|| env_nonempty("OIDC_ISSUER"))
+            .or(file.issuer)
+            .unwrap_or_else(|| DEFAULT_ISSUER.to_string());
+        let client_id = flags
+            .client_id
+            .clone()
+            .or_else(|| env_nonempty("OIDC_CLIENT_ID"))
+            .or(file.client_id)
+            .unwrap_or_else(|| DEFAULT_CLIENT_ID.to_string());
+        let redirect_port = flags
+            .redirect_port
+            .or_else(|| env_nonempty("LCI_REDIRECT_PORT").and_then(|s| s.parse().ok()))
+            .or(file.port)
+            .unwrap_or(DEFAULT_REDIRECT_PORT);
+
+        Ok(Self {
+            // Trim a trailing slash so `{base}/path` joins cleanly.
+            api_url: api_url.trim_end_matches('/').to_string(),
+            issuer: issuer.trim_end_matches('/').to_string(),
+            client_id,
+            redirect_port,
+            scope: DEFAULT_SCOPE.to_string(),
+        })
+    }
+
+    /// Read + parse `config.toml` if present. A parse error is surfaced (so a typo isn't silently
+    /// ignored); a missing file returns `None`.
+    fn load_file() -> Option<FileConfig> {
+        let path = Self::project_dir().ok()?.join("config.toml");
+        let raw = std::fs::read_to_string(&path).ok()?;
+        match toml_min::parse(&raw) {
+            Ok(cfg) => Some(cfg),
+            Err(error) => {
+                tracing::warn!(%error, path = %path.display(), "ignoring malformed config.toml");
+                None
+            }
+        }
+    }
+}
+
+/// Read an env var, treating empty/whitespace as unset.
+fn env_nonempty(key: &str) -> Option<String> {
+    std::env::var(key).ok().filter(|v| !v.trim().is_empty())
+}
+
+/// Flags captured from the command line (see [`crate::cli`]). All optional — unset falls through.
+#[derive(Debug, Default, Clone)]
+pub struct Flags {
+    pub api_url: Option<String>,
+    pub issuer: Option<String>,
+    pub client_id: Option<String>,
+    pub redirect_port: Option<u16>,
+}
+
+/// A deliberately tiny TOML reader for our four flat, string/int keys — avoids pulling the `toml`
+/// crate for a four-line config file. Handles `key = "value"` / `key = 123`, `#` comments, and
+/// blank lines. Anything it can't parse is reported as an error so a real typo surfaces.
+mod toml_min {
+    use super::FileConfig;
+
+    pub fn parse(raw: &str) -> Result<FileConfig, String> {
+        let mut cfg = FileConfig::default();
+        for (lineno, line) in raw.lines().enumerate() {
+            let line = strip_comment(line).trim();
+            if line.is_empty() {
+                continue;
+            }
+            let (key, value) = line
+                .split_once('=')
+                .ok_or_else(|| format!("line {}: expected `key = value`", lineno + 1))?;
+            let key = key.trim();
+            let value = unquote(value.trim());
+            match key {
+                "api_url" => cfg.api_url = Some(value),
+                "issuer" => cfg.issuer = Some(value),
+                "client_id" => cfg.client_id = Some(value),
+                "port" => {
+                    cfg.port = Some(
+                        value
+                            .parse()
+                            .map_err(|_| format!("line {}: port must be a number", lineno + 1))?,
+                    )
+                }
+                other => return Err(format!("line {}: unknown key `{other}`", lineno + 1)),
+            }
+        }
+        Ok(cfg)
+    }
+
+    /// Drop a `#` comment that is not inside a quoted string.
+    fn strip_comment(line: &str) -> &str {
+        let mut in_quotes = false;
+        for (i, c) in line.char_indices() {
+            match c {
+                '"' => in_quotes = !in_quotes,
+                '#' if !in_quotes => return &line[..i],
+                _ => {}
+            }
+        }
+        line
+    }
+
+    /// Strip a single pair of surrounding double quotes if present.
+    fn unquote(value: &str) -> String {
+        value
+            .strip_prefix('"')
+            .and_then(|v| v.strip_suffix('"'))
+            .unwrap_or(value)
+            .to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn defaults_apply_when_nothing_set() {
+        let cfg = Config {
+            api_url: DEFAULT_API_URL.to_string(),
+            issuer: DEFAULT_ISSUER.to_string(),
+            client_id: DEFAULT_CLIENT_ID.to_string(),
+            redirect_port: DEFAULT_REDIRECT_PORT,
+            scope: DEFAULT_SCOPE.to_string(),
+        };
+        assert_eq!(cfg.redirect_uri(), "http://127.0.0.1:8765/callback");
+    }
+
+    #[test]
+    fn toml_min_parses_flat_keys_and_ignores_comments() {
+        let raw = r#"
+            # connection settings
+            api_url = "https://example.test"   # trailing comment
+            client_id = "lightbridge-cli"
+            port = 9000
+        "#;
+        let cfg = toml_min::parse(raw).expect("parses");
+        assert_eq!(cfg.api_url.as_deref(), Some("https://example.test"));
+        assert_eq!(cfg.client_id.as_deref(), Some("lightbridge-cli"));
+        assert_eq!(cfg.port, Some(9000));
+        assert_eq!(cfg.issuer, None);
+    }
+
+    #[test]
+    fn toml_min_rejects_unknown_key() {
+        assert!(toml_min::parse("nope = 1").is_err());
+    }
+}
