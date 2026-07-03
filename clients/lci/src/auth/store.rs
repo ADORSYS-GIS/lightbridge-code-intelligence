@@ -89,17 +89,61 @@ pub fn load(path: &Path) -> Result<Option<StoredToken>> {
     }
 }
 
-/// Persist the token to `path`, creating the parent dir if needed and enforcing `0600` on the file.
+/// Persist the token to `path` atomically and never world-readable.
+///
+/// We write to a sibling temp file that is **created** `0600` up front (not chmod'd afterwards — that
+/// left a brief `0644` window, P2), then `rename` it over the target. The rename is atomic within the
+/// dir, so a reader sees either the old file or the new one, never a torn write, and never a
+/// permissive-mode window.
 pub fn save(path: &Path, token: &StoredToken) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating config dir {}", parent.display()))?;
-    }
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| Path::new(".").to_path_buf());
+    std::fs::create_dir_all(&parent)
+        .with_context(|| format!("creating config dir {}", parent.display()))?;
+
     let json = serde_json::to_string_pretty(token).context("serializing token")?;
-    std::fs::write(path, json)
-        .with_context(|| format!("writing token cache {}", path.display()))?;
-    set_owner_only(path)?;
+
+    // Unique sibling temp file (same dir → same filesystem → atomic rename).
+    let tmp = parent.join(format!(".token.json.{}.tmp", uuid::Uuid::new_v4()));
+    write_owner_only(&tmp, json.as_bytes())
+        .with_context(|| format!("writing token temp file {}", tmp.display()))?;
+
+    // Atomically move it into place; clean up the temp file if the rename fails.
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e)
+            .with_context(|| format!("atomically replacing token cache {}", path.display()));
+    }
     Ok(())
+}
+
+/// Create `path` `0600` (owner-only) up front and write `bytes` — no permissive window.
+#[cfg(unix)]
+fn write_owner_only(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()
+}
+
+/// Non-Unix: no mode support; create-new + write (the atomic rename still applies).
+#[cfg(not(unix))]
+fn write_owner_only(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()
 }
 
 /// Delete the token cache (for `--logout`). Absent file is a no-op success.
@@ -109,20 +153,6 @@ pub fn clear(path: &Path) -> Result<()> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e).with_context(|| format!("removing token cache {}", path.display())),
     }
-}
-
-/// Restrict the file to owner read/write (`0600`) on Unix. No-op elsewhere.
-#[cfg(unix)]
-pub fn set_owner_only(path: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    let perms = std::fs::Permissions::from_mode(0o600);
-    std::fs::set_permissions(path, perms)
-        .with_context(|| format!("setting 0600 on {}", path.display()))
-}
-
-#[cfg(not(unix))]
-pub fn set_owner_only(_path: &Path) -> Result<()> {
-    Ok(())
 }
 
 #[cfg(test)]
@@ -176,6 +206,42 @@ mod tests {
             load(&path).unwrap().is_none(),
             "cleared cache reads as None"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn overwrite_is_atomic_stays_0600_and_leaves_no_temp_files() {
+        let dir = std::env::temp_dir().join(format!("lci-test-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("token.json");
+
+        // First write creates the file; second write goes through the temp+rename path.
+        save(&path, &sample()).unwrap();
+        let mut second = sample();
+        second.access_token = "rotated".into();
+        save(&path, &second).unwrap();
+
+        // The replacement landed and is still owner-only (created 0600, never chmod'd from 0644).
+        let loaded = load(&path).unwrap().expect("token present");
+        assert_eq!(loaded.access_token, "rotated");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "final file must be 0600");
+        }
+
+        // No `.token.json.*.tmp` sibling should be left behind.
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with(".token.json.") && n.ends_with(".tmp"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "no temp files should linger: {leftovers:?}"
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

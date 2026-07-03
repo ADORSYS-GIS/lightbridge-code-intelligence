@@ -50,7 +50,7 @@ pub async fn run(
     refresh_token: Option<String>,
 ) -> Result<()> {
     let mut guard = TerminalGuard::enter()?;
-    let mut app = App::new(me, api.host(), token_expires_at);
+    let mut app = App::new(me, api.host(), token_expires_at, refresh_token);
 
     let (tx, mut rx) = mpsc::unbounded_channel::<Msg>();
     let mut input = EventStream::new();
@@ -82,7 +82,7 @@ pub async fn run(
             // --- periodic auto-refresh of the active view ---
             _ = refresh_timer.tick() => {
                 spawn_refresh_current_view(&app, &api, &tx);
-                maybe_spawn_token_refresh(&mut app, &cfg, &http, &refresh_token, &tx, &mut last_refresh_attempt);
+                maybe_spawn_token_refresh(&mut app, &cfg, &http, &tx, &mut last_refresh_attempt);
             }
 
             // --- lightweight UI tick (toast expiry + token countdown redraw) ---
@@ -94,8 +94,19 @@ pub async fn run(
 
             // --- async API results ---
             Some(msg) = rx.recv() => {
-                apply_msg(&mut app, msg);
+                match apply_msg(&mut app, msg) {
+                    FollowUp::None => {}
+                    // Swap the live bearer so subsequent requests use the refreshed token.
+                    FollowUp::SwapBearer(access) => api.set_bearer(access).await,
+                    // Re-fetch the current view now (after a successful mutation).
+                    FollowUp::RefreshView => app.request_view_refresh(),
+                }
             }
+        }
+
+        // A successful mutation (or a swapped bearer) asked for an immediate re-fetch.
+        if app.take_view_refresh() {
+            spawn_refresh_current_view(&app, &api, &tx);
         }
 
         if app.should_quit {
@@ -288,16 +299,20 @@ fn spawn_refresh_current_view(app: &App, api: &ApiClient, tx: &mpsc::UnboundedSe
     }
 }
 
-/// If the token is within the skew window and we have a refresh token, spawn a background refresh.
-/// Rate-limited so a burst of timer ticks doesn't stampede the IdP.
+/// If the token is within the skew window and we have a usable refresh token, spawn a background
+/// refresh. Rate-limited so a burst of timer ticks doesn't stampede the IdP, and short-circuited once
+/// `refresh_disabled` is latched (a prior fatal `invalid_grant`) so a dead token can't hot-loop.
 fn maybe_spawn_token_refresh(
     app: &mut App,
     cfg: &Config,
     http: &reqwest::Client,
-    refresh_token: &Option<String>,
     tx: &mpsc::UnboundedSender<Msg>,
     last_attempt: &mut Instant,
 ) {
+    // A prior fatal refresh already flipped us to re-auth; don't keep hammering the IdP.
+    if app.refresh_disabled {
+        return;
+    }
     let Some(exp) = app.token_expires_at else {
         return;
     };
@@ -305,8 +320,10 @@ fn maybe_spawn_token_refresh(
     if exp - now > EXPIRY_SKEW_SECS {
         return; // still fresh
     }
-    let Some(refresh) = refresh_token.clone() else {
+    let Some(refresh) = app.refresh_token.clone() else {
+        // No refresh token to use → re-auth, and latch so we stop re-checking every tick.
         app.reauth_needed = true;
+        app.refresh_disabled = true;
         app.mark_dirty();
         return;
     };
@@ -323,31 +340,179 @@ fn maybe_spawn_token_refresh(
     });
 }
 
-/// Fold an async result into the state.
-fn apply_msg(app: &mut App, msg: Msg) {
+/// A follow-up the event loop performs after folding a message into state — things that need `&api`
+/// or must be `async` (swapping the live bearer, re-fetching a view). Keeps [`apply_msg`] sync.
+enum FollowUp {
+    None,
+    /// A refresh produced a new access token → swap the client's live bearer to it.
+    SwapBearer(String),
+    /// A mutation succeeded → re-fetch the current view now (don't wait for the periodic refresh).
+    RefreshView,
+}
+
+/// Fold an async result into the state, returning any follow-up the loop must run.
+fn apply_msg(app: &mut App, msg: Msg) -> FollowUp {
     match msg {
-        Msg::Repos(Ok(repos)) => app.set_repos(repos),
-        Msg::Repos(Err(e)) => app.toast_error(format!("repos: {e}")),
-        Msg::Tasks(Ok(tasks)) => app.set_tasks(tasks),
-        Msg::Tasks(Err(e)) => app.toast_error(format!("runs: {e}")),
+        Msg::Repos(Ok(repos)) => {
+            app.set_repos(repos);
+            FollowUp::None
+        }
+        Msg::Repos(Err(e)) => {
+            app.toast_error(format!("repos: {e}"));
+            FollowUp::None
+        }
+        Msg::Tasks(Ok(tasks)) => {
+            app.set_tasks(tasks);
+            FollowUp::None
+        }
+        Msg::Tasks(Err(e)) => {
+            app.toast_error(format!("runs: {e}"));
+            FollowUp::None
+        }
         Msg::RepoAction { verb, result } => match result {
             Ok(repo) => {
                 app.toast_success(format!("{verb} {}/{}", repo.owner, repo.name));
                 // Reflect the change immediately by re-fetching the list.
-                app.mark_dirty();
+                FollowUp::RefreshView
             }
-            Err(e) => app.toast_error(format!("{verb} failed: {e}")),
+            Err(e) => {
+                app.toast_error(format!("{verb} failed: {e}"));
+                FollowUp::None
+            }
         },
-        Msg::Cancelled(Ok(())) => app.toast_success("cancel requested"),
-        Msg::Cancelled(Err(e)) => app.toast_error(format!("cancel failed: {e}")),
+        Msg::Cancelled(Ok(())) => {
+            app.toast_success("cancel requested");
+            FollowUp::RefreshView
+        }
+        Msg::Cancelled(Err(e)) => {
+            app.toast_error(format!("cancel failed: {e}"));
+            FollowUp::None
+        }
         Msg::TokenRefreshed(Ok(token)) => {
+            // Rotate ALL of: the live bearer (via the follow-up), the expiry, and the session refresh
+            // token (Keycloak issues a new one and revokes the old — the next refresh must use it).
             app.token_expires_at = Some(token.expires_at);
+            app.refresh_token = token.refresh_token.clone();
             app.reauth_needed = false;
+            app.refresh_disabled = false;
             app.toast_info("token refreshed");
+            FollowUp::SwapBearer(token.access_token)
         }
         Msg::TokenRefreshed(Err(_)) => {
+            // Fatal: the refresh token is dead (rotated/expired/revoked). Surface re-auth and latch so
+            // we don't re-fire it against the IdP every interval.
             app.reauth_needed = true;
+            app.refresh_disabled = true;
             app.mark_dirty();
+            FollowUp::None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::{Claims, Me};
+    use anyhow::anyhow;
+
+    fn test_app() -> App {
+        let me = Me {
+            claims: Claims {
+                sub: "s".into(),
+                email: None,
+                preferred_username: Some("op".into()),
+                name: None,
+                exp: Some(0),
+            },
+            permissions: vec!["repo:approve".into(), "task:cancel".into()],
+        };
+        // Seeded with the ORIGINAL session refresh token.
+        App::new(me, "api.test".into(), 1_000, Some("rt-original".into()))
+    }
+
+    fn stored(access: &str, refresh: Option<&str>, expires_at: i64) -> auth::StoredToken {
+        auth::StoredToken {
+            access_token: access.into(),
+            refresh_token: refresh.map(String::from),
+            token_type: "Bearer".into(),
+            scope: None,
+            expires_at,
+            obtained_at: 0,
+            id_token: None,
+        }
+    }
+
+    #[test]
+    fn successful_refresh_swaps_bearer_and_rotates_refresh_token() {
+        let mut app = test_app();
+        let token = stored("access-NEW", Some("rt-ROTATED"), 9_999);
+
+        let follow = apply_msg(&mut app, Msg::TokenRefreshed(Ok(token)));
+
+        // The loop is told to swap the live bearer to the new access token.
+        match follow {
+            FollowUp::SwapBearer(access) => assert_eq!(access, "access-NEW"),
+            _ => panic!("expected SwapBearer with the new access token"),
+        }
+        // Expiry advanced, session refresh token ROTATED to the new one, re-auth cleared.
+        assert_eq!(app.token_expires_at, Some(9_999));
+        assert_eq!(
+            app.refresh_token.as_deref(),
+            Some("rt-ROTATED"),
+            "next refresh must use the rotated token, not the revoked original"
+        );
+        assert!(!app.reauth_needed);
+        assert!(!app.refresh_disabled);
+    }
+
+    #[test]
+    fn failed_refresh_latches_reauth_and_stops_hot_looping() {
+        let mut app = test_app();
+        let follow = apply_msg(&mut app, Msg::TokenRefreshed(Err(anyhow!("invalid_grant"))));
+        assert!(matches!(follow, FollowUp::None));
+        assert!(app.reauth_needed, "surface re-auth in the status bar");
+        assert!(
+            app.refresh_disabled,
+            "latch so maybe_spawn_token_refresh can't re-fire the dead token every interval"
+        );
+
+        // With the latch set, maybe_spawn_token_refresh must short-circuit even though the token is
+        // expired and a refresh token is present — i.e. no further IdP calls until re-login.
+        app.token_expires_at = Some(auth::now_unix() - 10); // expired
+        let mut last = Instant::now() - REFRESH_INTERVAL * 2;
+        let cfg = Config::resolve(&Default::default()).unwrap();
+        let http = reqwest::Client::new();
+        let (tx, mut rx) = mpsc::unbounded_channel::<Msg>();
+        maybe_spawn_token_refresh(&mut app, &cfg, &http, &tx, &mut last);
+        assert!(
+            rx.try_recv().is_err(),
+            "no refresh task should be spawned once refresh_disabled is latched"
+        );
+    }
+
+    #[test]
+    fn successful_mutation_requests_immediate_view_refresh() {
+        let mut app = test_app();
+        let repo = RepositoryRow {
+            id: 1,
+            github_repo_id: 1,
+            owner: "o".into(),
+            name: "r".into(),
+            default_branch: "main".into(),
+            status: "approved".into(),
+            active: true,
+            approved_at: None,
+            approved_by: None,
+            task_count: 0,
+            last_task_at: None,
+        };
+        let follow = apply_msg(
+            &mut app,
+            Msg::RepoAction {
+                verb: "approved",
+                result: Ok(repo),
+            },
+        );
+        assert!(matches!(follow, FollowUp::RefreshView));
     }
 }

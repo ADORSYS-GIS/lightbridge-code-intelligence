@@ -123,11 +123,15 @@ impl TaskRow {
 }
 
 /// Thin authenticated client over the control-plane base URL.
+///
+/// The bearer is a **shared, swappable** cell (`Arc<RwLock<String>>`) read fresh per request, so a
+/// background token refresh can rotate it live without rebuilding the client (P1: a fixed bearer kept
+/// sending the expired access token after ~5 min). Cloning an `ApiClient` shares the same cell.
 #[derive(Clone)]
 pub struct ApiClient {
     http: reqwest::Client,
     base: String,
-    token: String,
+    token: std::sync::Arc<tokio::sync::RwLock<String>>,
 }
 
 impl ApiClient {
@@ -135,8 +139,18 @@ impl ApiClient {
         Self {
             http,
             base: base.into(),
-            token: token.into(),
+            token: std::sync::Arc::new(tokio::sync::RwLock::new(token.into())),
         }
+    }
+
+    /// Replace the bearer used by every subsequent request (called after a token refresh).
+    pub async fn set_bearer(&self, token: impl Into<String>) {
+        *self.token.write().await = token.into();
+    }
+
+    /// Read the current bearer for a single request.
+    async fn bearer(&self) -> String {
+        self.token.read().await.clone()
     }
 
     /// The host portion of the base URL, for the status bar.
@@ -184,7 +198,7 @@ impl ApiClient {
         let resp = self
             .http
             .post(&url)
-            .bearer_auth(&self.token)
+            .bearer_auth(self.bearer().await)
             .send()
             .await
             .with_context(|| format!("POST {url}"))?;
@@ -201,7 +215,7 @@ impl ApiClient {
         let resp = self
             .http
             .get(&url)
-            .bearer_auth(&self.token)
+            .bearer_auth(self.bearer().await)
             .send()
             .await
             .with_context(|| format!("GET {url}"))?;
@@ -214,7 +228,7 @@ impl ApiClient {
         let resp = self
             .http
             .post(&url)
-            .bearer_auth(&self.token)
+            .bearer_auth(self.bearer().await)
             .send()
             .await
             .with_context(|| format!("POST {url}"))?;
@@ -258,6 +272,28 @@ pub fn map_status(status: StatusCode, context: &str) -> anyhow::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn set_bearer_swaps_the_emitted_token_and_is_shared_across_clones() {
+        let client = ApiClient::new(reqwest::Client::new(), "https://api.test", "old-token");
+        // A clone shares the same bearer cell (as the TUI's spawned request tasks do).
+        let clone = client.clone();
+        assert_eq!(client.bearer().await, "old-token");
+        assert_eq!(clone.bearer().await, "old-token");
+
+        // Simulate a refresh rotating the access token.
+        client.set_bearer("new-token").await;
+        assert_eq!(
+            client.bearer().await,
+            "new-token",
+            "original sees the new bearer"
+        );
+        assert_eq!(
+            clone.bearer().await,
+            "new-token",
+            "clones share the swap — spawned tasks pick up the rotated token"
+        );
+    }
 
     #[test]
     fn parses_me_fixture() {

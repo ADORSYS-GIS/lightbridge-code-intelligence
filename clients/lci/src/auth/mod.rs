@@ -154,9 +154,18 @@ async fn interactive_login(
     let addr: SocketAddr = format!("127.0.0.1:{}", cfg.redirect_port)
         .parse()
         .expect("valid loopback socket address");
-    let listener = TcpListener::bind(addr)
-        .await
-        .with_context(|| format!("binding loopback listener on {addr} (is the port in use?)"))?;
+    let listener = TcpListener::bind(addr).await.map_err(|e| {
+        // A port collision is the common, actionable case — tell the operator how to move it.
+        if e.kind() == std::io::ErrorKind::AddrInUse {
+            anyhow!(
+                "redirect port {} is already in use — set LCI_REDIRECT_PORT (or --port) to a free \
+                 port and re-run (the Keycloak client must allow that port's /callback redirect URI)",
+                cfg.redirect_port
+            )
+        } else {
+            anyhow!("could not bind the loopback listener on {addr}: {e}")
+        }
+    })?;
 
     let authorize_url = build_authorize_url(meta, cfg, &redirect_uri, &state, &pkce.challenge)?;
 
@@ -256,13 +265,17 @@ async fn wait_for_callback(listener: &TcpListener) -> Result<Callback> {
             .await
             .context("accepting loopback connection")?;
 
-        // The request line (`GET /callback?... HTTP/1.1`) is all we need; a small read covers it.
-        let mut buf = [0u8; 8192];
-        let n = socket
-            .read(&mut buf)
-            .await
-            .context("reading callback request")?;
-        let request = String::from_utf8_lossy(&buf[..n]);
+        // Read until we have the full request line (up to the first CRLF); a single `read()` can
+        // return a partial line, which would miss `code`/`state`. Capped + bounded by the outer
+        // `LOGIN_TIMEOUT` so a slow/hung client can't stall us forever.
+        let request = match read_request_line(&mut socket).await {
+            Ok(req) => req,
+            Err(e) => {
+                tracing::debug!(error = %e, "callback read failed; ignoring this connection");
+                let _ = socket.write_all(&http_response(404, "Not found")).await;
+                continue;
+            }
+        };
         let Some(target) = request_target(&request) else {
             // Not a request we understand (e.g. a browser prefetch); answer 404 and keep waiting.
             let _ = socket.write_all(&http_response(404, "Not found")).await;
@@ -286,6 +299,38 @@ async fn wait_for_callback(listener: &TcpListener) -> Result<Callback> {
         let _ = socket.flush().await;
         return Ok(callback);
     }
+}
+
+/// Max bytes we'll read while looking for the request line — a `/callback?code=…&state=…` line is
+/// well under this; the cap bounds a misbehaving/hostile client.
+const MAX_REQUEST_LINE_BYTES: usize = 8192;
+
+/// Read from `socket` until the first CRLF (end of the HTTP request line) or the byte cap, returning
+/// the bytes read so far as a lossy string. Loops over `read` so a partial first packet can't cause
+/// us to miss the `code`/`state` query params.
+async fn read_request_line<S>(socket: &mut S) -> Result<String>
+where
+    S: AsyncReadExt + Unpin,
+{
+    let mut buf = Vec::with_capacity(512);
+    let mut chunk = [0u8; 1024];
+    loop {
+        let n = socket
+            .read(&mut chunk)
+            .await
+            .context("reading callback request")?;
+        if n == 0 {
+            break; // client closed before sending a full line — return what we have
+        }
+        buf.extend_from_slice(&chunk[..n]);
+        if buf.windows(2).any(|w| w == b"\r\n") {
+            break; // have the full request line
+        }
+        if buf.len() >= MAX_REQUEST_LINE_BYTES {
+            break; // cap: don't read unbounded from a misbehaving client
+        }
+    }
+    Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
 /// Extract the request target (the path+query) from an HTTP request's first line.
@@ -435,5 +480,28 @@ mod tests {
         let returned = parse_callback("/callback?code=abc&state=attacker");
         let expected = "ours";
         assert_ne!(returned.state.as_deref(), Some(expected));
+    }
+
+    #[tokio::test]
+    async fn read_request_line_reassembles_a_fragmented_request() {
+        // A duplex where the "client" dribbles the request line in three writes with the CRLF only in
+        // the last chunk — a single read() would miss code/state. The loop must reassemble it.
+        use tokio::io::AsyncWriteExt as _;
+        let (mut client, mut server) = tokio::io::duplex(64);
+        tokio::spawn(async move {
+            client.write_all(b"GET /callback?code=").await.unwrap();
+            client.write_all(b"abc123&state=xyz").await.unwrap();
+            client
+                .write_all(b" HTTP/1.1\r\nHost: x\r\n\r\n")
+                .await
+                .unwrap();
+            client.flush().await.unwrap();
+        });
+
+        let request = read_request_line(&mut server).await.unwrap();
+        let target = request_target(&request).expect("full request line reassembled");
+        let cb = parse_callback(target);
+        assert_eq!(cb.code.as_deref(), Some("abc123"));
+        assert_eq!(cb.state.as_deref(), Some("xyz"));
     }
 }

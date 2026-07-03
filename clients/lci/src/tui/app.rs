@@ -106,8 +106,17 @@ pub struct App {
     pub token_expires_at: Option<i64>,
     /// Set when background refresh fails — surfaced in the status bar.
     pub reauth_needed: bool,
+    /// The session's current refresh token, **rotated** on every successful refresh (Keycloak issues
+    /// a new one and revokes the old). `None` once we have no usable refresh token.
+    pub refresh_token: Option<String>,
+    /// Latch set after a fatal refresh failure (e.g. `invalid_grant`) so we stop re-firing a dead
+    /// refresh token against the IdP every interval (P1: that hot-looped). Cleared only by re-login.
+    pub refresh_disabled: bool,
 
     pub should_quit: bool,
+    /// Set when a mutation (approve/deny/cancel) succeeds so the event loop re-fetches the current
+    /// view on the next tick instead of waiting for the periodic refresh (P2).
+    needs_view_refresh: bool,
     /// Bumped whenever state changes in a way that needs a redraw.
     dirty: bool,
 }
@@ -116,7 +125,12 @@ pub struct App {
 const TOAST_TTL: Duration = Duration::from_secs(4);
 
 impl App {
-    pub fn new(me: Me, api_host: String, token_expires_at: i64) -> Self {
+    pub fn new(
+        me: Me,
+        api_host: String,
+        token_expires_at: i64,
+        refresh_token: Option<String>,
+    ) -> Self {
         Self {
             view: View::Repositories,
             me: Some(me),
@@ -132,9 +146,23 @@ impl App {
             show_help: false,
             token_expires_at: Some(token_expires_at),
             reauth_needed: false,
+            refresh_token,
+            refresh_disabled: false,
             should_quit: false,
+            needs_view_refresh: false,
             dirty: true,
         }
+    }
+
+    /// Flag that the current view should be re-fetched on the next event-loop tick (after a
+    /// successful mutation). Consumed by [`Self::take_view_refresh`].
+    pub fn request_view_refresh(&mut self) {
+        self.needs_view_refresh = true;
+    }
+
+    /// Consume the view-refresh request, returning whether a re-fetch is due.
+    pub fn take_view_refresh(&mut self) -> bool {
+        std::mem::replace(&mut self.needs_view_refresh, false)
     }
 
     /// Whether a redraw is pending; clears the flag.
@@ -344,6 +372,7 @@ mod tests {
             me_with(&["repo:approve", "task:read"]),
             "api.test".into(),
             0,
+            Some("rt-0".into()),
         )
     }
 
