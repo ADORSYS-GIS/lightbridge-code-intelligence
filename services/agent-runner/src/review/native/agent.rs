@@ -1159,6 +1159,86 @@ pub async fn run_native_agent(
     Ok(ReviewOutcome::Exhausted)
 }
 
+/// Chars-per-token heuristic for the prompt budgets (ADR-0070) — the same deliberate over-estimate as
+/// [`estimate_tokens`] (ADR-0045): the gateway model isn't OpenAI-tokenized, so ~4 chars/token errs
+/// toward smaller budgets, which is what a safety cap wants.
+const PROMPT_CHARS_PER_TOKEN: usize = 4;
+
+/// Floor for a window-derived block budget (ADR-0070): even on a tiny window a block keeps its header,
+/// a few lines, and the truncation marker — a nuked-to-nothing block would silently drop the *framing*
+/// ("untrusted", "don't re-report") along with the content.
+const MIN_BLOCK_CHARS: usize = 1_000;
+
+/// Absolute ceilings for the injected static context blocks (ADR-0070). Each mirrors the bound its
+/// assembly side already enforces — the control plane caps the prior-reviews block at 8k
+/// (`PRIOR_BLOCK_CHAR_CAP`), the SAST digest is `sast.max_findings` (25) one-liners, repo memory is a
+/// `LIMIT 30` of one-liners, and the AGENTS.md ingest is 32 KiB (`instructions::TOTAL_CAP`) — so on
+/// today's large-window models nothing changes. The window-proportional share below can only SHRINK
+/// them, never grow them.
+const SAST_BLOCK_CHAR_CEIL: usize = 6_000;
+const PRIORS_BLOCK_CHAR_CEIL: usize = 8_000;
+const MEMORY_BLOCK_CHAR_CEIL: usize = 4_000;
+const INSTRUCTIONS_BLOCK_CHAR_CEIL: usize = 32 * 1024;
+
+/// Char budgets for the static context blocks of one run (ADR-0070). The per-block constants (and the
+/// operator's `max_diff_chars`) were tuned for the current ~1M-window models; pointed at a small-window
+/// model they would silently eat the whole window before the review starts (the 60k-char diff cap alone
+/// is ~15k tokens). When `review.context_window` is set (ADR-0045 — the same knob that already drives
+/// wind-down/trim), each block budget becomes `min(absolute ceiling, share-of-window)`, floored at
+/// [`MIN_BLOCK_CHARS`]; with no window configured the ceilings apply unchanged (legacy behaviour).
+struct PromptBudgets {
+    diff: usize,
+    sast: usize,
+    priors: usize,
+    memory: usize,
+    instructions: usize,
+}
+
+impl PromptBudgets {
+    /// Shares of the window: diff 25%, instructions 2%, priors 2%, SAST 1.5%, memory 1% — together
+    /// ≤ ~31.5% of the window for static context, leaving the rest for the system prompt, the
+    /// conversation, and the ADR-0045 wind-down headroom.
+    fn for_review(review: &ReviewConfig) -> Self {
+        let share = |frac: f64, ceil: usize| -> usize {
+            match review.context_window {
+                Some(window) => {
+                    let chars = (window as f64 * frac) as usize * PROMPT_CHARS_PER_TOKEN;
+                    ceil.min(chars.max(MIN_BLOCK_CHARS))
+                }
+                None => ceil,
+            }
+        };
+        Self {
+            diff: share(0.25, review.max_diff_chars),
+            sast: share(0.015, SAST_BLOCK_CHAR_CEIL),
+            priors: share(0.02, PRIORS_BLOCK_CHAR_CEIL),
+            memory: share(0.01, MEMORY_BLOCK_CHAR_CEIL),
+            instructions: share(0.02, INSTRUCTIONS_BLOCK_CHAR_CEIL),
+        }
+    }
+}
+
+/// Cap an injected prompt block to its budget (ADR-0070): cut char-safely on a line boundary and
+/// append an explicit marker naming what was cut — the same never-truncate-silently rule as the diff
+/// packing (#275) and the prior-reviews block (ADR-0065). Under budget, the block passes through
+/// unchanged (borrowed).
+fn cap_prompt_block<'a>(block: &'a str, budget: usize, label: &str) -> std::borrow::Cow<'a, str> {
+    if block.len() <= budget {
+        return std::borrow::Cow::Borrowed(block);
+    }
+    let cut = truncate_on_boundary(block, budget);
+    // Prefer a line boundary so the cut never leaves half a finding/sentence dangling.
+    let cut = match cut.rfind('\n') {
+        Some(i) => &cut[..=i],
+        None => cut,
+    };
+    std::borrow::Cow::Owned(format!(
+        "{cut}\n… [{label} truncated to fit the model's context window — {} of {} chars shown]\n",
+        cut.len(),
+        block.len(),
+    ))
+}
+
 /// Assemble the system (operator prompt + tool-protocol) and user (request + diff) messages. The
 /// system prompt is the **required** operator-owned guidance (ADR-0037 — no built-in default); the
 /// tool-protocol is appended last so it's the final instruction the model sees.
@@ -1173,6 +1253,27 @@ fn build_messages(
     sast_digest: Option<&str>,
 ) -> Vec<ChatMessage> {
     let system = format!("{}\n\n{TOOL_PROTOCOL}", review.system_prompt);
+
+    // Window-proportional budgets for the static blocks (ADR-0070). Log once when the window actually
+    // shrank something below its ceiling, so a small-window deploy is legible from the run log.
+    let budgets = PromptBudgets::for_review(review);
+    if review.context_window.is_some()
+        && (budgets.diff < review.max_diff_chars
+            || budgets.sast < SAST_BLOCK_CHAR_CEIL
+            || budgets.priors < PRIORS_BLOCK_CHAR_CEIL
+            || budgets.memory < MEMORY_BLOCK_CHAR_CEIL
+            || budgets.instructions < INSTRUCTIONS_BLOCK_CHAR_CEIL)
+    {
+        tracing::info!(
+            context_window = review.context_window,
+            diff_chars = budgets.diff,
+            sast_chars = budgets.sast,
+            priors_chars = budgets.priors,
+            memory_chars = budgets.memory,
+            instructions_chars = budgets.instructions,
+            "prompt budgets: window-proportional caps active (ADR-0070)"
+        );
+    }
 
     let mut user = format!("The maintainer's request: {command}");
     match diff {
@@ -1191,7 +1292,7 @@ fn build_messages(
             // definition whose call site *was* visible, so the pass filed a P1 on code it never saw, while
             // 55% of the PR (every file past the cut) was silently absent. Anything not shown is disclosed
             // below so the model states honest coverage and can't fault unseen code.
-            let rendered = super::diff::render_diff_for_prompt(pr, review.max_diff_chars);
+            let rendered = super::diff::render_diff_for_prompt(pr, budgets.diff);
             user.push_str("\n\nUnified diff (review ONLY lines this diff changes):\n```diff\n");
             user.push_str(&rendered.text);
             user.push_str("\n```");
@@ -1225,7 +1326,7 @@ fn build_messages(
     // gated by the model). `None` when SAST is off or found nothing, so a normal run reads as before.
     if let Some(sast) = sast_digest {
         user.push_str("\n\n");
-        user.push_str(sast);
+        user.push_str(&cap_prompt_block(sast, budgets.sast, "SAST digest"));
     }
 
     // Prior-review context (ADR-0040 + ADR-0065): the agent's own prior reviews of this target,
@@ -1237,7 +1338,11 @@ fn build_messages(
     // authoritative. `None` on a first review, so a fresh PR reads exactly as before.
     if let Some(prior) = prior_reviews {
         user.push_str("\n\n");
-        user.push_str(prior);
+        user.push_str(&cap_prompt_block(
+            prior,
+            budgets.priors,
+            "prior-reviews context",
+        ));
     }
 
     // Per-repo feedback memory (M1, ADR-0044): findings rejected (👎) here before — untrusted context,
@@ -1245,14 +1350,22 @@ fn build_messages(
     // reading exactly as before.
     if let Some(memory) = repo_memory {
         user.push_str("\n\n");
-        user.push_str(memory);
+        user.push_str(&cap_prompt_block(
+            memory,
+            budgets.memory,
+            "repo feedback memory",
+        ));
     }
 
     // Repo-native agent instructions (ADR-0036), kept in the user message as untrusted context (it is
     // already labelled and the tool-protocol/mission in the system message stays authoritative).
     if let Some(instructions) = repo_instructions {
         user.push_str("\n\n");
-        user.push_str(instructions);
+        user.push_str(&cap_prompt_block(
+            instructions,
+            budgets.instructions,
+            "repository agent instructions",
+        ));
     }
 
     vec![ChatMessage::system(system), ChatMessage::user(user)]
@@ -1968,6 +2081,114 @@ mod tests {
         assert!(
             !summary.contains("Coverage note"),
             "a finish after real engagement is not amended: {summary}"
+        );
+    }
+
+    // ── Window-proportional prompt budgets (ADR-0070): no window → the absolute ceilings apply
+    // unchanged; a large window → still the ceilings (the share can only shrink); a small window →
+    // proportional shares, floored so a block never loses its framing entirely. ──
+    #[test]
+    fn prompt_budgets_scale_with_the_context_window() {
+        let mut review = review_config("http://unused/v1".to_string());
+
+        // No window configured → legacy behaviour: the ceilings, verbatim.
+        review.context_window = None;
+        let b = PromptBudgets::for_review(&review);
+        assert_eq!(b.diff, review.max_diff_chars);
+        assert_eq!(b.sast, SAST_BLOCK_CHAR_CEIL);
+        assert_eq!(b.priors, PRIORS_BLOCK_CHAR_CEIL);
+        assert_eq!(b.memory, MEMORY_BLOCK_CHAR_CEIL);
+        assert_eq!(b.instructions, INSTRUCTIONS_BLOCK_CHAR_CEIL);
+
+        // A 1M window (today's prod models): every share is far above its ceiling → unchanged.
+        review.context_window = Some(1_048_576);
+        let b = PromptBudgets::for_review(&review);
+        assert_eq!(b.diff, review.max_diff_chars);
+        assert_eq!(b.priors, PRIORS_BLOCK_CHAR_CEIL);
+
+        // A 32k window: diff = 25% of window in chars (32768 * 0.25 * 4 = 32768 < 60k),
+        // priors = 2% (32768 * 0.02 * 4 = 2621 < 8k) — the proportional caps bite.
+        review.context_window = Some(32_768);
+        let b = PromptBudgets::for_review(&review);
+        assert_eq!(b.diff, 32_768, "diff shrinks to 25% of a 32k window");
+        assert_eq!(b.priors, 2_620, "priors shrink to 2% of a 32k window");
+        assert!(b.sast < SAST_BLOCK_CHAR_CEIL && b.memory < MEMORY_BLOCK_CHAR_CEIL);
+
+        // A pathologically tiny window: the floor keeps each block's header + marker viable.
+        review.context_window = Some(1_000);
+        let b = PromptBudgets::for_review(&review);
+        assert_eq!(b.priors, MIN_BLOCK_CHARS, "floored, not nuked");
+        assert_eq!(b.memory, MIN_BLOCK_CHARS);
+        assert_eq!(
+            b.diff, MIN_BLOCK_CHARS,
+            "even the diff floors (the disclosure block then names every unshown file)"
+        );
+    }
+
+    // ── cap_prompt_block: under budget passes through untouched; over budget cuts on a line boundary
+    // and appends an explicit marker (never silent — the #275/ADR-0065 rule), char-safe on UTF-8. ──
+    #[test]
+    fn cap_prompt_block_truncates_on_line_boundary_with_marker() {
+        let small = "## Header\n- a\n- b\n";
+        assert!(matches!(
+            cap_prompt_block(small, 1_000, "x"),
+            std::borrow::Cow::Borrowed(_)
+        ));
+
+        let block = format!("## Header\n{}", "- finding line\n".repeat(100));
+        let capped = cap_prompt_block(&block, 200, "prior-reviews context");
+        assert!(capped.len() < block.len());
+        assert!(
+            capped.contains("truncated to fit the model's context window"),
+            "explicit marker: {capped}"
+        );
+        assert!(
+            capped.contains("of 1510 chars shown"),
+            "marker carries the real size: {capped}"
+        );
+        // The cut landed on a line boundary — no dangling half line before the marker.
+        let before_marker = capped.split("\n… [").next().unwrap();
+        assert!(
+            before_marker.ends_with("- finding line\n") || before_marker.ends_with("## Header\n")
+        );
+
+        // UTF-8: a cut point inside a multibyte char must back up, not panic.
+        let utf8 = "é".repeat(300);
+        let capped = cap_prompt_block(&utf8, 101, "x");
+        assert!(capped.contains("truncated"));
+    }
+
+    // ── build_messages applies the budgets: with a small window a long prior-reviews block is cut with
+    // the marker; with no window it passes through verbatim (legacy). ──
+    #[test]
+    fn build_messages_caps_static_blocks_to_the_window() {
+        let mut review = review_config("http://unused/v1".to_string());
+        // ~5k chars: under the 8k absolute ceiling (so the no-window case passes it through verbatim),
+        // over a small window's 2% share (so the windowed case cuts it).
+        let long_prior = format!(
+            "## Prior automated reviews\n{}",
+            "- [P2] some/file.rs:10 — an earlier finding title\n".repeat(100)
+        );
+
+        review.context_window = None;
+        let msgs = build_messages(&review, "review", None, None, Some(&long_prior), None, None);
+        let user = msgs[1].content.as_deref().unwrap();
+        assert!(
+            user.contains(&long_prior),
+            "no window → the block is injected verbatim"
+        );
+
+        review.context_window = Some(8_192);
+        let msgs = build_messages(&review, "review", None, None, Some(&long_prior), None, None);
+        let user = msgs[1].content.as_deref().unwrap();
+        assert!(
+            !user.contains(&long_prior),
+            "small window → the block was cut"
+        );
+        assert!(
+            user.contains("prior-reviews context truncated to fit the model's context window"),
+            "…and the cut is disclosed: {}",
+            &user[user.len().saturating_sub(400)..]
         );
     }
 

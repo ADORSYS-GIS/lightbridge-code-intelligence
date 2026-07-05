@@ -312,6 +312,17 @@ context — the tool-protocol stays authoritative):
 Prior review and repo memory are formatted control-plane-side (`format_prior_review`,
 `format_repo_memory` in `services/control-plane/src/review.rs`) and passed in via the task context.
 
+Each of these five static blocks is individually bounded on its assembly side (diff `max_diff_chars`;
+SAST `sast.max_findings` one-liners; priors `PRIOR_BLOCK_CHAR_CAP = 8k`; memory `LIMIT 30`;
+instructions `TOTAL_CAP = 32 KiB`). Those constants were tuned for ~1M-token windows, so
+**[ADR-0070](adr/0070-window-proportional-prompt-budgets.md)** makes them window-proportional:
+`PromptBudgets::for_review` gives each block `min(absolute ceiling, share-of-window)` (diff 25%, others
+1–2%), floored at `MIN_BLOCK_CHARS` so a shrunk block keeps its framing. With **no `context_window` set
+the ceilings apply unchanged** (legacy behaviour, and prod's default); a small-window model gets the
+blocks shrunk together and each cut is disclosed with an explicit marker via `cap_prompt_block` (the same
+never-truncate-silently rule as the diff packing #275). No new config — it reuses the ADR-0045
+`context_window` knob.
+
 ### Outcome model (`ReviewOutcome`)
 
 The loop returns a `ReviewOutcome`, distinct from `Err` (which is reserved for a true transport/chat
