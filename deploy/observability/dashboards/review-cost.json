@@ -6,8 +6,8 @@
   "panels": [
     {
       "datasource": {
-        "type": "grafana-postgresql-datasource",
-        "uid": "${DS_POSTGRES}"
+        "type": "loki",
+        "uid": "${DS_LOKI}"
       },
       "fieldConfig": {
         "defaults": {
@@ -26,25 +26,23 @@
       "targets": [
         {
           "datasource": {
-            "type": "grafana-postgresql-datasource",
-            "uid": "${DS_POSTGRES}"
+            "type": "loki",
+            "uid": "${DS_LOKI}"
           },
-          "editorMode": "code",
-          "format": "table",
-          "rawQuery": true,
-          "rawSql": "WITH priced AS (\n  SELECT tr.task_id,\n         coalesce(tr.model, 'unknown')           AS model,\n         coalesce(tr.prompt_tokens, 0)::bigint    AS prompt_tokens,\n         coalesce(tr.completion_tokens, 0)::bigint AS completion_tokens,\n         coalesce(tr.prompt_tokens, 0) / 1e6 * (CASE coalesce(tr.model, 'unknown') WHEN 'adorsys-reviewer' THEN 0.25 WHEN 'adorsys-reviewer-pro' THEN 0.95 ELSE 0 END)\n       + coalesce(tr.completion_tokens, 0) / 1e6 * (CASE coalesce(tr.model, 'unknown') WHEN 'adorsys-reviewer' THEN 1.00 WHEN 'adorsys-reviewer-pro' THEN 3.00 ELSE 0 END) AS cost_usd\n  FROM agent_transcript tr\n  WHERE tr.role = 'assistant'\n) SELECT round(coalesce(sum(p.cost_usd), 0)::numeric, 2) AS cost FROM priced p JOIN tasks t ON t.id = p.task_id LEFT JOIN repositories r ON r.id = t.repository_id WHERE $__timeFilter(t.created_at) AND ('${repo}' = '' OR (r.owner || '/' || r.name) = '${repo}') AND ('${kind}' = 'All' OR t.kind = '${kind}') AND ('${model}' = 'All' OR p.model = '${model}')",
+          "expr": "sum(sum_over_time({service_name=\"envoy-ai-gateway\"} | json | oidc_jti=~\"runid:.+\" | account_id=~\"$repo\" | gen_ai_request_model=~\"$model\" | unwrap gen_ai_usage_custom_total_cost | __error__=\"\" [$__range])) / 1e6",
+          "queryType": "range",
           "refId": "A"
         }
       ],
-      "title": "Total cost (range)",
+      "title": "Billed cost (range)",
       "transformations": [],
       "transparent": false,
       "type": "stat"
     },
     {
       "datasource": {
-        "type": "grafana-postgresql-datasource",
-        "uid": "${DS_POSTGRES}"
+        "type": "loki",
+        "uid": "${DS_LOKI}"
       },
       "fieldConfig": {
         "defaults": {},
@@ -61,13 +59,11 @@
       "targets": [
         {
           "datasource": {
-            "type": "grafana-postgresql-datasource",
-            "uid": "${DS_POSTGRES}"
+            "type": "loki",
+            "uid": "${DS_LOKI}"
           },
-          "editorMode": "code",
-          "format": "table",
-          "rawQuery": true,
-          "rawSql": "WITH priced AS (\n  SELECT tr.task_id,\n         coalesce(tr.model, 'unknown')           AS model,\n         coalesce(tr.prompt_tokens, 0)::bigint    AS prompt_tokens,\n         coalesce(tr.completion_tokens, 0)::bigint AS completion_tokens,\n         coalesce(tr.prompt_tokens, 0) / 1e6 * (CASE coalesce(tr.model, 'unknown') WHEN 'adorsys-reviewer' THEN 0.25 WHEN 'adorsys-reviewer-pro' THEN 0.95 ELSE 0 END)\n       + coalesce(tr.completion_tokens, 0) / 1e6 * (CASE coalesce(tr.model, 'unknown') WHEN 'adorsys-reviewer' THEN 1.00 WHEN 'adorsys-reviewer-pro' THEN 3.00 ELSE 0 END) AS cost_usd\n  FROM agent_transcript tr\n  WHERE tr.role = 'assistant'\n) SELECT count(DISTINCT p.task_id) AS reviews FROM priced p JOIN tasks t ON t.id = p.task_id LEFT JOIN repositories r ON r.id = t.repository_id WHERE $__timeFilter(t.created_at) AND ('${repo}' = '' OR (r.owner || '/' || r.name) = '${repo}') AND ('${kind}' = 'All' OR t.kind = '${kind}') AND ('${model}' = 'All' OR p.model = '${model}')",
+          "expr": "count(sum by (oidc_jti) (count_over_time({service_name=\"envoy-ai-gateway\"} | json | oidc_jti=~\"runid:.+\" | account_id=~\"$repo\" | gen_ai_request_model=~\"$model\" [$__range])))",
+          "queryType": "range",
           "refId": "A"
         }
       ],
@@ -78,8 +74,8 @@
     },
     {
       "datasource": {
-        "type": "grafana-postgresql-datasource",
-        "uid": "${DS_POSTGRES}"
+        "type": "loki",
+        "uid": "${DS_LOKI}"
       },
       "fieldConfig": {
         "defaults": {
@@ -98,13 +94,11 @@
       "targets": [
         {
           "datasource": {
-            "type": "grafana-postgresql-datasource",
-            "uid": "${DS_POSTGRES}"
+            "type": "loki",
+            "uid": "${DS_LOKI}"
           },
-          "editorMode": "code",
-          "format": "table",
-          "rawQuery": true,
-          "rawSql": "WITH priced AS (\n  SELECT tr.task_id,\n         coalesce(tr.model, 'unknown')           AS model,\n         coalesce(tr.prompt_tokens, 0)::bigint    AS prompt_tokens,\n         coalesce(tr.completion_tokens, 0)::bigint AS completion_tokens,\n         coalesce(tr.prompt_tokens, 0) / 1e6 * (CASE coalesce(tr.model, 'unknown') WHEN 'adorsys-reviewer' THEN 0.25 WHEN 'adorsys-reviewer-pro' THEN 0.95 ELSE 0 END)\n       + coalesce(tr.completion_tokens, 0) / 1e6 * (CASE coalesce(tr.model, 'unknown') WHEN 'adorsys-reviewer' THEN 1.00 WHEN 'adorsys-reviewer-pro' THEN 3.00 ELSE 0 END) AS cost_usd\n  FROM agent_transcript tr\n  WHERE tr.role = 'assistant'\n), per_task AS (  SELECT p.task_id, sum(p.cost_usd) AS cost FROM priced p JOIN tasks t ON t.id = p.task_id LEFT JOIN repositories r ON r.id = t.repository_id WHERE $__timeFilter(t.created_at) AND ('${repo}' = '' OR (r.owner || '/' || r.name) = '${repo}') AND ('${kind}' = 'All' OR t.kind = '${kind}') AND ('${model}' = 'All' OR p.model = '${model}') GROUP BY p.task_id) SELECT round(coalesce(avg(cost), 0)::numeric, 4) AS avg_cost FROM per_task",
+          "expr": "(sum(sum_over_time({service_name=\"envoy-ai-gateway\"} | json | oidc_jti=~\"runid:.+\" | account_id=~\"$repo\" | gen_ai_request_model=~\"$model\" | unwrap gen_ai_usage_custom_total_cost | __error__=\"\" [$__range])) / 1e6) / clamp_min(count(sum by (oidc_jti) (count_over_time({service_name=\"envoy-ai-gateway\"} | json | oidc_jti=~\"runid:.+\" | account_id=~\"$repo\" | gen_ai_request_model=~\"$model\" [$__range]))), 1)",
+          "queryType": "range",
           "refId": "A"
         }
       ],
@@ -115,8 +109,8 @@
     },
     {
       "datasource": {
-        "type": "grafana-postgresql-datasource",
-        "uid": "${DS_POSTGRES}"
+        "type": "loki",
+        "uid": "${DS_LOKI}"
       },
       "fieldConfig": {
         "defaults": {},
@@ -133,13 +127,11 @@
       "targets": [
         {
           "datasource": {
-            "type": "grafana-postgresql-datasource",
-            "uid": "${DS_POSTGRES}"
+            "type": "loki",
+            "uid": "${DS_LOKI}"
           },
-          "editorMode": "code",
-          "format": "table",
-          "rawQuery": true,
-          "rawSql": "WITH priced AS (\n  SELECT tr.task_id,\n         coalesce(tr.model, 'unknown')           AS model,\n         coalesce(tr.prompt_tokens, 0)::bigint    AS prompt_tokens,\n         coalesce(tr.completion_tokens, 0)::bigint AS completion_tokens,\n         coalesce(tr.prompt_tokens, 0) / 1e6 * (CASE coalesce(tr.model, 'unknown') WHEN 'adorsys-reviewer' THEN 0.25 WHEN 'adorsys-reviewer-pro' THEN 0.95 ELSE 0 END)\n       + coalesce(tr.completion_tokens, 0) / 1e6 * (CASE coalesce(tr.model, 'unknown') WHEN 'adorsys-reviewer' THEN 1.00 WHEN 'adorsys-reviewer-pro' THEN 3.00 ELSE 0 END) AS cost_usd\n  FROM agent_transcript tr\n  WHERE tr.role = 'assistant'\n) SELECT coalesce(sum(p.prompt_tokens + p.completion_tokens), 0) AS tokens FROM priced p JOIN tasks t ON t.id = p.task_id LEFT JOIN repositories r ON r.id = t.repository_id WHERE $__timeFilter(t.created_at) AND ('${repo}' = '' OR (r.owner || '/' || r.name) = '${repo}') AND ('${kind}' = 'All' OR t.kind = '${kind}') AND ('${model}' = 'All' OR p.model = '${model}')",
+          "expr": "sum(sum_over_time({service_name=\"envoy-ai-gateway\"} | json | oidc_jti=~\"runid:.+\" | account_id=~\"$repo\" | gen_ai_request_model=~\"$model\" | unwrap gen_ai_usage_total_tokens | __error__=\"\" [$__range]))",
+          "queryType": "range",
           "refId": "A"
         }
       ],
@@ -150,11 +142,13 @@
     },
     {
       "datasource": {
-        "type": "grafana-postgresql-datasource",
-        "uid": "${DS_POSTGRES}"
+        "type": "loki",
+        "uid": "${DS_LOKI}"
       },
       "fieldConfig": {
-        "defaults": {},
+        "defaults": {
+          "unit": "currencyUSD"
+        },
         "overrides": []
       },
       "gridPos": {
@@ -168,25 +162,23 @@
       "targets": [
         {
           "datasource": {
-            "type": "grafana-postgresql-datasource",
-            "uid": "${DS_POSTGRES}"
+            "type": "loki",
+            "uid": "${DS_LOKI}"
           },
-          "editorMode": "code",
-          "format": "table",
-          "rawQuery": true,
-          "rawSql": "WITH priced AS (\n  SELECT tr.task_id,\n         coalesce(tr.model, 'unknown')           AS model,\n         coalesce(tr.prompt_tokens, 0)::bigint    AS prompt_tokens,\n         coalesce(tr.completion_tokens, 0)::bigint AS completion_tokens,\n         coalesce(tr.prompt_tokens, 0) / 1e6 * (CASE coalesce(tr.model, 'unknown') WHEN 'adorsys-reviewer' THEN 0.25 WHEN 'adorsys-reviewer-pro' THEN 0.95 ELSE 0 END)\n       + coalesce(tr.completion_tokens, 0) / 1e6 * (CASE coalesce(tr.model, 'unknown') WHEN 'adorsys-reviewer' THEN 1.00 WHEN 'adorsys-reviewer-pro' THEN 3.00 ELSE 0 END) AS cost_usd\n  FROM agent_transcript tr\n  WHERE tr.role = 'assistant'\n), per_task AS (  SELECT p.task_id, p.model,          sum(p.prompt_tokens + p.completion_tokens) AS tokens,          sum(p.cost_usd) AS cost   FROM priced p JOIN tasks t ON t.id = p.task_id   LEFT JOIN repositories r ON r.id = t.repository_id   WHERE $__timeFilter(t.created_at) AND ('${repo}' = '' OR (r.owner || '/' || r.name) = '${repo}') AND ('${kind}' = 'All' OR t.kind = '${kind}') AND ('${model}' = 'All' OR p.model = '${model}')   GROUP BY p.task_id, p.model) SELECT model AS \"model\", count(*) AS \"review-runs\", round(avg(cost)::numeric, 4) AS \"avg $/review\", round((percentile_cont(0.5) WITHIN GROUP (ORDER BY cost))::numeric, 4) AS \"p50 $\", round((percentile_cont(0.95) WITHIN GROUP (ORDER BY cost))::numeric, 4) AS \"p95 $\", round(avg(tokens)::numeric, 0) AS \"avg tokens\", round(sum(cost)::numeric, 2) AS \"total $\" FROM per_task GROUP BY model ORDER BY \"total $\" DESC",
+          "expr": "sum by (gen_ai_request_model) (sum_over_time({service_name=\"envoy-ai-gateway\"} | json | oidc_jti=~\"runid:.+\" | account_id=~\"$repo\" | gen_ai_request_model=~\"$model\" | unwrap gen_ai_usage_custom_total_cost | __error__=\"\" [$__range])) / 1e6",
+          "queryType": "range",
           "refId": "A"
         }
       ],
-      "title": "Cost per review, by model (range)",
+      "title": "Billed cost by model (range)",
       "transformations": [],
       "transparent": false,
       "type": "table"
     },
     {
       "datasource": {
-        "type": "grafana-postgresql-datasource",
-        "uid": "${DS_POSTGRES}"
+        "type": "loki",
+        "uid": "${DS_LOKI}"
       },
       "fieldConfig": {
         "defaults": {
@@ -205,25 +197,23 @@
       "targets": [
         {
           "datasource": {
-            "type": "grafana-postgresql-datasource",
-            "uid": "${DS_POSTGRES}"
+            "type": "loki",
+            "uid": "${DS_LOKI}"
           },
-          "editorMode": "code",
-          "format": "table",
-          "rawQuery": true,
-          "rawSql": "WITH priced AS (\n  SELECT tr.task_id,\n         coalesce(tr.model, 'unknown')           AS model,\n         coalesce(tr.prompt_tokens, 0)::bigint    AS prompt_tokens,\n         coalesce(tr.completion_tokens, 0)::bigint AS completion_tokens,\n         coalesce(tr.prompt_tokens, 0) / 1e6 * (CASE coalesce(tr.model, 'unknown') WHEN 'adorsys-reviewer' THEN 0.25 WHEN 'adorsys-reviewer-pro' THEN 0.95 ELSE 0 END)\n       + coalesce(tr.completion_tokens, 0) / 1e6 * (CASE coalesce(tr.model, 'unknown') WHEN 'adorsys-reviewer' THEN 1.00 WHEN 'adorsys-reviewer-pro' THEN 3.00 ELSE 0 END) AS cost_usd\n  FROM agent_transcript tr\n  WHERE tr.role = 'assistant'\n), per_task AS (  SELECT p.task_id, p.model, sum(p.cost_usd) AS cost   FROM priced p JOIN tasks t ON t.id = p.task_id   LEFT JOIN repositories r ON r.id = t.repository_id   WHERE $__timeFilter(t.created_at) AND ('${repo}' = '' OR (r.owner || '/' || r.name) = '${repo}') AND ('${kind}' = 'All' OR t.kind = '${kind}') AND ('${model}' = 'All' OR p.model = '${model}')   GROUP BY p.task_id, p.model) SELECT model AS metric, round(avg(cost)::numeric, 4) AS value FROM per_task GROUP BY model ORDER BY value DESC",
+          "expr": "sum by (account_id) (sum_over_time({service_name=\"envoy-ai-gateway\"} | json | oidc_jti=~\"runid:.+\" | account_id=~\"$repo\" | gen_ai_request_model=~\"$model\" | unwrap gen_ai_usage_custom_total_cost | __error__=\"\" [$__range])) / 1e6",
+          "queryType": "range",
           "refId": "A"
         }
       ],
-      "title": "Avg cost per review by model (range)",
+      "title": "Billed cost by repository (range)",
       "transformations": [],
       "transparent": false,
       "type": "bargauge"
     },
     {
       "datasource": {
-        "type": "grafana-postgresql-datasource",
-        "uid": "${DS_POSTGRES}"
+        "type": "loki",
+        "uid": "${DS_LOKI}"
       },
       "fieldConfig": {
         "defaults": {
@@ -242,25 +232,23 @@
       "targets": [
         {
           "datasource": {
-            "type": "grafana-postgresql-datasource",
-            "uid": "${DS_POSTGRES}"
+            "type": "loki",
+            "uid": "${DS_LOKI}"
           },
-          "editorMode": "code",
-          "format": "time_series",
-          "rawQuery": true,
-          "rawSql": "WITH priced AS (\n  SELECT tr.task_id,\n         coalesce(tr.model, 'unknown')           AS model,\n         coalesce(tr.prompt_tokens, 0)::bigint    AS prompt_tokens,\n         coalesce(tr.completion_tokens, 0)::bigint AS completion_tokens,\n         coalesce(tr.prompt_tokens, 0) / 1e6 * (CASE coalesce(tr.model, 'unknown') WHEN 'adorsys-reviewer' THEN 0.25 WHEN 'adorsys-reviewer-pro' THEN 0.95 ELSE 0 END)\n       + coalesce(tr.completion_tokens, 0) / 1e6 * (CASE coalesce(tr.model, 'unknown') WHEN 'adorsys-reviewer' THEN 1.00 WHEN 'adorsys-reviewer-pro' THEN 3.00 ELSE 0 END) AS cost_usd\n  FROM agent_transcript tr\n  WHERE tr.role = 'assistant'\n) SELECT $__timeGroupAlias(t.created_at, $__interval), round(sum(p.cost_usd)::numeric, 4) AS \"cost\" FROM priced p JOIN tasks t ON t.id = p.task_id LEFT JOIN repositories r ON r.id = t.repository_id WHERE $__timeFilter(t.created_at) AND ('${repo}' = '' OR (r.owner || '/' || r.name) = '${repo}') AND ('${kind}' = 'All' OR t.kind = '${kind}') AND ('${model}' = 'All' OR p.model = '${model}') GROUP BY 1 ORDER BY 1",
+          "expr": "sum(sum_over_time({service_name=\"envoy-ai-gateway\"} | json | oidc_jti=~\"runid:.+\" | account_id=~\"$repo\" | gen_ai_request_model=~\"$model\" | unwrap gen_ai_usage_custom_total_cost | __error__=\"\" [$__interval])) / 1e6",
+          "queryType": "range",
           "refId": "A"
         }
       ],
-      "title": "Estimated review cost per day",
+      "title": "Billed cost per interval",
       "transformations": [],
       "transparent": false,
       "type": "timeseries"
     },
     {
       "datasource": {
-        "type": "grafana-postgresql-datasource",
-        "uid": "${DS_POSTGRES}"
+        "type": "loki",
+        "uid": "${DS_LOKI}"
       },
       "fieldConfig": {
         "defaults": {
@@ -279,115 +267,50 @@
       "targets": [
         {
           "datasource": {
-            "type": "grafana-postgresql-datasource",
-            "uid": "${DS_POSTGRES}"
+            "type": "loki",
+            "uid": "${DS_LOKI}"
           },
-          "editorMode": "code",
-          "format": "time_series",
-          "rawQuery": true,
-          "rawSql": "WITH priced AS (\n  SELECT tr.task_id,\n         coalesce(tr.model, 'unknown')           AS model,\n         coalesce(tr.prompt_tokens, 0)::bigint    AS prompt_tokens,\n         coalesce(tr.completion_tokens, 0)::bigint AS completion_tokens,\n         coalesce(tr.prompt_tokens, 0) / 1e6 * (CASE coalesce(tr.model, 'unknown') WHEN 'adorsys-reviewer' THEN 0.25 WHEN 'adorsys-reviewer-pro' THEN 0.95 ELSE 0 END)\n       + coalesce(tr.completion_tokens, 0) / 1e6 * (CASE coalesce(tr.model, 'unknown') WHEN 'adorsys-reviewer' THEN 1.00 WHEN 'adorsys-reviewer-pro' THEN 3.00 ELSE 0 END) AS cost_usd\n  FROM agent_transcript tr\n  WHERE tr.role = 'assistant'\n) SELECT $__timeGroupAlias(t.created_at, $__interval), p.model AS \"model\", round(sum(p.cost_usd)::numeric, 4) AS \"cost\" FROM priced p JOIN tasks t ON t.id = p.task_id LEFT JOIN repositories r ON r.id = t.repository_id WHERE $__timeFilter(t.created_at) AND ('${repo}' = '' OR (r.owner || '/' || r.name) = '${repo}') AND ('${kind}' = 'All' OR t.kind = '${kind}') AND ('${model}' = 'All' OR p.model = '${model}') GROUP BY 1, 2 ORDER BY 1",
+          "expr": "sum by (gen_ai_request_model) (sum_over_time({service_name=\"envoy-ai-gateway\"} | json | oidc_jti=~\"runid:.+\" | account_id=~\"$repo\" | gen_ai_request_model=~\"$model\" | unwrap gen_ai_usage_custom_total_cost | __error__=\"\" [$__interval])) / 1e6",
+          "queryType": "range",
           "refId": "A"
         }
       ],
-      "title": "Estimated review cost per day, by model",
+      "title": "Billed cost per interval, by model",
       "transformations": [],
       "transparent": false,
       "type": "timeseries"
     },
     {
       "datasource": {
-        "type": "grafana-postgresql-datasource",
-        "uid": "${DS_POSTGRES}"
+        "type": "loki",
+        "uid": "${DS_LOKI}"
       },
       "fieldConfig": {
-        "defaults": {},
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 24,
-        "x": 0,
-        "y": 20
-      },
-      "options": {
-        "calculate": true,
-        "cellGap": 1,
-        "color": {
-          "exponent": 0,
-          "fill": "",
-          "mode": "scheme",
-          "reverse": false,
-          "scale": "exponential",
-          "scheme": "Oranges",
-          "steps": 64
-        },
-        "exemplars": {
-          "color": "rgba(255,0,255,0.7)"
-        },
-        "filterValues": {
-          "le": 1e-09
-        },
-        "legend": {
-          "show": true
-        },
-        "showValue": "auto",
-        "tooltip": {
-          "show": false
-        },
-        "yAxis": {
+        "defaults": {
           "unit": "currencyUSD"
-        }
-      },
-      "repeatDirection": "h",
-      "targets": [
-        {
-          "datasource": {
-            "type": "grafana-postgresql-datasource",
-            "uid": "${DS_POSTGRES}"
-          },
-          "editorMode": "code",
-          "format": "time_series",
-          "rawQuery": true,
-          "rawSql": "WITH priced AS (\n  SELECT tr.task_id,\n         coalesce(tr.model, 'unknown')           AS model,\n         coalesce(tr.prompt_tokens, 0)::bigint    AS prompt_tokens,\n         coalesce(tr.completion_tokens, 0)::bigint AS completion_tokens,\n         coalesce(tr.prompt_tokens, 0) / 1e6 * (CASE coalesce(tr.model, 'unknown') WHEN 'adorsys-reviewer' THEN 0.25 WHEN 'adorsys-reviewer-pro' THEN 0.95 ELSE 0 END)\n       + coalesce(tr.completion_tokens, 0) / 1e6 * (CASE coalesce(tr.model, 'unknown') WHEN 'adorsys-reviewer' THEN 1.00 WHEN 'adorsys-reviewer-pro' THEN 3.00 ELSE 0 END) AS cost_usd\n  FROM agent_transcript tr\n  WHERE tr.role = 'assistant'\n), per_task AS (  SELECT t.id, t.created_at, sum(p.cost_usd) AS cost   FROM priced p JOIN tasks t ON t.id = p.task_id   LEFT JOIN repositories r ON r.id = t.repository_id   WHERE $__timeFilter(t.created_at) AND ('${repo}' = '' OR (r.owner || '/' || r.name) = '${repo}') AND ('${kind}' = 'All' OR t.kind = '${kind}') AND ('${model}' = 'All' OR p.model = '${model}')   GROUP BY t.id, t.created_at) SELECT created_at AS \"time\", cost FROM per_task ORDER BY 1",
-          "refId": "A"
-        }
-      ],
-      "title": "Per-review cost distribution over time",
-      "transformations": [],
-      "transparent": false,
-      "type": "heatmap"
-    },
-    {
-      "datasource": {
-        "type": "grafana-postgresql-datasource",
-        "uid": "${DS_POSTGRES}"
-      },
-      "fieldConfig": {
-        "defaults": {},
+        },
         "overrides": []
       },
       "gridPos": {
         "h": 12,
         "w": 24,
         "x": 0,
-        "y": 28
+        "y": 20
       },
       "options": null,
       "repeatDirection": "h",
       "targets": [
         {
           "datasource": {
-            "type": "grafana-postgresql-datasource",
-            "uid": "${DS_POSTGRES}"
+            "type": "loki",
+            "uid": "${DS_LOKI}"
           },
-          "editorMode": "code",
-          "format": "table",
-          "rawQuery": true,
-          "rawSql": "WITH priced AS (\n  SELECT tr.task_id,\n         coalesce(tr.model, 'unknown')           AS model,\n         coalesce(tr.prompt_tokens, 0)::bigint    AS prompt_tokens,\n         coalesce(tr.completion_tokens, 0)::bigint AS completion_tokens,\n         coalesce(tr.prompt_tokens, 0) / 1e6 * (CASE coalesce(tr.model, 'unknown') WHEN 'adorsys-reviewer' THEN 0.25 WHEN 'adorsys-reviewer-pro' THEN 0.95 ELSE 0 END)\n       + coalesce(tr.completion_tokens, 0) / 1e6 * (CASE coalesce(tr.model, 'unknown') WHEN 'adorsys-reviewer' THEN 1.00 WHEN 'adorsys-reviewer-pro' THEN 3.00 ELSE 0 END) AS cost_usd\n  FROM agent_transcript tr\n  WHERE tr.role = 'assistant'\n) SELECT t.created_at AS \"created\", coalesce(r.owner || '/' || r.name, t.repository_id::text) AS \"repository\", t.target_type AS \"target\", t.target_id AS \"number\", t.kind AS \"kind\", t.status AS \"status\", round(extract(epoch FROM (t.completed_at - t.started_at))::numeric, 1)   AS \"duration_s\", string_agg(DISTINCT p.model, ', ') AS \"model\", sum(p.prompt_tokens) AS \"prompt_tokens\", sum(p.completion_tokens) AS \"completion_tokens\", sum(p.prompt_tokens + p.completion_tokens) AS \"total_tokens\", round(sum(p.cost_usd)::numeric, 4) AS \"cost_usd\" FROM tasks t JOIN priced p ON p.task_id = t.id LEFT JOIN repositories r ON r.id = t.repository_id WHERE $__timeFilter(t.created_at) AND ('${repo}' = '' OR (r.owner || '/' || r.name) = '${repo}') AND ('${kind}' = 'All' OR t.kind = '${kind}') AND ('${model}' = 'All' OR p.model = '${model}') GROUP BY t.id, r.owner, r.name, t.repository_id, t.created_at, t.target_type, t.target_id, t.kind, t.status, t.completed_at, t.started_at ORDER BY t.created_at DESC, t.id DESC LIMIT 500",
+          "expr": "topk(500, sum by (oidc_jti, account_id, gen_ai_request_model) (sum_over_time({service_name=\"envoy-ai-gateway\"} | json | oidc_jti=~\"runid:.+\" | account_id=~\"$repo\" | gen_ai_request_model=~\"$model\" | unwrap gen_ai_usage_custom_total_cost | __error__=\"\" [$__range])) / 1e6)",
+          "queryType": "range",
           "refId": "A"
         }
       ],
-      "title": "Review tasks \u00d7 cost (range)",
+      "title": "Review runs \u00d7 billed cost (range)",
       "transformations": [],
       "transparent": false,
       "type": "table"
@@ -417,7 +340,7 @@
         "label": "Repository",
         "multi": false,
         "name": "repo",
-        "query": "SELECT __text, __value FROM (  SELECT 'All' AS __text, '' AS __value, 0 AS ord   UNION ALL   SELECT owner || '/' || name AS __text, owner || '/' || name AS __value, 1 AS ord   FROM repositories) t ORDER BY ord, __text",
+        "query": "SELECT __text, __value FROM (  SELECT 'All' AS __text, '.+' AS __value, 0 AS ord   UNION ALL   SELECT owner || '/' || name AS __text, owner || '/' || name AS __value, 1 AS ord   FROM repositories) t ORDER BY ord, __text",
         "skipUrlSync": false,
         "type": "query"
       },
@@ -435,23 +358,9 @@
         "label": "Model",
         "multi": false,
         "name": "model",
-        "query": "SELECT __text, __value FROM (  SELECT 'All' AS __text, 'All' AS __value, 0 AS ord   UNION ALL   SELECT DISTINCT coalesce(model, 'unknown') AS __text,          coalesce(model, 'unknown') AS __value, 1 AS ord   FROM agent_transcript WHERE role = 'assistant') t ORDER BY ord, __text",
+        "query": "SELECT __text, __value FROM (  SELECT 'All' AS __text, '.+' AS __value, 0 AS ord   UNION ALL   SELECT DISTINCT coalesce(model, 'unknown') AS __text,          coalesce(model, 'unknown') AS __value, 1 AS ord   FROM agent_transcript WHERE role = 'assistant' AND model IS NOT NULL) t ORDER BY ord, __text",
         "skipUrlSync": false,
         "type": "query"
-      },
-      {
-        "auto": false,
-        "auto_count": 30,
-        "auto_min": "10s",
-        "hide": 0,
-        "id": "00000000-0000-0000-0000-000000000000",
-        "includeAll": false,
-        "label": "Kind",
-        "multi": false,
-        "name": "kind",
-        "query": "All,review,ask",
-        "skipUrlSync": false,
-        "type": "custom"
       }
     ]
   },
