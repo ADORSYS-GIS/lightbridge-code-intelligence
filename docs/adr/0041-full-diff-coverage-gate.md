@@ -1,6 +1,6 @@
 # ADR-0041: A full-diff coverage gate before wind-down
 
-- **Status:** Accepted
+- **Status:** Accepted (bounce semantics refined by [ADR-0069](0069-review-tier-minimum-model-capability.md): bounce-once → capped re-bounces + coverage disclosure, after a weak model gamed the one-shot bounce)
 - **Date:** 2026-06-23
 - **Deciders:** @stephane-segning
 
