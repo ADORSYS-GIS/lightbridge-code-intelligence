@@ -57,6 +57,15 @@ pub const DEFAULT_MAX_FILES_READ: usize = 30;
 pub const DEFAULT_MAX_SEARCHES: usize = 15;
 pub const DEFAULT_MAX_BATCHES: usize = 6;
 
+/// Default ceiling on coverage-gate bounces (ADR-0069, run bac4b5d8). The gate re-bounces an early
+/// `finish` while changed files remain un-engaged, up to this cap — bounded so a model that will never
+/// comply can't burn the budget arguing with the gate; whatever gets through incomplete carries a
+/// coverage disclosure on the posted summary. Semantics of the knob (`review.<tier>.max_coverage_bounces`
+/// / `LLM_MAX_COVERAGE_BOUNCES`): **`0` disables the bounce entirely** (the disclosure still applies),
+/// `1` restores the pre-ADR-0069 bounce-once behaviour, higher values push a lazy model harder.
+/// Deliberately NOT clamped to ≥1 — unlike the read budgets, zero is a meaningful setting here.
+pub const DEFAULT_MAX_COVERAGE_BOUNCES: usize = 3;
+
 /// SAST (opengrep) defaults (ADR-0061). The whole feature is **opt-in** (default disabled) so the
 /// rollout is image-then-config: an existing deploy without the opengrep-bearing image is unaffected.
 pub const DEFAULT_SAST_BIN: &str = "opengrep";
@@ -171,6 +180,10 @@ pub struct ReviewFile {
     pub max_searches: Option<usize>,
     #[serde(default, deserialize_with = "lightbridge_config::de::opt_usize")]
     pub max_batches: Option<usize>,
+    /// Coverage-gate bounce cap (ADR-0069). Unset = [`DEFAULT_MAX_COVERAGE_BOUNCES`]; `0` disables the
+    /// bounce (the coverage disclosure still applies), `1` = legacy bounce-once.
+    #[serde(default, deserialize_with = "lightbridge_config::de::opt_usize")]
+    pub max_coverage_bounces: Option<usize>,
     /// Model context window in tokens (ADR-0045). When set, the agent budgets its conversation against
     /// it — winding down before overflow and trimming old tool output — instead of failing a 400 when
     /// the history grows too large. Unset = no budgeting (unchanged behaviour).
@@ -470,6 +483,11 @@ pub struct ReviewConfig {
     pub max_files_read: usize,
     pub max_searches: usize,
     pub max_batches: usize,
+    /// Coverage-gate bounce cap (ADR-0069): how many times an early `finish` with un-engaged changed
+    /// files is bounced before it goes through (with a coverage disclosure). From
+    /// `review.max_coverage_bounces` (or `LLM_MAX_COVERAGE_BOUNCES`) or
+    /// [`DEFAULT_MAX_COVERAGE_BOUNCES`]. `0` disables the bounce; NOT clamped — zero is meaningful.
+    pub max_coverage_bounces: usize,
     /// Model context window in tokens (ADR-0045). `Some(n)` enables conversation budgeting: the loop
     /// winds down + trims old tool output as the estimate nears `n`, and finalizes (never discards
     /// findings) on an overflow error. `None` = no budgeting. From `review.context_window` /
@@ -599,6 +617,10 @@ impl ReviewConfig {
                 .map(|n| n as usize)
                 .unwrap_or(DEFAULT_MAX_BATCHES)
                 .max(1),
+            // Deliberately unclamped: 0 = bounce disabled (ADR-0069).
+            max_coverage_bounces: parse_env_u64("LLM_MAX_COVERAGE_BOUNCES")
+                .map(|n| n as usize)
+                .unwrap_or(DEFAULT_MAX_COVERAGE_BOUNCES),
             context_window: parse_env_u64("LLM_CONTEXT_WINDOW")
                 .map(|n| n as usize)
                 .filter(|&n| n > 0),
@@ -714,6 +736,11 @@ impl ReviewConfig {
                 .or_else(|| parse_env_u64("LLM_MAX_BATCHES").map(|n| n as usize))
                 .unwrap_or(DEFAULT_MAX_BATCHES)
                 .max(1),
+            // Deliberately unclamped: 0 = bounce disabled (ADR-0069).
+            max_coverage_bounces: r
+                .max_coverage_bounces
+                .or_else(|| parse_env_u64("LLM_MAX_COVERAGE_BOUNCES").map(|n| n as usize))
+                .unwrap_or(DEFAULT_MAX_COVERAGE_BOUNCES),
             context_window,
             temperature,
             top_p,
@@ -803,6 +830,7 @@ impl ReviewConfig {
             "max_files_read": self.max_files_read,
             "max_searches": self.max_searches,
             "max_batches": self.max_batches,
+            "max_coverage_bounces": self.max_coverage_bounces,
             "context_window": self.context_window,
             "temperature": self.temperature,
             "top_p": self.top_p,
@@ -1111,6 +1139,7 @@ mod tests {
                 max_files_read: None,
                 max_searches: None,
                 max_batches: None,
+                max_coverage_bounces: None,
                 context_window: None,
                 stream: None,
                 fast: None,
@@ -1156,6 +1185,8 @@ mod tests {
                 max_files_read: Some(0),
                 max_searches: Some(0),
                 max_batches: Some(0),
+                // NOT clamped, unlike the budgets above: 0 = coverage bounce disabled (ADR-0069).
+                max_coverage_bounces: Some(0),
                 // A 0 context window is meaningless — it must resolve to "disabled" (None), not a
                 // window of zero that would force wind-down on turn 0 (ADR-0045).
                 context_window: Some(0),
@@ -1177,6 +1208,10 @@ mod tests {
         assert_eq!(cfg.max_files_read, 1, "max_files_read clamped");
         assert_eq!(cfg.max_searches, 1, "max_searches clamped");
         assert_eq!(cfg.max_batches, 1, "max_batches clamped");
+        assert_eq!(
+            cfg.max_coverage_bounces, 0,
+            "max_coverage_bounces is NOT clamped — 0 disables the coverage bounce (ADR-0069)"
+        );
         std::fs::remove_file(&prompt).ok();
     }
 
@@ -1201,6 +1236,7 @@ mod tests {
             max_files_read: None,
             max_searches: None,
             max_batches: None,
+            max_coverage_bounces: None,
             context_window: None,
             stream: None,
             fast: None,
@@ -1474,6 +1510,7 @@ mod tests {
             max_files_read: 50,
             max_searches: 30,
             max_batches: 12,
+            max_coverage_bounces: DEFAULT_MAX_COVERAGE_BOUNCES,
             context_window: Some(128_000),
             temperature: Some(0.2),
             top_p: None,

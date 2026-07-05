@@ -57,9 +57,13 @@ Operational rules:
 Implemented in `services/agent-runner/src/review/native/agent.rs`:
 
 - **Bounce with a cap, not once.** An early `finish` with un-engaged changed files is bounced up to
-  `MAX_COVERAGE_BOUNCES = 3` times (still pre-wind-down only, still skipped for fast). A re-`finish`
-  with **zero new engagement** since the last bounce is detected (`engaged_at_last_bounce`) and gets
-  a harsher nudge that names the failure: *claiming these files were reviewed would be false*.
+  `review.<tier>.max_coverage_bounces` times (still pre-wind-down only, still skipped for fast). The
+  cap is an **operator knob** (`DEFAULT_MAX_COVERAGE_BOUNCES = 3`; env `LLM_MAX_COVERAGE_BOUNCES`;
+  ai-helm values `config.model.<tier>.maxCoverageBounces`): **`0` disables the bounce entirely** (the
+  disclosure below still applies), `1` restores the pre-ADR-0069 bounce-once behaviour — deliberately
+  unclamped, unlike the read budgets, because zero is meaningful here. A re-`finish` with **zero new
+  engagement** since the last bounce is detected (`engaged_at_last_bounce`) and gets a harsher nudge
+  that names the failure: *claiming these files were reviewed would be false*.
 - **No escape hatch in the nudge.** The "call `finish` again now" sentence is gone. The honest way
   out for a genuinely un-reviewable file (lockfile, generated artifact) is to **name it as NOT
   reviewed in the final summary** — disclosure, not a claim.

@@ -261,7 +261,8 @@ Convergence levers (deep tier; the fast tier skips the investigation-oriented nu
 - **Full-diff coverage gate** ([ADR-0041](adr/0041-full-diff-coverage-gate.md), hardened by
   [ADR-0069](adr/0069-review-tier-minimum-model-capability.md)): an early `finish` (before wind-down)
   with changed files the agent never opened or commented on is **bounced with the explicit
-  uncovered-file list, up to `MAX_COVERAGE_BOUNCES = 3` times**, so one run accounts for the whole
+  uncovered-file list, up to `review.<tier>.max_coverage_bounces` times** (default 3; `0` disables
+  the bounce, `1` = the legacy bounce-once), so one run accounts for the whole
   change instead of finding one issue and stopping (two runs on the same PR each found a different
   real P1). A re-`finish` with zero new engagement since the last bounce gets a harsher nudge naming
   the fabrication, and a finish that ultimately goes through incomplete (cap hit, or the wind-down

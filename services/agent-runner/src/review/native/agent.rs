@@ -82,16 +82,14 @@ const WINDDOWN_MIN_TURNS: usize = 2;
 /// (if set) lowers this; this caps it so an unset fast block can't inherit the generous default (40).
 const FAST_TIER_MAX_TURNS: usize = 5;
 
-/// Coverage-gate bounce ceiling (run bac4b5d8, vymalo-shop#422). The gate used to bounce an early
-/// `finish` exactly once and let the next one through unconditionally — an honor system built for a
-/// strong model that treats the bounce as an instruction to go read. A weak model on the deep tier
-/// (flash-lite) instead re-finished 2 seconds later with ZERO reads, parroting the bounce message's
-/// own file list back as "I have thoroughly reviewed …". So the gate now re-bounces while changed
-/// files remain un-engaged, up to this cap — bounded so a model that will never comply can't burn the
-/// whole budget arguing with the gate. A finish that gets through with files still un-engaged carries
-/// a coverage disclosure appended to the posted summary (see [`coverage_disclosure`]), so a
-/// rubber-stamp is at least visibly labeled as one.
-const MAX_COVERAGE_BOUNCES: usize = 3;
+// Coverage-gate bounce ceiling (run bac4b5d8, vymalo-shop#422): the gate used to bounce an early
+// `finish` exactly once and let the next one through unconditionally — an honor system a weak model
+// gamed by re-finishing with zero reads, parroting the bounce message's own file list back as
+// "thoroughly reviewed". It now re-bounces while changed files remain un-engaged, up to
+// `review.max_coverage_bounces` (ADR-0069; default `DEFAULT_MAX_COVERAGE_BOUNCES`, `0` disables the
+// bounce, `1` = the legacy behaviour) — bounded so a model that will never comply can't burn the
+// budget arguing with the gate. A finish that gets through with files still un-engaged carries a
+// coverage disclosure appended to the posted summary (see `coverage_disclosure`).
 
 /// Default cap on how many chars of a turn's `reasoning_content` we echo to the live log. Generous on
 /// purpose: a heavy reasoner (GLM-5.2) emits thousands of chars per turn and the old 600-char cap hid
@@ -492,7 +490,7 @@ pub async fn run_native_agent(
     // finding on) and, while it tries to `finish` before the wind-down boundary with changed files still
     // untouched, bounce it with the explicit list so it accounts for the whole change across all
     // dimensions before converging. Gated to pre-wind-down so it never fights the #173 convergence tail,
-    // and capped at MAX_COVERAGE_BOUNCES (run bac4b5d8: bounce-once let a weak model re-finish with zero
+    // and capped at `review.max_coverage_bounces` (ADR-0069, default 3, 0 disables; run bac4b5d8: bounce-once let a weak model re-finish with zero
     // reads and fabricate coverage from the bounce message's file list). `engaged_at_last_bounce` tells a
     // stalled re-finish (no new engagement since the last bounce) apart from honest partial progress, so
     // the re-bounce message can call the fabrication out by name. `finish_summary` keeps the last summary
@@ -1039,7 +1037,7 @@ pub async fn run_native_agent(
             // there, so this can't reopen the rabbit-hole the wind-down exists to close.
             // The FAST tier (ADR-0062) is a single diff-only turn — no coverage bounce (it would waste
             // the only turn and never finalize). The deep run still enforces full-diff coverage.
-            // Bounces repeat up to MAX_COVERAGE_BOUNCES: a bounce-once gate was an honor system a weak
+            // Bounces repeat up to `review.max_coverage_bounces` (default 3, 0 disables, 1 = legacy once): a bounce-once gate was an honor system a weak
             // model gamed by re-finishing with zero reads and claiming coverage it never did, quoting
             // the bounce's own file list (run bac4b5d8, vymalo-shop#422). A stalled re-finish (no new
             // engagement since the last bounce) gets the harsher nudge that names the fabrication.
@@ -1049,7 +1047,7 @@ pub async fn run_native_agent(
                     .map(String::as_str)
                     .collect();
                 uncovered.sort_unstable();
-                if !uncovered.is_empty() && coverage_bounces < MAX_COVERAGE_BOUNCES {
+                if !uncovered.is_empty() && coverage_bounces < review.max_coverage_bounces {
                     let stalled =
                         coverage_bounces > 0 && engaged_files.len() == engaged_at_last_bounce;
                     coverage_bounces += 1;
@@ -1536,6 +1534,7 @@ mod tests {
             max_files_read: crate::bootstrap::config::DEFAULT_MAX_FILES_READ,
             max_searches: crate::bootstrap::config::DEFAULT_MAX_SEARCHES,
             max_batches: crate::bootstrap::config::DEFAULT_MAX_BATCHES,
+            max_coverage_bounces: crate::bootstrap::config::DEFAULT_MAX_COVERAGE_BOUNCES,
             context_window: None,
             temperature: None,
             top_p: None,
@@ -1795,16 +1794,20 @@ mod tests {
     }
 
     // ── Coverage gate (B, #137; hardened after run bac4b5d8): an early `finish` with a changed file
-    // never engaged is bounced repeatedly up to MAX_COVERAGE_BOUNCES; a model that complies after a
+    // never engaged is bounced repeatedly up to `review.max_coverage_bounces` (default 3); a model that complies after a
     // bounce finishes without further bounces, and a model that never complies gets through only at
     // the cap — with a coverage disclosure appended to the posted summary. Shares the Script counter
     // so we can assert on the round-trip count. ──
     #[tokio::test]
     async fn coverage_gate_bounces_early_finish_then_finishes() {
-        // Drives the loop with `responses` against a diff touching `files`; returns the chat
-        // round-trip count and the LAST summary body posted to the control plane (what finalize
-        // would render into the PR review).
-        async fn run(files: Vec<String>, responses: Vec<serde_json::Value>) -> (usize, String) {
+        // Drives the loop with `responses` against a diff touching `files` at the given bounce cap;
+        // returns the chat round-trip count and the LAST summary body posted to the control plane
+        // (what finalize would render into the PR review).
+        async fn run(
+            files: Vec<String>,
+            responses: Vec<serde_json::Value>,
+            max_coverage_bounces: usize,
+        ) -> (usize, String) {
             let calls = Arc::new(AtomicUsize::new(0));
             let chat = MockServer::start().await;
             Mock::given(method("POST"))
@@ -1825,7 +1828,8 @@ mod tests {
                     .await;
             }
 
-            let review = review_config(format!("{}/v1", chat.uri()));
+            let mut review = review_config(format!("{}/v1", chat.uri()));
+            review.max_coverage_bounces = max_coverage_bounces;
             let cpc = ControlPlaneClient::new(cp.uri(), "tok");
             let embc = EmbeddingsClient::new("http://unused", "key", "model");
             let diff = PrDiff {
@@ -1875,15 +1879,16 @@ mod tests {
         );
 
         // The bac4b5d8 pattern: the model re-finishes after every bounce without engaging anything.
-        // Bounced MAX_COVERAGE_BOUNCES (3) times (the Script repeats its last entry), then the finish
-        // goes through — with the coverage disclosure amended onto the posted summary so the
-        // rubber-stamp is labeled as one.
+        // Bounced max_coverage_bounces (3, the default) times (the Script repeats its last entry),
+        // then the finish goes through — with the coverage disclosure amended onto the posted
+        // summary so the rubber-stamp is labeled as one.
         let (calls, summary) = run(
             vec!["a.rs".to_string(), "b.rs".to_string()],
             vec![
                 finding_a.clone(),
                 tool_call_reply("finish", r#"{"summary":"done"}"#),
             ],
+            crate::bootstrap::config::DEFAULT_MAX_COVERAGE_BOUNCES,
         )
         .await;
         assert_eq!(calls, 5, "1 finding turn + 3 bounced finishes + 1 accepted");
@@ -1900,12 +1905,47 @@ mod tests {
                 finding_a.clone(),
                 tool_call_reply("finish", r#"{"summary":"done"}"#),
             ],
+            crate::bootstrap::config::DEFAULT_MAX_COVERAGE_BOUNCES,
         )
         .await;
         assert_eq!(calls, 2, "no bounce when the whole change is covered");
         assert!(
             !summary.contains("Coverage note"),
             "a fully-covered finish is not amended: {summary}"
+        );
+
+        // The knob (ADR-0069): `1` restores the legacy bounce-once behaviour — one bounce, the lazy
+        // re-finish goes through, but still labeled with the disclosure.
+        let (calls, summary) = run(
+            vec!["a.rs".to_string(), "b.rs".to_string()],
+            vec![
+                finding_a.clone(),
+                tool_call_reply("finish", r#"{"summary":"done"}"#),
+            ],
+            1,
+        )
+        .await;
+        assert_eq!(calls, 3, "cap 1 = legacy bounce-once");
+        assert!(
+            summary.contains("examined 1 of 2 changed files"),
+            "an incomplete finish is disclosed regardless of the cap: {summary}"
+        );
+
+        // `0` disables the bounce entirely — the first finish goes straight through, and the
+        // disclosure is the only remaining honesty layer.
+        let (calls, summary) = run(
+            vec!["a.rs".to_string(), "b.rs".to_string()],
+            vec![
+                finding_a.clone(),
+                tool_call_reply("finish", r#"{"summary":"done"}"#),
+            ],
+            0,
+        )
+        .await;
+        assert_eq!(calls, 2, "cap 0 = no bounce at all");
+        assert!(
+            summary.contains("examined 1 of 2 changed files"),
+            "the disclosure still fires with the bounce disabled: {summary}"
         );
 
         // The compliant path: after one bounce the model engages the remaining file, then finishes —
@@ -1921,6 +1961,7 @@ mod tests {
                 ),
                 tool_call_reply("finish", r#"{"summary":"done after reviewing the rest"}"#),
             ],
+            crate::bootstrap::config::DEFAULT_MAX_COVERAGE_BOUNCES,
         )
         .await;
         assert_eq!(calls, 4, "one bounce, then the engaged finish goes through");
@@ -3362,7 +3403,7 @@ mod tests {
                     "lightbridge_vector_semantic_search",
                     r#"{"query":"the removed validateToken helper"}"#,
                 ),
-                // The coverage gate bounces the finish up to MAX_COVERAGE_BOUNCES times (a.rs never
+                // The coverage gate bounces the finish up to review.max_coverage_bounces (default 3) times (a.rs never
                 // engaged) before letting it through with a coverage disclosure. Script repeats the
                 // last entry, so a single `finish` here suffices.
                 tool_call_reply("finish", r#"{"summary":"Reviewed; nothing actionable."}"#),
