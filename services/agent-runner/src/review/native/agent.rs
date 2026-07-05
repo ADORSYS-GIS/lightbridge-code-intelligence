@@ -1226,11 +1226,16 @@ fn cap_prompt_block<'a>(block: &'a str, budget: usize, label: &str) -> std::borr
     if block.len() <= budget {
         return std::borrow::Cow::Borrowed(block);
     }
+    // `truncate_on_boundary` already walks back to a valid UTF-8 char boundary, so the byte slice below
+    // never splits a multi-byte char (and `\n` is single-byte ASCII, so `[..=i]` stays on a boundary).
     let cut = truncate_on_boundary(block, budget);
-    // Prefer a line boundary so the cut never leaves half a finding/sentence dangling.
+    // Prefer a line boundary so the cut never leaves half a finding/sentence dangling — but only when
+    // it keeps most of the budget. A block with sparse newlines (e.g. one giant line) could otherwise
+    // have its last `\n` near the start, throwing away nearly the whole budget; below the halfway mark
+    // we keep the full char-safe cut instead (gemini review on #280).
     let cut = match cut.rfind('\n') {
-        Some(i) => &cut[..=i],
-        None => cut,
+        Some(i) if i >= budget / 2 => &cut[..=i],
+        _ => cut,
     };
     std::borrow::Cow::Owned(format!(
         "{cut}\n… [{label} truncated to fit the model's context window — {} of {} chars shown]\n",
@@ -2156,6 +2161,17 @@ mod tests {
         let utf8 = "é".repeat(300);
         let capped = cap_prompt_block(&utf8, 101, "x");
         assert!(capped.contains("truncated"));
+
+        // Sparse newlines: a `\n` near the START must NOT collapse the block to almost nothing —
+        // below the halfway mark we keep the full char-safe cut instead (gemini review on #280).
+        let sparse = format!("x\n{}", "y".repeat(500)); // only newline at byte 1
+        let capped = cap_prompt_block(&sparse, 200, "x");
+        let shown = capped.split("\n… [").next().unwrap();
+        assert!(
+            shown.len() > 100,
+            "a near-start newline must not throw away the budget: kept {} chars",
+            shown.len()
+        );
     }
 
     // ── build_messages applies the budgets: with a small window a long prior-reviews block is cut with
