@@ -82,6 +82,15 @@ const WINDDOWN_MIN_TURNS: usize = 2;
 /// (if set) lowers this; this caps it so an unset fast block can't inherit the generous default (40).
 const FAST_TIER_MAX_TURNS: usize = 5;
 
+// Coverage-gate bounce ceiling (run bac4b5d8, vymalo-shop#422): the gate used to bounce an early
+// `finish` exactly once and let the next one through unconditionally — an honor system a weak model
+// gamed by re-finishing with zero reads, parroting the bounce message's own file list back as
+// "thoroughly reviewed". It now re-bounces while changed files remain un-engaged, up to
+// `review.max_coverage_bounces` (ADR-0069; default `DEFAULT_MAX_COVERAGE_BOUNCES`, `0` disables the
+// bounce, `1` = the legacy behaviour) — bounded so a model that will never comply can't burn the
+// budget arguing with the gate. A finish that gets through with files still un-engaged carries a
+// coverage disclosure appended to the posted summary (see `coverage_disclosure`).
+
 /// Default cap on how many chars of a turn's `reasoning_content` we echo to the live log. Generous on
 /// purpose: a heavy reasoner (GLM-5.2) emits thousands of chars per turn and the old 600-char cap hid
 /// "how far it thinks". Override with the `REASONING_LOG_CHARS` env (`0` = unbounded).
@@ -478,15 +487,21 @@ pub async fn run_native_agent(
     // Full-diff coverage gate (B, #137). The whole diff is in the prompt, but a run tends to find ONE
     // issue and `finish` — two runs on the same PR each surfaced a *different* real P1 (see ADR-0041).
     // We track which changed files the agent has actually engaged (opened with `read_file` or recorded a
-    // finding on) and, the FIRST time it tries to `finish` before the wind-down boundary with changed
-    // files still untouched, bounce it once with the explicit list so it accounts for the whole change
-    // across all dimensions before converging. Gated to pre-wind-down so it never fights the #173
-    // convergence tail, and bounce-once so it costs at most a single extra turn.
+    // finding on) and, while it tries to `finish` before the wind-down boundary with changed files still
+    // untouched, bounce it with the explicit list so it accounts for the whole change across all
+    // dimensions before converging. Gated to pre-wind-down so it never fights the #173 convergence tail,
+    // and capped at `review.max_coverage_bounces` (ADR-0069, default 3, 0 disables; run bac4b5d8: bounce-once let a weak model re-finish with zero
+    // reads and fabricate coverage from the bounce message's file list). `engaged_at_last_bounce` tells a
+    // stalled re-finish (no new engagement since the last bounce) apart from honest partial progress, so
+    // the re-bounce message can call the fabrication out by name. `finish_summary` keeps the last summary
+    // the model recorded, so an accepted-but-incomplete finish can be amended with a coverage disclosure.
     let changed_files: HashSet<String> = diff
         .map(|d| d.files.iter().map(|f| normalize_repo_path(f)).collect())
         .unwrap_or_default();
     let mut engaged_files: HashSet<String> = HashSet::new();
-    let mut coverage_bounced = false;
+    let mut coverage_bounces = 0usize;
+    let mut engaged_at_last_bounce = 0usize;
+    let mut finish_summary: Option<String> = None;
 
     // Refute pass (Phase 2, ADR-0043): the quality gap is confidently-wrong P0/P1s. Before the first
     // `finish`, if any P0/P1 finding was recorded, bounce once to force the model to re-verify each
@@ -922,7 +937,15 @@ pub async fn run_native_agent(
                 }
             };
             match outcome {
-                ToolOutcome::Finish => should_finish = true,
+                ToolOutcome::Finish => {
+                    should_finish = true;
+                    // Keep the recorded summary so a finish that goes through with changed files never
+                    // engaged can be amended with a coverage disclosure (the control-plane summary
+                    // endpoint is a last-write-wins upsert, so re-posting overwrites cleanly).
+                    if let Some(s) = arg_field(&call.function.arguments, "summary") {
+                        finish_summary = Some(s);
+                    }
+                }
                 ToolOutcome::Abort(reason) => abort_reason = Some(reason),
                 ToolOutcome::Continue(result) => {
                     // Count successful inline findings so we know when to nudge the model toward
@@ -1008,29 +1031,38 @@ pub async fn run_native_agent(
         }
         if should_finish {
             // Full-diff coverage gate (B, #137): if the model wants to finish early (before the
-            // wind-down tail) with changed files it never opened or commented on, bounce it ONCE with
-            // the explicit list so a single run accounts for the whole change instead of finding one
-            // issue and stopping. After the wind-down boundary the #173 convergence wins — we never
-            // bounce there, so this can't reopen the rabbit-hole the wind-down exists to close.
+            // wind-down tail) with changed files it never opened or commented on, bounce it with the
+            // explicit list so a single run accounts for the whole change instead of finding one issue
+            // and stopping. After the wind-down boundary the #173 convergence wins — we never bounce
+            // there, so this can't reopen the rabbit-hole the wind-down exists to close.
             // The FAST tier (ADR-0062) is a single diff-only turn — no coverage bounce (it would waste
             // the only turn and never finalize). The deep run still enforces full-diff coverage.
-            if !review.fast && !coverage_bounced && turn < winddown {
-                let uncovered: Vec<&str> = changed_files
+            // Bounces repeat up to `review.max_coverage_bounces` (default 3, 0 disables, 1 = legacy once): a bounce-once gate was an honor system a weak
+            // model gamed by re-finishing with zero reads and claiming coverage it never did, quoting
+            // the bounce's own file list (run bac4b5d8, vymalo-shop#422). A stalled re-finish (no new
+            // engagement since the last bounce) gets the harsher nudge that names the fabrication.
+            if !review.fast && turn < winddown {
+                let mut uncovered: Vec<&str> = changed_files
                     .difference(&engaged_files)
                     .map(String::as_str)
                     .collect();
-                if !uncovered.is_empty() {
-                    coverage_bounced = true;
+                uncovered.sort_unstable();
+                if !uncovered.is_empty() && coverage_bounces < review.max_coverage_bounces {
+                    let stalled =
+                        coverage_bounces > 0 && engaged_files.len() == engaged_at_last_bounce;
+                    coverage_bounces += 1;
+                    engaged_at_last_bounce = engaged_files.len();
                     tracing::info!(
                         task_id = %task_id,
                         turn,
                         uncovered = uncovered.len(),
                         changed = changed_files.len(),
+                        bounce = coverage_bounces,
+                        stalled,
                         "coverage gate: bouncing early finish — changed files not yet engaged"
                     );
-                    messages.push(ChatMessage::user(coverage_nudge(&uncovered)));
-                    // Don't finish: loop again so the model reviews the rest, then finishes. The bounce
-                    // is one-shot, so the next `finish` always goes through.
+                    messages.push(ChatMessage::user(coverage_nudge(&uncovered, stalled)));
+                    // Don't finish: loop again so the model reviews the rest, then finishes.
                     continue;
                 }
             }
@@ -1056,6 +1088,23 @@ pub async fn run_native_agent(
                      missed nit. Keep only what you can prove, then call `finish`.",
                 ));
                 continue;
+            }
+            // Coverage disclosure (run bac4b5d8): a finish that goes through with changed files never
+            // engaged — bounce cap hit, or the wind-down tail skipped the gate — gets an appended,
+            // clearly machine-authored coverage note on the posted summary. The human reading the
+            // review sees "examined N of M changed files" instead of taking a possible rubber-stamp
+            // at face value. Deep tier only: the fast tier has no read_file by design, so per-file
+            // engagement is not a meaningful coverage signal there. Best-effort: a failed re-post
+            // keeps the model's own summary rather than failing a finished run.
+            if !review.fast {
+                amend_summary_with_coverage(
+                    client,
+                    task_id,
+                    finish_summary.as_deref(),
+                    &changed_files,
+                    &engaged_files,
+                )
+                .await;
             }
             return Ok(ReviewOutcome::Finished);
         }
@@ -1094,6 +1143,18 @@ pub async fn run_native_agent(
             findings_recorded,
             "review agent hit its turn budget without calling finish — finalizing buffered findings"
         );
+    }
+    // A bounced `finish` already posted its summary before the gate rejected it — if the budget then
+    // ran out, that summary is what finalize posts, so it gets the same coverage disclosure.
+    if !review.fast && finish_summary.is_some() {
+        amend_summary_with_coverage(
+            client,
+            task_id,
+            finish_summary.as_deref(),
+            &changed_files,
+            &engaged_files,
+        )
+        .await;
     }
     Ok(ReviewOutcome::Exhausted)
 }
@@ -1246,27 +1307,108 @@ fn arg_field(arguments: &str, key: &str) -> Option<String> {
 /// The one-shot coverage nudge (B, #137): list the changed files the agent hasn't engaged yet and ask it
 /// to review each across all dimensions before finishing. The file list is capped so a large PR can't
 /// blow the prompt; the agent still has the full diff above.
-fn coverage_nudge(uncovered: &[&str]) -> String {
-    const MAX_LISTED: usize = 15;
+/// Cap on how many un-engaged files the coverage nudge / disclosure lists by name.
+const COVERAGE_MAX_LISTED: usize = 15;
+
+/// The bulleted `- path` list (capped) shared by the nudge and the disclosure.
+fn coverage_file_list(uncovered: &[&str]) -> String {
     let listed = uncovered
         .iter()
-        .take(MAX_LISTED)
+        .take(COVERAGE_MAX_LISTED)
         .map(|f| format!("- {f}"))
         .collect::<Vec<_>>()
         .join("\n");
-    let more = if uncovered.len() > MAX_LISTED {
-        format!("\n- … and {} more", uncovered.len() - MAX_LISTED)
+    let more = if uncovered.len() > COVERAGE_MAX_LISTED {
+        format!("\n- … and {} more", uncovered.len() - COVERAGE_MAX_LISTED)
     } else {
         String::new()
     };
+    format!("{listed}{more}")
+}
+
+/// The bounce message the gate injects when the model tries to `finish` with changed files it never
+/// engaged. Deliberately does NOT offer a "just call finish again" escape hatch: that sentence was a
+/// literal permission slip a weak model took two seconds after the bounce, fabricating "thoroughly
+/// reviewed" coverage from this message's own file list (run bac4b5d8, vymalo-shop#422). The way out
+/// is to do the work — or to name a file as not-reviewed in the final summary, honestly. `stalled` is
+/// the re-bounce after a finish with ZERO new engagement since the last bounce: same demand, plus an
+/// explicit callout that claiming these files were reviewed would be false.
+fn coverage_nudge(uncovered: &[&str], stalled: bool) -> String {
+    let listed = coverage_file_list(uncovered);
+    if stalled {
+        format!(
+            "You called `finish` again without opening ANY of the files you were just asked to \
+             review. A summary claiming these files were reviewed would be false — do not write one. \
+             These changed files are still unexamined:\n{listed}\n\n\
+             Open them with read_file (or record a finding on them with add_review_comment) before \
+             you finish. If a file is genuinely not reviewable in depth (a lockfile, a generated \
+             artifact), leave it unopened but name it as NOT reviewed in your final summary. Only \
+             claim work you actually did."
+        )
+    } else {
+        format!(
+            "Before you finish: these changed files don't yet have a finding and you haven't opened \
+             them:\n{listed}\n\n\
+             Review each one across all relevant dimensions — correctness, security, quality, style, \
+             performance — not only the first issue you found. Open each with read_file, record \
+             anything worth raising with add_review_comment, then call `finish`. If a file is \
+             genuinely not reviewable in depth (a lockfile, a generated artifact), you may leave it \
+             unopened — but then name it as NOT reviewed in your final summary; never claim coverage \
+             you did not do."
+        )
+    }
+}
+
+/// The machine-authored coverage note appended to a summary that finishes with changed files never
+/// engaged (bounce cap hit, or the wind-down tail skipped the gate). Rendered into the posted review
+/// body, so the human sees the run's real coverage instead of taking the model's verdict at face
+/// value — the same disclose-what-was-cut philosophy as the diff-packing disclosure (#275).
+fn coverage_disclosure(engaged: usize, changed: usize, uncovered: &[&str]) -> String {
     format!(
-        "Before you finish: these changed files don't yet have a finding and you haven't opened them:\n\
-         {listed}{more}\n\n\
-         Make sure you've reviewed each one across all relevant dimensions — correctness, security, \
-         quality, style, performance — not only the first issue you found. Open any you're unsure about \
-         with read_file, record anything worth raising with add_review_comment, then call `finish`. If \
-         you've genuinely considered them and there's nothing to add, call `finish` again now."
+        "> ⚠️ **Coverage note (automated):** this run examined {engaged} of {changed} changed files. \
+         Never opened or commented on:\n{}",
+        coverage_file_list(uncovered)
+            .lines()
+            .map(|l| format!("> {l}"))
+            .collect::<Vec<_>>()
+            .join("\n")
     )
+}
+
+/// Re-post the recorded summary with [`coverage_disclosure`] appended when changed files were never
+/// engaged. No-op when coverage is complete or no summary was ever recorded. Best-effort: the summary
+/// endpoint is a last-write-wins upsert, and a failed re-post logs and keeps the model's own summary —
+/// never fails a run that produced a verdict.
+async fn amend_summary_with_coverage(
+    client: &ControlPlaneClient,
+    task_id: Uuid,
+    summary: Option<&str>,
+    changed_files: &HashSet<String>,
+    engaged_files: &HashSet<String>,
+) {
+    let Some(summary) = summary else { return };
+    let mut uncovered: Vec<&str> = changed_files
+        .difference(engaged_files)
+        .map(String::as_str)
+        .collect();
+    if uncovered.is_empty() {
+        return;
+    }
+    uncovered.sort_unstable();
+    let engaged = changed_files.len() - uncovered.len();
+    tracing::warn!(
+        task_id = %task_id,
+        engaged,
+        changed = changed_files.len(),
+        "coverage disclosure: finishing with changed files never engaged — amending the summary"
+    );
+    let amended = format!(
+        "{summary}\n\n{}",
+        coverage_disclosure(engaged, changed_files.len(), &uncovered)
+    );
+    if let Err(error) = client.set_review_summary(task_id, &amended).await {
+        tracing::warn!(task_id = %task_id, %error, "coverage disclosure: amending the summary failed");
+    }
 }
 
 /// A turn-level chat failure after retries, carrying whether the
@@ -1392,6 +1534,7 @@ mod tests {
             max_files_read: crate::bootstrap::config::DEFAULT_MAX_FILES_READ,
             max_searches: crate::bootstrap::config::DEFAULT_MAX_SEARCHES,
             max_batches: crate::bootstrap::config::DEFAULT_MAX_BATCHES,
+            max_coverage_bounces: crate::bootstrap::config::DEFAULT_MAX_COVERAGE_BOUNCES,
             context_window: None,
             temperature: None,
             top_p: None,
@@ -1549,13 +1692,13 @@ mod tests {
         assert_eq!(arg_field(r#"{"path":"x"}"#, "file"), None, "missing key");
         assert_eq!(arg_field("not json", "file"), None, "malformed args");
 
-        let nudge = coverage_nudge(&["src/b.rs", "src/c.rs"]);
+        let nudge = coverage_nudge(&["src/b.rs", "src/c.rs"], false);
         assert!(nudge.contains("src/b.rs") && nudge.contains("src/c.rs"));
         assert!(nudge.contains("correctness") && nudge.contains("security"));
         // The over-cap path elides the tail rather than dumping a huge list.
         let many: Vec<String> = (0..30).map(|i| format!("f{i}.rs")).collect();
         let refs: Vec<&str> = many.iter().map(String::as_str).collect();
-        assert!(coverage_nudge(&refs).contains("and 15 more"));
+        assert!(coverage_nudge(&refs, false).contains("and 15 more"));
     }
 
     // ── Positive e2e: search → add_review_comment → finish → Ok(()) ─────────────────────────────
@@ -1650,29 +1793,28 @@ mod tests {
         );
     }
 
-    // ── Coverage gate (B, #137): an early `finish` with a changed file never engaged is bounced ONCE,
-    // costing exactly one extra chat round-trip; the model then finishes. Shares the Script counter so
-    // we can assert on the round-trip count (the bounce isn't otherwise observable from the outcome). ──
+    // ── Coverage gate (B, #137; hardened after run bac4b5d8): an early `finish` with a changed file
+    // never engaged is bounced repeatedly up to `review.max_coverage_bounces` (default 3); a model that complies after a
+    // bounce finishes without further bounces, and a model that never complies gets through only at
+    // the cap — with a coverage disclosure appended to the posted summary. Shares the Script counter
+    // so we can assert on the round-trip count. ──
     #[tokio::test]
     async fn coverage_gate_bounces_early_finish_then_finishes() {
-        async fn run(files: Vec<String>) -> usize {
+        // Drives the loop with `responses` against a diff touching `files` at the given bounce cap;
+        // returns the chat round-trip count and the LAST summary body posted to the control plane
+        // (what finalize would render into the PR review).
+        async fn run(
+            files: Vec<String>,
+            responses: Vec<serde_json::Value>,
+            max_coverage_bounces: usize,
+        ) -> (usize, String) {
             let calls = Arc::new(AtomicUsize::new(0));
             let chat = MockServer::start().await;
             Mock::given(method("POST"))
                 .and(path("/v1/chat/completions"))
                 .respond_with(Script {
                     calls: calls.clone(),
-                    responses: vec![
-                        // Turn 0: a finding on a.rs only.
-                        tool_call_reply(
-                            "add_review_comment",
-                            r#"{"file":"a.rs","line":2,"title":"nit","priority":"P2","category":"quality","body":"b"}"#,
-                        ),
-                        // Turn 1: try to finish. Bounced iff a changed file is still un-engaged.
-                        tool_call_reply("finish", r#"{"summary":"done"}"#),
-                        // Turn 2 (only reached on a bounce): finish for real.
-                        tool_call_reply("finish", r#"{"summary":"done after reviewing the rest"}"#),
-                    ],
+                    responses,
                 })
                 .mount(&chat)
                 .await;
@@ -1686,7 +1828,8 @@ mod tests {
                     .await;
             }
 
-            let review = review_config(format!("{}/v1", chat.uri()));
+            let mut review = review_config(format!("{}/v1", chat.uri()));
+            review.max_coverage_bounces = max_coverage_bounces;
             let cpc = ControlPlaneClient::new(cp.uri(), "tok");
             let embc = EmbeddingsClient::new("http://unused", "key", "model");
             let diff = PrDiff {
@@ -1714,20 +1857,147 @@ mod tests {
                 matches!(outcome, ReviewOutcome::Finished),
                 "got: {outcome:?}"
             );
-            calls.load(Ordering::SeqCst)
+            let last_summary = cp
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .filter(|r| r.url.path().ends_with("/review/summary"))
+                .filter_map(|r| {
+                    serde_json::from_slice::<serde_json::Value>(&r.body)
+                        .ok()
+                        .and_then(|v| v.get("body").and_then(|b| b.as_str()).map(String::from))
+                })
+                .next_back()
+                .unwrap_or_default();
+            (calls.load(Ordering::SeqCst), last_summary)
         }
 
-        // b.rs is changed but never engaged → the turn-1 finish is bounced → 3 round-trips.
-        assert_eq!(
-            run(vec!["a.rs".to_string(), "b.rs".to_string()]).await,
-            3,
-            "early finish bounced once for the un-engaged file"
+        let finding_a = tool_call_reply(
+            "add_review_comment",
+            r#"{"file":"a.rs","line":2,"title":"nit","priority":"P2","category":"quality","body":"b"}"#,
         );
-        // Every changed file (a.rs) is engaged by the finding → no bounce → 2 round-trips.
-        assert_eq!(
-            run(vec!["a.rs".to_string()]).await,
-            2,
-            "no bounce when the whole change is covered"
+
+        // The bac4b5d8 pattern: the model re-finishes after every bounce without engaging anything.
+        // Bounced max_coverage_bounces (3, the default) times (the Script repeats its last entry),
+        // then the finish goes through — with the coverage disclosure amended onto the posted
+        // summary so the rubber-stamp is labeled as one.
+        let (calls, summary) = run(
+            vec!["a.rs".to_string(), "b.rs".to_string()],
+            vec![
+                finding_a.clone(),
+                tool_call_reply("finish", r#"{"summary":"done"}"#),
+            ],
+            crate::bootstrap::config::DEFAULT_MAX_COVERAGE_BOUNCES,
+        )
+        .await;
+        assert_eq!(calls, 5, "1 finding turn + 3 bounced finishes + 1 accepted");
+        assert!(
+            summary.contains("examined 1 of 2 changed files") && summary.contains("b.rs"),
+            "the accepted-but-incomplete finish discloses its real coverage: {summary}"
+        );
+        assert!(summary.contains("done"), "the model's own verdict is kept");
+
+        // Every changed file is engaged by the finding → no bounce, no disclosure.
+        let (calls, summary) = run(
+            vec!["a.rs".to_string()],
+            vec![
+                finding_a.clone(),
+                tool_call_reply("finish", r#"{"summary":"done"}"#),
+            ],
+            crate::bootstrap::config::DEFAULT_MAX_COVERAGE_BOUNCES,
+        )
+        .await;
+        assert_eq!(calls, 2, "no bounce when the whole change is covered");
+        assert!(
+            !summary.contains("Coverage note"),
+            "a fully-covered finish is not amended: {summary}"
+        );
+
+        // The knob (ADR-0069): `1` restores the legacy bounce-once behaviour — one bounce, the lazy
+        // re-finish goes through, but still labeled with the disclosure.
+        let (calls, summary) = run(
+            vec!["a.rs".to_string(), "b.rs".to_string()],
+            vec![
+                finding_a.clone(),
+                tool_call_reply("finish", r#"{"summary":"done"}"#),
+            ],
+            1,
+        )
+        .await;
+        assert_eq!(calls, 3, "cap 1 = legacy bounce-once");
+        assert!(
+            summary.contains("examined 1 of 2 changed files"),
+            "an incomplete finish is disclosed regardless of the cap: {summary}"
+        );
+
+        // `0` disables the bounce entirely — the first finish goes straight through, and the
+        // disclosure is the only remaining honesty layer.
+        let (calls, summary) = run(
+            vec!["a.rs".to_string(), "b.rs".to_string()],
+            vec![
+                finding_a.clone(),
+                tool_call_reply("finish", r#"{"summary":"done"}"#),
+            ],
+            0,
+        )
+        .await;
+        assert_eq!(calls, 2, "cap 0 = no bounce at all");
+        assert!(
+            summary.contains("examined 1 of 2 changed files"),
+            "the disclosure still fires with the bounce disabled: {summary}"
+        );
+
+        // The compliant path: after one bounce the model engages the remaining file, then finishes —
+        // accepted immediately (no further bounces), nothing to disclose.
+        let (calls, summary) = run(
+            vec!["a.rs".to_string(), "b.rs".to_string()],
+            vec![
+                finding_a,
+                tool_call_reply("finish", r#"{"summary":"done"}"#),
+                tool_call_reply(
+                    "add_review_comment",
+                    r#"{"file":"b.rs","line":1,"title":"nit","priority":"P2","category":"quality","body":"b"}"#,
+                ),
+                tool_call_reply("finish", r#"{"summary":"done after reviewing the rest"}"#),
+            ],
+            crate::bootstrap::config::DEFAULT_MAX_COVERAGE_BOUNCES,
+        )
+        .await;
+        assert_eq!(calls, 4, "one bounce, then the engaged finish goes through");
+        assert!(
+            !summary.contains("Coverage note"),
+            "a finish after real engagement is not amended: {summary}"
+        );
+    }
+
+    // ── Coverage nudge + disclosure prose: the bounce never offers a "just finish again" escape hatch
+    // (the sentence a weak model treated as a permission slip in run bac4b5d8), the stalled re-bounce
+    // calls the fabrication out, and the disclosure is a quoted, clearly machine-authored note. ──
+    #[test]
+    fn coverage_nudge_and_disclosure_prose() {
+        let first = coverage_nudge(&["a.rs", "b.rs"], false);
+        assert!(first.contains("- a.rs") && first.contains("- b.rs"));
+        assert!(
+            !first.to_lowercase().contains("finish` again now"),
+            "no escape hatch: {first}"
+        );
+        assert!(
+            first.contains("NOT reviewed"),
+            "the honest way out is disclosure, not a claim: {first}"
+        );
+
+        let stalled = coverage_nudge(&["b.rs"], true);
+        assert!(
+            stalled.contains("without opening ANY") && stalled.contains("would be false"),
+            "the stalled re-bounce names the fabrication: {stalled}"
+        );
+
+        let note = coverage_disclosure(3, 9, &["x.rs", "y.rs"]);
+        assert!(note.contains("examined 3 of 9 changed files"));
+        assert!(
+            note.lines().all(|l| l.starts_with('>')),
+            "the note is fully block-quoted so it reads as machine-authored: {note}"
         );
     }
 
@@ -3133,8 +3403,9 @@ mod tests {
                     "lightbridge_vector_semantic_search",
                     r#"{"query":"the removed validateToken helper"}"#,
                 ),
-                // The coverage gate bounces the first finish once (a.rs never engaged); the second goes
-                // through. Script repeats the last entry, so a single `finish` here suffices.
+                // The coverage gate bounces the finish up to review.max_coverage_bounces (default 3) times (a.rs never
+                // engaged) before letting it through with a coverage disclosure. Script repeats the
+                // last entry, so a single `finish` here suffices.
                 tool_call_reply("finish", r#"{"summary":"Reviewed; nothing actionable."}"#),
             ],
         )

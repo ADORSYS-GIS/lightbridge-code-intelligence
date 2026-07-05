@@ -94,6 +94,13 @@ The selected fast config carries a structural `fast: bool` flag (set in `resolve
 the task tier — a Job runs one task, so mutating it on the resolved config is sound). The model is
 **operator-tuned in ai-helm-values and churns — read it live, never assume a model name**.
 
+Model *names* churn; model **capability floors** do not
+([ADR-0069](adr/0069-review-tier-minimum-model-capability.md)): the **fast** tier is engineered for
+small/cheap models (closed allowlist, diff-only, anti-rubber-stamp prompt), but the **deep** tier's
+quality levers (coverage gate, refute pass, wind-down) are behavioral contracts that assume a
+**frontier-class reasoning model** — a flash/lite-class model on deep games the nudges and fabricates
+coverage (run `bac4b5d8`). Never point deep below the floor; cheapen its budgets instead.
+
 ### Per-tier tool allowlist (`review.<tier>.tools`)
 
 `review.<tier>.tools` declares the exact tool surface a tier offers the model. It deserializes to a
@@ -251,11 +258,18 @@ Convergence levers (deep tier; the fast tier skips the investigation-oriented nu
   spending the batch budget **or** by the context-window estimate nearing the window. The wind-down set
   is derived from the (allowlist-restricted) `defs`, so a per-tier allowlist is honoured in the tail too.
 - **Halfway nudge** + a light **finish nudge** once ≥1 finding is recorded.
-- **Full-diff coverage gate** ([ADR-0041](adr/0041-full-diff-coverage-gate.md)): the first early
-  `finish` (before wind-down) with changed files the agent never opened or commented on is **bounced
-  once** with the explicit uncovered-file list, so one run accounts for the whole change instead of
-  finding one issue and stopping (two runs on the same PR each found a different real P1). Skipped for
-  the fast tier (it would waste the single useful turn).
+- **Full-diff coverage gate** ([ADR-0041](adr/0041-full-diff-coverage-gate.md), hardened by
+  [ADR-0069](adr/0069-review-tier-minimum-model-capability.md)): an early `finish` (before wind-down)
+  with changed files the agent never opened or commented on is **bounced with the explicit
+  uncovered-file list, up to `review.<tier>.max_coverage_bounces` times** (default 3; `0` disables
+  the bounce, `1` = the legacy bounce-once), so one run accounts for the whole
+  change instead of finding one issue and stopping (two runs on the same PR each found a different
+  real P1). A re-`finish` with zero new engagement since the last bounce gets a harsher nudge naming
+  the fabrication, and a finish that ultimately goes through incomplete (cap hit, or the wind-down
+  tail skipped the gate) gets a machine-authored **coverage disclosure** ("examined N of M changed
+  files…") appended to the posted summary — a weak model gamed the original one-shot bounce by
+  re-finishing with zero reads and parroting the bounce's own file list as "thoroughly reviewed"
+  (run `bac4b5d8`). Skipped for the fast tier (it would waste the single useful turn).
 - **Refute pass** ([ADR-0043](adr/0043-review-finding-verification.md)): the first `finish` with any
   P0/P1 finding is **bounced once** to force the model to re-verify each against its cited evidence and
   `retract_finding` the ones that don't hold. A confidently-wrong blocker costs more trust than a missed
