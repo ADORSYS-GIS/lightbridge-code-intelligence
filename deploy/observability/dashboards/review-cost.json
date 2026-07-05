@@ -97,7 +97,7 @@
             "type": "loki",
             "uid": "${DS_LOKI}"
           },
-          "expr": "(sum(sum_over_time({service_name=\"envoy-ai-gateway\"} | json | oidc_jti=~\"runid:.+\" | account_id=~\"$repo\" | gen_ai_request_model=~\"$model\" | unwrap gen_ai_usage_custom_total_cost | __error__=\"\" [$__range])) / 1e6) / clamp_min(count(sum by (oidc_jti) (count_over_time({service_name=\"envoy-ai-gateway\"} | json | oidc_jti=~\"runid:.+\" | account_id=~\"$repo\" | gen_ai_request_model=~\"$model\" [$__range]))), 1)",
+          "expr": "avg(sum by (oidc_jti) (sum_over_time({service_name=\"envoy-ai-gateway\"} | json | oidc_jti=~\"runid:.+\" | account_id=~\"$repo\" | gen_ai_request_model=~\"$model\" | unwrap gen_ai_usage_custom_total_cost | __error__=\"\" [$__range]))) / 1e6",
           "queryType": "range",
           "refId": "A"
         }

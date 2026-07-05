@@ -121,9 +121,13 @@ def dashboard_builder() -> dashboard.Dashboard:
     # --- Row 1: headline KPIs over the selected range (all from the gateway logs) ---
     total_cost = _stat("Billed cost (range)", _COST_RANGE, layout, unit="currencyUSD")
     reviews = _stat("Reviews (range)", _RUNS_RANGE, layout)
+    # Mean cost across runs, as ONE aggregation: sum cost per run (`by oidc_jti`), then
+    # `avg` over runs. Not a division of two separate aggregations — LogQL rejected
+    # `(total) / clamp_min(count, 1)` ("unexpected IDENTIFIER" on clamp_min).
     avg_cost = _stat(
         "Avg cost / review (range)",
-        f"({_COST_RANGE}) / clamp_min({_RUNS_RANGE}, 1)",
+        "avg(sum by (oidc_jti) "
+        f"(sum_over_time({_unwrap('gen_ai_usage_custom_total_cost')} [$__range]))) / 1e6",
         layout,
         unit="currencyUSD",
     )
