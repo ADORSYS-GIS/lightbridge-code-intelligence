@@ -44,18 +44,30 @@ UID = "lci-review-cost"
 
 # Per-model price, $ per 1,000,000 tokens. Source: ai-helm
 # charts/ai-models/values.yaml -> <model>.pricing.standard.{inputPer1M,outputPer1M}.
-# adorsys-reviewer = MiniMax M2.7 ($0.25 in / $1.00 out);
-# adorsys-reviewer-pro = GLM-5.2 ($0.95 in / $3.00 out).
+# adorsys-reviewer      = MiniMax M2.7        ($0.25 in / $1.00 out);
+# adorsys-reviewer-pro  = GLM-5.2             ($0.95 in / $3.00 out);
+# gemini-3p1-flash-lite = Gemini 3.1 Flash Lite ($0.25 in / $1.50 out).
+#
+# ⚠️ This map is a HAND-MIRROR of gateway pricing and goes stale the moment the review model churns
+# to one not listed here — an unlisted model prices at $0 (ELSE), which is exactly why this dashboard
+# showed no cost after both tiers moved to gemini-3p1-flash-lite. Keep it in sync when the model
+# changes, OR read the authoritative billed cost from the AI-Gateway (eaig) instead: the gateway
+# meters + prices every request (`llm_custom_total_cost`) and — once ai-helm#582 logs the
+# `code_intelligence_repo`/`target` attribution headers — that cost is sliceable per repo/PR in Loki,
+# with no price table to maintain. This SQL estimate is an upper bound (standard input price, no cache
+# discount); prefer the gateway figure for real spend.
 _PRICE_IN = (
     "CASE coalesce(tr.model, 'unknown') "
     "WHEN 'adorsys-reviewer' THEN 0.25 "
     "WHEN 'adorsys-reviewer-pro' THEN 0.95 "
+    "WHEN 'gemini-3p1-flash-lite' THEN 0.25 "
     "ELSE 0 END"
 )
 _PRICE_OUT = (
     "CASE coalesce(tr.model, 'unknown') "
     "WHEN 'adorsys-reviewer' THEN 1.00 "
     "WHEN 'adorsys-reviewer-pro' THEN 3.00 "
+    "WHEN 'gemini-3p1-flash-lite' THEN 1.50 "
     "ELSE 0 END"
 )
 
