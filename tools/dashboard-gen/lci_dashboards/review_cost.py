@@ -52,10 +52,13 @@ UID = "lci-review-cost"
 # to one not listed here — an unlisted model prices at $0 (ELSE), which is exactly why this dashboard
 # showed no cost after both tiers moved to gemini-3p1-flash-lite. Keep it in sync when the model
 # changes, OR read the authoritative billed cost from the AI-Gateway (eaig) instead: the gateway
-# meters + prices every request (`llm_custom_total_cost`) and — once ai-helm#582 logs the
-# `code_intelligence_repo`/`target` attribution headers — that cost is sliceable per repo/PR in Loki,
-# with no price table to maintain. This SQL estimate is an upper bound (standard input price, no cache
-# discount); prefer the gateway figure for real spend.
+# meters + prices every request (`llm_custom_total_cost`, emitted to Loki as
+# `gen_ai.usage.custom_total_cost` on the `envoy-ai-gateway` stream). For LCI traffic the Authorino
+# internal AuthConfig already maps `x-code-intelligence-repo` → the `account_id` log field, so that
+# billed cost is ALREADY sliceable per repo in Loki today — `{service_name="envoy-ai-gateway"} | json`
+# filtered on `account_id`, `unwrap gen_ai_usage_custom_total_cost` — with no price table to maintain.
+# This SQL estimate is an upper bound (standard input price, no cache discount); prefer the gateway
+# figure for real spend.
 _PRICE_IN = (
     "CASE coalesce(tr.model, 'unknown') "
     "WHEN 'adorsys-reviewer' THEN 0.25 "
