@@ -319,6 +319,7 @@ async fn react_work_started(pool: &PgPool, task: &db::ClaimedTask, review: &Revi
     }
     let t = crate::outbox::Target {
         task_id: Some(task.id),
+        platform: context.platform,
         installation_id: context.installation_id,
         owner: &context.owner,
         repo: &context.name,

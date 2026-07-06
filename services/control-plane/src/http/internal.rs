@@ -1066,6 +1066,7 @@ pub async fn finalize_review(
     // every GitHub write is enqueued to `github_outbox` and the reconciler delivers it.
     let t = crate::outbox::Target {
         task_id: Some(id),
+        platform: context.platform,
         installation_id: context.installation_id,
         owner: &context.owner,
         repo: &context.name,
@@ -1246,8 +1247,14 @@ pub async fn finalize_review(
             real_summary
         };
         let body = if context.tier == "fast" {
+            // Platform-aware bot handle (Phase 6): GitLab reviews must name the GitLab bot, not the
+            // GitHub App handle, so the "request a deep review" @mention resolves on the right platform.
+            let handle = match context.platform {
+                crate::integrations::platform::Platform::GitLab => state.gitlab_app_handle.as_str(),
+                crate::integrations::platform::Platform::GitHub => state.app_handle.as_str(),
+            };
             crate::review::render_fast_body(
-                state.app_handle.as_str(),
+                handle,
                 fast_summary,
                 &validated.deferred,
                 &validated.out_of_scope,
@@ -1553,6 +1560,7 @@ async fn handle_review_failure(state: &AppState, pool: &sqlx::PgPool, id: Uuid) 
     };
     let t = crate::outbox::Target {
         task_id: Some(id),
+        platform: context.platform,
         installation_id: context.installation_id,
         owner: &context.owner,
         repo: &context.name,

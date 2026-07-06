@@ -24,6 +24,8 @@ use sqlx::PgPool;
 
 use crate::db;
 use crate::integrations::k8s::{JobLiveness, TaskLauncher};
+#[cfg(test)]
+use crate::integrations::platform::Platform;
 
 /// How many times a task is retried before the reaper gives up and marks it `failed`. `attempts` is
 /// incremented on every claim, so this bounds total dispatch attempts.
@@ -200,6 +202,7 @@ async fn enqueue_reaper_failure_notice(
     };
     let t = crate::outbox::Target {
         task_id: Some(task_id),
+        platform: context.platform,
         installation_id: context.installation_id,
         owner: &context.owner,
         repo: &context.name,
@@ -321,18 +324,25 @@ mod tests {
     /// Claim a freshly-created task and then expire its lease + record a Job name, simulating a Job
     /// that was launched and then went quiet. Returns the task id.
     async fn stuck_running_task(pool: &PgPool) -> Uuid {
-        let repo_id = db::upsert_repository(pool, 1, "octo", "repo", "main", None)
-            .await
-            .unwrap();
-        db::record_delivery(pool, "d1", "pull_request", &serde_json::json!({}))
-            .await
-            .unwrap();
+        let repo_id =
+            db::upsert_repository(pool, Platform::GitHub, 1, "octo", "repo", "main", None)
+                .await
+                .unwrap();
+        db::record_delivery(
+            pool,
+            Platform::GitHub,
+            "d1",
+            "pull_request",
+            &serde_json::json!({}),
+        )
+        .await
+        .unwrap();
         db::create_task(
             pool,
             &db::NewTask {
                 repository_id: repo_id,
                 installation_id: 99,
-                github_delivery_id: "d1".to_string(),
+                webhook_delivery_id: "d1".to_string(),
                 target_type: "pull_request".to_string(),
                 target_id: 7,
                 command_text: "review".to_string(),

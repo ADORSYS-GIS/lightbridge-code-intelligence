@@ -476,28 +476,244 @@ pub struct ReviewComment {
     pub body: String,
 }
 
-/// The result of posting a PR review: the GitHub review `id` (kept so feedback can correlate back to
-/// the run, ADR-0035) and its `html_url` permalink. Both `Option` since GitHub may omit them.
-#[derive(Debug, Default)]
-pub struct PostedReview {
-    pub id: Option<i64>,
-    pub html_url: Option<String>,
+// PostedReview, PostedComment, and ReviewCommentRef now live in `platform.rs` and are re-exported
+// here via the `use crate::integrations::platform::*` below.
+
+// ---------------------------------------------------------------------------
+// CodePlatform trait implementation (Phase 0 — platform abstraction).
+//
+// The trait encapsulates auth so callers never handle tokens. GitHub mints an
+// installation access token internally using `RepoRef.installation_id`, then
+// delegates to the existing API methods. No behavior changes — GitHub works
+// exactly as before.
+// ---------------------------------------------------------------------------
+
+use crate::integrations::platform::*;
+
+impl GithubApp {
+    // These helpers are used by the `impl CodePlatform` block below. Until the trait is wired
+    // into the webhook/outbox/reconciler (Phases 2–3), `#[allow(dead_code)]` keeps clippy quiet.
+    #![allow(dead_code)]
+    /// The webhook secret from env, read once and cached by the caller (AppState).
+    /// Used by `verify_webhook` for HMAC-SHA256 verification.
+    fn webhook_secret() -> String {
+        std::env::var("GITHUB_WEBHOOK_SECRET").unwrap_or_default()
+    }
+
+    /// Mint an installation token for the repo's installation_id. Internal helper for the
+    /// trait impl so every method doesn't repeat the token-mint dance.
+    async fn token_for(&self, repo: &RepoRef) -> anyhow::Result<String> {
+        self.installation_token(repo.installation_id).await
+    }
 }
 
-/// The result of posting an issue/PR comment: its `id` (for the feedback poller, ADR-0035) + `html_url`.
-#[derive(Debug, Default)]
-pub struct PostedComment {
-    pub id: Option<i64>,
-    pub html_url: Option<String>,
-}
+#[async_trait::async_trait]
+impl CodePlatform for GithubApp {
+    fn name(&self) -> &'static str {
+        "github"
+    }
 
-/// An inline review comment GitHub created, fetched after posting so the feedback poller knows its id
-/// (ADR-0035). `path`/`line` correlate it back to the finding.
-#[derive(Debug, Clone)]
-pub struct ReviewCommentRef {
-    pub id: i64,
-    pub path: Option<String>,
-    pub line: Option<i64>,
+    fn verify_webhook(&self, headers: &axum::http::HeaderMap, body: &[u8]) -> bool {
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+        type HmacSha256 = Hmac<Sha256>;
+
+        let secret = Self::webhook_secret();
+        if secret.is_empty() {
+            return false; // fail-closed
+        }
+
+        let sig_header = match headers
+            .get("x-hub-signature-256")
+            .and_then(|v| v.to_str().ok())
+        {
+            Some(s) => s,
+            None => return false,
+        };
+        let expected = match sig_header.strip_prefix("sha256=") {
+            Some(hex) => hex,
+            None => return false,
+        };
+        let mut mac = match HmacSha256::new_from_slice(secret.as_bytes()) {
+            Ok(m) => m,
+            Err(_) => return false,
+        };
+        mac.update(body);
+        let computed = hex::encode(mac.finalize().into_bytes());
+
+        // Constant-time comparison to avoid a timing oracle on the digest.
+        use subtle::ConstantTimeEq;
+        computed.as_bytes().ct_eq(expected.as_bytes()).into()
+    }
+
+    fn delivery_id(&self, headers: &axum::http::HeaderMap) -> Option<String> {
+        headers
+            .get("x-github-delivery")?
+            .to_str()
+            .ok()
+            .map(|s| s.to_string())
+    }
+
+    fn event_type(&self, headers: &axum::http::HeaderMap) -> Option<String> {
+        headers
+            .get("x-github-event")?
+            .to_str()
+            .ok()
+            .map(|s| s.to_string())
+    }
+
+    async fn list_changed_files(
+        &self,
+        repo: &RepoRef,
+        pr_number: i64,
+    ) -> anyhow::Result<Vec<ChangedFile>> {
+        let (owner, name) = repo.owner_repo();
+        let token = self.token_for(repo).await?;
+        let files = self.list_pr_files(&token, owner, name, pr_number).await?;
+        Ok(files
+            .into_iter()
+            .map(|f| ChangedFile {
+                path: f.filename,
+                patch: f.patch,
+            })
+            .collect())
+    }
+
+    async fn default_branch(&self, repo: &RepoRef) -> anyhow::Result<String> {
+        let (owner, name) = repo.owner_repo();
+        let token = self.token_for(repo).await?;
+        self.repository_default_branch(&token, owner, name).await
+    }
+
+    async fn pr_shas(
+        &self,
+        repo: &RepoRef,
+        pr_number: i64,
+    ) -> anyhow::Result<(Option<String>, Option<String>)> {
+        let (owner, name) = repo.owner_repo();
+        let token = self.token_for(repo).await?;
+        self.pull_request_shas(&token, owner, name, pr_number).await
+    }
+
+    async fn post_review(
+        &self,
+        repo: &RepoRef,
+        review: &ReviewPost,
+    ) -> anyhow::Result<PostedReview> {
+        let (owner, name) = repo.owner_repo();
+        let token = self.token_for(repo).await?;
+        let comments: Vec<ReviewComment> = review
+            .comments
+            .iter()
+            .map(|c| ReviewComment {
+                path: c.path.clone(),
+                line: c.line,
+                side: "RIGHT",
+                body: c.body.clone(),
+            })
+            .collect();
+        let posted = self
+            .create_pr_review(
+                &token,
+                owner,
+                name,
+                review.pr_number,
+                &review.body,
+                &comments,
+            )
+            .await?;
+        Ok(PostedReview {
+            id: posted.id,
+            html_url: posted.html_url,
+        })
+    }
+
+    async fn post_comment(
+        &self,
+        repo: &RepoRef,
+        issue_number: i64,
+        body: &str,
+    ) -> anyhow::Result<PostedComment> {
+        let (owner, name) = repo.owner_repo();
+        let token = self.token_for(repo).await?;
+        let posted = self
+            .create_issue_comment(&token, owner, name, issue_number, body)
+            .await?;
+        Ok(PostedComment {
+            id: posted.id,
+            html_url: posted.html_url,
+        })
+    }
+
+    async fn add_reaction(
+        &self,
+        repo: &RepoRef,
+        target: ReactionTarget,
+        emoji: &str,
+    ) -> anyhow::Result<()> {
+        let (owner, name) = repo.owner_repo();
+        let token = self.token_for(repo).await?;
+        match target {
+            ReactionTarget::Issue { number } => {
+                self.add_reaction(&token, owner, name, number, emoji).await
+            }
+            ReactionTarget::Comment { comment_id } => {
+                self.add_comment_reaction(&token, owner, name, comment_id, emoji)
+                    .await
+            }
+        }
+    }
+
+    async fn add_labels(
+        &self,
+        repo: &RepoRef,
+        issue_number: i64,
+        labels: &[String],
+    ) -> anyhow::Result<()> {
+        let (owner, name) = repo.owner_repo();
+        let token = self.token_for(repo).await?;
+        self.add_labels(&token, owner, name, issue_number, labels)
+            .await
+    }
+
+    async fn list_review_comments(
+        &self,
+        repo: &RepoRef,
+        pr_number: i64,
+        review_id: i64,
+    ) -> anyhow::Result<Vec<ReviewCommentRef>> {
+        let (owner, name) = repo.owner_repo();
+        let token = self.token_for(repo).await?;
+        self.list_review_comments(&token, owner, name, pr_number, review_id)
+            .await
+    }
+
+    async fn list_comment_reactions(
+        &self,
+        repo: &RepoRef,
+        comment_id: i64,
+        is_review_comment: bool,
+    ) -> anyhow::Result<Vec<Reaction>> {
+        let (owner, name) = repo.owner_repo();
+        let token = self.token_for(repo).await?;
+        let raw = self
+            .list_comment_reactions(&token, owner, name, comment_id, is_review_comment)
+            .await?;
+        Ok(raw
+            .into_iter()
+            .map(|(user_login, content)| Reaction {
+                content,
+                user_login,
+            })
+            .collect())
+    }
+
+    fn clone_url(&self, repo: &RepoRef) -> String {
+        // Use the installation token as a bearer for HTTPS clone.
+        // The token is minted on demand by the caller (the control plane provides it
+        // to the agent-runner via the internal API). Here we just build the URL shape.
+        format!("https://github.com/{}.git", repo.full_name)
+    }
 }
 
 #[cfg(test)]

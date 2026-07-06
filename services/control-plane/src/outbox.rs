@@ -9,11 +9,14 @@ use serde_json::json;
 use sqlx::PgPool;
 use uuid::Uuid;
 
+use crate::integrations::platform::Platform;
+
 /// Who to post as and where — shared by every intent.
 pub struct Target<'a> {
     /// `Some` for review/reply/failure_notice (the posted ids are recorded back against the task for the
     /// ADR-0035 feedback join); may be `None` for a bare reaction.
     pub task_id: Option<Uuid>,
+    pub platform: Platform,
     pub installation_id: i64,
     pub owner: &'a str,
     pub repo: &'a str,
@@ -67,8 +70,9 @@ pub async fn enqueue_review(
 ) -> anyhow::Result<bool> {
     let key = format!("{}:review", t.key_prefix(payload.pr));
     let value = serde_json::to_value(payload)?;
-    crate::db::enqueue_github_post(
+    crate::db::enqueue_outbox_post(
         pool,
+        t.platform,
         t.task_id,
         t.installation_id,
         t.owner,
@@ -90,8 +94,9 @@ pub async fn enqueue_reply(
 ) -> Result<bool, sqlx::Error> {
     let key = format!("{}:reply", t.key_prefix(issue));
     let value = json!({ "issue": issue, "body": body });
-    crate::db::enqueue_github_post(
+    crate::db::enqueue_outbox_post(
         pool,
+        t.platform,
         t.task_id,
         t.installation_id,
         t.owner,
@@ -118,8 +123,9 @@ pub async fn enqueue_reaction(
 ) -> Result<bool, sqlx::Error> {
     let key = format!("{}:reaction:{content}", t.key_prefix(issue));
     let value = reaction_payload(issue, content, comment_id);
-    crate::db::enqueue_github_post(
+    crate::db::enqueue_outbox_post(
         pool,
+        t.platform,
         t.task_id,
         t.installation_id,
         t.owner,
@@ -145,8 +151,9 @@ pub async fn enqueue_verdict_reaction(
 ) -> Result<bool, sqlx::Error> {
     let key = format!("{}:reaction:verdict", t.key_prefix(issue));
     let value = reaction_payload(issue, content, comment_id);
-    crate::db::enqueue_github_post(
+    crate::db::enqueue_outbox_post(
         pool,
+        t.platform,
         t.task_id,
         t.installation_id,
         t.owner,
@@ -177,8 +184,9 @@ pub async fn enqueue_failure_notice(
 ) -> Result<bool, sqlx::Error> {
     let key = format!("{}:failure_notice", t.key_prefix(issue));
     let value = json!({ "issue": issue, "body": crate::review::render_failure_notice() });
-    crate::db::enqueue_github_post(
+    crate::db::enqueue_outbox_post(
         pool,
+        t.platform,
         t.task_id,
         t.installation_id,
         t.owner,

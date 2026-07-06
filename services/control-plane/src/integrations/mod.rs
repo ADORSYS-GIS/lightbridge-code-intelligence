@@ -3,5 +3,7 @@
 //! and Neo4j (structural-graph writes).
 
 pub(crate) mod github;
+pub(crate) mod gitlab;
 pub(crate) mod k8s;
 pub(crate) mod neo4j;
+pub(crate) mod platform;

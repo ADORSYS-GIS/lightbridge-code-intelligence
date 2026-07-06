@@ -13,6 +13,8 @@ use sqlx::PgPool;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+use crate::integrations::platform::Platform;
+
 /// Postgres `LISTEN`/`NOTIFY` channel the dispatcher waits on; `create_task` notifies it on enqueue
 /// so a dispatcher reacts immediately instead of waiting for its poll fallback.
 pub const TASK_QUEUED_CHANNEL: &str = "task_queued";
@@ -114,7 +116,7 @@ pub struct ReviewRow {
     pub review_url: Option<String>,
     /// The GitHub review id we created (ADR-0035) — kept so a feedback signal (👍/👎) can correlate
     /// back to this run. `None` for older rows / non-PR runs.
-    pub github_review_id: Option<i64>,
+    pub platform_review_id: Option<i64>,
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
 }
@@ -132,17 +134,17 @@ pub async fn upsert_review(
     out_of_scope_count: i32,
     findings: &Value,
     review_url: Option<&str>,
-    github_review_id: Option<i64>,
+    platform_review_id: Option<i64>,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
         "INSERT INTO reviews \
-         (task_id, summary, body, inline_count, deferred_count, out_of_scope_count, findings, review_url, github_review_id) \
+         (task_id, summary, body, inline_count, deferred_count, out_of_scope_count, findings, review_url, platform_review_id) \
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
          ON CONFLICT (task_id) DO UPDATE SET \
            summary = EXCLUDED.summary, body = EXCLUDED.body, \
            inline_count = EXCLUDED.inline_count, deferred_count = EXCLUDED.deferred_count, \
            out_of_scope_count = EXCLUDED.out_of_scope_count, findings = EXCLUDED.findings, \
-           review_url = EXCLUDED.review_url, github_review_id = EXCLUDED.github_review_id, \
+           review_url = EXCLUDED.review_url, platform_review_id = EXCLUDED.platform_review_id, \
            created_at = now()",
     )
     .bind(task_id)
@@ -153,7 +155,7 @@ pub async fn upsert_review(
     .bind(out_of_scope_count)
     .bind(findings)
     .bind(review_url)
-    .bind(github_review_id)
+    .bind(platform_review_id)
     .execute(pool)
     .await
     .map(|_| ())
@@ -161,7 +163,7 @@ pub async fn upsert_review(
 
 /// Persist the silent-clean review copy (ADR-0068) **without clobbering** — `ON CONFLICT DO NOTHING`.
 /// The clean path must never overwrite a row the reconciler wrote for a *posted* review (that would null
-/// `github_review_id` and break the ADR-0035 feedback join); a re-run of the clean path itself is a
+/// `platform_review_id` and break the ADR-0035 feedback join); a re-run of the clean path itself is a
 /// no-op (same content). Contrast [`upsert_review`], which the reconciler uses at drain time where
 /// replacing on a re-post is the point.
 #[allow(clippy::too_many_arguments)]
@@ -196,15 +198,15 @@ pub async fn insert_review_if_absent(
 /// Whether this task already has a review going to (or on) GitHub: a `review` intent in the egress
 /// outbox (ANY status — even a dead-lettered one means the run had findings, so a later re-finalize
 /// against the cleared buffer must not re-read as "clean") or a persisted review that was actually
-/// posted (`github_review_id` set by the reconciler). The ADR-0068 silent-clean branch gates on this so
+/// posted (`platform_review_id` set by the reconciler). The ADR-0068 silent-clean branch gates on this so
 /// a re-finalize can't clobber a real review with a 👍-and-nothing.
 pub async fn has_review_intent_or_posted_review(
     pool: &PgPool,
     task_id: Uuid,
 ) -> Result<bool, sqlx::Error> {
     sqlx::query_scalar::<_, bool>(
-        "SELECT EXISTS (SELECT 1 FROM github_outbox WHERE task_id = $1 AND kind = 'review') \
-              OR EXISTS (SELECT 1 FROM reviews WHERE task_id = $1 AND github_review_id IS NOT NULL)",
+        "SELECT EXISTS (SELECT 1 FROM outbox WHERE task_id = $1 AND kind = 'review') \
+              OR EXISTS (SELECT 1 FROM reviews WHERE task_id = $1 AND platform_review_id IS NOT NULL)",
     )
     .bind(task_id)
     .fetch_one(pool)
@@ -300,7 +302,7 @@ pub async fn target_has_prior_findings(
 ///
 /// Two sources, unioned:
 /// - `reviews` — reviews the reconciler already delivered (persisted at post time, ADR-0035);
-/// - `github_outbox` `review`-kind rows still `pending` — a review **enqueued but not yet posted**
+/// - `outbox` `review`-kind rows still `pending` — a review **enqueued but not yet posted**
 ///   (reconciler backoff, or two rapid re-reviews racing finalize). Without these, the second finalize
 ///   wouldn't see the first run's findings and would double-post; their findings ride in the payload
 ///   (`payload->'findings_json'`, baked at produce time per ADR-0059). `posted` rows are skipped — the
@@ -325,7 +327,7 @@ pub async fn posted_findings_for_head(
            AND t.head_sha = $4 AND r.task_id <> $5 \
          UNION ALL \
          SELECT o.payload->'findings_json' \
-         FROM github_outbox o JOIN tasks t ON t.id = o.task_id \
+         FROM outbox o JOIN tasks t ON t.id = o.task_id \
          WHERE o.kind = 'review' AND o.status = 'pending' \
            AND t.repository_id = $1 AND t.target_type = $2 AND t.target_id = $3 \
            AND t.head_sha = $4 AND o.task_id <> $5",
@@ -457,7 +459,7 @@ pub async fn record_review_run_telemetry(
 /// an inline comment to its finding.
 #[derive(Debug, Clone)]
 pub struct ReviewCommentRef {
-    pub github_comment_id: i64,
+    pub platform_comment_id: i64,
     pub kind: String,
     pub file: Option<String>,
     pub line: Option<i32>,
@@ -471,13 +473,13 @@ pub async fn store_review_comments(
 ) -> Result<(), sqlx::Error> {
     for c in comments {
         sqlx::query(
-            "INSERT INTO review_comments (id, task_id, github_comment_id, kind, file, line) \
+            "INSERT INTO review_comments (id, task_id, platform_comment_id, kind, file, line) \
              VALUES ($1, $2, $3, $4, $5, $6) \
-             ON CONFLICT (kind, github_comment_id) DO NOTHING",
+             ON CONFLICT (kind, platform_comment_id) DO NOTHING",
         )
         .bind(Uuid::new_v4())
         .bind(task_id)
-        .bind(c.github_comment_id)
+        .bind(c.platform_comment_id)
         .bind(&c.kind)
         .bind(&c.file)
         .bind(c.line)
@@ -503,7 +505,7 @@ pub async fn has_responded_or_pending_content(
     sqlx::query_scalar::<_, bool>(
         "SELECT EXISTS (SELECT 1 FROM reviews WHERE task_id = $1) \
               OR EXISTS (SELECT 1 FROM review_comments WHERE task_id = $1) \
-              OR EXISTS (SELECT 1 FROM github_outbox \
+              OR EXISTS (SELECT 1 FROM outbox \
                          WHERE task_id = $1 AND kind IN ('review', 'reply') \
                            AND status IN ('pending', 'posted'))",
     )
@@ -519,7 +521,7 @@ pub async fn has_responded_or_pending_content(
 /// `LISTEN`/`NOTIFY` channel the reconciler's outbox drain waits on; producers notify it on enqueue
 /// (the timer fallback in the reconciler covers a missed notify, exactly like the dispatcher on
 /// [`TASK_QUEUED_CHANNEL`]).
-pub const GITHUB_OUTBOX_CHANNEL: &str = "github_outbox";
+pub const OUTBOX_CHANNEL: &str = "outbox";
 
 /// Max delivery attempts before an outbox row is parked `failed` (dead-letter). A courtesy post isn't
 /// worth retrying forever; the row stays for inspection.
@@ -536,14 +538,17 @@ pub struct OutboxRow {
     pub kind: String,
     pub payload: Value,
     pub attempts: i32,
+    #[allow(dead_code)]
+    pub platform: Platform,
 }
 
 /// Enqueue one GitHub-egress intent. Idempotent on `dedup_key` (`ON CONFLICT DO NOTHING`), so a
 /// re-finalize or a retry never double-enqueues, and wakes the reconciler via `NOTIFY`. Returns whether
 /// a new row was inserted (`false` = a row with this `dedup_key` already existed).
 #[allow(clippy::too_many_arguments)]
-pub async fn enqueue_github_post(
+pub async fn enqueue_outbox_post(
     pool: &PgPool,
+    platform: Platform,
     task_id: Option<Uuid>,
     installation_id: i64,
     owner: &str,
@@ -553,9 +558,10 @@ pub async fn enqueue_github_post(
     dedup_key: &str,
 ) -> Result<bool, sqlx::Error> {
     let inserted = sqlx::query(
-        "INSERT INTO github_outbox (task_id, installation_id, owner, repo, kind, payload, dedup_key) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT (dedup_key) DO NOTHING",
+        "INSERT INTO outbox (platform, task_id, installation_id, owner, repo, kind, payload, dedup_key) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ON CONFLICT (dedup_key) DO NOTHING",
     )
+    .bind(platform)
     .bind(task_id)
     .bind(installation_id)
     .bind(owner)
@@ -569,7 +575,7 @@ pub async fn enqueue_github_post(
         > 0;
     if inserted {
         let _ = sqlx::query("SELECT pg_notify($1, $2)")
-            .bind(GITHUB_OUTBOX_CHANNEL)
+            .bind(OUTBOX_CHANNEL)
             .bind(dedup_key)
             .execute(pool)
             .await;
@@ -588,8 +594,8 @@ pub async fn enqueue_github_post(
 /// an in-flight one.
 pub async fn claim_outbox_batch(pool: &PgPool, limit: i64) -> Result<Vec<OutboxRow>, sqlx::Error> {
     sqlx::query_as::<_, OutboxRow>(
-        "SELECT id, task_id, installation_id, owner, repo, kind, payload, attempts \
-         FROM github_outbox \
+        "SELECT id, task_id, installation_id, owner, repo, kind, payload, attempts, platform \
+         FROM outbox \
          WHERE status = 'pending' AND next_attempt_at <= now() \
          ORDER BY created_at, id \
          LIMIT $1 \
@@ -604,13 +610,13 @@ pub async fn claim_outbox_batch(pool: &PgPool, limit: i64) -> Result<Vec<OutboxR
 pub async fn mark_outbox_posted(
     pool: &PgPool,
     id: i64,
-    github_id: Option<i64>,
+    platform_ref_id: Option<i64>,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
-        "UPDATE github_outbox SET status = 'posted', posted_at = now(), github_id = $2 WHERE id = $1",
+        "UPDATE outbox SET status = 'posted', posted_at = now(), platform_ref_id = $2 WHERE id = $1",
     )
     .bind(id)
-    .bind(github_id)
+    .bind(platform_ref_id)
     .execute(pool)
     .await
     .map(|_| ())
@@ -620,7 +626,7 @@ pub async fn mark_outbox_posted(
 /// after `attempts²` minutes) or park as `failed` once `OUTBOX_MAX_ATTEMPTS` is reached.
 pub async fn mark_outbox_failed(pool: &PgPool, id: i64, error: &str) -> Result<(), sqlx::Error> {
     sqlx::query(
-        "UPDATE github_outbox SET \
+        "UPDATE outbox SET \
              attempts = attempts + 1, \
              last_error = $2, \
              status = CASE WHEN attempts + 1 >= $3 THEN 'failed' ELSE 'pending' END, \
@@ -635,7 +641,7 @@ pub async fn mark_outbox_failed(pool: &PgPool, id: i64, error: &str) -> Result<(
     .map(|_| ())
 }
 
-/// Prune terminal outbox rows past their retention window (ADR-0059 GC). `github_outbox` is
+/// Prune terminal outbox rows past their retention window (ADR-0059 GC). `outbox` is
 /// append-mostly — every delivered intent settles to `posted` (a 👀 reaction alone leaves a permanent
 /// row per PR) and every dead-lettered one to `failed`, and nothing ever deletes them — so the table,
 /// and the `ON CONFLICT (dedup_key)` probe every enqueue pays against it, grow without bound.
@@ -660,7 +666,7 @@ pub async fn prune_outbox(
 ) -> Result<(u64, u64), sqlx::Error> {
     let posted = if posted_retention_days > 0 {
         sqlx::query(
-            "DELETE FROM github_outbox \
+            "DELETE FROM outbox \
              WHERE status = 'posted' AND posted_at < now() - make_interval(days => $1::int)",
         )
         .bind(posted_retention_days)
@@ -672,7 +678,7 @@ pub async fn prune_outbox(
     };
     let failed = if failed_retention_days > 0 {
         sqlx::query(
-            "DELETE FROM github_outbox \
+            "DELETE FROM outbox \
              WHERE status = 'failed' AND created_at < now() - make_interval(days => $1::int)",
         )
         .bind(failed_retention_days)
@@ -690,11 +696,13 @@ pub async fn prune_outbox(
 #[derive(Debug, sqlx::FromRow)]
 pub struct PollableComment {
     pub task_id: Uuid,
-    pub github_comment_id: i64,
+    pub platform_comment_id: i64,
     pub kind: String,
     pub owner: String,
     pub name: String,
     pub installation_id: i64,
+    #[allow(dead_code)]
+    pub platform: Platform,
 }
 
 /// Comments to poll this cycle (ADR-0035), within `within_days`, **tiered by age** so API usage stays
@@ -709,7 +717,7 @@ pub async fn list_pollable_comments(
     interval_secs: i64,
 ) -> Result<Vec<PollableComment>, sqlx::Error> {
     sqlx::query_as::<_, PollableComment>(
-        "SELECT rc.task_id, rc.github_comment_id, rc.kind, r.owner, r.name, t.installation_id \
+        "SELECT rc.task_id, rc.platform_comment_id, rc.kind, r.owner, r.name, t.installation_id, r.platform \
          FROM review_comments rc \
          JOIN tasks t ON t.id = rc.task_id \
          JOIN repositories r ON r.id = t.repository_id \
@@ -717,9 +725,9 @@ pub async fn list_pollable_comments(
            AND ( \
              rc.created_at > now() - interval '1 day' \
              OR (rc.created_at BETWEEN now() - interval '3 days' AND now() - interval '1 day' \
-                 AND (rc.github_comment_id % 12) = (extract(epoch from now())::bigint / $2) % 12) \
+                 AND (rc.platform_comment_id % 12) = (extract(epoch from now())::bigint / $2) % 12) \
              OR (rc.created_at < now() - interval '3 days' \
-                 AND (rc.github_comment_id % 72) = (extract(epoch from now())::bigint / $2) % 72) \
+                 AND (rc.platform_comment_id % 72) = (extract(epoch from now())::bigint / $2) % 72) \
            ) \
          ORDER BY rc.created_at",
     )
@@ -735,7 +743,7 @@ pub async fn list_pollable_comments(
 pub async fn reconcile_comment_feedback(
     pool: &PgPool,
     task_id: Uuid,
-    github_comment_id: i64,
+    platform_comment_id: i64,
     kind: &str,
     reactions: &[(String, String)],
 ) -> Result<(), sqlx::Error> {
@@ -743,13 +751,13 @@ pub async fn reconcile_comment_feedback(
     for (reactor, reaction) in reactions {
         sqlx::query(
             "INSERT INTO review_feedback \
-             (id, task_id, github_comment_id, comment_kind, reactor, reaction) \
+             (id, task_id, platform_comment_id, comment_kind, reactor, reaction) \
              VALUES ($1, $2, $3, $4, $5, $6) \
-             ON CONFLICT (github_comment_id, comment_kind, reactor, reaction) DO NOTHING",
+             ON CONFLICT (platform_comment_id, comment_kind, reactor, reaction) DO NOTHING",
         )
         .bind(Uuid::new_v4())
         .bind(task_id)
-        .bind(github_comment_id)
+        .bind(platform_comment_id)
         .bind(kind)
         .bind(reactor)
         .bind(reaction)
@@ -762,10 +770,10 @@ pub async fn reconcile_comment_feedback(
     let present: Vec<String> = reactions.iter().map(|(u, c)| format!("{u}|{c}")).collect();
     sqlx::query(
         "DELETE FROM review_feedback \
-         WHERE github_comment_id = $1 AND comment_kind = $2 \
+         WHERE platform_comment_id = $1 AND comment_kind = $2 \
            AND (reactor || '|' || reaction) <> ALL($3)",
     )
-    .bind(github_comment_id)
+    .bind(platform_comment_id)
     .bind(kind)
     .bind(&present)
     .execute(&mut *tx)
@@ -777,7 +785,7 @@ pub async fn reconcile_comment_feedback(
 /// from the comment so the dashboard can show feedback per finding.
 #[derive(Debug, Serialize, sqlx::FromRow)]
 pub struct FeedbackRow {
-    pub github_comment_id: i64,
+    pub platform_comment_id: i64,
     pub comment_kind: String,
     pub reactor: String,
     pub reaction: String,
@@ -799,7 +807,7 @@ pub async fn rejected_findings_for_repo(
         "SELECT DISTINCT rc.file, rc.line, finding->>'title' AS title \
          FROM review_feedback f \
          JOIN review_comments rc \
-           ON rc.github_comment_id = f.github_comment_id AND rc.kind = f.comment_kind \
+           ON rc.platform_comment_id = f.platform_comment_id AND rc.kind = f.comment_kind \
          JOIN tasks t ON t.id = f.task_id \
          JOIN reviews r ON r.task_id = f.task_id \
          JOIN LATERAL jsonb_array_elements(r.findings) finding \
@@ -818,10 +826,10 @@ pub async fn rejected_findings_for_repo(
 /// All feedback recorded for a task (ADR-0035), for the dashboard.
 pub async fn get_feedback(pool: &PgPool, task_id: Uuid) -> Result<Vec<FeedbackRow>, sqlx::Error> {
     sqlx::query_as::<_, FeedbackRow>(
-        "SELECT f.github_comment_id, f.comment_kind, f.reactor, f.reaction, rc.file, rc.line \
+        "SELECT f.platform_comment_id, f.comment_kind, f.reactor, f.reaction, rc.file, rc.line \
          FROM review_feedback f \
          LEFT JOIN review_comments rc \
-           ON rc.github_comment_id = f.github_comment_id AND rc.kind = f.comment_kind \
+           ON rc.platform_comment_id = f.platform_comment_id AND rc.kind = f.comment_kind \
          WHERE f.task_id = $1 ORDER BY f.created_at",
     )
     .bind(task_id)
@@ -1025,14 +1033,16 @@ pub async fn load_pending_review(
 /// Returns `true` if the delivery is new (inserted), `false` if it was already seen (duplicate).
 pub async fn record_delivery(
     pool: &PgPool,
+    platform: Platform,
     delivery_id: &str,
     event_name: &str,
     payload: &Value,
 ) -> Result<bool, sqlx::Error> {
     let result = sqlx::query(
-        "INSERT INTO github_deliveries (delivery_id, event_name, payload_json) \
-         VALUES ($1, $2, $3) ON CONFLICT (delivery_id) DO NOTHING",
+        "INSERT INTO webhook_deliveries (platform, delivery_id, event_name, payload_json) \
+         VALUES ($1, $2, $3, $4) ON CONFLICT (delivery_id) DO NOTHING",
     )
+    .bind(platform)
     .bind(delivery_id)
     .bind(event_name)
     .bind(payload)
@@ -1057,7 +1067,7 @@ pub struct TaskRow {
     pub installation_id: i64,
     /// `None` for admin-initiated tasks (e.g. index-on-approve) that have no originating webhook
     /// delivery; `Some` for webhook-created tasks. (Column is nullable since migration 0008.)
-    pub github_delivery_id: Option<String>,
+    pub webhook_delivery_id: Option<String>,
     pub target_type: String,
     pub target_id: i64,
     pub command_text: String,
@@ -1097,7 +1107,7 @@ const TASK_SELECT: &str = "SELECT t.*, r.owner AS repo_owner, r.name AS repo_nam
 pub struct NewTask {
     pub repository_id: i64,
     pub installation_id: i64,
-    pub github_delivery_id: String,
+    pub webhook_delivery_id: String,
     pub target_type: String,
     pub target_id: i64,
     pub command_text: String,
@@ -1137,22 +1147,24 @@ pub struct ClaimedTask {
 /// owns it).
 pub async fn upsert_repository(
     pool: &PgPool,
-    github_repo_id: i64,
+    platform: Platform,
+    platform_repo_id: i64,
     owner: &str,
     name: &str,
     default_branch: &str,
     installation_id: Option<i64>,
 ) -> Result<i64, sqlx::Error> {
     sqlx::query_scalar(
-        "INSERT INTO repositories (github_repo_id, owner, name, default_branch, installation_id) \
-         VALUES ($1, $2, $3, $4, $5) \
-         ON CONFLICT (github_repo_id) DO UPDATE \
+        "INSERT INTO repositories (platform, platform_repo_id, owner, name, default_branch, installation_id) \
+         VALUES ($1, $2, $3, $4, $5, $6) \
+         ON CONFLICT (platform, platform_repo_id) DO UPDATE \
            SET owner = EXCLUDED.owner, name = EXCLUDED.name, \
                default_branch = EXCLUDED.default_branch, \
                installation_id = COALESCE(EXCLUDED.installation_id, repositories.installation_id) \
          RETURNING id",
     )
-    .bind(github_repo_id)
+    .bind(platform)
+    .bind(platform_repo_id)
     .bind(owner)
     .bind(name)
     .bind(default_branch)
@@ -1201,7 +1213,7 @@ async fn notify_or_log_initial_status(pool: &PgPool, id: Uuid, repository_id: i6
 pub async fn create_task(pool: &PgPool, task: &NewTask) -> Result<Option<Uuid>, sqlx::Error> {
     let id = Uuid::new_v4();
     let inserted: Option<(Uuid, String)> = sqlx::query_as(&format!(
-        "INSERT INTO tasks (id, repository_id, installation_id, github_delivery_id, target_type, \
+        "INSERT INTO tasks (id, repository_id, installation_id, webhook_delivery_id, target_type, \
          target_id, command_text, base_sha, head_sha, run_epoch, tier, trigger_comment_id, status) \
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, {INITIAL_TASK_STATUS_SQL}) \
          ON CONFLICT (repository_id, target_type, target_id, command_text, head_sha, run_epoch) \
@@ -1211,7 +1223,7 @@ pub async fn create_task(pool: &PgPool, task: &NewTask) -> Result<Option<Uuid>, 
     .bind(id)
     .bind(task.repository_id)
     .bind(task.installation_id)
-    .bind(&task.github_delivery_id)
+    .bind(&task.webhook_delivery_id)
     .bind(&task.target_type)
     .bind(task.target_id)
     .bind(&task.command_text)
@@ -1231,7 +1243,7 @@ pub async fn create_task(pool: &PgPool, task: &NewTask) -> Result<Option<Uuid>, 
 
 /// Enqueue an **explicit human command** (an `@mention`), which must ALWAYS land a task — never
 /// content-deduped. True webhook redeliveries are already collapsed upstream by the
-/// `github_deliveries` PRIMARY KEY, so content-idempotency on this path adds nothing and only drops
+/// `webhook_deliveries` PRIMARY KEY, so content-idempotency on this path adds nothing and only drops
 /// legitimate re-requests.
 ///
 /// The `run_epoch` is folded into the INSERT — `COALESCE(MAX(run_epoch), -1) + 1` over the SAME
@@ -1251,7 +1263,7 @@ pub async fn create_explicit_task(pool: &PgPool, task: &NewTask) -> Result<Uuid,
         attempt += 1;
         let id = Uuid::new_v4();
         let result = sqlx::query_as::<_, (Uuid, String)>(&format!(
-            "INSERT INTO tasks (id, repository_id, installation_id, github_delivery_id, target_type, \
+            "INSERT INTO tasks (id, repository_id, installation_id, webhook_delivery_id, target_type, \
              target_id, command_text, base_sha, head_sha, tier, trigger_comment_id, run_epoch, status) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, \
                (SELECT COALESCE(MAX(run_epoch), -1) + 1 FROM tasks \
@@ -1263,7 +1275,7 @@ pub async fn create_explicit_task(pool: &PgPool, task: &NewTask) -> Result<Uuid,
         .bind(id)
         .bind(task.repository_id)
         .bind(task.installation_id)
-        .bind(&task.github_delivery_id)
+        .bind(&task.webhook_delivery_id)
         .bind(&task.target_type)
         .bind(task.target_id)
         .bind(&task.command_text)
@@ -1638,7 +1650,8 @@ pub async fn get_task(pool: &PgPool, id: Uuid) -> Result<Option<TaskRow>, sqlx::
 #[derive(Debug, Serialize, sqlx::FromRow)]
 pub struct RepositoryRow {
     pub id: i64,
-    pub github_repo_id: i64,
+    pub platform_repo_id: i64,
+    pub platform: Platform,
     pub owner: String,
     pub name: String,
     pub default_branch: String,
@@ -1662,7 +1675,7 @@ pub async fn list_repositories(
     status: Option<&str>,
 ) -> Result<Vec<RepositoryRow>, sqlx::Error> {
     sqlx::query_as::<_, RepositoryRow>(
-        "SELECT r.id, r.github_repo_id, r.owner, r.name, r.default_branch, r.status, \
+        "SELECT r.id, r.platform_repo_id, r.platform, r.owner, r.name, r.default_branch, r.status, \
            (r.status = 'approved') AS active, r.approved_at, r.approved_by, \
            COUNT(t.id) AS task_count, MAX(t.created_at) AS last_task_at \
          FROM repositories r LEFT JOIN tasks t ON t.repository_id = r.id \
@@ -1683,21 +1696,23 @@ pub async fn list_repositories(
 /// the first PR webhook fills it in. Returns `true` when a row was inserted or re-pended.
 pub async fn register_pending_repository(
     pool: &PgPool,
-    github_repo_id: i64,
+    platform: Platform,
+    platform_repo_id: i64,
     owner: &str,
     name: &str,
     default_branch: &str,
     installation_id: Option<i64>,
 ) -> Result<bool, sqlx::Error> {
     let affected = sqlx::query(
-        "INSERT INTO repositories (github_repo_id, owner, name, default_branch, installation_id, status) \
-         VALUES ($1, $2, $3, $4, $5, 'pending') \
-         ON CONFLICT (github_repo_id) DO UPDATE \
+        "INSERT INTO repositories (platform, platform_repo_id, owner, name, default_branch, installation_id, status) \
+         VALUES ($1, $2, $3, $4, $5, $6, 'pending') \
+         ON CONFLICT (platform, platform_repo_id) DO UPDATE \
            SET status = 'pending', owner = EXCLUDED.owner, name = EXCLUDED.name, \
                installation_id = COALESCE(EXCLUDED.installation_id, repositories.installation_id) \
            WHERE repositories.status = 'disabled'",
     )
-    .bind(github_repo_id)
+    .bind(platform)
+    .bind(platform_repo_id)
     .bind(owner)
     .bind(name)
     .bind(default_branch)
@@ -1756,7 +1771,7 @@ pub async fn repository_installation_id(
 /// runs on admin approval, and on every default-branch push via `handle_push`). Skips if an index task
 /// is already active for the repo (so a burst of pushes / a re-approve doesn't pile up duplicates).
 /// Returns the new task id, or `None` if one was already pending/running. Unlike review tasks it has no
-/// originating delivery (`github_delivery_id` NULL) and no SHA (the runner indexes the default-branch
+/// originating delivery (`webhook_delivery_id` NULL) and no SHA (the runner indexes the default-branch
 /// HEAD).
 ///
 /// `run_epoch` is computed as `MAX+1` over the same columns as `tasks_idempotency_idx` (minus
@@ -1814,21 +1829,23 @@ pub async fn create_index_task(
 /// Set a repository's approval status by its **GitHub** id (webhook path — e.g. mark `disabled` when
 /// removed from the installation). Returns the repo's **local** id (so the caller can purge its index
 /// data), or `None` if the repo isn't known locally.
-pub async fn set_repository_status_by_github_id(
+pub async fn set_repository_status_by_platform_id(
     pool: &PgPool,
-    github_repo_id: i64,
+    platform: Platform,
+    platform_repo_id: i64,
     status: &str,
 ) -> Result<Option<i64>, sqlx::Error> {
     // Clear the approval audit on any non-approved transition (e.g. disable) so stale approver/time
     // don't linger — mirrors `set_repository_status_by_id`.
     sqlx::query_scalar(
-        "UPDATE repositories SET status = $2, \
-           approved_at = CASE WHEN $2 = 'approved' THEN approved_at ELSE NULL END, \
-           approved_by = CASE WHEN $2 = 'approved' THEN approved_by ELSE NULL END \
-         WHERE github_repo_id = $1 \
+        "UPDATE repositories SET status = $3, \
+           approved_at = CASE WHEN $3 = 'approved' THEN approved_at ELSE NULL END, \
+           approved_by = CASE WHEN $3 = 'approved' THEN approved_by ELSE NULL END \
+         WHERE platform_repo_id = $2 AND platform = $1 \
          RETURNING id",
     )
-    .bind(github_repo_id)
+    .bind(platform)
+    .bind(platform_repo_id)
     .bind(status)
     .fetch_optional(pool)
     .await
@@ -1858,7 +1875,7 @@ pub async fn set_repository_status_by_id(
         return Ok(None);
     }
     sqlx::query_as::<_, RepositoryRow>(
-        "SELECT r.id, r.github_repo_id, r.owner, r.name, r.default_branch, r.status, \
+        "SELECT r.id, r.platform_repo_id, r.platform, r.owner, r.name, r.default_branch, r.status, \
            (r.status = 'approved') AS active, r.approved_at, r.approved_by, \
            COUNT(t.id) AS task_count, MAX(t.created_at) AS last_task_at \
          FROM repositories r LEFT JOIN tasks t ON t.repository_id = r.id \
@@ -1881,6 +1898,7 @@ pub struct TaskContextRow {
     pub owner: String,
     pub name: String,
     pub default_branch: String,
+    pub platform: Platform,
     pub target_type: String,
     pub target_id: i64,
     pub command_text: String,
@@ -1904,7 +1922,7 @@ pub async fn get_task_context(
     id: Uuid,
 ) -> Result<Option<TaskContextRow>, sqlx::Error> {
     sqlx::query_as::<_, TaskContextRow>(
-        "SELECT t.id, t.repository_id, t.installation_id, r.owner, r.name, r.default_branch, \
+        "SELECT t.id, t.repository_id, t.installation_id, r.owner, r.name, r.default_branch, r.platform, \
                 t.target_type, t.target_id, t.command_text, t.kind, t.tier, t.base_sha, t.head_sha, \
                 t.trigger_comment_id \
          FROM tasks t JOIN repositories r ON r.id = t.repository_id \
@@ -2156,23 +2174,35 @@ mod tests {
     async fn record_delivery_dedupes_on_delivery_id(pool: PgPool) {
         let payload = json!({ "action": "opened" });
 
-        let first = record_delivery(&pool, "delivery-abc", "pull_request", &payload)
-            .await
-            .unwrap();
+        let first = record_delivery(
+            &pool,
+            Platform::GitHub,
+            "delivery-abc",
+            "pull_request",
+            &payload,
+        )
+        .await
+        .unwrap();
         assert!(first, "first delivery is new");
 
-        let replay = record_delivery(&pool, "delivery-abc", "pull_request", &payload)
-            .await
-            .unwrap();
+        let replay = record_delivery(
+            &pool,
+            Platform::GitHub,
+            "delivery-abc",
+            "pull_request",
+            &payload,
+        )
+        .await
+        .unwrap();
         assert!(!replay, "replayed delivery id is a duplicate");
 
-        let other = record_delivery(&pool, "delivery-xyz", "push", &payload)
+        let other = record_delivery(&pool, Platform::GitHub, "delivery-xyz", "push", &payload)
             .await
             .unwrap();
         assert!(other, "a different delivery id is independent");
 
         let count: i64 =
-            sqlx::query_scalar("SELECT count(*) FROM github_deliveries WHERE delivery_id = $1")
+            sqlx::query_scalar("SELECT count(*) FROM webhook_deliveries WHERE delivery_id = $1")
                 .bind("delivery-abc")
                 .fetch_one(&pool)
                 .await
@@ -2182,10 +2212,10 @@ mod tests {
 
     /// Seed the FK rows a task needs (one repository + one delivery); returns the repository id.
     async fn seed(pool: &PgPool) -> i64 {
-        let repo_id = upsert_repository(pool, 1, "octo", "repo", "main", None)
+        let repo_id = upsert_repository(pool, Platform::GitHub, 1, "octo", "repo", "main", None)
             .await
             .unwrap();
-        record_delivery(pool, "d1", "pull_request", &json!({}))
+        record_delivery(pool, Platform::GitHub, "d1", "pull_request", &json!({}))
             .await
             .unwrap();
         repo_id
@@ -2195,7 +2225,7 @@ mod tests {
         NewTask {
             repository_id,
             installation_id: 99,
-            github_delivery_id: "d1".to_string(),
+            webhook_delivery_id: "d1".to_string(),
             target_type: "pull_request".to_string(),
             target_id: 7,
             command_text: "review".to_string(),
@@ -2315,7 +2345,7 @@ mod tests {
             &pool,
             task,
             &[ReviewCommentRef {
-                github_comment_id: 12345,
+                platform_comment_id: 12345,
                 kind: "failure_notice".to_string(),
                 file: None,
                 line: None,
@@ -2355,7 +2385,7 @@ mod tests {
     /// ADR-0059: an enqueued intent is claimable in order, idempotent on `dedup_key`, and the
     /// posted/failed transitions move it out of (or back into, after backoff) the claim set.
     #[sqlx::test]
-    async fn github_outbox_enqueue_claim_and_mark(pool: PgPool) {
+    async fn outbox_enqueue_claim_and_mark(pool: PgPool) {
         let repo_id = seed(&pool).await;
         let task = create_task(&pool, &pr_task(repo_id, "h"))
             .await
@@ -2365,15 +2395,35 @@ mod tests {
 
         // First enqueue inserts; a second with the same dedup_key is a no-op (idempotent).
         assert!(
-            enqueue_github_post(&pool, Some(task), 99, "o", "r", "reaction", &payload, "k1")
-                .await
-                .unwrap(),
+            enqueue_outbox_post(
+                &pool,
+                Platform::GitHub,
+                Some(task),
+                99,
+                "o",
+                "r",
+                "reaction",
+                &payload,
+                "k1"
+            )
+            .await
+            .unwrap(),
             "first enqueue inserts"
         );
         assert!(
-            !enqueue_github_post(&pool, Some(task), 99, "o", "r", "reaction", &payload, "k1")
-                .await
-                .unwrap(),
+            !enqueue_outbox_post(
+                &pool,
+                Platform::GitHub,
+                Some(task),
+                99,
+                "o",
+                "r",
+                "reaction",
+                &payload,
+                "k1"
+            )
+            .await
+            .unwrap(),
             "duplicate dedup_key is a no-op"
         );
 
@@ -2388,9 +2438,19 @@ mod tests {
         assert!(claim_outbox_batch(&pool, 10).await.unwrap().is_empty());
 
         // A failed delivery backs the row off into the future (not immediately re-claimable).
-        enqueue_github_post(&pool, Some(task), 99, "o", "r", "reply", &payload, "k2")
-            .await
-            .unwrap();
+        enqueue_outbox_post(
+            &pool,
+            Platform::GitHub,
+            Some(task),
+            99,
+            "o",
+            "r",
+            "reply",
+            &payload,
+            "k2",
+        )
+        .await
+        .unwrap();
         let id = claim_outbox_batch(&pool, 10).await.unwrap()[0].id;
         mark_outbox_failed(&pool, id, "github 502").await.unwrap();
         assert!(
@@ -2419,6 +2479,7 @@ mod tests {
         // Clean pass: 👍 on the @mention comment, no review intent.
         let t_clean = crate::outbox::Target {
             task_id: Some(clean),
+            platform: Platform::GitHub,
             installation_id: 99,
             owner: "o",
             repo: "r",
@@ -2438,6 +2499,7 @@ mod tests {
         // Findings: 👎 on the PR body (no comment_id).
         let t_dirty = crate::outbox::Target {
             task_id: Some(dirty),
+            platform: Platform::GitHub,
             installation_id: 99,
             owner: "o",
             repo: "r",
@@ -2472,7 +2534,7 @@ mod tests {
 
     /// ADR-0068 re-finalize safety: the silent-clean guard trips on a `review` intent OR an
     /// actually-posted review, and the clean-path persist never clobbers a posted row (it would null
-    /// `github_review_id` and break the ADR-0035 feedback join).
+    /// `platform_review_id` and break the ADR-0035 feedback join).
     #[sqlx::test]
     async fn silent_clean_guard_and_insert_if_absent_protect_a_posted_review(pool: PgPool) {
         let repo_id = seed(&pool).await;
@@ -2487,7 +2549,7 @@ mod tests {
             .await
             .unwrap());
 
-        // A silent-clean persisted row (no github_review_id) does NOT trip the guard — re-running the
+        // A silent-clean persisted row (no platform_review_id) does NOT trip the guard — re-running the
         // clean path is harmless (insert-if-absent no-ops, verdict key no-ops).
         insert_review_if_absent(&pool, task, "clean", "body", 0, 0, 0, &findings)
             .await
@@ -2496,7 +2558,7 @@ mod tests {
             .await
             .unwrap());
 
-        // The reconciler upserts the POSTED copy (github_review_id set) → guard trips…
+        // The reconciler upserts the POSTED copy (platform_review_id set) → guard trips…
         upsert_review(
             &pool,
             task,
@@ -2515,13 +2577,13 @@ mod tests {
             .await
             .unwrap());
 
-        // …and a late clean-path insert is a no-op: the posted row keeps its github_review_id.
+        // …and a late clean-path insert is a no-op: the posted row keeps its platform_review_id.
         insert_review_if_absent(&pool, task, "clean", "body", 0, 0, 0, &findings)
             .await
             .unwrap();
         let row = get_review(&pool, task).await.unwrap().expect("review row");
         assert_eq!(
-            row.github_review_id,
+            row.platform_review_id,
             Some(9),
             "insert-if-absent must never clobber the posted review"
         );
@@ -2532,8 +2594,9 @@ mod tests {
             .await
             .unwrap()
             .expect("task2");
-        enqueue_github_post(
+        enqueue_outbox_post(
             &pool,
+            Platform::GitHub,
             Some(task2),
             99,
             "o",
@@ -2566,9 +2629,19 @@ mod tests {
         );
 
         // A pending review intent → counts as responding (suppress the notice).
-        enqueue_github_post(&pool, Some(task), 99, "o", "r", "review", &payload, "rk")
-            .await
-            .unwrap();
+        enqueue_outbox_post(
+            &pool,
+            Platform::GitHub,
+            Some(task),
+            99,
+            "o",
+            "r",
+            "review",
+            &payload,
+            "rk",
+        )
+        .await
+        .unwrap();
         assert!(
             has_responded_or_pending_content(&pool, task).await.unwrap(),
             "a pending review intent means a review is coming"
@@ -2577,11 +2650,13 @@ mod tests {
         // Once that review intent dead-letters, it no longer suppresses (the review won't post).
         let id = claim_outbox_batch(&pool, 10).await.unwrap()[0].id;
         for _ in 0..OUTBOX_MAX_ATTEMPTS {
-            sqlx::query("UPDATE github_outbox SET next_attempt_at = now() - interval '1 minute' WHERE id = $1")
-                .bind(id)
-                .execute(&pool)
-                .await
-                .unwrap();
+            sqlx::query(
+                "UPDATE outbox SET next_attempt_at = now() - interval '1 minute' WHERE id = $1",
+            )
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
             mark_outbox_failed(&pool, id, "boom").await.unwrap();
         }
         assert!(
@@ -2598,7 +2673,7 @@ mod tests {
         let issue = NewTask {
             repository_id: repo_id,
             installation_id: 99,
-            github_delivery_id: "d1".to_string(),
+            webhook_delivery_id: "d1".to_string(),
             target_type: "issue".to_string(),
             target_id: 42,
             command_text: "explain the retry logic".to_string(),
@@ -2667,7 +2742,7 @@ mod tests {
         let mention = |head: &str| NewTask {
             repository_id: repo_id,
             installation_id: 99,
-            github_delivery_id: "d1".to_string(),
+            webhook_delivery_id: "d1".to_string(),
             target_type: "pull_request".to_string(),
             target_id: 7,
             command_text: "review this".to_string(),
@@ -2841,25 +2916,31 @@ mod tests {
     /// reports `0` with a null `last_task_at`, and the active repo sorts first.
     #[sqlx::test]
     async fn list_repositories_summarises_activity(pool: PgPool) {
-        let active = upsert_repository(&pool, 1, "vymalo", "shop", "main", None)
+        let active = upsert_repository(&pool, Platform::GitHub, 1, "vymalo", "shop", "main", None)
             .await
             .unwrap();
-        let idle = upsert_repository(&pool, 2, "vymalo", "idle", "trunk", None)
+        let idle = upsert_repository(&pool, Platform::GitHub, 2, "vymalo", "idle", "trunk", None)
             .await
             .unwrap();
 
         for (n, delivery) in ["d-1", "d-2"].iter().enumerate() {
-            // tasks.github_delivery_id FKs github_deliveries — record the delivery first, exactly as
+            // tasks.webhook_delivery_id FKs webhook_deliveries — record the delivery first, exactly as
             // the webhook handler does before creating a task.
-            record_delivery(&pool, delivery, "pull_request", &json!({}))
-                .await
-                .unwrap();
+            record_delivery(
+                &pool,
+                Platform::GitHub,
+                delivery,
+                "pull_request",
+                &json!({}),
+            )
+            .await
+            .unwrap();
             create_task(
                 &pool,
                 &NewTask {
                     repository_id: active,
                     installation_id: 7,
-                    github_delivery_id: (*delivery).to_string(),
+                    webhook_delivery_id: (*delivery).to_string(),
                     target_type: "pull_request".to_string(),
                     target_id: n as i64,
                     command_text: "review".to_string(),
@@ -2893,7 +2974,7 @@ mod tests {
     #[sqlx::test]
     async fn repo_approval_status_transitions(pool: PgPool) {
         // A repo seen via the normal upsert path defaults to pending → gated.
-        let id = upsert_repository(&pool, 4242, "o", "r", "main", None)
+        let id = upsert_repository(&pool, Platform::GitHub, 4242, "o", "r", "main", None)
             .await
             .unwrap();
         assert!(
@@ -2903,13 +2984,13 @@ mod tests {
 
         // register_pending is insert-only: it reports not-new for an existing repo and leaves it be.
         assert!(
-            !register_pending_repository(&pool, 4242, "o", "r", "", None)
+            !register_pending_repository(&pool, Platform::GitHub, 4242, "o", "r", "", None)
                 .await
                 .unwrap()
         );
         // A brand-new repo registers as pending (reports new).
         assert!(
-            register_pending_repository(&pool, 5555, "o", "r2", "", None)
+            register_pending_repository(&pool, Platform::GitHub, 5555, "o", "r2", "", None)
                 .await
                 .unwrap()
         );
@@ -2945,12 +3026,12 @@ mod tests {
         assert!(!repository_approved(&pool, id).await.unwrap());
 
         // Disable-by-github-id (the webhook removal path).
-        set_repository_status_by_github_id(&pool, 5555, "disabled")
+        set_repository_status_by_platform_id(&pool, Platform::GitHub, 5555, "disabled")
             .await
             .unwrap();
         // Re-install of a DISABLED repo re-opens it to pending (so the admin can re-approve).
         assert!(
-            register_pending_repository(&pool, 5555, "o", "r2", "", None)
+            register_pending_repository(&pool, Platform::GitHub, 5555, "o", "r2", "", None)
                 .await
                 .unwrap(),
             "re-registering a disabled repo re-pends it"
@@ -2959,13 +3040,13 @@ mod tests {
             .await
             .unwrap()
             .iter()
-            .any(|r| r.github_repo_id == 5555));
+            .any(|r| r.platform_repo_id == 5555));
         // Re-registering an APPROVED repo is a no-op (must not revert it).
         set_repository_status_by_id(&pool, id, "approved", Some("alice"))
             .await
             .unwrap();
         assert!(
-            !register_pending_repository(&pool, 4242, "o", "r", "", None)
+            !register_pending_repository(&pool, Platform::GitHub, 4242, "o", "r", "", None)
                 .await
                 .unwrap(),
             "an approved repo is not re-pended"
@@ -2986,9 +3067,10 @@ mod tests {
     #[sqlx::test]
     async fn purge_cancels_only_target_repo_tasks(pool: PgPool) {
         let repo_a = seed(&pool).await;
-        let repo_b = upsert_repository(&pool, 9001, "octo", "other", "main", None)
-            .await
-            .unwrap();
+        let repo_b =
+            upsert_repository(&pool, Platform::GitHub, 9001, "octo", "other", "main", None)
+                .await
+                .unwrap();
         create_task(&pool, &pr_task(repo_a, "h1"))
             .await
             .unwrap()
@@ -3030,7 +3112,7 @@ mod tests {
     /// task is created once but not duplicated while one is already active.
     #[sqlx::test]
     async fn index_task_creation_is_deduped(pool: PgPool) {
-        let id = upsert_repository(&pool, 1212, "o", "r", "main", Some(555))
+        let id = upsert_repository(&pool, Platform::GitHub, 1212, "o", "r", "main", Some(555))
             .await
             .unwrap();
         assert_eq!(
@@ -3106,7 +3188,7 @@ mod tests {
             Some("https://github.com/o/r/pull/7#pullrequestreview-1")
         );
         assert_eq!(
-            row.github_review_id,
+            row.platform_review_id,
             Some(987654),
             "review id persisted (ADR-0035)"
         );
@@ -3361,7 +3443,7 @@ mod tests {
             "still only the *other* task's review, not its own"
         );
 
-        // A review ENQUEUED but not yet delivered (pending `github_outbox` row — reconciler backoff, or
+        // A review ENQUEUED but not yet delivered (pending `outbox` row — reconciler backoff, or
         // two rapid re-reviews racing finalize) also counts: its findings ride the payload JSON.
         let queued_same_head = create_task(
             &pool,
@@ -3379,8 +3461,9 @@ mod tests {
             "findings_json": [{ "file": "q.rs", "line": 5, "title": "queued finding", "body": "b" }],
             "label_findings": true, "label_error": false
         });
-        enqueue_github_post(
+        enqueue_outbox_post(
             &pool,
+            Platform::GitHub,
             Some(queued_same_head),
             99,
             "acme",
@@ -3402,7 +3485,7 @@ mod tests {
 
         // Once delivered (`posted`), the outbox arm skips it — the reconciler persists it into
         // `reviews` at that point, so the first arm covers it without double-counting.
-        sqlx::query("UPDATE github_outbox SET status = 'posted' WHERE task_id = $1")
+        sqlx::query("UPDATE outbox SET status = 'posted' WHERE task_id = $1")
             .bind(queued_same_head)
             .execute(&pool)
             .await
@@ -3440,13 +3523,13 @@ mod tests {
             task_id,
             &[
                 ReviewCommentRef {
-                    github_comment_id: 555,
+                    platform_comment_id: 555,
                     kind: "inline".to_string(),
                     file: Some("a.rs".to_string()),
                     line: Some(7),
                 },
                 ReviewCommentRef {
-                    github_comment_id: 556,
+                    platform_comment_id: 556,
                     kind: "inline".to_string(),
                     file: Some("a.rs".to_string()),
                     line: Some(9),
@@ -3497,7 +3580,7 @@ mod tests {
             &pool,
             task_id,
             &[ReviewCommentRef {
-                github_comment_id: 555,
+                platform_comment_id: 555,
                 kind: "inline".to_string(),
                 file: Some("a.rs".to_string()),
                 line: Some(7),
@@ -3509,7 +3592,7 @@ mod tests {
         // The comment is pollable (joined to repo identity + installation).
         let pollable = list_pollable_comments(&pool, 14, 300).await.unwrap();
         assert_eq!(pollable.len(), 1);
-        assert_eq!(pollable[0].github_comment_id, 555);
+        assert_eq!(pollable[0].platform_comment_id, 555);
         assert_eq!(pollable[0].owner, "octo");
 
         // First cycle: two reactions.
@@ -3749,7 +3832,7 @@ mod tests {
             &NewTask {
                 repository_id: repo_id,
                 installation_id: 99,
-                github_delivery_id: "d1".to_string(),
+                webhook_delivery_id: "d1".to_string(),
                 target_type: "pull_request".to_string(),
                 target_id: 8,
                 command_text: "@lightbridge review".to_string(),

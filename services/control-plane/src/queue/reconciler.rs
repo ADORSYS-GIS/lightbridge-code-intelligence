@@ -1,14 +1,19 @@
-//! The `reconciler` role (ADR-0058) — bidirectional GitHub reconciliation in one single-replica loop:
+//! The `reconciler` role (ADR-0058) — bidirectional platform reconciliation in one single-replica loop:
 //!
-//! - **outbound (ADR-0059):** the **sole** GitHub egress. It drains `github_outbox` — the intent rows
-//!   serve/finalize, the reaper, and the webhook 👀 enqueue — and posts each via the App key, marking it
-//!   `posted` (recording the id for the feedback join) or backing it off on failure. NOTIFY-driven with a
-//!   timer fallback, exactly like the dispatcher on `task_queued`.
+//! - **outbound (ADR-0059):** the **sole** platform egress. It drains `outbox` — the intent rows
+//!   serve/finalize, the reaper, and the webhook 👀 enqueue — and posts each via the platform
+//!   implementation, marking it `posted` (recording the id for the feedback join) or backing it off
+//!   on failure. NOTIFY-driven with a timer fallback, exactly like the dispatcher on `task_queued`.
 //! - **inbound (ADR-0035):** reads 👍/👎 reactions on the comments we posted and reconciles them into
 //!   `review_feedback` (GitHub emits no webhook for reactions).
 //!
 //! Single replica is load-bearing: it makes "sole consumer" literal and keeps the outbox's per-task
-//! ordering intact. The role is the only one besides serve that holds the App key (ADR-0002).
+//! ordering intact. The role is the only one besides serve that holds the platform credentials
+//! (ADR-0002).
+//!
+//! Platform dispatch: each outbox row carries a `platform` column; the reconciler looks up the
+//! matching `CodePlatform` implementation from a `HashMap` supplied at startup. GitHub rows use the
+//! `GithubApp` impl; GitLab rows (Phase 4+) use the `GitlabClient` impl.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -18,25 +23,28 @@ use sqlx::postgres::PgListener;
 use sqlx::PgPool;
 
 use crate::config::ReviewSection;
-use crate::integrations::github::{GithubApp, ReviewComment};
+use crate::integrations::platform::{CodePlatform, Platform, ReactionTarget, RepoRef};
 
 /// How many intents to claim per drain pass.
 const DRAIN_BATCH: i64 = 50;
-/// Fallback wake if a `NOTIFY github_outbox` is missed (e.g. fired while we were mid-batch).
+/// Fallback wake if a `NOTIFY outbox` is missed (e.g. fired while we were mid-batch).
 const DRAIN_FALLBACK: Duration = Duration::from_secs(15);
 
-/// Run the reconciler: the outbox drain (foreground) plus the feedback poll (spawned). Either failing a
-/// cycle is logged and retried — a transient GitHub/DB blip must not kill the role.
+/// Run the reconciler: the outbox drain (foreground) plus the feedback poll (spawned). Either failing
+/// a cycle is logged and retried — a transient platform/DB blip must not kill the role.
+///
+/// `platforms` maps each `Platform` variant to its `CodePlatform` implementation. GitHub uses
+/// `GithubApp`; GitLab uses `GitlabClient` (ADR-0071).
 pub async fn run(
     pool: PgPool,
-    app: GithubApp,
+    platforms: HashMap<Platform, Arc<dyn CodePlatform>>,
     review: Arc<ReviewSection>,
     interval: Duration,
     within_days: i32,
 ) -> anyhow::Result<()> {
     // Feedback poll (ADR-0035) on its own cadence, alongside the drain.
     {
-        let (pool, app) = (pool.clone(), app.clone());
+        let (pool, platforms) = (pool.clone(), platforms.clone());
         let interval_secs = interval.as_secs() as i64;
         tokio::spawn(async move {
             tracing::info!(
@@ -45,34 +53,34 @@ pub async fn run(
                 "reconciler: feedback poll started"
             );
             let mut tick = tokio::time::interval(interval);
-            // A slow cycle (e.g. GitHub stalling) must not make the next ticks burst-fire to catch up and
-            // spike DB + API load — skip the missed ticks instead (gemini #219).
+            // A slow cycle (e.g. platform stalling) must not make the next ticks burst-fire to catch up
+            // and spike DB + API load — skip the missed ticks instead (gemini #219).
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 tick.tick().await;
-                match poll_once(&pool, &app, within_days, interval_secs).await {
+                match poll_once(&pool, &platforms, within_days, interval_secs).await {
                     Ok(n) => tracing::debug!(comments = n, "feedback poll cycle complete"),
                     Err(error) => tracing::warn!(%error, "feedback poll cycle failed (will retry)"),
                 }
             }
         });
     }
-    run_outbox_drain(pool, app, review).await
+    run_outbox_drain(pool, platforms, review).await
 }
 
-/// The GitHub-egress drain loop (ADR-0059): wake on `NOTIFY github_outbox` (timer fallback), then drain
-/// every due intent before sleeping again. If the `LISTEN` connection drops, reconnect a fresh listener
-/// (gemini #219) — the timer fallback keeps draining throughout, so a lost connection degrades latency,
-/// never liveness.
+/// The platform-egress drain loop (ADR-0059): wake on `NOTIFY outbox` (timer fallback), then drain
+/// every due intent before sleeping again. If the `LISTEN` connection drops, reconnect a fresh
+/// listener (gemini #219) — the timer fallback keeps draining throughout, so a lost connection
+/// degrades latency, never liveness.
 async fn run_outbox_drain(
     pool: PgPool,
-    app: GithubApp,
+    platforms: HashMap<Platform, Arc<dyn CodePlatform>>,
     review: Arc<ReviewSection>,
 ) -> anyhow::Result<()> {
     loop {
         let mut listener = match connect_listener(&pool).await {
             Ok(l) => {
-                tracing::info!("reconciler: github-egress drain listening");
+                tracing::info!("reconciler: egress drain listening");
                 l
             }
             Err(error) => {
@@ -84,7 +92,7 @@ async fn run_outbox_drain(
         // Drain + park until the listener drops, then reconnect via the outer loop.
         loop {
             loop {
-                match drain_once(&pool, &app, &review).await {
+                match drain_once(&pool, &platforms, &review).await {
                     Ok(0) => break,
                     Ok(n) => tracing::debug!(posted = n, "outbox drain batch"),
                     Err(error) => {
@@ -108,87 +116,108 @@ async fn run_outbox_drain(
 
 async fn connect_listener(pool: &PgPool) -> anyhow::Result<PgListener> {
     let mut listener = PgListener::connect_with(pool).await?;
-    listener.listen(crate::db::GITHUB_OUTBOX_CHANNEL).await?;
+    listener.listen(crate::db::OUTBOX_CHANNEL).await?;
     Ok(listener)
 }
 
-/// Claim one batch and deliver each intent. Marks every row `posted` (with the returned id) or backs it
-/// off `failed`, so the row never re-claims unbounded — including a token-mint failure. Returns how many
-/// posted.
+/// Claim one batch and deliver each intent. Marks every row `posted` (with the returned id) or backs
+/// it off `failed`, so the row never re-claims unbounded — including an auth failure. Returns how
+/// many posted.
+///
+/// Token minting is now encapsulated inside each `CodePlatform` implementation (GitHub mints an
+/// installation token internally; GitLab uses a static token), so the per-installation token cache
+/// is gone — the implementation owns its own caching if it needs one.
 async fn drain_once(
     pool: &PgPool,
-    app: &GithubApp,
+    platforms: &HashMap<Platform, Arc<dyn CodePlatform>>,
     review: &ReviewSection,
 ) -> anyhow::Result<usize> {
     let rows = crate::db::claim_outbox_batch(pool, DRAIN_BATCH).await?;
     if rows.is_empty() {
         return Ok(0);
     }
-    // One token per installation per batch; `None` caches a mint failure.
-    let mut tokens: HashMap<i64, Option<String>> = HashMap::new();
     let mut posted = 0;
     for row in rows {
-        let token = match tokens.get(&row.installation_id) {
-            Some(Some(t)) => t.clone(),
-            Some(None) => {
-                // Mint already failed this batch — back the row off rather than spin on it.
-                let _ = crate::db::mark_outbox_failed(pool, row.id, "mint token failed").await;
-                continue;
-            }
-            None => match app.installation_token(row.installation_id).await {
-                Ok(t) => {
-                    tokens.insert(row.installation_id, Some(t.clone()));
-                    t
-                }
-                Err(error) => {
-                    tracing::warn!(%error, installation = row.installation_id, "outbox: mint token failed");
-                    tokens.insert(row.installation_id, None);
-                    let _ = crate::db::mark_outbox_failed(pool, row.id, "mint token failed").await;
-                    continue;
-                }
-            },
+        let Some(platform) = platforms.get(&row.platform) else {
+            tracing::warn!(
+                platform = %row.platform,
+                outbox_id = row.id,
+                "no platform implementation registered for outbox row; backing off"
+            );
+            let _ = crate::db::mark_outbox_failed(pool, row.id, "no platform implementation").await;
+            continue;
+        };
+        let repo = RepoRef {
+            platform: row.platform,
+            full_name: format!("{}/{}", row.owner, row.repo),
+            // `platform_repo_id` is not used by any API method (auth uses `installation_id`, URL
+            // paths use `owner/repo`), so a placeholder is safe here.
+            platform_repo_id: 0,
+            installation_id: row.installation_id,
         };
         if row.attempts > 0 {
-            tracing::info!(outbox_id = row.id, attempts = row.attempts, kind = %row.kind, "outbox: retrying delivery");
+            tracing::info!(
+                outbox_id = row.id,
+                attempts = row.attempts,
+                kind = %row.kind,
+                "outbox: retrying delivery"
+            );
         }
-        match deliver(pool, app, &token, review, &row).await {
-            Ok(github_id) => {
-                if let Err(error) = crate::db::mark_outbox_posted(pool, row.id, github_id).await {
+        match deliver(pool, platform.as_ref(), &repo, review, &row).await {
+            Ok(platform_id) => {
+                if let Err(error) = crate::db::mark_outbox_posted(pool, row.id, platform_id).await {
                     tracing::warn!(%error, outbox_id = row.id, "marking outbox posted failed");
                 }
+                crate::http::metrics::outbox_delivery(
+                    &row.platform.to_string(),
+                    &row.kind,
+                    "posted",
+                );
                 posted += 1;
             }
             Err(error) => {
-                tracing::warn!(%error, outbox_id = row.id, kind = %row.kind, "outbox delivery failed (will back off)");
+                tracing::warn!(
+                    %error,
+                    outbox_id = row.id,
+                    kind = %row.kind,
+                    "outbox delivery failed (will back off)"
+                );
                 let _ = crate::db::mark_outbox_failed(pool, row.id, &error.to_string()).await;
+                crate::http::metrics::outbox_delivery(
+                    &row.platform.to_string(),
+                    &row.kind,
+                    "failed",
+                );
             }
         }
     }
     Ok(posted)
 }
 
-/// Post one intent. Returns the GitHub id to record (review/comment) or `None`. An `Err` backs the row
-/// off for retry.
+/// Post one intent. Returns the platform id to record (review/comment) or `None`. An `Err` backs the
+/// row off for retry.
 async fn deliver(
     pool: &PgPool,
-    app: &GithubApp,
-    token: &str,
+    platform: &dyn CodePlatform,
+    repo: &RepoRef,
     review: &ReviewSection,
     row: &crate::db::OutboxRow,
 ) -> anyhow::Result<Option<i64>> {
     match row.kind.as_str() {
         "reaction" => {
             let content = payload_str(&row.payload, "content")?;
-            // ADR-0068: when the payload carries a `comment_id`, react on the triggering @mention comment;
-            // otherwise on the PR/issue body (the automatic-review case).
+            // ADR-0068: when the payload carries a `comment_id`, react on the triggering @mention
+            // comment; otherwise on the PR/issue body (the automatic-review case).
             match row.payload.get("comment_id").and_then(|x| x.as_i64()) {
                 Some(comment_id) => {
-                    app.add_comment_reaction(token, &row.owner, &row.repo, comment_id, content)
+                    platform
+                        .add_reaction(repo, ReactionTarget::Comment { comment_id }, content)
                         .await?;
                 }
                 None => {
                     let issue = payload_i64(&row.payload, "issue")?;
-                    app.add_reaction(token, &row.owner, &row.repo, issue, content)
+                    platform
+                        .add_reaction(repo, ReactionTarget::Issue { number: issue }, content)
                         .await?;
                 }
             }
@@ -197,18 +226,16 @@ async fn deliver(
         "reply" => {
             let issue = payload_i64(&row.payload, "issue")?;
             let body = payload_str(&row.payload, "body")?;
-            let posted = app
-                .create_issue_comment(token, &row.owner, &row.repo, issue, body)
-                .await?;
+            let posted = platform.post_comment(repo, issue, body).await?;
             record_comment(pool, row.task_id, posted.id, "reply").await;
             Ok(posted.id)
         }
         "failure_notice" => {
-            // Re-check the dedup gate at post time and consume silently if the task already responded —
-            // OR is *about to*: a `review`/`reply` intent still pending in the outbox (e.g. one that
-            // transiently 502'd and is backing off) means a real review is coming, so don't race a
-            // misleading apology ahead of it (#219 review). A dead-lettered (`failed`) review is excluded,
-            // so a review that truly can't be delivered still yields a notice.
+            // Re-check the dedup gate at post time and consume silently if the task already
+            // responded — OR is *about to*: a `review`/`reply` intent still pending in the outbox
+            // (e.g. one that transiently 502'd and is backing off) means a real review is coming, so
+            // don't race a misleading apology ahead of it (#219 review). A dead-lettered (`failed`)
+            // review is excluded, so a review that truly can't be delivered still yields a notice.
             if let Some(task) = row.task_id {
                 if crate::db::has_responded_or_pending_content(pool, task)
                     .await
@@ -219,13 +246,11 @@ async fn deliver(
             }
             let issue = payload_i64(&row.payload, "issue")?;
             let body = payload_str(&row.payload, "body")?;
-            let posted = app
-                .create_issue_comment(token, &row.owner, &row.repo, issue, body)
-                .await?;
+            let posted = platform.post_comment(repo, issue, body).await?;
             record_comment(pool, row.task_id, posted.id, "failure_notice").await;
             Ok(posted.id)
         }
-        "review" => deliver_review(pool, app, token, review, row).await,
+        "review" => deliver_review(pool, platform, repo, review, row).await,
         other => anyhow::bail!("unknown outbox kind {other:?}"),
     }
 }
@@ -235,25 +260,30 @@ async fn deliver(
 /// pre-shaped payload. The verdict reaction is enqueued separately at finalize (ADR-0068).
 async fn deliver_review(
     pool: &PgPool,
-    app: &GithubApp,
-    token: &str,
+    platform: &dyn CodePlatform,
+    repo: &RepoRef,
     review: &ReviewSection,
     row: &crate::db::OutboxRow,
 ) -> anyhow::Result<Option<i64>> {
     let p: crate::outbox::ReviewPayload = serde_json::from_value(row.payload.clone())?;
-    let comments: Vec<ReviewComment> = p
+    let comments: Vec<crate::integrations::platform::InlineComment> = p
         .comments
         .iter()
-        .map(|c| ReviewComment {
+        .map(|c| crate::integrations::platform::InlineComment {
             path: c.path.clone(),
             line: c.line,
-            side: "RIGHT",
             body: c.body.clone(),
         })
         .collect();
-    let posted = app
-        .create_pr_review(token, &row.owner, &row.repo, p.pr, &p.body, &comments)
-        .await?;
+    let review_post = crate::integrations::platform::ReviewPost {
+        pr_number: p.pr,
+        body: p.body.clone(),
+        comments,
+        // Labels are applied separately after the review post (see below) so the trait's
+        // `post_review` stays a single API call and `add_labels` rides its own best-effort path.
+        labels: Vec::new(),
+    };
+    let posted = platform.post_review(repo, &review_post).await?;
     tracing::info!(
         outbox_id = row.id,
         pr = p.pr,
@@ -280,15 +310,12 @@ async fn deliver_review(
         }
         // Inline comment ids (the create-review response omits them) for the feedback join.
         if let Some(review_id) = posted.id {
-            match app
-                .list_review_comments(token, &row.owner, &row.repo, p.pr, review_id)
-                .await
-            {
+            match platform.list_review_comments(repo, p.pr, review_id).await {
                 Ok(refs) => {
                     let stored: Vec<crate::db::ReviewCommentRef> = refs
                         .into_iter()
                         .map(|c| crate::db::ReviewCommentRef {
-                            github_comment_id: c.id,
+                            platform_comment_id: c.id,
                             kind: "inline".to_string(),
                             file: c.path,
                             line: c.line.map(|l| l as i32),
@@ -306,7 +333,7 @@ async fn deliver_review(
         }
     }
 
-    // Outcome labels (ADR rides the outbox, not a 2nd serve writer) + the 🎉 reaction — both best-effort.
+    // Outcome labels (ADR rides the outbox, not a 2nd serve writer) — best-effort.
     let mut labels = Vec::new();
     if let Some(l) = &review.label_reviewed {
         labels.push(l.clone());
@@ -322,16 +349,13 @@ async fn deliver_review(
         }
     }
     if !labels.is_empty() {
-        if let Err(error) = app
-            .add_labels(token, &row.owner, &row.repo, p.pr, &labels)
-            .await
-        {
+        if let Err(error) = platform.add_labels(repo, p.pr, &labels).await {
             tracing::warn!(%error, pr = p.pr, "applying outcome labels failed (non-fatal)");
         }
     }
-    // ADR-0068: the verdict reaction (👎 findings / 👍 clean) is a separate `reaction` intent enqueued at
-    // finalize — a `review` intent is only ever produced when there ARE findings, so the old
-    // unconditional 🎉 here is gone.
+    // ADR-0068: the verdict reaction (👎 findings / 👍 clean) is a separate `reaction` intent
+    // enqueued at finalize — a `review` intent is only ever produced when there ARE findings, so the
+    // old unconditional 🎉 here is gone.
     Ok(posted.id)
 }
 
@@ -345,7 +369,7 @@ async fn record_comment(pool: &PgPool, task_id: Option<uuid::Uuid>, id: Option<i
         pool,
         task,
         &[crate::db::ReviewCommentRef {
-            github_comment_id: cid,
+            platform_comment_id: cid,
             kind: kind.to_string(),
             file: None,
             line: None,
@@ -370,60 +394,57 @@ fn payload_str<'a>(v: &'a serde_json::Value, key: &str) -> anyhow::Result<&'a st
 }
 
 /// One feedback poll cycle: for each comment due this cycle (age-tiered), read its reactions and
-/// reconcile. Returns the number checked. Mints at most one token per installation per cycle.
+/// reconcile. Returns the number checked. Looks up the platform implementation per comment.
 async fn poll_once(
     pool: &PgPool,
-    app: &GithubApp,
+    platforms: &HashMap<Platform, Arc<dyn CodePlatform>>,
     within_days: i32,
     interval_secs: i64,
 ) -> anyhow::Result<usize> {
     let comments = crate::db::list_pollable_comments(pool, within_days, interval_secs).await?;
-    let mut tokens: HashMap<i64, Option<String>> = HashMap::new();
     let mut checked = 0;
     for c in &comments {
-        let token = match tokens.get(&c.installation_id) {
-            Some(Some(t)) => t.clone(),
-            Some(None) => continue,
-            None => match app.installation_token(c.installation_id).await {
-                Ok(t) => {
-                    tokens.insert(c.installation_id, Some(t.clone()));
-                    t
-                }
-                Err(error) => {
-                    tracing::warn!(%error, installation = c.installation_id, "mint token for poll failed");
-                    tokens.insert(c.installation_id, None);
-                    continue;
-                }
-            },
+        let Some(platform) = platforms.get(&c.platform) else {
+            tracing::warn!(
+                platform = %c.platform,
+                comment = c.platform_comment_id,
+                "no platform implementation for pollable comment; skipping"
+            );
+            continue;
+        };
+        let repo = RepoRef {
+            platform: c.platform,
+            full_name: format!("{}/{}", c.owner, c.name),
+            platform_repo_id: 0,
+            installation_id: c.installation_id,
         };
         let is_review_comment = c.kind == "inline";
-        match app
-            .list_comment_reactions(
-                &token,
-                &c.owner,
-                &c.name,
-                c.github_comment_id,
-                is_review_comment,
-            )
+        match platform
+            .list_comment_reactions(&repo, c.platform_comment_id, is_review_comment)
             .await
         {
             Ok(reactions) => {
+                // `reconcile_comment_feedback` expects `&[(reactor_login, reaction_content)]`.
+                let pairs: Vec<(String, String)> = reactions
+                    .into_iter()
+                    .map(|r| (r.user_login, r.content))
+                    .collect();
                 if let Err(error) = crate::db::reconcile_comment_feedback(
                     pool,
                     c.task_id,
-                    c.github_comment_id,
+                    c.platform_comment_id,
                     &c.kind,
-                    &reactions,
+                    &pairs,
                 )
                 .await
                 {
-                    tracing::warn!(%error, comment = c.github_comment_id, "reconciling feedback failed");
+                    tracing::warn!(%error, comment = c.platform_comment_id, "reconciling feedback failed");
                 } else {
                     checked += 1;
                 }
             }
             Err(error) => {
-                tracing::warn!(%error, comment = c.github_comment_id, "reading reactions failed")
+                tracing::warn!(%error, comment = c.platform_comment_id, "reading reactions failed")
             }
         }
     }

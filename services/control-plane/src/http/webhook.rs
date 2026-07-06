@@ -1,58 +1,107 @@
-//! GitHub webhook receiver.
+//! Unified webhook receiver (GitHub + GitLab).
 //!
-//! Mirrors docs/github-app-and-control-plane.md: verify `X-Hub-Signature-256`, dedupe on
-//! `X-GitHub-Delivery`, then hand off to task routing. With a database, dedup + persistence happen
-//! atomically via the `github_deliveries` PRIMARY KEY; without one (dev) it falls back to an
-//! in-memory set.
+//! A single `/webhook` route detects the platform from headers, verifies the signature, dedupes
+//! on the platform's delivery ID, then hands off to platform-specific event routing. With a
+//! database, dedup + persistence happen atomically via the `webhook_deliveries` PRIMARY KEY;
+//! without one (dev) it falls back to an in-memory set.
+//!
+//! The legacy `/github/webhook` route is kept as an alias during the transition and forwards to
+//! the same unified handler.
 
 use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
-use axum::response::IntoResponse;
+use axum::response::{IntoResponse, Response};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 
+use crate::integrations::platform::{CodePlatform, Platform};
 use crate::AppState;
 
 type HmacSha256 = Hmac<Sha256>;
 
-pub async fn github_webhook(
+/// Detect the platform from webhook headers.
+/// GitHub sends `X-GitHub-Event`; GitLab sends `X-Gitlab-Event`.
+fn detect_platform(headers: &HeaderMap) -> Option<Platform> {
+    if headers.contains_key("x-github-event") {
+        Some(Platform::GitHub)
+    } else if headers.contains_key("x-gitlab-event") {
+        Some(Platform::GitLab)
+    } else {
+        None
+    }
+}
+
+/// Unified webhook receiver. Detects the platform from headers and dispatches.
+pub async fn webhook_router(
     State(state): State<AppState>,
     headers: HeaderMap,
     body: Bytes,
-) -> impl IntoResponse {
-    let signature = header(&headers, "x-hub-signature-256");
-    if !verify_signature(state.github_webhook_secret.as_bytes(), &body, &signature) {
-        crate::http::metrics::webhook_signature_failure();
-        tracing::warn!("invalid webhook signature");
-        return (StatusCode::UNAUTHORIZED, "invalid signature");
+) -> Response {
+    let platform = match detect_platform(&headers) {
+        Some(p) => p,
+        None => {
+            tracing::warn!(
+                "webhook: unknown platform (no X-GitHub-Event or X-Gitlab-Event header)"
+            );
+            return (StatusCode::BAD_REQUEST, "unknown platform").into_response();
+        }
+    };
+
+    tracing::info!(%platform, "webhook received");
+
+    // Verify signature — platform-specific.
+    let valid = match platform {
+        Platform::GitHub => verify_signature(
+            state.github_webhook_secret.as_bytes(),
+            &body,
+            &header(&headers, "x-hub-signature-256"),
+        ),
+        Platform::GitLab => verify_gitlab_token(
+            &state.gitlab_webhook_secret,
+            &header(&headers, "x-gitlab-token"),
+        ),
+    };
+    if !valid {
+        crate::http::metrics::webhook_signature_failure(&platform.to_string());
+        tracing::warn!(%platform, "invalid webhook signature");
+        return (StatusCode::UNAUTHORIZED, "invalid signature").into_response();
     }
 
-    let delivery_id = header(&headers, "x-github-delivery");
+    // Delivery ID for dedup — platform-specific header.
+    let delivery_id = match platform {
+        Platform::GitHub => header(&headers, "x-github-delivery"),
+        Platform::GitLab => header(&headers, "x-gitlab-event-uuid"),
+    };
     if delivery_id.is_empty() {
-        return (StatusCode::BAD_REQUEST, "missing delivery id");
+        return (StatusCode::BAD_REQUEST, "missing delivery id").into_response();
     }
-    let event = header(&headers, "x-github-event");
 
-    // Parse the payload up front: reject non-JSON bodies (never persist `null`), and have the
-    // parsed value ready for the upcoming task-routing logic.
+    // Event type — platform-specific header.
+    let event = match platform {
+        Platform::GitHub => header(&headers, "x-github-event"),
+        Platform::GitLab => header(&headers, "x-gitlab-event"),
+    };
+
+    // Parse the payload up front: reject non-JSON bodies (never persist `null`).
     let payload: serde_json::Value = match serde_json::from_slice(&body) {
         Ok(payload) => payload,
         Err(error) => {
-            tracing::error!(%error, delivery_id, "webhook payload is not valid JSON");
-            return (StatusCode::BAD_REQUEST, "invalid json payload");
+            tracing::error!(%error, %platform, %delivery_id, "webhook payload is not valid JSON");
+            return (StatusCode::BAD_REQUEST, "invalid json payload").into_response();
         }
     };
 
     // Dedup (and persist, when a database is configured). `is_new` is false for a replayed
-    // delivery id — GitHub retries, so this is the exactly-once guard.
+    // delivery id — platforms retry, so this is the exactly-once guard.
     let is_new = match &state.db {
         Some(pool) => {
-            match crate::db::record_delivery(pool, &delivery_id, &event, &payload).await {
+            match crate::db::record_delivery(pool, platform, &delivery_id, &event, &payload).await {
                 Ok(is_new) => is_new,
                 Err(error) => {
-                    tracing::error!(%error, delivery_id, "failed to persist delivery");
-                    return (StatusCode::INTERNAL_SERVER_ERROR, "persistence error");
+                    tracing::error!(%error, %delivery_id, "failed to persist delivery");
+                    return (StatusCode::INTERNAL_SERVER_ERROR, "persistence error")
+                        .into_response();
                 }
             }
         }
@@ -63,41 +112,426 @@ pub async fn github_webhook(
             .insert(delivery_id.clone()),
     };
     if !is_new {
-        crate::http::metrics::webhook_duplicate();
-        tracing::info!(delivery_id, "duplicate delivery");
-        return (StatusCode::ACCEPTED, "duplicate delivery");
+        crate::http::metrics::webhook_duplicate(&platform.to_string());
+        tracing::info!(%platform, %delivery_id, "duplicate delivery");
+        return (StatusCode::ACCEPTED, "duplicate delivery").into_response();
     }
 
-    crate::http::metrics::webhook_delivery(&event);
-    tracing::info!(delivery_id, event, "accepted webhook");
+    crate::http::metrics::webhook_delivery(&platform.to_string(), &event);
+    tracing::info!(%platform, %delivery_id, %event, "accepted webhook");
 
-    // Webhook → internal action mapping (the only events that do anything beyond being persisted):
-    //
-    //   pull_request               opened                  → review task (the automatic FIRST review)
-    //   pull_request               closed                  → cancel the PR's active tasks
-    //   pull_request               synchronize | reopened  → nothing (re-review via @mention)
-    //   push                       to the default branch    → re-index task (keep the base index fresh)
-    //   issue_comment              created, body @<handle> → task: PR re-review, or an issue answer
-    //   installation               created                 → register the installed repos as pending
-    //   installation               deleted                 → disable the installation's repos
-    //   installation_repositories  added | removed         → register pending / disable those repos
-    //
-    // Repos start **pending** and need admin approval before any review/index runs (Epic #75).
-    // Everything else is persisted to `github_deliveries` only.
+    // Route by platform.
     if state.db.is_some() {
-        match event.as_str() {
-            "pull_request" => handle_pull_request(&state, &payload, &delivery_id).await,
-            "push" => handle_push(&state, &payload, &delivery_id).await,
-            "issue_comment" => handle_issue_comment(&state, &payload, &delivery_id).await,
-            "installation" => handle_installation(&state, &payload, &delivery_id).await,
-            "installation_repositories" => {
-                handle_installation_repositories(&state, &payload, &delivery_id).await
-            }
-            _ => {}
+        match platform {
+            Platform::GitHub => route_github_event(&state, &event, &payload, &delivery_id).await,
+            Platform::GitLab => route_gitlab_event(&state, &event, &payload, &delivery_id).await,
         }
     }
 
-    (StatusCode::ACCEPTED, "accepted")
+    (StatusCode::ACCEPTED, "accepted").into_response()
+}
+
+/// Legacy GitHub webhook route — forwards to the unified [`webhook_router`]. Kept during the
+/// transition so existing webhook configurations don't break; remove in a later release.
+pub async fn github_webhook_legacy(
+    state: State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    webhook_router(state, headers, body).await
+}
+
+/// GitHub webhook → internal action mapping (the only events that do anything beyond being
+/// persisted):
+///
+///   pull_request               opened                  → review task (the automatic FIRST review)
+///   pull_request               closed                  → cancel the PR's active tasks
+///   pull_request               synchronize | reopened  → nothing (re-review via @mention)
+///   push                       to the default branch    → re-index task (keep the base index fresh)
+///   issue_comment              created, body @<handle> → task: PR re-review, or an issue answer
+///   installation               created                 → register the installed repos as pending
+///   installation               deleted                 → disable the installation's repos
+///   installation_repositories  added | removed         → register pending / disable those repos
+///
+/// Repos start **pending** and need admin approval before any review/index runs (Epic #75).
+/// Everything else is persisted to `webhook_deliveries` only.
+async fn route_github_event(
+    state: &AppState,
+    event: &str,
+    payload: &serde_json::Value,
+    delivery_id: &str,
+) {
+    match event {
+        "pull_request" => handle_pull_request(state, payload, delivery_id).await,
+        "push" => handle_push(state, payload, delivery_id).await,
+        "issue_comment" => handle_issue_comment(state, payload, delivery_id).await,
+        "installation" => handle_installation(state, payload, delivery_id).await,
+        "installation_repositories" => {
+            handle_installation_repositories(state, payload, delivery_id).await
+        }
+        _ => {}
+    }
+}
+
+/// GitLab webhook → internal action mapping:
+///
+///   Merge Request Hook   open    → review task (the automatic FIRST review)
+///   Merge Request Hook   close   → cancel the MR's active tasks
+///   Merge Request Hook   update/reopen/merge → nothing (re-review via @mention)
+///   Push Hook             to the default branch → re-index task
+///   Note Hook             created, body @<handle> → task: MR re-review, or an issue answer
+///
+/// GitLab has no installation events — repos are registered as pending via the admin console
+/// (manual approval, same as GitHub's approval gate Epic #75).
+async fn route_gitlab_event(
+    state: &AppState,
+    event: &str,
+    payload: &serde_json::Value,
+    delivery_id: &str,
+) {
+    match event {
+        "Merge Request Hook" => handle_gitlab_merge_request(state, payload, delivery_id).await,
+        "Push Hook" => handle_gitlab_push(state, payload, delivery_id).await,
+        "Note Hook" => handle_gitlab_note(state, payload, delivery_id).await,
+        _ => {
+            tracing::debug!(%delivery_id, %event, "GitLab event type not handled; persisted only");
+        }
+    }
+}
+
+/// Split a GitLab `path_with_namespace` (e.g. `group/subgroup/repo`) into `(owner, name)`.
+/// `owner` is everything before the last `/`; `name` is the last segment. This way
+/// `format!("{}/{}", owner, name)` reconstructs the full path.
+fn gitlab_path_split(path_with_namespace: &str) -> Option<(&str, &str)> {
+    let (owner, name) = path_with_namespace.rsplit_once('/')?;
+    Some((owner, name))
+}
+
+/// Extract `(project_id, owner, name, default_branch)` from a GitLab webhook `project` object.
+fn gitlab_project_identity(project: &serde_json::Value) -> Option<(i64, &str, &str, &str)> {
+    let project_id = project["id"].as_i64()?;
+    let path = project["path_with_namespace"].as_str()?;
+    let default_branch = project["default_branch"].as_str().unwrap_or("main");
+    let (owner, name) = gitlab_path_split(path)?;
+    Some((project_id, owner, name, default_branch))
+}
+
+/// `Merge Request Hook`: `open` → the automatic first review. `close` → cancel the MR's active
+/// tasks. Other actions (`update`, `reopen`, `merge`) do nothing — a re-review is requested with
+/// an `@<handle>` note ([`handle_gitlab_note`]).
+async fn handle_gitlab_merge_request(
+    state: &crate::AppState,
+    payload: &serde_json::Value,
+    delivery_id: &str,
+) {
+    let Some(pool) = state.db.as_ref() else {
+        return;
+    };
+    let attrs = &payload["object_attributes"];
+    let action = attrs["action"].as_str().unwrap_or_default();
+    if !matches!(action, "open" | "close") {
+        return;
+    }
+    let project = &payload["project"];
+    let Some((project_id, owner, name, default_branch)) = gitlab_project_identity(project) else {
+        tracing::warn!(
+            delivery_id,
+            "GitLab MR payload missing project fields; skipping"
+        );
+        return;
+    };
+    let Some(mr_iid) = attrs["iid"].as_i64() else {
+        tracing::warn!(delivery_id, "GitLab MR payload missing iid; skipping");
+        return;
+    };
+    // GitLab has no installation ID — use the project ID so the outbox/reconciler can look it up.
+    let installation_id = project_id;
+    let repository_id = match crate::db::upsert_repository(
+        pool,
+        Platform::GitLab,
+        project_id,
+        owner,
+        name,
+        default_branch,
+        Some(installation_id),
+    )
+    .await
+    {
+        Ok(id) => id,
+        Err(error) => {
+            tracing::error!(%error, delivery_id, "GitLab: failed to upsert repository");
+            return;
+        }
+    };
+
+    match action {
+        "open" => {
+            // Approval gate (Epic #75): a repo must be admin-approved before any review runs.
+            if !approved_or_skip(pool, repository_id, delivery_id, mr_iid).await {
+                return;
+            }
+            // Skip draft MRs (GitLab's equivalent of GitHub's draft PRs) — not ready for review.
+            if attrs["draft"].as_bool() == Some(true) {
+                tracing::info!(
+                    delivery_id,
+                    mr = mr_iid,
+                    repository_id,
+                    "GitLab MR is draft; skipping automatic review"
+                );
+                return;
+            }
+            // RFC-0003: skip bot-authored MRs. GitLab bots typically have usernames ending in `_bot`.
+            // Absent a clean `type` field, we fail open (treat as human) — never silently drop a real MR.
+            let author = attrs["last_commit"]["author"]["name"]
+                .as_str()
+                .unwrap_or("");
+            if should_skip_gitlab_bot_review(state.review.skip_bot_authored_prs(), author) {
+                tracing::info!(
+                    delivery_id,
+                    mr = mr_iid,
+                    repository_id,
+                    "GitLab MR author appears to be a bot; skipping automatic review"
+                );
+                crate::http::metrics::review_skipped_bot_author();
+                return;
+            }
+            // GitLab MR webhook payload includes diff_refs (base_sha/head_sha/start_sha).
+            let base_sha = attrs["diff_refs"]["base_sha"].as_str().map(str::to_string);
+            let head_sha = attrs["diff_refs"]["head_sha"]
+                .as_str()
+                .or_else(|| attrs["last_commit"]["id"].as_str())
+                .map(str::to_string);
+            let task = crate::db::NewTask {
+                repository_id,
+                installation_id,
+                webhook_delivery_id: delivery_id.to_string(),
+                target_type: "pull_request".to_string(),
+                target_id: mr_iid,
+                command_text: "review".to_string(),
+                base_sha,
+                head_sha,
+                run_epoch: 0,
+                tier: "fast".to_string(),
+                trigger_comment_id: None,
+            };
+            create_review_task(pool, task, delivery_id).await;
+        }
+        "close" => match crate::db::cancel_active_tasks_for_pr(pool, repository_id, mr_iid).await {
+            Ok(ids) if !ids.is_empty() => tracing::info!(
+                delivery_id,
+                mr = mr_iid,
+                cancelled = ids.len(),
+                "GitLab MR closed; cancelled active tasks"
+            ),
+            Ok(_) => {}
+            Err(error) => {
+                tracing::error!(%error, delivery_id, mr = mr_iid, "GitLab: failed to cancel MR tasks")
+            }
+        },
+        _ => {}
+    }
+}
+
+/// `Push Hook`: re-index the repo when its **default branch** moves, same as GitHub push events.
+async fn handle_gitlab_push(
+    state: &crate::AppState,
+    payload: &serde_json::Value,
+    delivery_id: &str,
+) {
+    let Some(pool) = state.db.as_ref() else {
+        return;
+    };
+    // A branch deletion carries no commits to index.
+    if payload["after"].as_str() == Some("0000000000000000000000000000000000000000") {
+        return;
+    }
+    let project = &payload["project"];
+    let Some((project_id, owner, name, default_branch)) = gitlab_project_identity(project) else {
+        tracing::warn!(
+            delivery_id,
+            "GitLab push payload missing project fields; skipping"
+        );
+        return;
+    };
+    let Some(git_ref) = payload["ref"].as_str() else {
+        tracing::warn!(delivery_id, "GitLab push payload missing ref; skipping");
+        return;
+    };
+    // Only the default branch matters for the base index.
+    if git_ref != format!("refs/heads/{default_branch}") {
+        return;
+    }
+    let installation_id = project_id;
+    let repository_id = match crate::db::upsert_repository(
+        pool,
+        Platform::GitLab,
+        project_id,
+        owner,
+        name,
+        default_branch,
+        Some(installation_id),
+    )
+    .await
+    {
+        Ok(id) => id,
+        Err(error) => {
+            tracing::error!(%error, delivery_id, "GitLab push: failed to upsert repository");
+            return;
+        }
+    };
+    // Approval gate (Epic #75).
+    if !approved_or_skip(pool, repository_id, delivery_id, 0).await {
+        return;
+    }
+    match crate::db::create_index_task(pool, repository_id, installation_id).await {
+        Ok(Some(task_id)) => tracing::info!(
+            delivery_id, repo = %format!("{owner}/{name}"), %task_id,
+            "GitLab default-branch push → re-index queued"
+        ),
+        Ok(None) => tracing::info!(
+            delivery_id, repo = %format!("{owner}/{name}"),
+            "GitLab default-branch push → index already in flight; skipped"
+        ),
+        Err(error) => {
+            tracing::error!(%error, delivery_id, "GitLab push: failed to create index task")
+        }
+    }
+}
+
+/// `Note Hook` whose body starts with `@<handle>` → a manual run. Works on an **MR thread** (a
+/// diff-scoped re-review — we fetch the MR's base/head SHAs via the GitLab API) and on a **plain
+/// issue** (no diff, the agent answers). Mirrors [`handle_issue_comment`] for GitHub.
+async fn handle_gitlab_note(
+    state: &crate::AppState,
+    payload: &serde_json::Value,
+    delivery_id: &str,
+) {
+    let Some(pool) = state.db.as_ref() else {
+        return;
+    };
+    // GitLab note hooks don't carry an `action` — the hook fires on creation only.
+    let body = payload["object_attributes"]["note"]
+        .as_str()
+        .unwrap_or_default();
+    if !mentions_handle(body, &state.gitlab_app_handle) {
+        return;
+    }
+    // `noteable_type` tells us MR vs issue: "MergeRequest" or "Issue".
+    let noteable_type = payload["object_attributes"]["noteable_type"]
+        .as_str()
+        .unwrap_or_default();
+    let is_pr = noteable_type == "MergeRequest";
+    let target_type = if is_pr { "pull_request" } else { "issue" };
+
+    let project = &payload["project"];
+    let Some((project_id, owner, name, default_branch)) = gitlab_project_identity(project) else {
+        tracing::warn!(
+            delivery_id,
+            "GitLab note payload missing project fields; skipping"
+        );
+        return;
+    };
+    let installation_id = project_id;
+
+    // The MR/issue iid: `merge_request.iid` for MR notes, `issue.iid` for issue notes.
+    let target_iid = if is_pr {
+        payload["merge_request"]["iid"].as_i64()
+    } else {
+        payload["issue"]["iid"].as_i64()
+    };
+    let Some(target_iid) = target_iid else {
+        tracing::warn!(
+            delivery_id,
+            "GitLab note payload missing MR/issue iid; skipping"
+        );
+        return;
+    };
+
+    let repository_id = match crate::db::upsert_repository(
+        pool,
+        Platform::GitLab,
+        project_id,
+        owner,
+        name,
+        default_branch,
+        Some(installation_id),
+    )
+    .await
+    {
+        Ok(id) => id,
+        Err(error) => {
+            tracing::error!(%error, delivery_id, "GitLab: failed to upsert repository");
+            return;
+        }
+    };
+    // Approval gate (Epic #75).
+    if !approved_or_skip(pool, repository_id, delivery_id, target_iid).await {
+        return;
+    }
+
+    // An MR re-review needs the base/head SHAs to scope the diff; a plain issue has no diff.
+    let (base_sha, head_sha) = if is_pr {
+        let Some(gitlab) = state.gitlab.as_ref() else {
+            tracing::warn!(
+                delivery_id,
+                "GitLab client not configured; cannot fetch MR SHAs"
+            );
+            return;
+        };
+        let repo_ref = crate::integrations::platform::RepoRef {
+            platform: Platform::GitLab,
+            full_name: format!("{owner}/{name}"),
+            platform_repo_id: project_id,
+            installation_id,
+        };
+        match CodePlatform::pr_shas(gitlab, &repo_ref, target_iid).await {
+            Ok(shas) => shas,
+            Err(error) => {
+                tracing::error!(%error, delivery_id, mr = target_iid, "GitLab: fetch MR SHAs failed");
+                return;
+            }
+        }
+    } else {
+        (None, None)
+    };
+
+    let command_text = command_from_comment(body);
+    let trigger_comment_id = payload["object_attributes"]["id"].as_i64();
+    let task = crate::db::NewTask {
+        repository_id,
+        installation_id,
+        webhook_delivery_id: delivery_id.to_string(),
+        target_type: target_type.to_string(),
+        target_id: target_iid,
+        command_text,
+        base_sha,
+        head_sha,
+        run_epoch: 0,
+        tier: "deep".to_string(),
+        trigger_comment_id,
+    };
+    tracing::info!(
+        delivery_id,
+        target = target_iid,
+        kind = target_type,
+        "GitLab @mention requested"
+    );
+    create_explicit_review_task(pool, task, delivery_id).await;
+}
+
+/// RFC-0003 for GitLab: skip the automatic fast-tier review for bot-authored MRs. GitLab doesn't
+/// have a clean `type: "Bot"` field like GitHub; we check the commit author name for a `_bot`
+/// suffix or known bot patterns. Absent/garbled signals **fail open** (treated as human).
+fn should_skip_gitlab_bot_review(skip_bot_authored_prs: bool, author: &str) -> bool {
+    if !skip_bot_authored_prs {
+        return false;
+    }
+    // GitLab bot accounts typically end with `_bot` (e.g. `gitlab-bot`, `dependabot-bot`).
+    // Also check for common bot name patterns. Fail open: an empty/unknown author is human.
+    if author.is_empty() {
+        return false;
+    }
+    author.ends_with("_bot") || author.ends_with("-bot") || author == "GitLab"
 }
 
 /// True when a comment body is addressed to the app — its first non-space text is `@<handle>`
@@ -155,6 +589,7 @@ async fn handle_pull_request(
     let installation_id_opt = payload["installation"]["id"].as_i64();
     let repository_id = match crate::db::upsert_repository(
         pool,
+        crate::integrations::platform::Platform::GitHub,
         github_repo_id,
         owner,
         name,
@@ -197,7 +632,7 @@ async fn handle_pull_request(
             let task = crate::db::NewTask {
                 repository_id,
                 installation_id,
-                github_delivery_id: delivery_id.to_string(),
+                webhook_delivery_id: delivery_id.to_string(),
                 target_type: "pull_request".to_string(),
                 target_id: pr_number,
                 command_text: "review".to_string(),
@@ -267,6 +702,7 @@ async fn handle_push(state: &crate::AppState, payload: &serde_json::Value, deliv
     };
     let repository_id = match crate::db::upsert_repository(
         pool,
+        crate::integrations::platform::Platform::GitHub,
         github_repo_id,
         owner,
         name,
@@ -349,6 +785,7 @@ async fn handle_issue_comment(
 
     let repository_id = match crate::db::upsert_repository(
         pool,
+        crate::integrations::platform::Platform::GitHub,
         github_repo_id,
         owner,
         name,
@@ -415,7 +852,7 @@ async fn handle_issue_comment(
     let task = crate::db::NewTask {
         repository_id,
         installation_id,
-        github_delivery_id: delivery_id.to_string(),
+        webhook_delivery_id: delivery_id.to_string(),
         target_type: target_type.to_string(),
         target_id: number,
         command_text,
@@ -584,6 +1021,7 @@ async fn register_pending(
         };
         match crate::db::register_pending_repository(
             pool,
+            crate::integrations::platform::Platform::GitHub,
             github_repo_id,
             owner,
             name,
@@ -618,7 +1056,13 @@ async fn disable_repos(
         let Some(github_repo_id) = repo["id"].as_i64() else {
             continue;
         };
-        match crate::db::set_repository_status_by_github_id(pool, github_repo_id, "disabled").await
+        match crate::db::set_repository_status_by_platform_id(
+            pool,
+            crate::integrations::platform::Platform::GitHub,
+            github_repo_id,
+            "disabled",
+        )
+        .await
         {
             Ok(Some(repository_id)) => {
                 tracing::info!(
@@ -667,6 +1111,17 @@ fn verify_signature(secret: &[u8], body: &[u8], signature: &str) -> bool {
     let expected = format!("sha256={}", hex::encode(mac.finalize().into_bytes()));
     use subtle::ConstantTimeEq;
     expected.as_bytes().ct_eq(signature.as_bytes()).into()
+}
+
+/// Constant-time plain-token verification of the GitLab webhook token (`X-Gitlab-Token`).
+/// GitLab doesn't use HMAC — it sends the raw secret in a header — so we compare in constant time
+/// to avoid timing leaks. An unset secret rejects everything (fail closed).
+fn verify_gitlab_token(secret: &str, token: &str) -> bool {
+    if secret.is_empty() {
+        return false;
+    }
+    use subtle::ConstantTimeEq;
+    secret.as_bytes().ct_eq(token.as_bytes()).into()
 }
 
 #[cfg(test)]
@@ -801,5 +1256,125 @@ mod tests {
         // Human author is never skipped, knob on or off.
         assert!(!should_skip_bot_review(true, &human_pr));
         assert!(!should_skip_bot_review(false, &human_pr));
+    }
+
+    #[test]
+    fn detect_platform_recognises_github_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-github-event", "pull_request".parse().unwrap());
+        assert_eq!(detect_platform(&headers), Some(Platform::GitHub));
+    }
+
+    #[test]
+    fn detect_platform_recognises_gitlab_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-gitlab-event", "Merge Request Hook".parse().unwrap());
+        assert_eq!(detect_platform(&headers), Some(Platform::GitLab));
+    }
+
+    #[test]
+    fn detect_platform_returns_none_for_unknown() {
+        let headers = HeaderMap::new();
+        assert_eq!(detect_platform(&headers), None);
+    }
+
+    #[test]
+    fn gitlab_token_rejects_when_secret_unset() {
+        assert!(!verify_gitlab_token("", "anything"));
+    }
+
+    #[test]
+    fn gitlab_token_accepts_a_valid_match() {
+        let secret = "it is a secret";
+        assert!(verify_gitlab_token(secret, secret));
+    }
+
+    #[test]
+    fn gitlab_token_rejects_a_mismatch() {
+        assert!(!verify_gitlab_token("secret", "wrong"));
+    }
+
+    #[test]
+    fn gitlab_path_split_simple() {
+        assert_eq!(gitlab_path_split("group/repo"), Some(("group", "repo")));
+    }
+
+    #[test]
+    fn gitlab_path_split_nested_subgroup() {
+        assert_eq!(
+            gitlab_path_split("group/sub/repo"),
+            Some(("group/sub", "repo"))
+        );
+    }
+
+    #[test]
+    fn gitlab_path_split_no_slash() {
+        assert_eq!(gitlab_path_split("noslash"), None);
+    }
+
+    #[test]
+    fn gitlab_project_identity_extracts_fields() {
+        let project = serde_json::json!({
+            "id": 42,
+            "path_with_namespace": "group/sub/repo",
+            "default_branch": "main"
+        });
+        assert_eq!(
+            gitlab_project_identity(&project),
+            Some((42, "group/sub", "repo", "main"))
+        );
+    }
+
+    #[test]
+    fn gitlab_project_identity_missing_id() {
+        let project = serde_json::json!({
+            "path_with_namespace": "group/repo",
+            "default_branch": "main"
+        });
+        assert_eq!(gitlab_project_identity(&project), None);
+    }
+
+    #[test]
+    fn gitlab_project_identity_missing_path() {
+        let project = serde_json::json!({
+            "id": 42,
+            "default_branch": "main"
+        });
+        assert_eq!(gitlab_project_identity(&project), None);
+    }
+
+    #[test]
+    fn gitlab_project_identity_defaults_branch() {
+        let project = serde_json::json!({
+            "id": 42,
+            "path_with_namespace": "group/repo"
+        });
+        assert_eq!(
+            gitlab_project_identity(&project),
+            Some((42, "group", "repo", "main"))
+        );
+    }
+
+    #[test]
+    fn gitlab_bot_review_skips_known_bots() {
+        assert!(should_skip_gitlab_bot_review(true, "dependabot_bot"));
+        assert!(should_skip_gitlab_bot_review(true, "gitlab-bot"));
+        assert!(should_skip_gitlab_bot_review(true, "GitLab"));
+    }
+
+    #[test]
+    fn gitlab_bot_review_fails_open_on_empty() {
+        assert!(!should_skip_gitlab_bot_review(true, ""));
+    }
+
+    #[test]
+    fn gitlab_bot_review_treats_humans_as_not_bot() {
+        assert!(!should_skip_gitlab_bot_review(true, "octocat"));
+        assert!(!should_skip_gitlab_bot_review(true, "Alice"));
+    }
+
+    #[test]
+    fn gitlab_bot_review_disabled_knob_never_skips() {
+        assert!(!should_skip_gitlab_bot_review(false, "dependabot_bot"));
     }
 }
