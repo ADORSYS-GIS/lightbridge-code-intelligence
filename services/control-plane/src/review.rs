@@ -19,6 +19,15 @@ use serde::{Deserialize, Serialize};
 pub struct Finding {
     pub file: String,
     pub line: u32,
+    /// Optional first line of a multi-line span this finding describes (ADR-0071); `line` remains the
+    /// span's *last* line (GitHub's convention for a ranged review comment). Validated in [`validate`]:
+    /// the finding anchors as a GitHub **range** comment only when every line from `start_line` to
+    /// `line` (inclusive) is commentable — i.e. contiguous, added/context lines inside a single diff
+    /// hunk. When absent, or when the range doesn't validate, the finding falls back to today's
+    /// single-line anchor at `line` (never dropped). Optional on the wire so a runner that predates
+    /// ADR-0071 (and any already-stored row) still deserializes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_line: Option<u32>,
     /// Triage priority `P0`|`P1`|`P2` (ADR-0032). Optional on the wire so rows that predate the
     /// priority model (and an older runner still emitting `severity`) still deserialize;
     /// [`Finding::priority`] falls back to the legacy `severity`.
@@ -409,6 +418,10 @@ fn badge_label(label: &str) -> String {
 pub struct InlineComment {
     pub path: String,
     pub line: u32,
+    /// `Some` when this finding's `start_line..=line` range validated (ADR-0071) — GitHub renders it
+    /// as a ranged comment (`start_line` + `start_side: RIGHT` alongside `line` + `side: RIGHT`).
+    /// `None` for the (overwhelming majority) single-line comment, byte-for-byte as before this ADR.
+    pub start_line: Option<u32>,
     pub body: String,
 }
 
@@ -497,13 +510,14 @@ pub fn validate(
             review.out_of_scope.push(finding); // outside the PR diff — surfaced, not dropped
             continue;
         }
-        let anchorable = commentable
-            .get(&finding.file)
-            .is_some_and(|lines| lines.contains(&finding.line));
+        let file_lines = commentable.get(&finding.file);
+        let anchorable = file_lines.is_some_and(|lines| lines.contains(&finding.line));
         if anchorable && finding.line > 0 {
+            let start_line = validated_range_start(&finding, file_lines);
             review.inline.push(InlineComment {
                 path: finding.file.clone(),
                 line: finding.line,
+                start_line,
                 body: inline_body(&finding),
             });
         } else {
@@ -511,6 +525,32 @@ pub fn validate(
         }
     }
     review
+}
+
+/// Resolve a finding's `start_line` (ADR-0071) into a validated range anchor, or `None` to fall back to
+/// today's single-line comment at `line`. The range validates only when:
+/// - `start_line` is present, and
+/// - `start_line <= line` (GitHub always treats `line` as the range's *last* line), and
+/// - every line from `start_line` to `line` (inclusive) is in the file's `commentable` set.
+///
+/// That last check is both the contiguity check AND the single-hunk check: [`commentable_lines`] only
+/// ever inserts a line that is actually an added/context line inside some hunk, and hunks never share
+/// line numbers (they're strictly increasing down the file), so a contiguous run of membership can only
+/// come from one hunk. GitHub itself rejects a range that crosses a hunk boundary or starts on a
+/// non-commentable line — this must be checked here, before the API is ever called (ADR-0022's
+/// "validate before posting" contract, extended to ranges).
+///
+/// The caller has already established `finding.line` itself is anchorable; this only resolves whether
+/// the *range* additionally validates.
+fn validated_range_start(finding: &Finding, file_lines: Option<&BTreeSet<u32>>) -> Option<u32> {
+    let start = finding.start_line?;
+    if start == 0 || start > finding.line {
+        return None; // not a valid range end/start ordering — fall back to single-line
+    }
+    let lines = file_lines?;
+    (start..=finding.line)
+        .all(|l| lines.contains(&l))
+        .then_some(start)
 }
 
 /// Render an inline comment body: the level badges + titled finding, plus a committable GitHub
@@ -572,6 +612,14 @@ fn remove_spans(input: &str, open: &str, close: &str) -> String {
 /// No leading `---`: the CTA is a quiet quoted line, not a section break — no horizontal rule before it.
 const FEEDBACK_FOOTER: &str = "\n\n> Was this useful? React 👍/👎 to give us feedback";
 
+// ADR-0071: a ```suggestion fence's replacement span is NOT markdown metadata — GitHub derives it from
+// the *surrounding comment's* `start_line`/`line` (set on `InlineComment`/`ReviewComment` by
+// `validate`'s `validated_range_start`, independent of this function). So when a finding anchors as a
+// validated range, the fence rendered below is already correct for the whole `start_line..=line` span
+// with NO change to its content or this function — the range is honored by posting `start_line` +
+// `start_side: RIGHT` alongside it, not by anything inside the ```suggestion block itself. This
+// function only ever needs the multi-line replacement text the finding already carries in
+// `suggestion` (never synthesized here).
 fn inline_body(finding: &Finding) -> String {
     // Standardized finding format (epic #89): badge row → titled finding → explanation → committable
     // suggestion → resources. The badges sit on their OWN line above the bold title (a single newline,
@@ -764,6 +812,7 @@ mod tests {
         Finding {
             file: file.into(),
             line,
+            start_line: None,
             priority: Some("P1".into()),
             category: Some("correctness".into()),
             severity: None,
@@ -1143,6 +1192,101 @@ mod tests {
                 .body
                 .contains("```suggestion\n    let b = 4;\n```"),
             "anchored finding renders a committable suggestion block"
+        );
+    }
+
+    // A two-hunk patch (ADR-0071 range tests): hunk 1 covers new-side lines 1-3, hunk 2 covers 20-21 —
+    // lines 4..19 are NOT commentable (outside any hunk), so a range spanning the gap must fail.
+    const TWO_HUNK_PATCH: &str = "@@ -1,1 +1,3 @@\n let a = 1;\n+let b = 2;\n+let c = 3;\n\
+         @@ -20,1 +20,2 @@\n let x = 20;\n+let y = 21;";
+
+    #[test]
+    fn validate_anchors_ranged_finding_when_fully_commentable_within_one_hunk() {
+        let mut commentable = HashMap::new();
+        commentable.insert("src/main.rs".to_string(), commentable_lines(PATCH));
+        let mut f = finding("src/main.rs", 3, "Whole loop is wrong");
+        f.start_line = Some(2); // 2..=3 fully commentable (PATCH: {1,2,3,4})
+
+        let review = validate(vec![f], &commentable);
+        assert_eq!(review.inline.len(), 1);
+        assert_eq!(review.inline[0].line, 3);
+        assert_eq!(
+            review.inline[0].start_line,
+            Some(2),
+            "the range validates and anchors start_line"
+        );
+    }
+
+    #[test]
+    fn validate_range_crossing_hunk_boundary_falls_back_to_single_line() {
+        let mut commentable = HashMap::new();
+        commentable.insert("src/main.rs".to_string(), commentable_lines(TWO_HUNK_PATCH));
+        let mut f = finding("src/main.rs", 21, "Spans two hunks");
+        f.start_line = Some(2); // commentable in hunk 1, but 4..19 aren't → crosses the boundary
+
+        let review = validate(vec![f], &commentable);
+        assert_eq!(
+            review.inline.len(),
+            1,
+            "never dropped — falls back to a single-line comment"
+        );
+        assert_eq!(review.inline[0].line, 21);
+        assert_eq!(
+            review.inline[0].start_line, None,
+            "range didn't validate, so no start_line is sent"
+        );
+    }
+
+    #[test]
+    fn validate_range_with_uncommentable_start_falls_back_to_single_line() {
+        let mut commentable = HashMap::new();
+        commentable.insert("src/main.rs".to_string(), commentable_lines(TWO_HUNK_PATCH));
+        let mut f = finding("src/main.rs", 21, "start_line isn't in any hunk");
+        f.start_line = Some(10); // in the gap between hunks — not commentable at all
+
+        let review = validate(vec![f], &commentable);
+        assert_eq!(review.inline.len(), 1, "never dropped");
+        assert_eq!(review.inline[0].line, 21);
+        assert_eq!(review.inline[0].start_line, None);
+    }
+
+    #[test]
+    fn validate_range_start_after_line_falls_back_to_single_line() {
+        let mut commentable = HashMap::new();
+        commentable.insert("src/main.rs".to_string(), commentable_lines(PATCH));
+        let mut f = finding("src/main.rs", 2, "start_line > line");
+        f.start_line = Some(3); // start_line > line — invalid ordering
+
+        let review = validate(vec![f], &commentable);
+        assert_eq!(review.inline.len(), 1, "never dropped");
+        assert_eq!(review.inline[0].line, 2);
+        assert_eq!(
+            review.inline[0].start_line, None,
+            "start_line > line safely falls back"
+        );
+    }
+
+    #[test]
+    fn validate_ranged_finding_with_suggestion_renders_correctly() {
+        let mut commentable = HashMap::new();
+        commentable.insert("src/main.rs".to_string(), commentable_lines(PATCH));
+        let mut f = finding("src/main.rs", 3, "Replace both lines");
+        f.start_line = Some(2);
+        f.suggestion = Some("    let b = 4;\n    let c = 5;".into());
+
+        let review = validate(vec![f], &commentable);
+        assert_eq!(review.inline.len(), 1);
+        assert_eq!(
+            review.inline[0].start_line,
+            Some(2),
+            "range validates, so the comment posts as a range"
+        );
+        assert!(
+            review.inline[0]
+                .body
+                .contains("```suggestion\n    let b = 4;\n    let c = 5;\n```"),
+            "the suggestion fence carries the caller's multi-line replacement verbatim: {}",
+            review.inline[0].body
         );
     }
 

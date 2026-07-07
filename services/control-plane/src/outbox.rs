@@ -34,6 +34,11 @@ impl Target<'_> {
 pub struct ReviewCommentPayload {
     pub path: String,
     pub line: u32,
+    /// First line of a validated range (ADR-0071), carried through the outbox row so the reconciler can
+    /// post it as `start_line`/`start_side` alongside `line`/`side`. `default` so an outbox row enqueued
+    /// before this ADR shipped (in flight across a deploy) still deserializes as a single-line comment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_line: Option<u32>,
     pub body: String,
 }
 

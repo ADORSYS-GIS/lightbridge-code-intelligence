@@ -1131,6 +1131,11 @@ pub async fn finalize_review(
             .map(|pi| crate::review::Finding {
                 file: pi.file.clone(),
                 line: pi.line.max(0) as u32,
+                // The buffered `add_review_comment` tool call (`InlineActionBody`) doesn't yet carry a
+                // `start_line` — extending that mediated-tool contract (agent-runner's
+                // `AddReviewCommentArgs` + this receiving DTO) is ADR-0071's companion ticket (#287).
+                // `validate()` already handles `start_line: None` as today's single-line path.
+                start_line: None,
                 priority: pi.priority.clone(),
                 category: pi.category.clone(),
                 severity: None,
@@ -1261,6 +1266,7 @@ pub async fn finalize_review(
             .map(|c| crate::outbox::ReviewCommentPayload {
                 path: c.path.clone(),
                 line: c.line,
+                start_line: c.start_line,
                 body: c.body.clone(),
             })
             .collect();
