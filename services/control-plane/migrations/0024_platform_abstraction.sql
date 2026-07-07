@@ -1,8 +1,9 @@
--- Platform abstraction: rename GitHub-specific columns and tables to platform-agnostic names.
--- All existing rows get platform = 'github' (the default), so existing behaviour is unchanged.
+-- ADR-0071: platform-abstraction layer. Rename GitHub-specific columns and tables to
+-- platform-agnostic names so the control plane can serve GitHub and GitLab (and any future
+-- platform) from one schema. All existing rows get platform = 'github' (the default), so
+-- existing behaviour is unchanged — this is a pure rename + add-default-column refactor.
 --
--- This migration is a pure rename + add-default-column refactor. No data is lost, no behaviour
--- changes. The application code is updated in the same deploy to use the new column names.
+-- The application code is updated in the same deploy to use the new column names.
 
 BEGIN;
 
@@ -10,10 +11,13 @@ BEGIN;
 ALTER TABLE repositories ADD COLUMN IF NOT EXISTS platform TEXT NOT NULL DEFAULT 'github';
 ALTER TABLE repositories RENAME COLUMN github_repo_id TO platform_repo_id;
 
--- The old UNIQUE constraint on github_repo_id became a UNIQUE on platform_repo_id after the
--- rename. A GitHub repo ID and a GitLab project ID could collide numerically, so we need a
--- composite unique on (platform, platform_repo_id).
-DROP INDEX IF EXISTS repositories_platform_repo_id_key;
+-- The old UNIQUE constraint on github_repo_id retained its creation-time name
+-- (repositories_github_repo_id_key) after the RENAME COLUMN — PostgreSQL does NOT rename
+-- indexes/constraints on RENAME COLUMN. We must DROP CONSTRAINT (not DROP INDEX, which
+-- cannot drop the index backing a UNIQUE constraint) using the original name, then create
+-- a composite unique so a GitHub repo ID and a GitLab project ID can coexist even if they
+-- collide numerically.
+ALTER TABLE repositories DROP CONSTRAINT IF EXISTS repositories_github_repo_id_key;
 CREATE UNIQUE INDEX IF NOT EXISTS repositories_platform_repo_id_unique
     ON repositories (platform, platform_repo_id);
 

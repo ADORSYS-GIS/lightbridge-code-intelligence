@@ -282,10 +282,17 @@ async fn handle_gitlab_merge_request(
             }
             // RFC-0003: skip bot-authored MRs. GitLab bots typically have usernames ending in `_bot`.
             // Absent a clean `type` field, we fail open (treat as human) — never silently drop a real MR.
+            // Check both the commit author's display name and the triggerer's username for robustness.
             let author = attrs["last_commit"]["author"]["name"]
                 .as_str()
                 .unwrap_or("");
-            if should_skip_gitlab_bot_review(state.review.skip_bot_authored_prs(), author) {
+            let trigger_username = payload["user"]["username"].as_str().unwrap_or("");
+            if should_skip_gitlab_bot_review(state.review.skip_bot_authored_prs(), author)
+                || should_skip_gitlab_bot_review(
+                    state.review.skip_bot_authored_prs(),
+                    trigger_username,
+                )
+            {
                 tracing::info!(
                     delivery_id,
                     mr = mr_iid,

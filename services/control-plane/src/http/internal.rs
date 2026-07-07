@@ -1,11 +1,15 @@
 //! Internal runner API — the control-plane side of the runner↔control-plane contract (ADR-0017).
 //!
 //! The dispatcher launches one Kubernetes Job per task (ADR-0004); that Job runs the agent runner,
-//! which has no GitHub App key of its own. Per the trust boundary (ADR-0002) the runner calls back
-//! here to (a) fetch its task context plus a freshly-minted, short-lived installation token, and
-//! (b) report status transitions. These routes are **not** OIDC-protected (the caller is a pod, not
-//! a user): they authenticate with a shared bearer (`AGENT_RUNNER_TOKEN`) the control plane injects
+//! which has no platform credentials of its own. Per the trust boundary (ADR-0002) the runner calls
+//! back here to (a) fetch its task context plus a platform-appropriate clone URL + token, and (b)
+//! report status transitions. These routes are **not** OIDC-protected (the caller is a pod, not a
+//! user): they authenticate with a shared bearer (`AGENT_RUNNER_TOKEN`) the control plane injects
 //! into the Job. Absent that token in this process, the routes fail closed (503) — never open.
+//!
+//! Platform handling (ADR-0071): GitHub mints a short-lived installation token and sends a plain
+//! clone_url (the runner splices `x-access-token:<token>@`). GitLab embeds the token in the
+//! clone_url itself (`oauth2:<token>@host`) and sends an empty token field.
 
 use axum::extract::{FromRequestParts, Path, State};
 use axum::http::request::Parts;
@@ -16,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 use uuid::Uuid;
 
+use crate::integrations::platform::{CodePlatform, Platform, RepoRef};
 use crate::AppState;
 
 /// Authenticates a runner request by comparing its `Authorization: Bearer` token against the
@@ -75,10 +80,13 @@ fn bearer_token(parts: &Parts) -> Option<String> {
         .map(str::to_string)
 }
 
-/// The runner's view of a task: where the code is, how to fetch it, and what to do. `token` is a
-/// short-lived installation access token (~1h) minted just-in-time; `clone_url` is the plain HTTPS
-/// remote (the runner composes the authenticated URL with the token, so the token isn't baked into
-/// a value it might log).
+/// The runner's view of a task: where the code is, how to fetch it, and what to do.
+///
+/// `clone_url` + `token` are platform-aware (ADR-0071):
+/// - **GitHub**: `clone_url` is the plain HTTPS remote; `token` is a short-lived installation
+///   access token (~1h) minted just-in-time. The runner composes the authenticated URL.
+/// - **GitLab**: `clone_url` already has the token embedded (`oauth2:<token>@host`); `token`
+///   is empty. The runner detects the pre-authenticated URL and passes it through.
 #[derive(Debug, Serialize)]
 pub struct TaskContextResponse {
     pub task_id: Uuid,
@@ -128,11 +136,6 @@ pub async fn get_context(
     let Some(pool) = state.db.as_ref() else {
         return (StatusCode::SERVICE_UNAVAILABLE, "no database").into_response();
     };
-    let Some(app) = state.github.as_ref() else {
-        // Without the App key we cannot mint a token, so the runner could not clone — fail closed.
-        return (StatusCode::SERVICE_UNAVAILABLE, "github app not configured").into_response();
-    };
-
     let context = match crate::db::get_task_context(pool, id).await {
         Ok(Some(context)) => context,
         Ok(None) => return (StatusCode::NOT_FOUND, "task not found").into_response(),
@@ -142,11 +145,43 @@ pub async fn get_context(
         }
     };
 
-    let token = match app.installation_token(context.installation_id).await {
-        Ok(token) => token,
-        Err(error) => {
-            tracing::error!(%error, task_id = %id, "mint installation token failed");
-            return (StatusCode::BAD_GATEWAY, "could not mint installation token").into_response();
+    // Platform-aware clone URL + token (ADR-0071). GitHub mints a short-lived installation
+    // token and sends a plain clone_url (the runner splices `x-access-token:<token>@`).
+    // GitLab embeds the token in the clone_url itself (`oauth2:<token>@host`) and sends an
+    // empty token field — the runner detects the `@` and passes the URL through unchanged.
+    let repo_ref = RepoRef {
+        platform: context.platform,
+        full_name: format!("{}/{}", context.owner, context.name),
+        platform_repo_id: 0,
+        installation_id: context.installation_id,
+    };
+
+    let (clone_url, token) = match context.platform {
+        Platform::GitHub => {
+            let Some(app) = state.github.as_ref() else {
+                return (StatusCode::SERVICE_UNAVAILABLE, "github app not configured")
+                    .into_response();
+            };
+            let token = match app.installation_token(context.installation_id).await {
+                Ok(token) => token,
+                Err(error) => {
+                    tracing::error!(%error, task_id = %id, "mint installation token failed");
+                    return (StatusCode::BAD_GATEWAY, "could not mint installation token")
+                        .into_response();
+                }
+            };
+            (app.clone_url(&repo_ref), token)
+        }
+        Platform::GitLab => {
+            let Some(gitlab) = state.gitlab.as_ref() else {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "gitlab client not configured",
+                )
+                    .into_response();
+            };
+            // GitlabClient::clone_url() embeds the token (oauth2:<token>@host).
+            (gitlab.clone_url(&repo_ref), String::new())
         }
     };
 
@@ -216,7 +251,7 @@ pub async fn get_context(
     Json(TaskContextResponse {
         task_id: context.id,
         repository_id: context.repository_id,
-        clone_url: format!("https://github.com/{}/{}.git", context.owner, context.name),
+        clone_url,
         owner: context.owner,
         name: context.name,
         default_branch: context.default_branch,

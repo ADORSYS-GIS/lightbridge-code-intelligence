@@ -32,6 +32,8 @@ pub struct GitlabClient {
     api_url: String,
     /// Access token sent as the `PRIVATE-TOKEN` header.
     token: String,
+    /// Webhook secret used to verify GitLab webhook tokens (cached at init).
+    webhook_secret: String,
     /// HTTP client (shared, connection-pooled).
     http: Client,
 }
@@ -49,6 +51,7 @@ impl GitlabClient {
             .unwrap_or_else(|_| "https://gitlab.com/api/v4".to_string())
             .trim_end_matches('/')
             .to_string();
+        let webhook_secret = std::env::var("GITLAB_WEBHOOK_SECRET").unwrap_or_default();
         let http = Client::builder()
             .user_agent("lightbridge-code-intelligence")
             .build()
@@ -56,13 +59,9 @@ impl GitlabClient {
         Some(Self {
             api_url,
             token,
+            webhook_secret,
             http,
         })
-    }
-
-    /// The webhook secret from env, read on demand (mirrors GithubApp::webhook_secret).
-    fn webhook_secret() -> String {
-        std::env::var("GITLAB_WEBHOOK_SECRET").unwrap_or_default()
     }
 
     /// URL-encode the project path: `group/subgroup/repo` → `group%2Fsubgroup%2Frepo`.
@@ -136,8 +135,7 @@ impl CodePlatform for GitlabClient {
 
     fn verify_webhook(&self, headers: &axum::http::HeaderMap, _body: &[u8]) -> bool {
         // GitLab sends the raw webhook secret in the `X-Gitlab-Token` header — no HMAC.
-        let secret = Self::webhook_secret();
-        if secret.is_empty() {
+        if self.webhook_secret.is_empty() {
             return false; // fail-closed
         }
         let token = match headers.get("x-gitlab-token").and_then(|v| v.to_str().ok()) {
@@ -146,7 +144,10 @@ impl CodePlatform for GitlabClient {
         };
         // Constant-time comparison.
         use subtle::ConstantTimeEq;
-        secret.as_bytes().ct_eq(token.as_bytes()).into()
+        self.webhook_secret
+            .as_bytes()
+            .ct_eq(token.as_bytes())
+            .into()
     }
 
     fn delivery_id(&self, headers: &axum::http::HeaderMap) -> Option<String> {
@@ -318,8 +319,11 @@ impl CodePlatform for GitlabClient {
                 id: v.get("id").and_then(|i| i.as_i64()),
                 html_url: None,
             });
+        } else if resp.status() != reqwest::StatusCode::NOT_FOUND {
+            // Non-404 errors (401, 403, 429, etc.) should propagate, not fall back.
+            resp.error_for_status()?;
         }
-        // Fall back to issue notes.
+        // Fall back to issue notes (only on 404 — the MR doesn't exist, so it's an issue).
         let issue_url = self.url(&format!(
             "/projects/{}/issues/{}/notes",
             project, issue_number
@@ -362,6 +366,9 @@ impl CodePlatform for GitlabClient {
                     .await?;
                 if resp.status().is_success() {
                     return Ok(());
+                } else if resp.status() != reqwest::StatusCode::NOT_FOUND {
+                    // Non-404 errors (401, 403, 429, etc.) should propagate, not fall back.
+                    resp.error_for_status()?;
                 }
                 let issue_url = self.url(&format!(
                     "/projects/{}/issues/{}/award_emoji",
@@ -420,7 +427,7 @@ impl CodePlatform for GitlabClient {
     ) -> anyhow::Result<Vec<ReviewCommentRef>> {
         let project = Self::project_encoded(repo);
         let url = self.url(&format!(
-            "/projects/{}/merge_requests/{}/discussions",
+            "/projects/{}/merge_requests/{}/discussions?per_page=100",
             project, pr_number
         ));
         let resp = self
@@ -477,15 +484,17 @@ impl CodePlatform for GitlabClient {
     }
 
     fn clone_url(&self, repo: &RepoRef) -> String {
-        // Embed the token for HTTPS clone (oauth2:TOKEN@host form, like the plan).
-        // Strip the `/api/v4` suffix to get the base host URL.
+        // Embed the token for HTTPS clone (oauth2:TOKEN@host form).
+        // Strip the `/api/v4` suffix to get the base host URL, then strip the
+        // protocol prefix to avoid a doubled scheme in the final URL.
         let base = self
             .api_url
             .strip_suffix("/api/v4")
             .unwrap_or(&self.api_url);
+        let host = base.split_once("://").map(|(_, h)| h).unwrap_or(base);
         format!(
             "https://oauth2:{}@{}/{}.git",
-            self.token, base, repo.full_name
+            self.token, host, repo.full_name
         )
     }
 }
