@@ -84,7 +84,11 @@ exactly what the memory service must expose. Concretely the memory service must 
   just `{name, url}`. The service must therefore be network-isolated (in-cluster Service, not publicly
   exposed) and hold its own storage credentials.
 
-Config shape (ai-helm-values, mirrors `brave-search` / `context7`):
+Config shape (ai-helm-values, mirrors `brave-search` / `context7`). These are **two separate service
+configs** — the control plane and the agent runner each load their own file, and both use
+`deny_unknown_fields`, so they must **not** be merged into one document:
+
+Control-plane config (`FileConfig`, `services/control-plane/src/config.rs`) — registers the server:
 
 ```json
 {
@@ -92,7 +96,15 @@ Config shape (ai-helm-values, mirrors `brave-search` / `context7`):
     "mcp_servers": [
       { "name": "memory", "url": "http://memory.converse.svc.cluster.local:8080/mcp" }
     ]
-  },
+  }
+}
+```
+
+Agent-runner review config (`ReviewFile.<tier>.tools`, `services/agent-runner/src/bootstrap/config.rs`)
+— allowlists the tools per tier (`recall` both tiers; `remember` deep-tier only):
+
+```json
+{
   "review": {
     "fast": { "tools": ["...", "mcp__memory__recall"] },
     "deep": { "tools": ["...", "mcp__memory__recall", "mcp__memory__remember"] }
