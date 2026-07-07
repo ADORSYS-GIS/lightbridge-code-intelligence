@@ -15,7 +15,7 @@ use axum::response::{IntoResponse, Response};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 
-use crate::integrations::platform::{CodePlatform, Platform};
+use crate::integrations::platform::{CodePlatform, Platform, RepoRef};
 use crate::AppState;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -302,12 +302,57 @@ async fn handle_gitlab_merge_request(
                 crate::http::metrics::review_skipped_bot_author();
                 return;
             }
-            // GitLab MR webhook payload includes diff_refs (base_sha/head_sha/start_sha).
-            let base_sha = attrs["diff_refs"]["base_sha"].as_str().map(str::to_string);
-            let head_sha = attrs["diff_refs"]["head_sha"]
+            // GitLab MR webhook payload includes diff_refs (base_sha/head_sha/start_sha), but some
+            // events (e.g. push-triggered MR updates, or payloads from older GitLab versions) omit
+            // diff_refs. Fall back to the GitLab API to fetch the MR's diff refs so the agent-runner
+            // gets a non-empty base_sha — without it, `clone::pr_diff` returns None and the review
+            // runs on an empty diff.
+            let mut base_sha = attrs["diff_refs"]["base_sha"].as_str().map(str::to_string);
+            let mut head_sha = attrs["diff_refs"]["head_sha"]
                 .as_str()
                 .or_else(|| attrs["last_commit"]["id"].as_str())
                 .map(str::to_string);
+            if base_sha.is_none() {
+                if let Some(gitlab) = state.gitlab.as_ref() {
+                    let repo_ref = RepoRef {
+                        platform: Platform::GitLab,
+                        full_name: format!("{owner}/{name}"),
+                        platform_repo_id: project_id,
+                        installation_id,
+                    };
+                    match gitlab.pr_shas(&repo_ref, mr_iid).await {
+                        Ok((api_base, api_head)) => {
+                            if base_sha.is_none() {
+                                base_sha = api_base;
+                            }
+                            if head_sha.is_none() {
+                                head_sha = api_head;
+                            }
+                            tracing::info!(
+                                delivery_id,
+                                mr = mr_iid,
+                                "GitLab MR payload missing diff_refs; fetched SHAs from API"
+                            );
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                %error,
+                                delivery_id,
+                                mr = mr_iid,
+                                "GitLab MR payload missing diff_refs and API fetch failed; \
+                                 review may run on an empty diff"
+                            );
+                        }
+                    }
+                } else {
+                    tracing::warn!(
+                        delivery_id,
+                        mr = mr_iid,
+                        "GitLab MR payload missing diff_refs and no GitLab client configured; \
+                         review may run on an empty diff"
+                    );
+                }
+            }
             let task = crate::db::NewTask {
                 repository_id,
                 installation_id,

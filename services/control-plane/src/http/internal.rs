@@ -1071,9 +1071,6 @@ pub async fn finalize_review(
     let Some(pool) = state.db.as_ref() else {
         return (StatusCode::SERVICE_UNAVAILABLE, "no database").into_response();
     };
-    let Some(app) = state.github.as_ref() else {
-        return (StatusCode::SERVICE_UNAVAILABLE, "github app not configured").into_response();
-    };
     let context = match crate::db::get_task_context(pool, id).await {
         Ok(Some(c)) => c,
         Ok(None) => return (StatusCode::NOT_FOUND, "task not found").into_response(),
@@ -1089,12 +1086,20 @@ pub async fn finalize_review(
             return (StatusCode::INTERNAL_SERVER_ERROR, "query error").into_response();
         }
     };
-    let token = match app.installation_token(context.installation_id).await {
-        Ok(t) => t,
-        Err(error) => {
-            tracing::error!(%error, task_id = %id, "mint installation token failed");
-            return (StatusCode::BAD_GATEWAY, "could not mint installation token").into_response();
-        }
+    // Platform dispatch (ADR-0071): pick the CodePlatform implementation for this task's platform.
+    // GitHub mints an installation token internally; GitLab uses its static PAT. The trait
+    // encapsulates auth so this handler stays platform-agnostic.
+    let Some(platform) = state.platforms.get(&context.platform) else {
+        tracing::error!(
+            task_id = %id,
+            platform = %context.platform,
+            "no platform implementation configured for this task's platform",
+        );
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "platform not configured for this task",
+        )
+            .into_response();
     };
     // serve keeps the App key for READS only (ADR-0059): we mint a token to fetch the PR diff so the
     // review is fully *shaped* here (pre-rendered body + validated inline comments). Nothing is posted —
@@ -1241,16 +1246,21 @@ pub async fn finalize_review(
         let summary = effective_summary(real_summary, deduped_n, all_deduped);
 
         // The PR-diff fetch is a READ done at produce time (ADR-0059: shaping is the producer's job).
+        // Platform-aware (ADR-0071): the trait's `list_changed_files` dispatches to GitHub or GitLab
+        // and encapsulates auth internally — no token minting here.
+        let repo_ref = RepoRef {
+            platform: context.platform,
+            full_name: format!("{}/{}", context.owner, context.name),
+            platform_repo_id: context.repository_id,
+            installation_id: context.installation_id,
+        };
         let commentable: std::collections::HashMap<String, std::collections::BTreeSet<u32>> =
-            match app
-                .list_pr_files(&token, &context.owner, &context.name, pr)
-                .await
-            {
+            match platform.list_changed_files(&repo_ref, pr).await {
                 Ok(files) => files
                     .into_iter()
                     .filter_map(|f| {
                         f.patch
-                            .map(|p| (f.filename, crate::review::commentable_lines(&p)))
+                            .map(|p| (f.path, crate::review::commentable_lines(&p)))
                     })
                     .collect(),
                 Err(error) => {

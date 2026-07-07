@@ -81,6 +81,15 @@ pub struct AppState {
     pub github: Option<github::GithubApp>,
     /// GitLab API client (static `PRIVATE-TOKEN`). `None` when `GITLAB_API_TOKEN` is unset.
     pub gitlab: Option<gitlab::GitlabClient>,
+    /// Platform dispatch table (ADR-0071): maps each configured `Platform` to its `CodePlatform`
+    /// implementation. Built once at startup from the configured GitHub App + GitLab client; shared
+    /// by the HTTP handlers (e.g. `finalize_review`) and the reconciler so both pick the right
+    /// implementation per task. Empty when no platform is configured (the reconciler bails in that
+    /// case; HTTP handlers return 503).
+    pub platforms: std::collections::HashMap<
+        integrations::platform::Platform,
+        Arc<dyn integrations::platform::CodePlatform>,
+    >,
     /// Shared bearer for the internal runner API (`AGENT_RUNNER_TOKEN`). `None` disables those
     /// routes (they fail closed with 503) — the control plane injects the same value into each
     /// agent Job so the runner can authenticate back (see internal.rs / ADR-0017).
@@ -165,6 +174,27 @@ impl AppState {
                 );
             }
         }
+        let github = github::GithubApp::from_env();
+        let gitlab = gitlab::GitlabClient::from_env();
+        // Build the platform dispatch table (ADR-0071) once, from the configured implementations.
+        // Shared by the HTTP handlers and the reconciler so both pick the right implementation per task.
+        let mut platforms: std::collections::HashMap<
+            integrations::platform::Platform,
+            Arc<dyn integrations::platform::CodePlatform>,
+        > = std::collections::HashMap::new();
+        if let Some(app) = github.clone() {
+            platforms.insert(
+                integrations::platform::Platform::GitHub,
+                Arc::new(app) as Arc<dyn integrations::platform::CodePlatform>,
+            );
+        }
+        if let Some(client) = gitlab.clone() {
+            platforms.insert(
+                integrations::platform::Platform::GitLab,
+                Arc::new(client) as Arc<dyn integrations::platform::CodePlatform>,
+            );
+        }
+
         Ok(Self {
             github_webhook_secret: Arc::new(
                 std::env::var("GITHUB_WEBHOOK_SECRET").unwrap_or_default(),
@@ -176,8 +206,9 @@ impl AppState {
             jwt: jwt::from_env(),
             db,
             allow_no_db,
-            github: github::GithubApp::from_env(),
-            gitlab: gitlab::GitlabClient::from_env(),
+            github,
+            gitlab,
+            platforms,
             runner_token: std::env::var("AGENT_RUNNER_TOKEN")
                 .ok()
                 .filter(|token| !token.is_empty())
@@ -509,18 +540,9 @@ async fn run_reconciler(state: AppState) -> anyhow::Result<()> {
         .db
         .clone()
         .ok_or_else(|| anyhow::anyhow!("reconciler requires DATABASE_URL"))?;
-    let mut platforms: std::collections::HashMap<
-        crate::integrations::platform::Platform,
-        Arc<dyn crate::integrations::platform::CodePlatform>,
-    > = std::collections::HashMap::new();
-    if let Some(app) = state.github.clone() {
-        let app: Arc<dyn crate::integrations::platform::CodePlatform> = Arc::new(app);
-        platforms.insert(crate::integrations::platform::Platform::GitHub, app);
-    }
-    if let Some(client) = state.gitlab.clone() {
-        let client: Arc<dyn crate::integrations::platform::CodePlatform> = Arc::new(client);
-        platforms.insert(crate::integrations::platform::Platform::GitLab, client);
-    }
+    // The platform dispatch table is built once at startup in `AppState::from_env` and shared by the
+    // HTTP handlers and the reconciler (ADR-0071). Clone it out of the shared state.
+    let platforms = state.platforms.clone();
     if platforms.is_empty() {
         anyhow::bail!(
             "reconciler requires at least one platform implementation \
