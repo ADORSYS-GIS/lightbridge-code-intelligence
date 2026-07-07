@@ -95,6 +95,13 @@ struct ReadFileArgs {
 struct AddReviewCommentArgs {
     file: String,
     line: i32,
+    /// Optional first line of a multi-line range (ADR-0071): `line` is always the range's last line
+    /// when both are given. Forwarded to the control plane unchanged — the runner does not validate it
+    /// against the diff (that's the control plane's job, ADR-0022's trust boundary); an unrecognized or
+    /// invalid range simply falls back to single-line behavior control-plane-side. `Option` keeps this
+    /// fully backward compatible: absent is today's single-line path, byte-for-byte.
+    #[serde(default)]
+    start_line: Option<i32>,
     title: String,
     priority: String,
     category: String,
@@ -243,6 +250,7 @@ pub fn tool_defs() -> Vec<ToolDef> {
             "properties": {
                 "file": { "type": "string", "description": "Path from repo root." },
                 "line": { "type": "integer", "description": "A line this diff adds or changes." },
+                "start_line": { "type": "integer", "description": "Optional first line of the range, when this finding's evidence spans more than one line; omit for a single-line finding. `line` is always the range's last line when both are given." },
                 "title": { "type": "string", "description": "Short (≤ ~8 words)." },
                 "priority": { "type": "string", "enum": ["P0", "P1", "P2"], "description": "P0 = must fix (bug/security/data-loss), P1 = should fix, P2 = minor/nit." },
                 "category": { "type": "string", "enum": ["security", "correctness", "quality", "style", "performance"], "description": "The dimension this finding is about." },
@@ -395,6 +403,7 @@ impl Tools<'_> {
                             self.task_id,
                             &a.file,
                             a.line,
+                            a.start_line,
                             Some(&a.title),
                             Some(&a.priority),
                             Some(&a.category),
@@ -415,7 +424,8 @@ impl Tools<'_> {
                 Err(e) => ToolOutcome::Continue(format!(
                     "{e} Expected JSON like {{\"file\": \"path\", \"line\": 42, \"title\": \"…\", \
                      \"priority\": \"P0\", \"category\": \"security\", \"body\": \"…\", \
-                     \"evidence\": \"the lines this rests on\", \"suggestion\": \"optional\"}}. \
+                     \"evidence\": \"the lines this rests on\", \"suggestion\": \"optional\", \
+                     \"start_line\": \"optional, first line of a multi-line range\"}}. \
                      priority is P0|P1|P2; category is security|correctness|quality|style|performance."
                 )),
             },
@@ -675,7 +685,7 @@ fn resolve_in_root(root: &Path, rel: &str) -> Result<PathBuf, String> {
 mod tests {
     use super::*;
     use crate::review::native::chat::FunctionCall;
-    use wiremock::matchers::{method, path};
+    use wiremock::matchers::{body_partial_json, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn call(name: &str, arguments: &str) -> ToolCall {
@@ -931,6 +941,107 @@ mod tests {
             }
             other => panic!("expected Continue, got {other:?}"),
         }
+    }
+
+    // ── ADR-0071: start_line, when the model provides it, is forwarded to the control plane
+    // unchanged — no agent-runner-side range validation (that's the control plane's job). ──────────
+    #[tokio::test]
+    async fn dispatch_add_review_comment_forwards_start_line_unchanged() {
+        let cp_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(format!(
+                "/internal/tasks/{}/review/inline",
+                Uuid::nil()
+            )))
+            // The exact wire payload must carry start_line unchanged from what the model sent.
+            .and(body_partial_json(serde_json::json!({
+                "file": "a.rs", "line": 12, "start_line": 9,
+            })))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&cp_server)
+            .await;
+        let cp = ControlPlaneClient::new(cp_server.uri(), "tok");
+        let emb = EmbeddingsClient::new("http://unused", "key", "model");
+        let args = r#"{"file":"a.rs","line":12,"start_line":9,"title":"Multi-line bug","priority":"P1","category":"correctness","body":"the whole loop is wrong","evidence":"lines 9-12"}"#;
+        match tools(&cp, &emb)
+            .dispatch(&call(ADD_REVIEW_COMMENT, args))
+            .await
+        {
+            ToolOutcome::Continue(s) => {
+                assert!(s.contains("recorded finding at a.rs:12"), "got: {s}")
+            }
+            other => panic!("expected Continue, got {other:?}"),
+        }
+    }
+
+    // ── ADR-0071 backward compatibility: omitting start_line (the default/current case) still
+    // dispatches — the mock only matches when the field is explicitly null, proving the wire shape
+    // sends `"start_line": null` rather than silently dropping/mis-defaulting the key. ─────────────
+    #[tokio::test]
+    async fn dispatch_add_review_comment_without_start_line_sends_null() {
+        let cp_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(format!(
+                "/internal/tasks/{}/review/inline",
+                Uuid::nil()
+            )))
+            .and(body_partial_json(serde_json::json!({
+                "file": "a.rs", "line": 7, "start_line": null,
+            })))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&cp_server)
+            .await;
+        let cp = ControlPlaneClient::new(cp_server.uri(), "tok");
+        let emb = EmbeddingsClient::new("http://unused", "key", "model");
+        let args = r#"{"file":"a.rs","line":7,"title":"No expiry","priority":"P0","category":"security","body":"accepts expired tokens","suggestion":"if expired { return Err }"}"#;
+        match tools(&cp, &emb)
+            .dispatch(&call(ADD_REVIEW_COMMENT, args))
+            .await
+        {
+            ToolOutcome::Continue(s) => {
+                assert!(s.contains("recorded finding at a.rs:7"), "got: {s}")
+            }
+            other => panic!("expected Continue, got {other:?}"),
+        }
+    }
+
+    // ── Negative: a non-integer start_line is a recoverable Continue, same handling as any other
+    // malformed optional field in this file (parse::<T> maps a serde error to model-facing text). ───
+    #[tokio::test]
+    async fn dispatch_add_review_comment_non_integer_start_line_is_recoverable() {
+        let cp = ControlPlaneClient::new("http://unused", "tok");
+        let emb = EmbeddingsClient::new("http://unused", "key", "model");
+        let args = r#"{"file":"a.rs","line":7,"start_line":"not-a-number","title":"t","priority":"P2","category":"quality","body":"b"}"#;
+        match tools(&cp, &emb)
+            .dispatch(&call(ADD_REVIEW_COMMENT, args))
+            .await
+        {
+            ToolOutcome::Continue(s) => {
+                assert!(s.starts_with("error: invalid arguments"), "got: {s}")
+            }
+            other => panic!("expected Continue (recoverable), got {other:?}"),
+        }
+    }
+
+    // ── The tool schema documents start_line as optional (not required) and its description matches
+    // ADR-0071's wording, so a schema drift regresses visibly here rather than silently. ────────────
+    #[test]
+    fn add_review_comment_schema_has_optional_start_line() {
+        let def = tool_defs()
+            .into_iter()
+            .find(|t| t.function.name == ADD_REVIEW_COMMENT)
+            .expect("add_review_comment is defined");
+        let schema = &def.function.parameters;
+        assert!(
+            schema["properties"]["start_line"].is_object(),
+            "start_line must be documented in the schema: {schema}"
+        );
+        assert_eq!(schema["properties"]["start_line"]["type"], "integer");
+        let required = schema["required"].as_array().expect("required is an array");
+        assert!(
+            !required.iter().any(|v| v == "start_line"),
+            "start_line must not be required: {required:?}"
+        );
     }
 
     // ── Positive: finish records the summary and ends the run ───────────────────────────────────
