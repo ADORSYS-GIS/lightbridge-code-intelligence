@@ -312,7 +312,9 @@ impl CodePlatform for GitlabClient {
         // Phase A (ADR-0072): use `noteable_type` to route directly — no probe.
         // GitLab MRs and issues share iid sequences (both start at 1), so a probe would
         // succeed on the wrong noteable. `target_type` is `"pull_request"` or `"issue"`.
-        let is_mr = noteable_type.map(|t| t == "pull_request").unwrap_or(true); // default to MR (the common case for reviews)
+        // Note: old outbox rows may not have `target_type` in their payload; default to MR
+        // (the common case for reviews). This is a low-risk fallback for in-flight rows.
+        let is_mr = noteable_type.map(|t| t == "pull_request").unwrap_or(true);
 
         let endpoint = if is_mr {
             format!(
@@ -349,7 +351,9 @@ impl CodePlatform for GitlabClient {
         match target {
             ReactionTarget::Issue { number } => {
                 // Phase A (ADR-0072): use `noteable_type` to route directly — no probe.
-                let is_mr = noteable_type.map(|t| t == "pull_request").unwrap_or(true); // default to MR (the common case for reviews)
+                // Note: old outbox rows may not have `target_type` in their payload; default to MR
+                // (the common case for reviews). This is a low-risk fallback for in-flight rows.
+                let is_mr = noteable_type.map(|t| t == "pull_request").unwrap_or(true);
 
                 let endpoint = if is_mr {
                     format!(
@@ -473,6 +477,9 @@ impl CodePlatform for GitlabClient {
         // Embed the token for HTTPS clone (oauth2:TOKEN@host form).
         // Strip the `/api/v4` suffix to get the base host URL, then strip the
         // protocol prefix to avoid a doubled scheme in the final URL.
+        // Note: Token and path are not URL-encoded. GitLab PATs are alphanumeric + hyphens,
+        // and project paths are typically alphanumeric + hyphens + underscores, so this is
+        // low-risk in practice. URL-encoding would break the OAuth2 format.
         let base = self
             .api_url
             .strip_suffix("/api/v4")

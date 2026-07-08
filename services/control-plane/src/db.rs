@@ -714,12 +714,15 @@ pub async fn list_pollable_comments(
     within_days: i32,
     interval_secs: i64,
 ) -> Result<Vec<PollableComment>, sqlx::Error> {
+    // Phase 7 TODO: GitLab feedback polling is not implemented yet (list_comment_reactions returns empty).
+    // Filter to GitHub only to avoid wasting cycles on no-op GitLab API calls.
     sqlx::query_as::<_, PollableComment>(
         "SELECT rc.task_id, rc.platform_comment_id, rc.kind, r.owner, r.name, t.installation_id, r.platform \
          FROM review_comments rc \
          JOIN tasks t ON t.id = rc.task_id \
          JOIN repositories r ON r.id = t.repository_id \
-         WHERE t.created_at > now() - ($1 * interval '1 day') \
+         WHERE r.platform = 'github' \
+           AND t.created_at > now() - ($1 * interval '1 day') \
            AND ( \
              rc.created_at > now() - interval '1 day' \
              OR (rc.created_at BETWEEN now() - interval '3 days' AND now() - interval '1 day' \
@@ -1065,10 +1068,6 @@ pub struct TaskRow {
     pub installation_id: i64,
     /// `None` for admin-initiated tasks (e.g. index-on-approve) that have no originating webhook
     /// delivery; `Some` for webhook-created tasks. (Column is nullable since migration 0008.)
-    ///
-    /// `#[serde(alias)]` keeps the old `github_delivery_id` name accepted on deserialization so
-    /// existing frontend/CLI clients don't break during the platform-abstraction rollout (ADR-0072).
-    #[serde(alias = "github_delivery_id")]
     pub webhook_delivery_id: Option<String>,
     pub target_type: String,
     pub target_id: i64,
