@@ -35,7 +35,7 @@ pub struct Task {
     pub id: uuid::Uuid,
     pub repository_id: i64,
     pub installation_id: i64,
-    pub github_delivery_id: String,
+    pub webhook_delivery_id: String,
     pub target_type: String,
     pub target_id: i64,
     pub command_text: String,

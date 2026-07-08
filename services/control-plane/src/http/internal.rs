@@ -1103,7 +1103,7 @@ pub async fn finalize_review(
     };
     // serve keeps the App key for READS only (ADR-0059): we mint a token to fetch the PR diff so the
     // review is fully *shaped* here (pre-rendered body + validated inline comments). Nothing is posted —
-    // every GitHub write is enqueued to `github_outbox` and the reconciler delivers it.
+    // every GitHub write is enqueued to `outbox` and the reconciler delivers it.
     let t = crate::outbox::Target {
         task_id: Some(id),
         platform: context.platform,
@@ -1199,7 +1199,7 @@ pub async fn finalize_review(
         // this PR from a prior Lightbridge review. Drop findings whose normalized `(file, line, title)`
         // key matches one already posted — or already QUEUED in the outbox — on the SAME head_sha (line
         // numbers drift across commits, so a key match is only trustworthy within one commit). Sourced
-        // from our own persisted `reviews` + pending `github_outbox` review rows (ADR-0035/0059), not the
+        // from our own persisted `reviews` + pending `outbox` review rows (ADR-0035/0059), not the
         // GitHub API. Best-effort: a lookup error means "nothing posted yet" → no dedup, never a failed
         // finalize. The prompt-side re-derive-then-retract framing (Option C) reduces re-emission
         // upstream; this is the deterministic backstop.

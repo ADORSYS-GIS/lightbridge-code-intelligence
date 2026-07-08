@@ -896,7 +896,7 @@ async fn handle_issue_comment(
     // malformed payload → `None`, and the reactions fall back to the PR/issue body.
     let trigger_comment_id = payload["comment"]["id"].as_i64();
     // An @mention is an explicit human command: it must ALWAYS create a task. True webhook
-    // redeliveries are already deduped upstream by the `github_deliveries` delivery-id PRIMARY KEY,
+    // redeliveries are already deduped upstream by the `webhook_deliveries` delivery-id PRIMARY KEY,
     // so content-idempotency adds nothing here — and previously dropped legitimate re-requests when
     // the same wording landed on an unchanged head. `create_explicit_task` folds the next epoch into
     // the INSERT, so every mention lands a fresh, non-colliding row atomically. `run_epoch` is

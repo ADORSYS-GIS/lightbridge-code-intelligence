@@ -67,7 +67,7 @@ pub struct AppState {
     /// configured — the unified webhook route rejects GitLab traffic in that case.
     pub gitlab_webhook_secret: Arc<String>,
     /// In-memory delivery-id dedup set — the fallback when no database is configured (dev). With a
-    /// pool, the webhook dedups on the `github_deliveries` PRIMARY KEY instead.
+    /// pool, the webhook dedups on the `webhook_deliveries` PRIMARY KEY instead.
     pub seen_deliveries: Arc<Mutex<HashSet<String>>>,
     /// OIDC token validator for protected routes. `None` when `OIDC_ISSUER` is unset (fails closed).
     pub jwt: Option<Arc<JwtValidator>>,
