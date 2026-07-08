@@ -94,12 +94,16 @@ struct ReadFileArgs {
 #[derive(Debug, Deserialize)]
 struct AddReviewCommentArgs {
     file: String,
+    /// The line this finding anchors to — a line the diff adds or changes. When `start_line` is also
+    /// given, this is the range's LAST (anchor) line, not a co-equal endpoint: everything downstream
+    /// (retraction, feedback correlation, prior-review context) keys off this single `line` (ADR-0071).
     line: i32,
-    /// Optional first line of a multi-line range (ADR-0071): `line` is always the range's last line
-    /// when both are given. Forwarded to the control plane unchanged — the runner does not validate it
-    /// against the diff (that's the control plane's job, ADR-0022's trust boundary); an unrecognized or
-    /// invalid range simply falls back to single-line behavior control-plane-side. `Option` keeps this
-    /// fully backward compatible: absent is today's single-line path, byte-for-byte.
+    /// Optional FIRST line of a multi-line range (ADR-0071); the range ends at (is anchored by) `line`,
+    /// which is always the range's last line when both are given. Forwarded to the control plane
+    /// unchanged — the runner does not validate it against the diff (that's the control plane's job,
+    /// ADR-0022's trust boundary); an unrecognized or invalid range simply falls back to single-line
+    /// behavior control-plane-side. `Option` keeps this fully backward compatible: absent is today's
+    /// single-line path, byte-for-byte.
     #[serde(default)]
     start_line: Option<i32>,
     title: String,
@@ -249,8 +253,8 @@ pub fn tool_defs() -> Vec<ToolDef> {
             "type": "object",
             "properties": {
                 "file": { "type": "string", "description": "Path from repo root." },
-                "line": { "type": "integer", "description": "A line this diff adds or changes." },
-                "start_line": { "type": "integer", "description": "Optional first line of the range, when this finding's evidence spans more than one line; omit for a single-line finding. `line` is always the range's last line when both are given." },
+                "line": { "type": "integer", "description": "The line this finding anchors to — a line the diff adds or changes. When `start_line` is also given, this is the LAST line of the multi-line range." },
+                "start_line": { "type": "integer", "description": "Optional. The FIRST line of a multi-line range; the range ends at `line`. Omit for a single-line finding. Leave unset unless the finding's evidence genuinely spans multiple contiguous lines." },
                 "title": { "type": "string", "description": "Short (≤ ~8 words)." },
                 "priority": { "type": "string", "enum": ["P0", "P1", "P2"], "description": "P0 = must fix (bug/security/data-loss), P1 = should fix, P2 = minor/nit." },
                 "category": { "type": "string", "enum": ["security", "correctness", "quality", "style", "performance"], "description": "The dimension this finding is about." },
