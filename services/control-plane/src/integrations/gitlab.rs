@@ -298,39 +298,27 @@ impl CodePlatform for GitlabClient {
         repo: &RepoRef,
         issue_number: i64,
         body: &str,
+        noteable_type: Option<&str>,
     ) -> anyhow::Result<PostedComment> {
         let project = Self::project_encoded(repo);
-        // Try MR notes first; if 404, fall back to issue notes.
-        let mr_url = self.url(&format!(
-            "/projects/{}/merge_requests/{}/notes",
-            project, issue_number
-        ));
         let payload = serde_json::json!({ "body": body });
+
+        // Phase A (ADR-0072): use `noteable_type` to route directly — no probe.
+        // GitLab MRs and issues share iid sequences (both start at 1), so a probe would
+        // succeed on the wrong noteable. `target_type` is `"pull_request"` or `"issue"`.
+        let is_mr = noteable_type
+            .map(|t| t == "pull_request")
+            .unwrap_or(true); // default to MR (the common case for reviews)
+
+        let endpoint = if is_mr {
+            format!("/projects/{}/merge_requests/{}/notes", project, issue_number)
+        } else {
+            format!("/projects/{}/issues/{}/notes", project, issue_number)
+        };
+        let url = self.url(&endpoint);
         let resp = self
             .http
-            .post(&mr_url)
-            .headers(self.api_headers())
-            .json(&payload)
-            .send()
-            .await?;
-        if resp.status().is_success() {
-            let v: serde_json::Value = resp.json().await?;
-            return Ok(PostedComment {
-                id: v.get("id").and_then(|i| i.as_i64()),
-                html_url: None,
-            });
-        } else if resp.status() != reqwest::StatusCode::NOT_FOUND {
-            // Non-404 errors (401, 403, 429, etc.) should propagate, not fall back.
-            resp.error_for_status()?;
-        }
-        // Fall back to issue notes (only on 404 — the MR doesn't exist, so it's an issue).
-        let issue_url = self.url(&format!(
-            "/projects/{}/issues/{}/notes",
-            project, issue_number
-        ));
-        let resp = self
-            .http
-            .post(&issue_url)
+            .post(&url)
             .headers(self.api_headers())
             .json(&payload)
             .send()
@@ -348,35 +336,25 @@ impl CodePlatform for GitlabClient {
         repo: &RepoRef,
         target: ReactionTarget,
         emoji: &str,
+        noteable_type: Option<&str>,
     ) -> anyhow::Result<()> {
         let project = Self::project_encoded(repo);
         match target {
             ReactionTarget::Issue { number } => {
-                // Try MR award emoji first, then issue award emoji.
-                let mr_url = self.url(&format!(
-                    "/projects/{}/merge_requests/{}/award_emoji",
-                    project, number
-                ));
-                let resp = self
-                    .http
-                    .post(&mr_url)
-                    .headers(self.api_headers())
-                    .json(&serde_json::json!({ "name": emoji }))
-                    .send()
-                    .await?;
-                if resp.status().is_success() {
-                    return Ok(());
-                } else if resp.status() != reqwest::StatusCode::NOT_FOUND {
-                    // Non-404 errors (401, 403, 429, etc.) should propagate, not fall back.
-                    resp.error_for_status()?;
-                }
-                let issue_url = self.url(&format!(
-                    "/projects/{}/issues/{}/award_emoji",
-                    project, number
-                ));
+                // Phase A (ADR-0072): use `noteable_type` to route directly — no probe.
+                let is_mr = noteable_type
+                    .map(|t| t == "pull_request")
+                    .unwrap_or(true); // default to MR (the common case for reviews)
+
+                let endpoint = if is_mr {
+                    format!("/projects/{}/merge_requests/{}/award_emoji", project, number)
+                } else {
+                    format!("/projects/{}/issues/{}/award_emoji", project, number)
+                };
+                let url = self.url(&endpoint);
                 let _ = self
                     .http
-                    .post(&issue_url)
+                    .post(&url)
                     .headers(self.api_headers())
                     .json(&serde_json::json!({ "name": emoji }))
                     .send()

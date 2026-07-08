@@ -81,7 +81,7 @@ pub struct AppState {
     pub github: Option<github::GithubApp>,
     /// GitLab API client (static `PRIVATE-TOKEN`). `None` when `GITLAB_API_TOKEN` is unset.
     pub gitlab: Option<gitlab::GitlabClient>,
-    /// Platform dispatch table (ADR-0071): maps each configured `Platform` to its `CodePlatform`
+    /// Platform dispatch table (ADR-0072): maps each configured `Platform` to its `CodePlatform`
     /// implementation. Built once at startup from the configured GitHub App + GitLab client; shared
     /// by the HTTP handlers (e.g. `finalize_review`) and the reconciler so both pick the right
     /// implementation per task. Empty when no platform is configured (the reconciler bails in that
@@ -176,7 +176,7 @@ impl AppState {
         }
         let github = github::GithubApp::from_env();
         let gitlab = gitlab::GitlabClient::from_env();
-        // Build the platform dispatch table (ADR-0071) once, from the configured implementations.
+        // Build the platform dispatch table (ADR-0072) once, from the configured implementations.
         // Shared by the HTTP handlers and the reconciler so both pick the right implementation per task.
         let mut platforms: std::collections::HashMap<
             integrations::platform::Platform,
@@ -541,7 +541,7 @@ async fn run_reconciler(state: AppState) -> anyhow::Result<()> {
         .clone()
         .ok_or_else(|| anyhow::anyhow!("reconciler requires DATABASE_URL"))?;
     // The platform dispatch table is built once at startup in `AppState::from_env` and shared by the
-    // HTTP handlers and the reconciler (ADR-0071). Clone it out of the shared state.
+    // HTTP handlers and the reconciler (ADR-0072). Clone it out of the shared state.
     let platforms = state.platforms.clone();
     if platforms.is_empty() {
         anyhow::bail!(

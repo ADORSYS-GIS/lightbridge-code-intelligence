@@ -44,7 +44,7 @@ pub fn http_request(method: &'static str, path: &str, status: &'static str, seco
 }
 
 /// An accepted (verified, non-duplicate) webhook delivery, labelled by platform + event type.
-/// `platform` is `"github"` or `"gitlab"` (ADR-0071).
+/// `platform` is `"github"` or `"gitlab"` (ADR-0072).
 pub fn webhook_delivery(platform: &str, event: &str) {
     counter!(
         "lci_webhook_deliveries_total",

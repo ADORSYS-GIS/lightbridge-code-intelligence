@@ -197,19 +197,24 @@ pub trait CodePlatform: Send + Sync {
     ) -> anyhow::Result<PostedReview>;
 
     /// Post a comment on an issue/PR/MR. Returns the platform comment ID + optional HTML URL.
+    /// `noteable_type` carries the task's `target_type` (`"pull_request"` or `"issue"`) so GitLab
+    /// can route to MR notes vs issue notes without probing (MRs and issues share iid sequences).
     async fn post_comment(
         &self,
         repo: &RepoRef,
         issue_number: i64,
         body: &str,
+        noteable_type: Option<&str>,
     ) -> anyhow::Result<PostedComment>;
 
     /// Add a reaction (emoji) to an issue/PR/MR body or to a comment.
+    /// `noteable_type` carries the task's `target_type` for GitLab routing (see `post_comment`).
     async fn add_reaction(
         &self,
         repo: &RepoRef,
         target: ReactionTarget,
         emoji: &str,
+        noteable_type: Option<&str>,
     ) -> anyhow::Result<()>;
 
     /// Add labels to an issue/PR/MR.

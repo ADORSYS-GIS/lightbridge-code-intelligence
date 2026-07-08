@@ -1,4 +1,4 @@
-# ADR-0071: Platform-abstraction layer (`CodePlatform` trait) for GitHub + GitLab
+# ADR-0072: Platform-abstraction layer (`CodePlatform` trait) for GitHub + GitLab
 
 - **Status:** Accepted
 - **Date:** 2026-07-06

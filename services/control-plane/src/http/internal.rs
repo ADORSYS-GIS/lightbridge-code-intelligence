@@ -7,7 +7,7 @@
 //! user): they authenticate with a shared bearer (`AGENT_RUNNER_TOKEN`) the control plane injects
 //! into the Job. Absent that token in this process, the routes fail closed (503) — never open.
 //!
-//! Platform handling (ADR-0071): GitHub mints a short-lived installation token and sends a plain
+//! Platform handling (ADR-0072): GitHub mints a short-lived installation token and sends a plain
 //! clone_url (the runner splices `x-access-token:<token>@`). GitLab embeds the token in the
 //! clone_url itself (`oauth2:<token>@host`) and sends an empty token field.
 
@@ -82,7 +82,7 @@ fn bearer_token(parts: &Parts) -> Option<String> {
 
 /// The runner's view of a task: where the code is, how to fetch it, and what to do.
 ///
-/// `clone_url` + `token` are platform-aware (ADR-0071):
+/// `clone_url` + `token` are platform-aware (ADR-0072):
 /// - **GitHub**: `clone_url` is the plain HTTPS remote; `token` is a short-lived installation
 ///   access token (~1h) minted just-in-time. The runner composes the authenticated URL.
 /// - **GitLab**: `clone_url` already has the token embedded (`oauth2:<token>@host`); `token`
@@ -145,7 +145,7 @@ pub async fn get_context(
         }
     };
 
-    // Platform-aware clone URL + token (ADR-0071). GitHub mints a short-lived installation
+    // Platform-aware clone URL + token (ADR-0072). GitHub mints a short-lived installation
     // token and sends a plain clone_url (the runner splices `x-access-token:<token>@`).
     // GitLab embeds the token in the clone_url itself (`oauth2:<token>@host`) and sends an
     // empty token field — the runner detects the `@` and passes the URL through unchanged.
@@ -1086,7 +1086,7 @@ pub async fn finalize_review(
             return (StatusCode::INTERNAL_SERVER_ERROR, "query error").into_response();
         }
     };
-    // Platform dispatch (ADR-0071): pick the CodePlatform implementation for this task's platform.
+    // Platform dispatch (ADR-0072): pick the CodePlatform implementation for this task's platform.
     // GitHub mints an installation token internally; GitLab uses its static PAT. The trait
     // encapsulates auth so this handler stays platform-agnostic.
     let Some(platform) = state.platforms.get(&context.platform) else {
@@ -1145,7 +1145,7 @@ pub async fn finalize_review(
             }
         } else {
             let body = crate::review::render_answer_body(&pending.comments.join("\n\n---\n\n"));
-            match crate::outbox::enqueue_reply(pool, &t, context.target_id, &body).await {
+            match crate::outbox::enqueue_reply(pool, &t, context.target_id, &body, &context.target_type).await {
                 Ok(_) => {
                     queued_reply = true;
                     let _ = crate::db::clear_pending_action(pool, id, "comment").await;
@@ -1246,7 +1246,7 @@ pub async fn finalize_review(
         let summary = effective_summary(real_summary, deduped_n, all_deduped);
 
         // The PR-diff fetch is a READ done at produce time (ADR-0059: shaping is the producer's job).
-        // Platform-aware (ADR-0071): the trait's `list_changed_files` dispatches to GitHub or GitLab
+        // Platform-aware (ADR-0072): the trait's `list_changed_files` dispatches to GitHub or GitLab
         // and encapsulates auth internally — no token minting here.
         let repo_ref = RepoRef {
             platform: context.platform,
@@ -1412,6 +1412,7 @@ pub async fn finalize_review(
                         context.target_id,
                         REACTION_CLEAN,
                         context.trigger_comment_id,
+                        &context.target_type,
                     )
                     .await
                     {
@@ -1470,6 +1471,7 @@ pub async fn finalize_review(
                     context.target_id,
                     content,
                     context.trigger_comment_id,
+                    &context.target_type,
                 )
                 .await
                 {
@@ -1485,6 +1487,7 @@ pub async fn finalize_review(
                     context.target_id,
                     "confused",
                     context.trigger_comment_id,
+                    &context.target_type,
                 )
                 .await
                 {
@@ -1618,13 +1621,14 @@ async fn handle_review_failure(state: &AppState, pool: &sqlx::PgPool, id: Uuid) 
             context.target_id,
             "confused",
             context.trigger_comment_id,
+            &context.target_type,
         )
         .await
         {
             tracing::warn!(%error, task_id = %id, "enqueueing failure reaction failed (non-fatal)");
         }
     }
-    if let Err(error) = crate::outbox::enqueue_failure_notice(pool, &t, context.target_id).await {
+    if let Err(error) = crate::outbox::enqueue_failure_notice(pool, &t, context.target_id, &context.target_type).await {
         tracing::warn!(%error, task_id = %id, "enqueueing failure notice failed (non-fatal)");
     }
 }

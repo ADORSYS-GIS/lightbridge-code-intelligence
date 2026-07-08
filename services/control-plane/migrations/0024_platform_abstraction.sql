@@ -1,4 +1,4 @@
--- ADR-0071: platform-abstraction layer. Rename GitHub-specific columns and tables to
+-- ADR-0072: platform-abstraction layer. Rename GitHub-specific columns and tables to
 -- platform-agnostic names so the control plane can serve GitHub and GitLab (and any future
 -- platform) from one schema. All existing rows get platform = 'github' (the default), so
 -- existing behaviour is unchanged — this is a pure rename + add-default-column refactor.
@@ -41,7 +41,27 @@ ALTER TABLE reviews RENAME COLUMN github_review_id TO platform_review_id;
 -- 6. review_comments: rename github_comment_id → platform_comment_id
 ALTER TABLE review_comments RENAME COLUMN github_comment_id TO platform_comment_id;
 
--- 7. review_feedback: add platform
+-- 7. review_feedback: add platform, rename github_comment_id → platform_comment_id
 ALTER TABLE review_feedback ADD COLUMN IF NOT EXISTS platform TEXT NOT NULL DEFAULT 'github';
+
+-- review_feedback.github_comment_id was missed in the initial draft; rename it here so
+-- db.rs queries (rejected_findings_for_repo, get_feedback, record_feedback) that reference
+-- f.platform_comment_id resolve. Idempotent: checks whether the old column still exists.
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'review_feedback' AND column_name = 'github_comment_id'
+    ) THEN
+        ALTER TABLE review_feedback RENAME COLUMN github_comment_id TO platform_comment_id;
+    END IF;
+END $$;
+
+-- Drop the old-named UNIQUE constraint and recreate with the new column name so
+-- ON CONFLICT (platform_comment_id, comment_kind, reactor, reaction) clauses match.
+ALTER TABLE review_feedback
+    DROP CONSTRAINT IF EXISTS review_feedback_github_comment_id_comment_kind_reactor_reac_key;
+CREATE UNIQUE INDEX IF NOT EXISTS review_feedback_platform_comment_id_comment_kind_reactor_reac_key
+    ON review_feedback (platform_comment_id, comment_kind, reactor, reaction);
 
 COMMIT;

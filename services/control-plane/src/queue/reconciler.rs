@@ -34,7 +34,7 @@ const DRAIN_FALLBACK: Duration = Duration::from_secs(15);
 /// a cycle is logged and retried — a transient platform/DB blip must not kill the role.
 ///
 /// `platforms` maps each `Platform` variant to its `CodePlatform` implementation. GitHub uses
-/// `GithubApp`; GitLab uses `GitlabClient` (ADR-0071).
+/// `GithubApp`; GitLab uses `GitlabClient` (ADR-0072).
 pub async fn run(
     pool: PgPool,
     platforms: HashMap<Platform, Arc<dyn CodePlatform>>,
@@ -203,6 +203,13 @@ async fn deliver(
     review: &ReviewSection,
     row: &crate::db::OutboxRow,
 ) -> anyhow::Result<Option<i64>> {
+    // Phase A (ADR-0072): extract `target_type` from the payload so GitLab can route to MR notes
+    // vs issue notes without probing (MRs and issues share iid sequences — a probe would succeed
+    // on the wrong noteable). GitHub ignores this field (same endpoint for PR/issue comments).
+    let noteable_type = row
+        .payload
+        .get("target_type")
+        .and_then(|v| v.as_str());
     match row.kind.as_str() {
         "reaction" => {
             let content = payload_str(&row.payload, "content")?;
@@ -211,13 +218,13 @@ async fn deliver(
             match row.payload.get("comment_id").and_then(|x| x.as_i64()) {
                 Some(comment_id) => {
                     platform
-                        .add_reaction(repo, ReactionTarget::Comment { comment_id }, content)
+                        .add_reaction(repo, ReactionTarget::Comment { comment_id }, content, noteable_type)
                         .await?;
                 }
                 None => {
                     let issue = payload_i64(&row.payload, "issue")?;
                     platform
-                        .add_reaction(repo, ReactionTarget::Issue { number: issue }, content)
+                        .add_reaction(repo, ReactionTarget::Issue { number: issue }, content, noteable_type)
                         .await?;
                 }
             }
@@ -226,7 +233,7 @@ async fn deliver(
         "reply" => {
             let issue = payload_i64(&row.payload, "issue")?;
             let body = payload_str(&row.payload, "body")?;
-            let posted = platform.post_comment(repo, issue, body).await?;
+            let posted = platform.post_comment(repo, issue, body, noteable_type).await?;
             record_comment(pool, row.task_id, posted.id, "reply").await;
             Ok(posted.id)
         }
@@ -246,7 +253,7 @@ async fn deliver(
             }
             let issue = payload_i64(&row.payload, "issue")?;
             let body = payload_str(&row.payload, "body")?;
-            let posted = platform.post_comment(repo, issue, body).await?;
+            let posted = platform.post_comment(repo, issue, body, noteable_type).await?;
             record_comment(pool, row.task_id, posted.id, "failure_notice").await;
             Ok(posted.id)
         }

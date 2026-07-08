@@ -330,6 +330,7 @@ async fn react_work_started(pool: &PgPool, task: &db::ClaimedTask, review: &Revi
         context.target_id,
         "eyes",
         context.trigger_comment_id,
+        &context.target_type,
     )
     .await
     {

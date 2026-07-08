@@ -91,9 +91,10 @@ pub async fn enqueue_reply(
     t: &Target<'_>,
     issue: i64,
     body: &str,
+    target_type: &str,
 ) -> Result<bool, sqlx::Error> {
     let key = format!("{}:reply", t.key_prefix(issue));
-    let value = json!({ "issue": issue, "body": body });
+    let value = json!({ "issue": issue, "body": body, "target_type": target_type });
     crate::db::enqueue_outbox_post(
         pool,
         t.platform,
@@ -120,9 +121,10 @@ pub async fn enqueue_reaction(
     issue: i64,
     content: &str,
     comment_id: Option<i64>,
+    target_type: &str,
 ) -> Result<bool, sqlx::Error> {
     let key = format!("{}:reaction:{content}", t.key_prefix(issue));
-    let value = reaction_payload(issue, content, comment_id);
+    let value = reaction_payload(issue, content, comment_id, target_type);
     crate::db::enqueue_outbox_post(
         pool,
         t.platform,
@@ -148,9 +150,10 @@ pub async fn enqueue_verdict_reaction(
     issue: i64,
     content: &str,
     comment_id: Option<i64>,
+    target_type: &str,
 ) -> Result<bool, sqlx::Error> {
     let key = format!("{}:reaction:verdict", t.key_prefix(issue));
-    let value = reaction_payload(issue, content, comment_id);
+    let value = reaction_payload(issue, content, comment_id, target_type);
     crate::db::enqueue_outbox_post(
         pool,
         t.platform,
@@ -168,10 +171,15 @@ pub async fn enqueue_verdict_reaction(
 /// The `reaction` intent payload (ADR-0068). `comment_id` is included **only when `Some`**, so the
 /// reconciler routes on its presence: present → react on that issue comment (the `@mention` trigger);
 /// absent → react on the PR/issue body. Pure, so the shape is unit-tested without a DB.
-fn reaction_payload(issue: i64, content: &str, comment_id: Option<i64>) -> serde_json::Value {
+fn reaction_payload(
+    issue: i64,
+    content: &str,
+    comment_id: Option<i64>,
+    target_type: &str,
+) -> serde_json::Value {
     match comment_id {
-        Some(cid) => json!({ "issue": issue, "content": content, "comment_id": cid }),
-        None => json!({ "issue": issue, "content": content }),
+        Some(cid) => json!({ "issue": issue, "content": content, "comment_id": cid, "target_type": target_type }),
+        None => json!({ "issue": issue, "content": content, "target_type": target_type }),
     }
 }
 
@@ -181,9 +189,10 @@ pub async fn enqueue_failure_notice(
     pool: &PgPool,
     t: &Target<'_>,
     issue: i64,
+    target_type: &str,
 ) -> Result<bool, sqlx::Error> {
     let key = format!("{}:failure_notice", t.key_prefix(issue));
-    let value = json!({ "issue": issue, "body": crate::review::render_failure_notice() });
+    let value = json!({ "issue": issue, "body": crate::review::render_failure_notice(), "target_type": target_type });
     crate::db::enqueue_outbox_post(
         pool,
         t.platform,
@@ -208,16 +217,18 @@ mod tests {
     #[test]
     fn reaction_payload_includes_comment_id_only_when_present() {
         // Mention-triggered: comment_id present → the reconciler reacts on the comment.
-        let with = reaction_payload(7, "eyes", Some(4242));
+        let with = reaction_payload(7, "eyes", Some(4242), "pull_request");
         assert_eq!(with["issue"], 7);
         assert_eq!(with["content"], "eyes");
         assert_eq!(with["comment_id"], 4242);
+        assert_eq!(with["target_type"], "pull_request");
 
         // Auto review: no trigger comment → the key is absent (not null), so `get("comment_id")` → None
         // and the reconciler falls back to the PR/issue body.
-        let without = reaction_payload(7, "+1", None);
+        let without = reaction_payload(7, "+1", None, "issue");
         assert_eq!(without["issue"], 7);
         assert_eq!(without["content"], "+1");
+        assert_eq!(without["target_type"], "issue");
         assert!(
             without.get("comment_id").is_none(),
             "comment_id must be absent, not null, so the reconciler routes to the issue body"
