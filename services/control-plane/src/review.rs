@@ -525,11 +525,12 @@ pub fn validate(
         let anchorable = file_lines.is_some_and(|lines| lines.contains(&finding.line));
         if anchorable && finding.line > 0 {
             let start_line = validated_range_start(&finding, file_lines);
+            let body = inline_body(&finding);
             review.inline.push(InlineComment {
-                path: finding.file.clone(),
+                path: finding.file,
                 line: finding.line,
                 start_line,
-                body: inline_body(&finding),
+                body,
             });
         } else {
             review.deferred.push(finding);
