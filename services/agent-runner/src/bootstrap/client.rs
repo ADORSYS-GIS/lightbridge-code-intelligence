@@ -325,12 +325,20 @@ impl ControlPlaneClient {
 
     /// `POST /internal/tasks/{id}/review/inline` — buffer one inline finding (ADR-0037 mediated write
     /// action). The control plane accumulates it and flushes on [`finalize_review`].
+    ///
+    /// `start_line` (ADR-0071) is the optional first line of a multi-line range — `line` is always the
+    /// range's last line when both are given. Forwarded to the control plane unchanged: the runner does
+    /// no range validation (ADR-0022's trust boundary puts that control-plane side), and an
+    /// unrecognized/invalid range there simply falls back to a single-line comment, never a hard
+    /// failure. `None` serializes as JSON `null` (an added key on the wire, but semantically identical
+    /// to today's single-line behavior — same as every other `Option` field on this payload).
     #[allow(clippy::too_many_arguments)]
     pub async fn add_review_comment(
         &self,
         task_id: Uuid,
         file: &str,
         line: i32,
+        start_line: Option<i32>,
         title: Option<&str>,
         priority: Option<&str>,
         category: Option<&str>,
@@ -343,8 +351,8 @@ impl ControlPlaneClient {
             .post(&url)
             .bearer_auth(&self.token)
             .json(&serde_json::json!({
-                "file": file, "line": line, "title": title, "priority": priority,
-                "category": category, "suggestion": suggestion, "body": body,
+                "file": file, "line": line, "start_line": start_line, "title": title,
+                "priority": priority, "category": category, "suggestion": suggestion, "body": body,
             }))
             .send()
             .await

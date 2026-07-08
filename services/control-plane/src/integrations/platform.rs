@@ -91,6 +91,14 @@ pub struct ChangedFile {
 pub struct InlineComment {
     pub path: String,
     pub line: u32,
+    /// Which side of the diff the comment anchors to (`"RIGHT"` for the PR head, `"LEFT"` for the
+    /// base). GitHub uses this in its review API; GitLab infers it from the position object.
+    pub side: &'static str,
+    /// First line of a validated multi-line range (ADR-0071), or `None` for a single-line comment.
+    pub start_line: Option<u32>,
+    /// Side for the start of the range (`"RIGHT"` when `start_line` is set). GitHub requires this
+    /// alongside `start_line`; GitLab uses `line_range` in the position object instead.
+    pub start_side: Option<&'static str>,
     pub body: String,
 }
 

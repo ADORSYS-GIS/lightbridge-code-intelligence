@@ -468,11 +468,28 @@ pub struct PrFile {
 }
 
 /// An inline comment in the GitHub "create review" payload (RIGHT = the new file side).
+///
+/// `start_line`/`start_side` are the ADR-0071 range fields: additive and optional, so a single-line
+/// comment (`start_line: None`) serializes to byte-for-byte the same JSON as before that ADR — both are
+/// `#[serde(skip_serializing_if = "Option::is_none")]` so they're omitted entirely (not sent as
+/// `null`), since GitHub may reject an inline comment payload with an unexpected null field.
 #[derive(Debug, Serialize)]
 pub struct ReviewComment {
     pub path: String,
+    /// Maps directly to GitHub's `line`, which GitHub itself treats as the range's **LAST** line
+    /// whenever `start_line` is also present — so this is the range's *end* (and the sole anchor
+    /// everything downstream keys on), not a co-equal endpoint. For a single-line comment it's just that
+    /// one line.
     pub line: u32,
     pub side: &'static str,
+    /// First line of a validated range (ADR-0071), or `None` for a single-line comment — the complement
+    /// to `line` (the range's last line); GitHub renders the span from `start_line` to `line`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start_line: Option<u32>,
+    /// Always `Some("RIGHT")` when `start_line` is `Some` — this repo doesn't support LEFT-side
+    /// (deleted-line) ranges, matching ADR-0022's existing single-line limitation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start_side: Option<&'static str>,
     pub body: String,
 }
 
@@ -608,7 +625,9 @@ impl CodePlatform for GithubApp {
             .map(|c| ReviewComment {
                 path: c.path.clone(),
                 line: c.line,
-                side: "RIGHT",
+                side: c.side,
+                start_line: c.start_line,
+                start_side: c.start_side,
                 body: c.body.clone(),
             })
             .collect();
@@ -757,6 +776,67 @@ mod tests {
         assert!(
             claims["iat"].as_u64().unwrap() <= now,
             "iat must be backdated"
+        );
+    }
+
+    /// Regression (ADR-0071): a single-line `ReviewComment` (`start_line: None`, the only shape ever
+    /// produced before this ADR) must serialize to byte-for-byte the same JSON as today — the range
+    /// fields must be OMITTED entirely, not present as `null` (GitHub may reject an unexpected null
+    /// field on this endpoint).
+    #[test]
+    fn review_comment_without_start_line_serializes_unchanged() {
+        let comment = ReviewComment {
+            path: "src/main.rs".to_string(),
+            line: 42,
+            side: "RIGHT",
+            start_line: None,
+            start_side: None,
+            body: "a finding".to_string(),
+        };
+        let value = serde_json::to_value(&comment).expect("serializes");
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "path": "src/main.rs",
+                "line": 42,
+                "side": "RIGHT",
+                "body": "a finding",
+            }),
+            "no start_line/start_side keys at all when the finding is single-line: {value}"
+        );
+        assert!(
+            value.get("start_line").is_none(),
+            "start_line key must be absent, not null"
+        );
+        assert!(
+            value.get("start_side").is_none(),
+            "start_side key must be absent, not null"
+        );
+    }
+
+    /// A ranged `ReviewComment` (ADR-0071) posts `start_line` + `start_side: RIGHT` alongside the
+    /// existing `line` + `side: RIGHT`.
+    #[test]
+    fn review_comment_with_start_line_serializes_range_fields() {
+        let comment = ReviewComment {
+            path: "src/main.rs".to_string(),
+            line: 42,
+            side: "RIGHT",
+            start_line: Some(40),
+            start_side: Some("RIGHT"),
+            body: "a ranged finding".to_string(),
+        };
+        let value = serde_json::to_value(&comment).expect("serializes");
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "path": "src/main.rs",
+                "line": 42,
+                "side": "RIGHT",
+                "start_line": 40,
+                "start_side": "RIGHT",
+                "body": "a ranged finding",
+            })
         );
     }
 }

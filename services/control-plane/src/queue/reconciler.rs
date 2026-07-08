@@ -279,6 +279,9 @@ async fn deliver_review(
         .map(|c| crate::integrations::platform::InlineComment {
             path: c.path.clone(),
             line: c.line,
+            side: "RIGHT",
+            start_line: c.start_line,
+            start_side: c.start_line.map(|_| "RIGHT"),
             body: c.body.clone(),
         })
         .collect();

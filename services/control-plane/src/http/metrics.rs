@@ -121,7 +121,7 @@ pub fn outbox_prune_deleted(posted: u64, failed: u64) {
     counter!("lci_outbox_prune_failed_deleted_total").increment(failed);
 }
 
-/// An outbox delivery outcome (ADR-0059/0071): `posted` (success) or `failed` (retry/dead-letter),
+/// An outbox delivery outcome (ADR-0059/0072): `posted` (success) or `failed` (retry/dead-letter),
 /// labelled by `platform` (`"github"` / `"gitlab"`) and `kind` (`review` / `reply` / `reaction` /
 /// `failure_notice`). Bounded cardinality — 2 platforms × 4 kinds × 2 outcomes = 16 series.
 pub fn outbox_delivery(platform: &str, kind: &str, outcome: &'static str) {

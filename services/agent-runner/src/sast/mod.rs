@@ -204,6 +204,9 @@ pub async fn buffer(client: &ControlPlaneClient, task_id: Uuid, findings: &[Sast
                 task_id,
                 &f.file,
                 f.line as i32,
+                // opengrep findings are always single-line (ADR-0071 ranges are a native-agent-only
+                // concept — SAST has no notion of a multi-line evidence span).
+                None,
                 Some(&title),
                 Some(&f.priority),
                 Some("security"),
