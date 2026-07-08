@@ -476,9 +476,14 @@ pub struct PrFile {
 #[derive(Debug, Serialize)]
 pub struct ReviewComment {
     pub path: String,
+    /// Maps directly to GitHub's `line`, which GitHub itself treats as the range's **LAST** line
+    /// whenever `start_line` is also present — so this is the range's *end* (and the sole anchor
+    /// everything downstream keys on), not a co-equal endpoint. For a single-line comment it's just that
+    /// one line.
     pub line: u32,
     pub side: &'static str,
-    /// First line of a validated range (ADR-0071), or `None` for a single-line comment.
+    /// First line of a validated range (ADR-0071), or `None` for a single-line comment — the complement
+    /// to `line` (the range's last line); GitHub renders the span from `start_line` to `line`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub start_line: Option<u32>,
     /// Always `Some("RIGHT")` when `start_line` is `Some` — this repo doesn't support LEFT-side

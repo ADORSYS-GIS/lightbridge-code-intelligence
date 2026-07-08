@@ -18,9 +18,17 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Finding {
     pub file: String,
+    /// The line this finding anchors to. When [`Finding::start_line`] is set and the range validates,
+    /// `line` is the **LAST** line of the range (GitHub's convention — a ranged review comment always
+    /// treats `line` as the end); otherwise it's the single commented line. Either way `line` **is** the
+    /// anchor: every downstream consumer keys on it and it alone — cross-run dedup ([`dedup_key`]),
+    /// `retract_finding`, the ADR-0035 feedback poller, and the ADR-0040 prior-review context — so
+    /// `start_line` widens the *rendered span* without moving the identity. The range's end IS the
+    /// anchor.
     pub line: u32,
-    /// Optional first line of a multi-line span this finding describes (ADR-0071); `line` remains the
-    /// span's *last* line (GitHub's convention for a ranged review comment). Validated in [`validate`]:
+    /// Optional first line of a multi-line span this finding describes (ADR-0071) — the complement to
+    /// [`Finding::line`], which stays the span's *last* line (GitHub's convention for a ranged review
+    /// comment) and remains the sole anchor everything downstream keys on. Validated in [`validate`]:
     /// the finding anchors as a GitHub **range** comment only when every line from `start_line` to
     /// `line` (inclusive) is commentable — i.e. contiguous, added/context lines inside a single diff
     /// hunk. When absent, or when the range doesn't validate, the finding falls back to today's
@@ -417,6 +425,9 @@ fn badge_label(label: &str) -> String {
 #[derive(Debug, Clone, PartialEq)]
 pub struct InlineComment {
     pub path: String,
+    /// The anchor line. With `start_line` set it's the **LAST** line of the range (GitHub's
+    /// convention); otherwise the single commented line. This is the anchor the whole pipeline keys on
+    /// — `start_line` only widens the rendered span.
     pub line: u32,
     /// `Some` when this finding's `start_line..=line` range validated (ADR-0071) — GitHub renders it
     /// as a ranged comment (`start_line` + `start_side: RIGHT` alongside `line` + `side: RIGHT`).
