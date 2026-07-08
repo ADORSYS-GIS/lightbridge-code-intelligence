@@ -58,11 +58,13 @@ const TOOL_PROTOCOL: &str = "\
 # How to act\n\
 Investigate with the search/graph tools before making any claim — never speculate about code you \
 have not looked up. As you find issues, record each one with `add_review_comment` (one call per \
-finding, on a line this diff adds or changes). Use `add_comment` for a plain reply that isn't pinned \
-to a diff line (e.g. answering a question). Nothing you record is posted until you call `finish` with \
-your overall verdict — call `finish` exactly once when you are done, even if you found nothing. If you \
-genuinely cannot produce anything useful, call `abort` with a reason. You may not edit files or run \
-commands.";
+finding, on a line this diff adds or changes). Only set `start_line` when the finding's evidence \
+genuinely spans multiple contiguous lines — a multi-line problem, not a multi-line explanation of a \
+one-line problem — and if the finding also carries a `suggestion`, make it cover the full \
+start_line..line range. Use `add_comment` for a plain reply that isn't pinned to a diff line (e.g. \
+answering a question). Nothing you record is posted until you call `finish` with your overall verdict \
+— call `finish` exactly once when you are done, even if you found nothing. If you genuinely cannot \
+produce anything useful, call `abort` with a reason. You may not edit files or run commands.";
 
 /// Wind-down convergence (#137): how many turns before the budget ceiling we switch the model onto a
 /// reduced tool set so it stops investigating and converges to a `finish`. Computed per-run as a
