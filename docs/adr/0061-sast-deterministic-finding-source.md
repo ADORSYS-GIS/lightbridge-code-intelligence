@@ -1,6 +1,6 @@
 # ADR-0061: SAST (opengrep) as a deterministic finding source in the review pipeline
 
-- **Status:** Accepted
+- **Status:** Superseded by [ADR-0073](0073-sast-as-agent-tool.md)
 - **Date:** 2026-06-27
 - **Deciders:** @stephane-segning
 
