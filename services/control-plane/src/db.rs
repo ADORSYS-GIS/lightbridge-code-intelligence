@@ -2484,15 +2484,29 @@ mod tests {
             owner: "o",
             repo: "r",
         };
-        crate::outbox::enqueue_verdict_reaction(&pool, &t_clean, 7, "+1", Some(555), "pull_request")
-            .await
-            .unwrap();
+        crate::outbox::enqueue_verdict_reaction(
+            &pool,
+            &t_clean,
+            7,
+            "+1",
+            Some(555),
+            "pull_request",
+        )
+        .await
+        .unwrap();
         // A re-finalize that flips the verdict (e.g. a stray retry against the cleared buffer) is a
         // no-op: one shared `verdict` key per task, first verdict wins.
         assert!(
-            !crate::outbox::enqueue_verdict_reaction(&pool, &t_clean, 7, "-1", Some(555), "pull_request")
-                .await
-                .unwrap(),
+            !crate::outbox::enqueue_verdict_reaction(
+                &pool,
+                &t_clean,
+                7,
+                "-1",
+                Some(555),
+                "pull_request"
+            )
+            .await
+            .unwrap(),
             "a flipped verdict on the same task must not enqueue a second reaction"
         );
 

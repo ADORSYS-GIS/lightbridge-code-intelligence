@@ -183,7 +183,9 @@ fn reaction_payload(
     target_type: &str,
 ) -> serde_json::Value {
     match comment_id {
-        Some(cid) => json!({ "issue": issue, "content": content, "comment_id": cid, "target_type": target_type }),
+        Some(cid) => {
+            json!({ "issue": issue, "content": content, "comment_id": cid, "target_type": target_type })
+        }
         None => json!({ "issue": issue, "content": content, "target_type": target_type }),
     }
 }

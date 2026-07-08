@@ -222,7 +222,10 @@ async fn enqueue_reaper_failure_notice(
             tracing::warn!(%error, task_id = %task_id, "reaper: enqueueing 😕 failed (non-fatal)");
         }
     }
-    if let Err(error) = crate::outbox::enqueue_failure_notice(pool, &t, context.target_id, &context.target_type).await {
+    if let Err(error) =
+        crate::outbox::enqueue_failure_notice(pool, &t, context.target_id, &context.target_type)
+            .await
+    {
         tracing::warn!(%error, task_id = %task_id, "reaper: enqueueing failure notice failed (non-fatal)");
     }
 }

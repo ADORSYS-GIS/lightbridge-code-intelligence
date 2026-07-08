@@ -306,12 +306,13 @@ impl CodePlatform for GitlabClient {
         // Phase A (ADR-0072): use `noteable_type` to route directly — no probe.
         // GitLab MRs and issues share iid sequences (both start at 1), so a probe would
         // succeed on the wrong noteable. `target_type` is `"pull_request"` or `"issue"`.
-        let is_mr = noteable_type
-            .map(|t| t == "pull_request")
-            .unwrap_or(true); // default to MR (the common case for reviews)
+        let is_mr = noteable_type.map(|t| t == "pull_request").unwrap_or(true); // default to MR (the common case for reviews)
 
         let endpoint = if is_mr {
-            format!("/projects/{}/merge_requests/{}/notes", project, issue_number)
+            format!(
+                "/projects/{}/merge_requests/{}/notes",
+                project, issue_number
+            )
         } else {
             format!("/projects/{}/issues/{}/notes", project, issue_number)
         };
@@ -342,12 +343,13 @@ impl CodePlatform for GitlabClient {
         match target {
             ReactionTarget::Issue { number } => {
                 // Phase A (ADR-0072): use `noteable_type` to route directly — no probe.
-                let is_mr = noteable_type
-                    .map(|t| t == "pull_request")
-                    .unwrap_or(true); // default to MR (the common case for reviews)
+                let is_mr = noteable_type.map(|t| t == "pull_request").unwrap_or(true); // default to MR (the common case for reviews)
 
                 let endpoint = if is_mr {
-                    format!("/projects/{}/merge_requests/{}/award_emoji", project, number)
+                    format!(
+                        "/projects/{}/merge_requests/{}/award_emoji",
+                        project, number
+                    )
                 } else {
                     format!("/projects/{}/issues/{}/award_emoji", project, number)
                 };

@@ -1145,7 +1145,15 @@ pub async fn finalize_review(
             }
         } else {
             let body = crate::review::render_answer_body(&pending.comments.join("\n\n---\n\n"));
-            match crate::outbox::enqueue_reply(pool, &t, context.target_id, &body, &context.target_type).await {
+            match crate::outbox::enqueue_reply(
+                pool,
+                &t,
+                context.target_id,
+                &body,
+                &context.target_type,
+            )
+            .await
+            {
                 Ok(_) => {
                     queued_reply = true;
                     let _ = crate::db::clear_pending_action(pool, id, "comment").await;
@@ -1634,7 +1642,10 @@ async fn handle_review_failure(state: &AppState, pool: &sqlx::PgPool, id: Uuid) 
             tracing::warn!(%error, task_id = %id, "enqueueing failure reaction failed (non-fatal)");
         }
     }
-    if let Err(error) = crate::outbox::enqueue_failure_notice(pool, &t, context.target_id, &context.target_type).await {
+    if let Err(error) =
+        crate::outbox::enqueue_failure_notice(pool, &t, context.target_id, &context.target_type)
+            .await
+    {
         tracing::warn!(%error, task_id = %id, "enqueueing failure notice failed (non-fatal)");
     }
 }
