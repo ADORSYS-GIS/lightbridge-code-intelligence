@@ -1,6 +1,6 @@
-//! GitHub-egress outbox pruning sweeper (ADR-0059).
+//! Platform-egress outbox pruning sweeper (ADR-0059/0072).
 //!
-//! `github_outbox` (ADR-0059) is the single GitHub egress: every outbound content write becomes an
+//! `outbox` (ADR-0059) is the single platform egress: every outbound content write becomes an
 //! intent row the reconciler drains. It is append-mostly — a delivered intent settles to `posted` and
 //! a dead-lettered one to `failed`, and nothing ever deletes either. In particular the per-PR 👀
 //! `eyes` reaction leaves a permanent `posted` row per PR, and every enqueue (including each re-review)
@@ -48,7 +48,7 @@ mod tests {
     /// keys on); `failed`/`pending` rows leave it NULL and age off `created_at`, exactly as in prod.
     async fn insert_row(pool: &PgPool, dedup_key: &str, status: &str, age_days: i64) {
         sqlx::query(
-            "INSERT INTO github_outbox \
+            "INSERT INTO outbox \
                  (installation_id, owner, repo, kind, payload, dedup_key, status, created_at, posted_at) \
              VALUES (1, 'o', 'r', 'reaction', '{}'::jsonb, $1, $2, \
                      now() - make_interval(days => $3::int), \
@@ -64,7 +64,7 @@ mod tests {
 
     /// Surviving rows' dedup keys, sorted, so assertions are order-stable.
     async fn surviving_keys(pool: &PgPool) -> Vec<String> {
-        sqlx::query_scalar("SELECT dedup_key FROM github_outbox ORDER BY dedup_key")
+        sqlx::query_scalar("SELECT dedup_key FROM outbox ORDER BY dedup_key")
             .fetch_all(pool)
             .await
             .unwrap()

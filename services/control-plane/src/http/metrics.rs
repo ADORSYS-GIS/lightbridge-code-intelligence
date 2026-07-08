@@ -43,17 +43,25 @@ pub fn http_request(method: &'static str, path: &str, status: &'static str, seco
     .record(seconds);
 }
 
-/// An accepted (verified, non-duplicate) webhook delivery, labelled by event type.
-pub fn webhook_delivery(event: &str) {
-    counter!("lci_webhook_deliveries_total", "event" => event.to_string()).increment(1);
+/// An accepted (verified, non-duplicate) webhook delivery, labelled by platform + event type.
+/// `platform` is `"github"` or `"gitlab"` (ADR-0072).
+pub fn webhook_delivery(platform: &str, event: &str) {
+    counter!(
+        "lci_webhook_deliveries_total",
+        "platform" => platform.to_string(),
+        "event" => event.to_string(),
+    )
+    .increment(1);
 }
 
-pub fn webhook_signature_failure() {
-    counter!("lci_webhook_signature_failures_total").increment(1);
+pub fn webhook_signature_failure(platform: &str) {
+    counter!("lci_webhook_signature_failures_total", "platform" => platform.to_string())
+        .increment(1);
 }
 
-pub fn webhook_duplicate() {
-    counter!("lci_webhook_duplicate_deliveries_total").increment(1);
+pub fn webhook_duplicate(platform: &str) {
+    counter!("lci_webhook_duplicate_deliveries_total", "platform" => platform.to_string())
+        .increment(1);
 }
 
 pub fn task_created() {
@@ -106,11 +114,25 @@ pub fn index_prune_deleted(chunks: u64, graph_nodes: u64) {
     counter!("lci_index_prune_graph_nodes_deleted_total").increment(graph_nodes);
 }
 
-/// Terminal `github_outbox` rows pruned across one sweep (ADR-0059 GC): delivered (`posted`) +
+/// Terminal `outbox` rows pruned across one sweep (ADR-0059 GC): delivered (`posted`) +
 /// dead-lettered (`failed`) rows past their retention window.
 pub fn outbox_prune_deleted(posted: u64, failed: u64) {
     counter!("lci_outbox_prune_posted_deleted_total").increment(posted);
     counter!("lci_outbox_prune_failed_deleted_total").increment(failed);
+}
+
+/// An outbox delivery outcome (ADR-0059/0072): `posted` (success), `skipped` (silently consumed —
+/// e.g. a `failure_notice` dedup gate), or `failed` (retry/dead-letter), labelled by `platform`
+/// (`"github"` / `"gitlab"`) and `kind` (`review` / `reply` / `reaction` / `failure_notice`).
+/// Bounded cardinality — 2 platforms × 4 kinds × 3 outcomes = 24 series.
+pub fn outbox_delivery(platform: &str, kind: &str, outcome: &'static str) {
+    counter!(
+        "lci_outbox_delivery_total",
+        "platform" => platform.to_string(),
+        "kind" => kind.to_string(),
+        "outcome" => outcome,
+    )
+    .increment(1);
 }
 
 #[cfg(test)]
@@ -120,13 +142,21 @@ mod tests {
     #[test]
     fn recorded_metrics_appear_in_the_render() {
         let handle = install();
-        webhook_delivery("pull_request");
-        webhook_signature_failure();
+        webhook_delivery("github", "pull_request");
+        webhook_delivery("gitlab", "Merge Request Hook");
+        webhook_signature_failure("github");
         dispatch_outcome("launched");
+        outbox_delivery("gitlab", "review", "posted");
         let rendered = handle.render();
         assert!(rendered.contains("lci_webhook_deliveries_total"));
+        assert!(rendered.contains("platform=\"github\""));
+        assert!(rendered.contains("platform=\"gitlab\""));
         assert!(rendered.contains("event=\"pull_request\""));
+        assert!(rendered.contains("event=\"Merge Request Hook\""));
         assert!(rendered.contains("lci_webhook_signature_failures_total"));
         assert!(rendered.contains("outcome=\"launched\""));
+        assert!(rendered.contains("lci_outbox_delivery_total"));
+        assert!(rendered.contains("kind=\"review\""));
+        assert!(rendered.contains("outcome=\"posted\""));
     }
 }

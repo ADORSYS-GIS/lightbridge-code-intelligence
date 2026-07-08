@@ -1,11 +1,15 @@
 //! Internal runner API — the control-plane side of the runner↔control-plane contract (ADR-0017).
 //!
 //! The dispatcher launches one Kubernetes Job per task (ADR-0004); that Job runs the agent runner,
-//! which has no GitHub App key of its own. Per the trust boundary (ADR-0002) the runner calls back
-//! here to (a) fetch its task context plus a freshly-minted, short-lived installation token, and
-//! (b) report status transitions. These routes are **not** OIDC-protected (the caller is a pod, not
-//! a user): they authenticate with a shared bearer (`AGENT_RUNNER_TOKEN`) the control plane injects
+//! which has no platform credentials of its own. Per the trust boundary (ADR-0002) the runner calls
+//! back here to (a) fetch its task context plus a platform-appropriate clone URL + token, and (b)
+//! report status transitions. These routes are **not** OIDC-protected (the caller is a pod, not a
+//! user): they authenticate with a shared bearer (`AGENT_RUNNER_TOKEN`) the control plane injects
 //! into the Job. Absent that token in this process, the routes fail closed (503) — never open.
+//!
+//! Platform handling (ADR-0072): GitHub mints a short-lived installation token and sends a plain
+//! clone_url (the runner splices `x-access-token:<token>@`). GitLab embeds the token in the
+//! clone_url itself (`oauth2:<token>@host`) and sends an empty token field.
 
 use axum::extract::{FromRequestParts, Path, State};
 use axum::http::request::Parts;
@@ -16,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 use uuid::Uuid;
 
+use crate::integrations::platform::{CodePlatform, Platform, RepoRef};
 use crate::AppState;
 
 /// Authenticates a runner request by comparing its `Authorization: Bearer` token against the
@@ -75,11 +80,14 @@ fn bearer_token(parts: &Parts) -> Option<String> {
         .map(str::to_string)
 }
 
-/// The runner's view of a task: where the code is, how to fetch it, and what to do. `token` is a
-/// short-lived installation access token (~1h) minted just-in-time; `clone_url` is the plain HTTPS
-/// remote (the runner composes the authenticated URL with the token, so the token isn't baked into
-/// a value it might log).
-#[derive(Debug, Serialize)]
+/// The runner's view of a task: where the code is, how to fetch it, and what to do.
+///
+/// `clone_url` + `token` are platform-aware (ADR-0072):
+/// - **GitHub**: `clone_url` is the plain HTTPS remote; `token` is a short-lived installation
+///   access token (~1h) minted just-in-time. The runner composes the authenticated URL.
+/// - **GitLab**: `clone_url` already has the token embedded (`oauth2:<token>@host`); `token`
+///   is empty. The runner detects the pre-authenticated URL and passes it through.
+#[derive(Serialize)]
 pub struct TaskContextResponse {
     pub task_id: Uuid,
     pub repository_id: i64,
@@ -119,6 +127,32 @@ pub struct TaskContextResponse {
     pub repo_memory: Option<String>,
 }
 
+/// Custom Debug impl that redacts `clone_url` and `token` — for GitLab the clone URL embeds the
+/// API token (`oauth2:<token>@host`), so a `tracing::debug!(?response)` would leak it (ADR-0072).
+impl std::fmt::Debug for TaskContextResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TaskContextResponse")
+            .field("task_id", &self.task_id)
+            .field("repository_id", &self.repository_id)
+            .field("owner", &self.owner)
+            .field("name", &self.name)
+            .field("default_branch", &self.default_branch)
+            .field("clone_url", &"<redacted>")
+            .field("token", &"<redacted>")
+            .field("target_type", &self.target_type)
+            .field("target_id", &self.target_id)
+            .field("command", &self.command)
+            .field("kind", &self.kind)
+            .field("tier", &self.tier)
+            .field("base_sha", &self.base_sha)
+            .field("head_sha", &self.head_sha)
+            .field("repo_indexed", &self.repo_indexed)
+            .field("prior_reviews", &self.prior_reviews)
+            .field("repo_memory", &self.repo_memory)
+            .finish()
+    }
+}
+
 /// `GET /internal/tasks/{id}` — task context + a freshly-minted installation token for the runner.
 pub async fn get_context(
     _auth: RunnerAuth,
@@ -128,11 +162,6 @@ pub async fn get_context(
     let Some(pool) = state.db.as_ref() else {
         return (StatusCode::SERVICE_UNAVAILABLE, "no database").into_response();
     };
-    let Some(app) = state.github.as_ref() else {
-        // Without the App key we cannot mint a token, so the runner could not clone — fail closed.
-        return (StatusCode::SERVICE_UNAVAILABLE, "github app not configured").into_response();
-    };
-
     let context = match crate::db::get_task_context(pool, id).await {
         Ok(Some(context)) => context,
         Ok(None) => return (StatusCode::NOT_FOUND, "task not found").into_response(),
@@ -142,11 +171,43 @@ pub async fn get_context(
         }
     };
 
-    let token = match app.installation_token(context.installation_id).await {
-        Ok(token) => token,
-        Err(error) => {
-            tracing::error!(%error, task_id = %id, "mint installation token failed");
-            return (StatusCode::BAD_GATEWAY, "could not mint installation token").into_response();
+    // Platform-aware clone URL + token (ADR-0072). GitHub mints a short-lived installation
+    // token and sends a plain clone_url (the runner splices `x-access-token:<token>@`).
+    // GitLab embeds the token in the clone_url itself (`oauth2:<token>@host`) and sends an
+    // empty token field — the runner detects the `@` and passes the URL through unchanged.
+    let repo_ref = RepoRef {
+        platform: context.platform,
+        full_name: format!("{}/{}", context.owner, context.name),
+        platform_repo_id: 0,
+        installation_id: context.installation_id,
+    };
+
+    let (clone_url, token) = match context.platform {
+        Platform::GitHub => {
+            let Some(app) = state.github.as_ref() else {
+                return (StatusCode::SERVICE_UNAVAILABLE, "github app not configured")
+                    .into_response();
+            };
+            let token = match app.installation_token(context.installation_id).await {
+                Ok(token) => token,
+                Err(error) => {
+                    tracing::error!(%error, task_id = %id, "mint installation token failed");
+                    return (StatusCode::BAD_GATEWAY, "could not mint installation token")
+                        .into_response();
+                }
+            };
+            (app.clone_url(&repo_ref), token)
+        }
+        Platform::GitLab => {
+            let Some(gitlab) = state.gitlab.as_ref() else {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "gitlab client not configured",
+                )
+                    .into_response();
+            };
+            // GitlabClient::clone_url() embeds the token (oauth2:<token>@host).
+            (gitlab.clone_url(&repo_ref), String::new())
         }
     };
 
@@ -216,7 +277,7 @@ pub async fn get_context(
     Json(TaskContextResponse {
         task_id: context.id,
         repository_id: context.repository_id,
-        clone_url: format!("https://github.com/{}/{}.git", context.owner, context.name),
+        clone_url,
         owner: context.owner,
         name: context.name,
         default_branch: context.default_branch,
@@ -1036,9 +1097,6 @@ pub async fn finalize_review(
     let Some(pool) = state.db.as_ref() else {
         return (StatusCode::SERVICE_UNAVAILABLE, "no database").into_response();
     };
-    let Some(app) = state.github.as_ref() else {
-        return (StatusCode::SERVICE_UNAVAILABLE, "github app not configured").into_response();
-    };
     let context = match crate::db::get_task_context(pool, id).await {
         Ok(Some(c)) => c,
         Ok(None) => return (StatusCode::NOT_FOUND, "task not found").into_response(),
@@ -1054,18 +1112,27 @@ pub async fn finalize_review(
             return (StatusCode::INTERNAL_SERVER_ERROR, "query error").into_response();
         }
     };
-    let token = match app.installation_token(context.installation_id).await {
-        Ok(t) => t,
-        Err(error) => {
-            tracing::error!(%error, task_id = %id, "mint installation token failed");
-            return (StatusCode::BAD_GATEWAY, "could not mint installation token").into_response();
-        }
+    // Platform dispatch (ADR-0072): pick the CodePlatform implementation for this task's platform.
+    // GitHub mints an installation token internally; GitLab uses its static PAT. The trait
+    // encapsulates auth so this handler stays platform-agnostic.
+    let Some(platform) = state.platforms.get(&context.platform) else {
+        tracing::error!(
+            task_id = %id,
+            platform = %context.platform,
+            "no platform implementation configured for this task's platform",
+        );
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "platform not configured for this task",
+        )
+            .into_response();
     };
     // serve keeps the App key for READS only (ADR-0059): we mint a token to fetch the PR diff so the
     // review is fully *shaped* here (pre-rendered body + validated inline comments). Nothing is posted —
-    // every GitHub write is enqueued to `github_outbox` and the reconciler delivers it.
+    // every GitHub write is enqueued to `outbox` and the reconciler delivers it.
     let t = crate::outbox::Target {
         task_id: Some(id),
+        platform: context.platform,
         installation_id: context.installation_id,
         owner: &context.owner,
         repo: &context.name,
@@ -1104,7 +1171,15 @@ pub async fn finalize_review(
             }
         } else {
             let body = crate::review::render_answer_body(&pending.comments.join("\n\n---\n\n"));
-            match crate::outbox::enqueue_reply(pool, &t, context.target_id, &body).await {
+            match crate::outbox::enqueue_reply(
+                pool,
+                &t,
+                context.target_id,
+                &body,
+                &context.target_type,
+            )
+            .await
+            {
                 Ok(_) => {
                     queued_reply = true;
                     let _ = crate::db::clear_pending_action(pool, id, "comment").await;
@@ -1150,7 +1225,7 @@ pub async fn finalize_review(
         // this PR from a prior Lightbridge review. Drop findings whose normalized `(file, line, title)`
         // key matches one already posted — or already QUEUED in the outbox — on the SAME head_sha (line
         // numbers drift across commits, so a key match is only trustworthy within one commit). Sourced
-        // from our own persisted `reviews` + pending `github_outbox` review rows (ADR-0035/0059), not the
+        // from our own persisted `reviews` + pending `outbox` review rows (ADR-0035/0059), not the
         // GitHub API. Best-effort: a lookup error means "nothing posted yet" → no dedup, never a failed
         // finalize. The prompt-side re-derive-then-retract framing (Option C) reduces re-emission
         // upstream; this is the deterministic backstop.
@@ -1210,16 +1285,21 @@ pub async fn finalize_review(
         let summary = effective_summary(real_summary, deduped_n, all_deduped);
 
         // The PR-diff fetch is a READ done at produce time (ADR-0059: shaping is the producer's job).
+        // Platform-aware (ADR-0072): the trait's `list_changed_files` dispatches to GitHub or GitLab
+        // and encapsulates auth internally — no token minting here.
+        let repo_ref = RepoRef {
+            platform: context.platform,
+            full_name: format!("{}/{}", context.owner, context.name),
+            platform_repo_id: context.repository_id,
+            installation_id: context.installation_id,
+        };
         let commentable: std::collections::HashMap<String, std::collections::BTreeSet<u32>> =
-            match app
-                .list_pr_files(&token, &context.owner, &context.name, pr)
-                .await
-            {
+            match platform.list_changed_files(&repo_ref, pr).await {
                 Ok(files) => files
                     .into_iter()
                     .filter_map(|f| {
                         f.patch
-                            .map(|p| (f.filename, crate::review::commentable_lines(&p)))
+                            .map(|p| (f.path, crate::review::commentable_lines(&p)))
                     })
                     .collect(),
                 Err(error) => {
@@ -1251,8 +1331,14 @@ pub async fn finalize_review(
             real_summary
         };
         let body = if context.tier == "fast" {
+            // Platform-aware bot handle (Phase 6): GitLab reviews must name the GitLab bot, not the
+            // GitHub App handle, so the "request a deep review" @mention resolves on the right platform.
+            let handle = match context.platform {
+                crate::integrations::platform::Platform::GitLab => state.gitlab_app_handle.as_str(),
+                crate::integrations::platform::Platform::GitHub => state.app_handle.as_str(),
+            };
             crate::review::render_fast_body(
-                state.app_handle.as_str(),
+                handle,
                 fast_summary,
                 &validated.deferred,
                 &validated.out_of_scope,
@@ -1366,6 +1452,7 @@ pub async fn finalize_review(
                         context.target_id,
                         REACTION_CLEAN,
                         context.trigger_comment_id,
+                        &context.target_type,
                     )
                     .await
                     {
@@ -1424,6 +1511,7 @@ pub async fn finalize_review(
                     context.target_id,
                     content,
                     context.trigger_comment_id,
+                    &context.target_type,
                 )
                 .await
                 {
@@ -1439,6 +1527,7 @@ pub async fn finalize_review(
                     context.target_id,
                     "confused",
                     context.trigger_comment_id,
+                    &context.target_type,
                 )
                 .await
                 {
@@ -1559,6 +1648,7 @@ async fn handle_review_failure(state: &AppState, pool: &sqlx::PgPool, id: Uuid) 
     };
     let t = crate::outbox::Target {
         task_id: Some(id),
+        platform: context.platform,
         installation_id: context.installation_id,
         owner: &context.owner,
         repo: &context.name,
@@ -1571,13 +1661,17 @@ async fn handle_review_failure(state: &AppState, pool: &sqlx::PgPool, id: Uuid) 
             context.target_id,
             "confused",
             context.trigger_comment_id,
+            &context.target_type,
         )
         .await
         {
             tracing::warn!(%error, task_id = %id, "enqueueing failure reaction failed (non-fatal)");
         }
     }
-    if let Err(error) = crate::outbox::enqueue_failure_notice(pool, &t, context.target_id).await {
+    if let Err(error) =
+        crate::outbox::enqueue_failure_notice(pool, &t, context.target_id, &context.target_type)
+            .await
+    {
         tracing::warn!(%error, task_id = %id, "enqueueing failure notice failed (non-fatal)");
     }
 }

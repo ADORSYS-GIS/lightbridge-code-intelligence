@@ -179,11 +179,11 @@ pub struct DispatcherSection {
     /// it runs on its own slow tick rather than the ~30s reaper cadence. Default 600.
     #[serde(default, deserialize_with = "lightbridge_config::de::opt_u64")]
     pub purge_reconcile_interval_seconds: Option<u64>,
-    /// Days a delivered (`posted`) `github_outbox` row is kept before the outbox sweeper prunes it
+    /// Days a delivered (`posted`) `outbox` row is kept before the outbox sweeper prunes it
     /// (ADR-0059). Default 7.
     #[serde(default, deserialize_with = "lightbridge_config::de::opt_i64")]
     pub outbox_posted_retention_days: Option<i64>,
-    /// Days a dead-lettered (`failed`) `github_outbox` row is kept — longer, for inspection — before
+    /// Days a dead-lettered (`failed`) `outbox` row is kept — longer, for inspection — before
     /// pruning (ADR-0059). Default 30.
     #[serde(default, deserialize_with = "lightbridge_config::de::opt_i64")]
     pub outbox_failed_retention_days: Option<i64>,

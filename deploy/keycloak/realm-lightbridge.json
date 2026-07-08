@@ -4,6 +4,17 @@
   "sslRequired": "none",
   "loginWithEmailAllowed": true,
   "registrationAllowed": false,
+  "roles": {
+    "realm": [
+      { "name": "task:read", "description": "Read tasks (ADR-0023)", "composite": false, "clientRole": false },
+      { "name": "task:cancel", "description": "Cancel an active run (ADR-0023)", "composite": false, "clientRole": false },
+      { "name": "task:logs", "description": "Stream run logs (ADR-0023)", "composite": false, "clientRole": false },
+      { "name": "repo:read", "description": "Read repositories (ADR-0023)", "composite": false, "clientRole": false },
+      { "name": "repo:approve", "description": "Approve a repository (ADR-0023)", "composite": false, "clientRole": false },
+      { "name": "repo:deny", "description": "Deny a repository (ADR-0023)", "composite": false, "clientRole": false },
+      { "name": "review:read", "description": "Read a run's review (ADR-0023)", "composite": false, "clientRole": false }
+    ]
+  },
   "clients": [
     {
       "clientId": "lightbridge-web",
@@ -32,6 +43,64 @@
             "id.token.claim": "false",
             "access.token.claim": "true"
           }
+        },
+        {
+          "name": "permissions-claim",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-realm-role-mapper",
+          "consentRequired": false,
+          "config": {
+            "claim.name": "permissions",
+            "access.token.claim": "true",
+            "id.token.claim": "false",
+            "userinfo.token.claim": "false",
+            "multivalued": "true"
+          }
+        }
+      ]
+    },
+    {
+      "clientId": "lightbridge-cli",
+      "name": "Lightbridge CLI (loopback PKCE public client)",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": true,
+      "standardFlowEnabled": true,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": false,
+      "redirectUris": [
+        "http://127.0.0.1:8765/callback",
+        "http://localhost:8765/callback"
+      ],
+      "webOrigins": [],
+      "attributes": {
+        "pkce.code.challenge.method": "S256"
+      },
+      "protocolMappers": [
+        {
+          "name": "lightbridge-api-audience",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "consentRequired": false,
+          "config": {
+            "included.custom.audience": "lightbridge-api",
+            "id.token.claim": "false",
+            "access.token.claim": "true"
+          }
+        },
+        {
+          "name": "permissions-claim",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-realm-role-mapper",
+          "consentRequired": false,
+          "config": {
+            "claim.name": "permissions",
+            "access.token.claim": "true",
+            "id.token.claim": "false",
+            "userinfo.token.claim": "false",
+            "multivalued": "true"
+          }
         }
       ]
     }
@@ -44,7 +113,16 @@
       "email": "dev@lightbridge.test",
       "firstName": "Dev",
       "lastName": "User",
-      "credentials": [{ "type": "password", "value": "password", "temporary": false }]
+      "credentials": [{ "type": "password", "value": "password", "temporary": false }],
+      "realmRoles": [
+        "task:read",
+        "task:cancel",
+        "task:logs",
+        "repo:read",
+        "repo:approve",
+        "repo:deny",
+        "review:read"
+      ]
     }
   ]
 }

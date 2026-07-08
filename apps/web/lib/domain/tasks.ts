@@ -9,7 +9,7 @@ export interface Task {
   repository_id: number;
   installation_id: number;
   /** `null` for admin-initiated tasks (e.g. index-on-approve) that had no originating webhook. */
-  github_delivery_id: string | null;
+  webhook_delivery_id: string | null;
   target_type: string;
   target_id: number;
   command_text: string;

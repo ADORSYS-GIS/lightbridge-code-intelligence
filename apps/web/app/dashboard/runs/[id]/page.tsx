@@ -117,7 +117,7 @@ export default async function RunDetail({ params }: { params: Promise<{ id: stri
             <Field label="Repository" value={repoLabel(task)} href={repoUrl(task)} />
             <Field label="Branch" value={task.repo_default_branch ?? "—"} />
             <Field label="Trigger" value={triggerLabel(task)} href={targetUrl(task)} />
-            <Field label="Delivery" value={task.github_delivery_id ?? "—"} mono />
+            <Field label="Delivery" value={task.webhook_delivery_id ?? "—"} mono />
             <Field label="Base SHA" value={shortSha(task.base_sha) ?? "—"} mono />
             <Field label="Head SHA" value={shortSha(task.head_sha) ?? "—"} mono />
             <Field label="Created" value={absoluteTime(task.created_at)} />

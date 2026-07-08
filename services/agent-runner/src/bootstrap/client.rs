@@ -111,11 +111,19 @@ impl TaskContext {
         ]
     }
 
-    /// The HTTPS remote with the installation token embedded — what `git` is invoked against.
-    /// GitHub accepts `x-access-token:<token>` basic auth for App installation tokens.
+    /// The HTTPS remote with credentials embedded — what `git` is invoked against.
+    ///
+    /// Two paths:
+    /// - **GitHub**: the control plane sends a plain `clone_url` + a short-lived installation
+    ///   `token`; we splice `x-access-token:<token>@` in here (GitHub's basic-auth convention).
+    /// - **GitLab** (and any platform that pre-authenticates): the control plane sends a
+    ///   `clone_url` that already has credentials embedded (e.g. `https://oauth2:<token>@...`);
+    ///   we detect the `@` and pass it through unchanged.
     pub fn authenticated_clone_url(&self) -> String {
-        // clone_url is `https://github.com/<owner>/<repo>.git`; splice credentials after the scheme.
         match self.clone_url.strip_prefix("https://") {
+            // Already authenticated by the control plane — use as-is.
+            Some(rest) if rest.contains('@') => self.clone_url.clone(),
+            // Splice the token in (GitHub's x-access-token:<token>@ form).
             Some(rest) => format!("https://x-access-token:{}@{rest}", self.token),
             None => self.clone_url.clone(),
         }
@@ -707,6 +715,20 @@ mod tests {
         assert_eq!(
             ctx.authenticated_clone_url(),
             "git@github.com:octo/repo.git"
+        );
+    }
+
+    #[test]
+    fn authenticated_url_passes_through_pre_authenticated_https_unchanged() {
+        // GitLab: the control plane embeds oauth2:<token>@ in the clone_url itself.
+        // The runner must NOT re-splice x-access-token: into an already-authenticated URL.
+        let ctx = context(
+            "https://oauth2:glpat-deadbeef@gitlab.com/group/repo.git",
+            "",
+        );
+        assert_eq!(
+            ctx.authenticated_clone_url(),
+            "https://oauth2:glpat-deadbeef@gitlab.com/group/repo.git"
         );
     }
 }

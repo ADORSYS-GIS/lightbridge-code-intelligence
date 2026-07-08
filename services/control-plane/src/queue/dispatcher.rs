@@ -54,9 +54,9 @@ pub struct DispatcherConfig {
     /// How often the durable data-purge backstop re-checks for `disabled` repos with leftover index
     /// data. A rare recovery net, so it runs on its own slow tick, not the reaper cadence.
     pub purge_reconcile_interval: Duration,
-    /// Days a delivered (`posted`) `github_outbox` row is kept before the outbox sweeper prunes it.
+    /// Days a delivered (`posted`) `outbox` row is kept before the outbox sweeper prunes it.
     pub outbox_posted_retention_days: i64,
-    /// Days a dead-lettered (`failed`) `github_outbox` row is kept — longer, for inspection.
+    /// Days a dead-lettered (`failed`) `outbox` row is kept — longer, for inspection.
     pub outbox_failed_retention_days: i64,
 }
 
@@ -185,7 +185,7 @@ pub async fn run<L: TaskLauncher>(
                     });
                 }
                 {
-                    // Prune terminal `github_outbox` rows past their retention window (ADR-0059) — the
+                    // Prune terminal `outbox` rows past their retention window (ADR-0059) — the
                     // table is append-only otherwise (a 👀 reaction leaves a permanent `posted` row per PR).
                     let pool = pool.clone();
                     let posted_days = cfg.outbox_posted_retention_days;
@@ -319,6 +319,7 @@ async fn react_work_started(pool: &PgPool, task: &db::ClaimedTask, review: &Revi
     }
     let t = crate::outbox::Target {
         task_id: Some(task.id),
+        platform: context.platform,
         installation_id: context.installation_id,
         owner: &context.owner,
         repo: &context.name,
@@ -329,6 +330,7 @@ async fn react_work_started(pool: &PgPool, task: &db::ClaimedTask, review: &Revi
         context.target_id,
         "eyes",
         context.trigger_comment_id,
+        &context.target_type,
     )
     .await
     {

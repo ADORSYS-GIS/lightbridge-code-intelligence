@@ -35,6 +35,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 futures = "0.3"
 
 # --- control-plane: HTTP + auth ---
+async-trait = "0.1"
 axum = "0.8"
 jsonwebtoken = "9"
 hmac = "0.12"
