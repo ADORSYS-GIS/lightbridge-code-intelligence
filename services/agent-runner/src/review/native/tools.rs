@@ -429,8 +429,10 @@ impl Tools<'_> {
                     "{e} Expected JSON like {{\"file\": \"path\", \"line\": 42, \"title\": \"…\", \
                      \"priority\": \"P0\", \"category\": \"security\", \"body\": \"…\", \
                      \"evidence\": \"the lines this rests on\", \"suggestion\": \"optional\", \
-                     \"start_line\": \"optional, first line of a multi-line range\"}}. \
-                     priority is P0|P1|P2; category is security|correctness|quality|style|performance."
+                     \"start_line\": 40}}. \
+                     priority is P0|P1|P2; category is security|correctness|quality|style|performance; \
+                     start_line is optional — the integer first line of a multi-line range (omit for a \
+                     single-line finding)."
                 )),
             },
             RETRACT_FINDING => match parse::<RetractFindingArgs>(args) {
