@@ -70,9 +70,11 @@ pub struct RepoRef {
 }
 
 impl RepoRef {
-    /// Split `full_name` into `(owner, repo)` / `(namespace, path)`.
+    /// Split `full_name` into `(owner, repo)` / `(namespace, path)`. Uses
+    /// `rsplit_once` so the repo name is always the last segment — correct for
+    /// GitLab nested subgroups (`group/sub/repo` → `("group/sub", "repo")`).
     pub fn owner_repo(&self) -> (&str, &str) {
-        match self.full_name.split_once('/') {
+        match self.full_name.rsplit_once('/') {
             Some((o, r)) => (o, r),
             None => (&self.full_name, ""),
         }

@@ -538,7 +538,6 @@ pub struct OutboxRow {
     pub kind: String,
     pub payload: Value,
     pub attempts: i32,
-    #[allow(dead_code)]
     pub platform: Platform,
 }
 
@@ -701,7 +700,6 @@ pub struct PollableComment {
     pub owner: String,
     pub name: String,
     pub installation_id: i64,
-    #[allow(dead_code)]
     pub platform: Platform,
 }
 
@@ -1067,6 +1065,10 @@ pub struct TaskRow {
     pub installation_id: i64,
     /// `None` for admin-initiated tasks (e.g. index-on-approve) that have no originating webhook
     /// delivery; `Some` for webhook-created tasks. (Column is nullable since migration 0008.)
+    ///
+    /// `#[serde(alias)]` keeps the old `github_delivery_id` name accepted on deserialization so
+    /// existing frontend/CLI clients don't break during the platform-abstraction rollout (ADR-0072).
+    #[serde(alias = "github_delivery_id")]
     pub webhook_delivery_id: Option<String>,
     pub target_type: String,
     pub target_id: i64,

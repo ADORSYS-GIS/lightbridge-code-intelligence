@@ -6,16 +6,31 @@
 //! (PEM). Absent either, [`GithubApp::from_env`] returns `None`; webhook handling and task creation
 //! still work — only authenticated GitHub API calls require a token.
 
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use serde::{Deserialize, Serialize};
+
+/// A cached installation token with its expiry epoch-second. GitHub installation
+/// tokens expire after 1 hour; we cache with a 50-minute TTL (10-minute safety
+/// margin) so repeated trait method calls within the same reconciler drain batch
+/// reuse one token instead of minting per-method (ADR-0072).
+struct CachedToken {
+    token: String,
+    expires_at: u64,
+}
+
+/// 50 minutes — 10 minutes before GitHub's 1-hour installation token expiry.
+const TOKEN_CACHE_TTL_SECS: u64 = 50 * 60;
 
 #[derive(Clone)]
 pub struct GithubApp {
     app_id: String,
     key: EncodingKey,
     http: reqwest::Client,
+    token_cache: Arc<Mutex<HashMap<i64, CachedToken>>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -36,6 +51,7 @@ impl GithubApp {
                 app_id,
                 key,
                 http: reqwest::Client::new(),
+                token_cache: Arc::new(Mutex::new(HashMap::new())),
             }),
             Err(error) => {
                 tracing::error!(%error, "GITHUB_APP_PRIVATE_KEY is not valid RSA PEM");
@@ -59,9 +75,15 @@ impl GithubApp {
         encode(&Header::new(Algorithm::RS256), &claims, &self.key)
     }
 
-    /// Exchange the App JWT for an installation access token.
+    /// Exchange the App JWT for an installation access token. Uses an in-process
+    /// TTL cache (50 min) so repeated calls within the same reconciler drain batch
+    /// reuse one token instead of minting per-method (ADR-0072, review-3 P1 #2).
     pub async fn installation_token(&self, installation_id: i64) -> anyhow::Result<String> {
         use anyhow::Context;
+        // Fast path: return a cached token if it's still within its TTL.
+        if let Some(cached) = self.cached_token(installation_id) {
+            return Ok(cached);
+        }
         #[derive(Deserialize)]
         struct TokenResponse {
             token: String,
@@ -85,7 +107,34 @@ impl GithubApp {
             .await
             .context("parsing installation token response")?
             .token;
+        // Cache the freshly minted token with a 50-minute TTL.
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        if let Ok(mut cache) = self.token_cache.lock() {
+            cache.insert(
+                installation_id,
+                CachedToken {
+                    token: token.clone(),
+                    expires_at: now + TOKEN_CACHE_TTL_SECS,
+                },
+            );
+        }
         Ok(token)
+    }
+
+    /// Return a cached token if one exists and is still within its TTL, else `None`.
+    fn cached_token(&self, installation_id: i64) -> Option<String> {
+        let cache = self.token_cache.lock().ok()?;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        cache
+            .get(&installation_id)
+            .filter(|c| c.expires_at > now)
+            .map(|c| c.token.clone())
     }
 
     /// Fetch a PR's changed files with their unified-diff patches (first page, up to 100 files —
@@ -752,6 +801,7 @@ mod tests {
             app_id: app_id.to_string(),
             key: EncodingKey::from_rsa_pem(pem.as_bytes()).expect("encoding key"),
             http: reqwest::Client::new(),
+            token_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 

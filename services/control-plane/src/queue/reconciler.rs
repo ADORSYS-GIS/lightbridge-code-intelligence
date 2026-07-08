@@ -165,15 +165,22 @@ async fn drain_once(
         }
         match deliver(pool, platform.as_ref(), &repo, review, &row).await {
             Ok(platform_id) => {
+                let outcome = if platform_id.is_some() {
+                    "posted"
+                } else {
+                    "skipped"
+                };
                 if let Err(error) = crate::db::mark_outbox_posted(pool, row.id, platform_id).await {
                     tracing::warn!(%error, outbox_id = row.id, "marking outbox posted failed");
                 }
                 crate::http::metrics::outbox_delivery(
                     &row.platform.to_string(),
                     &row.kind,
-                    "posted",
+                    outcome,
                 );
-                posted += 1;
+                if platform_id.is_some() {
+                    posted += 1;
+                }
             }
             Err(error) => {
                 tracing::warn!(

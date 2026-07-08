@@ -47,6 +47,12 @@ impl GitlabClient {
         if token.is_empty() {
             return None;
         }
+        // Fail fast if the token contains bytes that can't be a valid header value —
+        // otherwise every API call would silently go out unauthenticated (ADR-0072).
+        if reqwest::header::HeaderValue::from_str(&token).is_err() {
+            tracing::error!("GITLAB_API_TOKEN contains invalid header bytes — GitLab disabled");
+            return None;
+        }
         let api_url = std::env::var("GITLAB_API_URL")
             .unwrap_or_else(|_| "https://gitlab.com/api/v4".to_string())
             .trim_end_matches('/')

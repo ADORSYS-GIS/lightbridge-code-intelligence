@@ -149,7 +149,10 @@ flowchart TD
 ### Option A — `CodePlatform` trait + unified routes/tables
 
 - Good, because phases 0–3 are pure refactors with zero behavior change for GitHub (verified by
-  `cargo test`: 87 passed, 0 failed across all phases).
+  `cargo test`: 87 passed, 0 failed across all phases). The one wire-format change — renaming
+  `github_delivery_id` to `webhook_delivery_id` in the task API JSON — is backward-compatible via
+  `#[serde(alias = "github_delivery_id")]` on `TaskRow`, so existing frontend clients keep working
+  without a coordinated deploy.
 - Good, because the agent-runner is entirely untouched — it already clones a Git URL and talks to
   the internal API; the control plane just hands it the right `clone_url` via the trait.
 - Good, because one migration (`0024_platform_abstraction.sql`) renames `github_*` → `platform_*`

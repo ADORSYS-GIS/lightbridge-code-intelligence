@@ -87,7 +87,7 @@ fn bearer_token(parts: &Parts) -> Option<String> {
 ///   access token (~1h) minted just-in-time. The runner composes the authenticated URL.
 /// - **GitLab**: `clone_url` already has the token embedded (`oauth2:<token>@host`); `token`
 ///   is empty. The runner detects the pre-authenticated URL and passes it through.
-#[derive(Debug, Serialize)]
+#[derive(Serialize)]
 pub struct TaskContextResponse {
     pub task_id: Uuid,
     pub repository_id: i64,
@@ -125,6 +125,32 @@ pub struct TaskContextResponse {
     /// rejected findings. The runner injects it so the agent stops re-raising known false positives.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub repo_memory: Option<String>,
+}
+
+/// Custom Debug impl that redacts `clone_url` and `token` — for GitLab the clone URL embeds the
+/// API token (`oauth2:<token>@host`), so a `tracing::debug!(?response)` would leak it (ADR-0072).
+impl std::fmt::Debug for TaskContextResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TaskContextResponse")
+            .field("task_id", &self.task_id)
+            .field("repository_id", &self.repository_id)
+            .field("owner", &self.owner)
+            .field("name", &self.name)
+            .field("default_branch", &self.default_branch)
+            .field("clone_url", &"<redacted>")
+            .field("token", &"<redacted>")
+            .field("target_type", &self.target_type)
+            .field("target_id", &self.target_id)
+            .field("command", &self.command)
+            .field("kind", &self.kind)
+            .field("tier", &self.tier)
+            .field("base_sha", &self.base_sha)
+            .field("head_sha", &self.head_sha)
+            .field("repo_indexed", &self.repo_indexed)
+            .field("prior_reviews", &self.prior_reviews)
+            .field("repo_memory", &self.repo_memory)
+            .finish()
+    }
 }
 
 /// `GET /internal/tasks/{id}` — task context + a freshly-minted installation token for the runner.
