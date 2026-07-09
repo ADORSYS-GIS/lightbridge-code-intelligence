@@ -33,6 +33,13 @@ rustls = { version = "0.23", default-features = false, features = ["ring"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 # Concurrent joins for batched read-only tool dispatch (ADR-0042).
 futures = "0.3"
+# Durable orchestration (RFC-0005 / ADR-0074): the Restate SDK serves a discoverable HTTP endpoint
+# the Restate server invokes. Pinned exactly while the sdk-rust 0.10 ↔ server compat is being
+# validated (ticket #296). Default features give `http_server` (hyper/hyper-util, plain h2c — NO
+# TLS) + `rust_crypto` for request-identity verification. We deliberately do NOT enable `aws_lc_rs`:
+# it would link a second rustls crypto provider next to sqlx's `ring` and reintroduce the
+# process-default-provider panic that `main` guards against.
+restate-sdk = "=0.10.0"
 
 # --- control-plane: HTTP + auth ---
 async-trait = "0.1"

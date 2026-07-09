@@ -38,6 +38,7 @@ metrics-exporter-prometheus.workspace = true
 neo4rs.workspace = true
 rmcp.workspace = true
 futures.workspace = true
+restate-sdk.workspace = true
 
 [dev-dependencies]
 # Test-only: generate an RSA keypair at runtime so no private key is committed (see src/jwt.rs).
