@@ -27,7 +27,7 @@ use a2a_server::TaskStore;
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 use serde_json::{json, Map, Value};
-use sqlx::postgres::PgListener;
+use sqlx::postgres::{PgListener, PgPoolOptions};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -51,6 +51,15 @@ const TAIL_POLL_FALLBACK: std::time::Duration = std::time::Duration::from_secs(5
 /// terminal event (ADR-0077 S2/S7). Comfortably longer than a 2 h deep run (ADR-0062) so it never cuts
 /// a legitimate long tail short.
 const MAX_STREAM_LIFETIME: std::time::Duration = std::time::Duration::from_secs(3 * 60 * 60);
+/// Streaming subscriptions get their OWN small connection pool, separate from the request pool that
+/// serves `SendMessage`/`GetTask`/`CancelTask`. A [`PgListener`] holds its connection for the whole
+/// stream lifetime (up to [`MAX_STREAM_LIFETIME`] = 3 h), so serving tails from the request pool would
+/// let a handful of long-lived streams starve every other query on the replica. This size therefore
+/// doubles as the **per-replica cap on concurrent streams**: past it a new subscription fails fast
+/// (a short acquire timeout) with a clear "capacity reached" error rather than pinning a request
+/// connection or an unbounded Postgres backend. A global cap, not per-caller — per-caller fairness is
+/// a later refinement (RFC-0006).
+const MAX_CONCURRENT_STREAMS: u32 = 64;
 
 /// Per-identity rate limit on deep-run submission (RFC-0006 R4).
 #[derive(Debug, Clone, Copy)]
@@ -70,6 +79,10 @@ struct CallerCtx {
 /// The A2A review request handler.
 pub struct A2aHandler {
     pool: PgPool,
+    /// Dedicated pool for streaming `LISTEN` connections — isolated from `pool` and bounded to
+    /// [`MAX_CONCURRENT_STREAMS`] so long-lived tails can neither starve the request pool nor open
+    /// unbounded Postgres backends (see the const).
+    listener_pool: PgPool,
     store: PgTaskStore,
     quota: QuotaConfig,
 }
@@ -77,7 +90,20 @@ pub struct A2aHandler {
 impl A2aHandler {
     pub fn new(pool: PgPool, quota: QuotaConfig) -> Self {
         let store = PgTaskStore::new(pool.clone());
-        Self { pool, store, quota }
+        // Derived from the request pool's own connect options (so it targets the same database,
+        // including in tests) but with its own small cap and a short acquire timeout, so a saturated
+        // stream pool surfaces as a fast, explicit error instead of blocking. `connect_lazy_with`
+        // opens nothing until the first subscription.
+        let listener_pool = PgPoolOptions::new()
+            .max_connections(MAX_CONCURRENT_STREAMS)
+            .acquire_timeout(std::time::Duration::from_millis(250))
+            .connect_lazy_with((*pool.connect_options()).clone());
+        Self {
+            pool,
+            listener_pool,
+            store,
+            quota,
+        }
     }
 
     /// Extract the caller identity from the middleware-injected params. The middleware validated the
@@ -459,6 +485,9 @@ impl A2aHandler {
         let snapshot = self.build_task_snapshot(a2a_task_id, &mapping).await?;
         let already_terminal = snapshot.status.state.is_terminal();
         let pool = self.pool.clone();
+        // Streams LISTEN on the dedicated, bounded listener pool — never the request pool (see
+        // MAX_CONCURRENT_STREAMS): a long tail must not hold a request connection.
+        let listener_pool = self.listener_pool.clone();
         let underlying = mapping.underlying_task_id;
         let channel = crate::a2a::events::task_channel(&id);
 
@@ -498,11 +527,16 @@ impl A2aHandler {
             }
 
             // 3) Tail: NOTIFY-wake with a bounded fallback poll; the seq-cursor SELECT is authoritative.
-            let mut listener = match PgListener::connect_with(&pool).await {
+            // The listener draws from the dedicated stream pool; when it is saturated (too many
+            // concurrent streams on this replica) the acquire times out fast — surface that as a clear,
+            // retryable "capacity" error rather than a generic internal failure.
+            let mut listener = match PgListener::connect_with(&listener_pool).await {
                 Ok(listener) => listener,
                 Err(error) => {
-                    tracing::error!(%error, a2a_task_id = %id, "a2a: stream listener connect failed");
-                    yield Err(A2AError::internal("internal error"));
+                    tracing::warn!(%error, a2a_task_id = %id, "a2a: stream listener pool saturated or unavailable");
+                    yield Err(A2AError::internal(
+                        "streaming capacity reached; retry shortly or poll GetTask",
+                    ));
                     return;
                 }
             };
