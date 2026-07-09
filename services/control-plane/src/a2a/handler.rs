@@ -539,11 +539,40 @@ impl A2aHandler {
                     }
                 }
 
-                // Backstop (ADR-0077 risk S7): if the live state is already terminal but no terminal
-                // event ever landed (a crash between the run finishing and the append), close rather
-                // than tail forever. Safe because a completed artifact rides the same transaction as the
-                // terminal status-update, so it is never stranded after this check.
+                // Backstop (ADR-0077 risk S7): if the live state is already terminal, do one FINAL
+                // drain before closing. The terminal `set_task_status` transaction commits the status
+                // flip and its terminal events (COMPLETED + any artifact) atomically, so a
+                // live-terminal read means those events are already durable. Returning here WITHOUT
+                // re-draining would drop them whenever the completion commits in the window between the
+                // drain at the top of this loop and this check — the stream would close after WORKING,
+                // never delivering the terminal event (an R6 violation: the stream must close *at* the
+                // terminal state, delivering it). Re-fetch once; in the genuine crash case (the run
+                // finished but no terminal event was ever appended) this finds nothing and we still
+                // close rather than tail forever.
                 if is_live_terminal(&pool, underlying).await {
+                    match crate::a2a::events::fetch_events_after(&pool, id, last_seq).await {
+                        Ok(events) => {
+                            // Final drain: emit whatever the terminal commit left past the cursor, then
+                            // close unconditionally (no need to advance `last_seq` — we never loop again).
+                            for (seq, payload, is_final) in events {
+                                match serde_json::from_value::<StreamResponse>(payload) {
+                                    Ok(event) => yield Ok(event),
+                                    Err(error) => {
+                                        tracing::error!(%error, a2a_task_id = %id, seq, "a2a: corrupt stream event payload");
+                                        yield Err(A2AError::internal("internal error"));
+                                        return;
+                                    }
+                                }
+                                if is_final {
+                                    return;
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            yield Err(db_error(error));
+                            return;
+                        }
+                    }
                     return;
                 }
 
