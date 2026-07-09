@@ -331,7 +331,10 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), 200);
         // Downstream sees the token's subject + permissions, never the spoofed values.
-        assert_eq!(resp.text().await.unwrap(), "svc-account-9|a2a:review,other:perm");
+        assert_eq!(
+            resp.text().await.unwrap(),
+            "svc-account-9|a2a:review,other:perm"
+        );
     }
 
     #[test]

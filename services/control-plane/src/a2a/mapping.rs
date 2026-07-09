@@ -65,10 +65,12 @@ impl std::fmt::Display for ParseError {
     }
 }
 
-/// The parsed input for the `review` skill. Repo identity is resolved against our DB later; the
-/// SHAs are optional because the `a2a` role holds NO forge credentials (it cannot fetch them) — a
-/// caller that knows the head SHA supplies it so the review dedups against a webhook-triggered run
-/// of the same head; otherwise the run is created with a null head (still a valid deep review).
+/// The parsed input for the `review` skill. Repo identity is resolved against our DB later. Both
+/// SHAs are optional *at parse time*, but the handler REQUIRES a `head_sha` before it will submit:
+/// the `a2a` role holds NO forge credentials (it cannot resolve a PR head itself), and a null head
+/// would fall through downstream to a review of the repo's default branch — so a submission without
+/// one is rejected (RFC-0006). `base_sha` stays genuinely optional. A supplied head also lets the
+/// review dedup onto a webhook-triggered run of the same head.
 #[derive(Debug, PartialEq, Eq)]
 pub struct ReviewInput {
     pub platform: Platform,

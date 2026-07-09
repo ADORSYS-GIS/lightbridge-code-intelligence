@@ -224,6 +224,22 @@ impl A2aHandler {
                 .await;
         };
 
+        // Require a caller-supplied head SHA. The `a2a` role holds NO forge credentials, so it cannot
+        // resolve a PR head itself; a null head would fall through downstream to a review of the
+        // repo's DEFAULT branch (agent-runner clones the default branch and returns no PR diff), which
+        // then gets posted onto the PR — a silently-wrong review. Reject instead of guessing. Rejecting
+        // here (before `create_task`) creates zero task rows, exactly like the approval gate above.
+        if input.head_sha.is_none() {
+            return self
+                .reject(
+                    caller,
+                    &a2a_task_id,
+                    &context_id,
+                    "A2A review requires an explicit headSha; this server cannot resolve a PR head without forge credentials",
+                )
+                .await;
+        }
+
         // Build the deep-tier review task — the SAME shape as the webhook `@mention` path, so it rides
         // the identical idempotency tuple / run_epoch semantics.
         let new_task = db::NewTask {
@@ -615,7 +631,9 @@ mod tests {
         let resp = h
             .send_message(
                 &params("svc-a", &["a2a:review"]),
-                review_req(json!({ "repo": "acme/api", "pr": 42, "prompt": "focus on auth" })),
+                review_req(
+                    json!({ "repo": "acme/api", "pr": 42, "prompt": "focus on auth", "headSha": "deadbeef" }),
+                ),
             )
             .await
             .unwrap();
@@ -673,24 +691,30 @@ mod tests {
         let ok = params("svc-a", &["a2a:review"]);
         for pr in 1..=2 {
             let t = task_of(
-                h.send_message(&ok, review_req(json!({ "repo": "acme/api", "pr": pr })))
-                    .await
-                    .unwrap(),
+                h.send_message(
+                    &ok,
+                    review_req(json!({ "repo": "acme/api", "pr": pr, "headSha": "abc" })),
+                )
+                .await
+                .unwrap(),
             );
             assert_eq!(t.status.state, TaskState::Submitted, "submission {pr}");
         }
         // The third breaches the per-identity quota.
         let third = task_of(
-            h.send_message(&ok, review_req(json!({ "repo": "acme/api", "pr": 3 })))
-                .await
-                .unwrap(),
+            h.send_message(
+                &ok,
+                review_req(json!({ "repo": "acme/api", "pr": 3, "headSha": "abc" })),
+            )
+            .await
+            .unwrap(),
         );
         assert_eq!(third.status.state, TaskState::Rejected);
         // A different caller is unaffected (quota is per-identity).
         let other = task_of(
             h.send_message(
                 &params("svc-b", &["a2a:review"]),
-                review_req(json!({ "repo": "acme/api", "pr": 4 })),
+                review_req(json!({ "repo": "acme/api", "pr": 4, "headSha": "abc" })),
             )
             .await
             .unwrap(),
@@ -742,6 +766,84 @@ mod tests {
             count, 0,
             "A2A must not create a run behind the approval gate"
         );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn missing_head_sha_is_rejected_and_creates_no_run(pool: PgPool) {
+        // Approved repo, authorized caller, valid PR — the ONLY thing missing is a head SHA.
+        seed_approved_repo(&pool, "acme", "api", 111).await;
+        let h = handler(pool.clone(), 10);
+        let task = task_of(
+            h.send_message(
+                &params("svc-a", &["a2a:review"]),
+                // No `headSha`: the `a2a` role cannot resolve a PR head (no forge credentials), so a
+                // null-head review would silently review the default branch — reject instead.
+                review_req(json!({ "repo": "acme/api", "pr": 42, "prompt": "focus on auth" })),
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(task.status.state, TaskState::Rejected);
+        // A rejection creates no underlying run…
+        assert!(underlying_of(&task).is_none());
+        // …and, mirroring the approval-gate zero-rows guarantee, no `tasks` row exists at all.
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM tasks")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            count, 0,
+            "a null-head A2A review must not create a run (it would review the default branch)"
+        );
+
+        // A base SHA alone does not satisfy the requirement — a head is still required.
+        let base_only = task_of(
+            h.send_message(
+                &params("svc-a", &["a2a:review"]),
+                review_req(json!({ "repo": "acme/api", "pr": 42, "baseSha": "def456" })),
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(base_only.status.state, TaskState::Rejected);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn approved_repo_without_installation_is_rejected(pool: PgPool) {
+        // Approved but not fully provisioned: no installation id (handler.rs approval gate branch).
+        let id = db::upsert_repository(
+            &pool,
+            Platform::GitHub,
+            4242,
+            "acme",
+            "noinstall",
+            "main",
+            None, // no installation
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE repositories SET status = 'approved' WHERE id = $1")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let h = handler(pool.clone(), 10);
+        let task = task_of(
+            h.send_message(
+                &params("svc-a", &["a2a:review"]),
+                review_req(json!({ "repo": "acme/noinstall", "pr": 1, "headSha": "abc" })),
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(task.status.state, TaskState::Rejected);
+        assert!(underlying_of(&task).is_none());
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM tasks")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 0, "an unprovisioned repo must not create a run");
     }
 
     #[sqlx::test(migrations = "./migrations")]
@@ -801,9 +903,12 @@ mod tests {
         let h = handler(pool.clone(), 10);
         let caller = params("svc-a", &["a2a:review"]);
         let submitted = task_of(
-            h.send_message(&caller, review_req(json!({ "repo": "acme/api", "pr": 7 })))
-                .await
-                .unwrap(),
+            h.send_message(
+                &caller,
+                review_req(json!({ "repo": "acme/api", "pr": 7, "headSha": "abc" })),
+            )
+            .await
+            .unwrap(),
         );
         let a2a_id = submitted.id.clone();
         let underlying = underlying_of(&submitted).unwrap();
@@ -870,7 +975,7 @@ mod tests {
         let mine = task_of(
             h.send_message(
                 &params("svc-a", &["a2a:review"]),
-                review_req(json!({ "repo": "acme/api", "pr": 1 })),
+                review_req(json!({ "repo": "acme/api", "pr": 1, "headSha": "abc" })),
             )
             .await
             .unwrap(),
@@ -909,9 +1014,12 @@ mod tests {
         let h = handler(pool.clone(), 10);
         let caller = params("svc-a", &["a2a:review"]);
         let submitted = task_of(
-            h.send_message(&caller, review_req(json!({ "repo": "acme/api", "pr": 5 })))
-                .await
-                .unwrap(),
+            h.send_message(
+                &caller,
+                review_req(json!({ "repo": "acme/api", "pr": 5, "headSha": "abc" })),
+            )
+            .await
+            .unwrap(),
         );
         let underlying = underlying_of(&submitted).unwrap();
 

@@ -63,9 +63,11 @@ pub fn build_agent_card(base_url: &str, oidc_discovery_url: &str) -> AgentCard {
             id: "review".to_string(),
             name: "Deep PR review".to_string(),
             description: "Request a deep review of a pull/merge request. Input is a `data` part \
-                          with `repo` (owner/name) and `pr`; optional `forge` (default github), \
-                          `prompt`, and `headSha`/`baseSha`. The review posts to the PR through the \
-                          existing pipeline; the A2A task additionally returns the summary + findings."
+                          with `repo` (owner/name), `pr`, and `headSha` (required — this server \
+                          holds no forge credentials and cannot resolve a PR head itself); optional \
+                          `forge` (default github), `prompt`, and `baseSha`. The review posts to the \
+                          PR through the existing pipeline; the A2A task additionally returns the \
+                          summary + findings."
                 .to_string(),
             tags: vec![
                 "code-review".to_string(),
@@ -73,7 +75,8 @@ pub fn build_agent_card(base_url: &str, oidc_discovery_url: &str) -> AgentCard {
                 "static-analysis".to_string(),
             ],
             examples: Some(vec![
-                "{\"skill\":\"review\",\"repo\":\"acme/api\",\"pr\":128}".to_string()
+                "{\"skill\":\"review\",\"repo\":\"acme/api\",\"pr\":128,\"headSha\":\"abc123\"}"
+                    .to_string(),
             ]),
             input_modes: Some(vec!["application/json".to_string()]),
             output_modes: Some(vec![
