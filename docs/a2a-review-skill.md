@@ -54,19 +54,46 @@ serve the same handler.
 
 ### Request fields (the `data` object)
 
-| Field     | Type                | Required | Default    | Notes |
+| Field     | Type                | Required | Default    | Meaning & effect |
 |-----------|---------------------|----------|------------|-------|
-| `skill`   | string              | no       | `"review"` | Only `"review"` exists in this phase. |
-| `forge`   | string              | no       | `"github"` | `"github"` or `"gitlab"`. |
-| `repo`    | string              | **yes**  | —          | `"owner/name"` (surrounding whitespace trimmed). |
-| `pr`      | integer \| string   | **yes**  | —          | PR/MR number, `> 0`. A JSON integer **or** a numeric string (`164` or `"164"`). |
-| `headSha` | string              | **yes**  | —          | Commit SHA of the PR/MR head. Also accepted as `head_sha`. |
-| `baseSha` | string              | no       | —          | Base commit SHA. Also accepted as `base_sha`. |
-| `prompt`  | string              | no       | generic    | Focus prompt recorded as the run's intent. |
+| `skill`   | string              | no       | `"review"` | Skill selector. Only `"review"` exists in this phase; any other value → `UNSUPPORTED_OPERATION`. |
+| `forge`   | string              | no       | `"github"` | Source forge: `"github"` or `"gitlab"`. Selects which platform `repo`/`pr` resolve against. |
+| `repo`    | string              | **yes**  | —          | Repository slug `"owner/name"` (exactly one slash; surrounding whitespace trimmed). Must be an approved repo, else `REJECTED`. |
+| `pr`      | integer \| string   | **yes**  | —          | PR/MR number, `> 0`. A JSON integer **or** a numeric string (`164` or `"164"`). Which change set to review. |
+| `headSha` | string              | **yes**  | —          | The exact commit to review — the PR/MR head. The repo is checked out here and the review runs against it. Also accepted as `head_sha`. |
+| `baseSha` | string              | no (**recommended**) | —  | The PR/MR **base** (target-branch) commit. **Present → diff-scoped review** of just the PR's changes; **absent → whole-working-tree review** at `headSha` (see [Scoping](#scoping-diff-vs-whole-tree)). Also accepted as `base_sha`. |
+| `prompt`  | string              | no       | generic    | Free-text focus prompt, recorded as the run's intent and shown to the agent. Steers emphasis; does **not** change scope. |
 
 `headSha` is **required**: this server holds no forge credentials and cannot resolve a PR head
 itself. A submission without one is `REJECTED` (a null head would otherwise silently review the
 repository's default branch and post a wrong review).
+
+### Scoping: diff vs whole-tree
+
+`baseSha` is optional but **strongly recommended** — it decides *what* the review looks at:
+
+- **With `baseSha` → a diff-scoped review of the PR's changes.** The runner computes
+  `git diff merge-base(baseSha, headSha)..headSha` — the same three-dot "Files changed" set the forge
+  shows — and scopes the review (and where findings may land) to exactly those changed files. This is
+  what you almost always want.
+- **Without `baseSha` → a whole-working-tree review at `headSha`.** No diff can be computed, so the
+  review falls back to auditing the *entire* repository snapshot at `headSha` — broader, unfocused, and
+  **not** the PR's delta. Useful only when you genuinely want a full-tree audit rather than a PR review.
+
+Why the caller must supply the base: the `a2a` role holds **no forge credentials**, so it cannot look
+up a PR's base commit itself — it only passes through the SHAs you send. (`headSha`/`baseSha` also
+accept the `head_sha`/`base_sha` snake_case aliases.)
+
+A diff-scoped request (both SHAs):
+
+```json
+{ "skill": "review", "repo": "acme/api", "pr": "164",
+  "headSha": "9f2a1c4e8b7d6053a1f4c2e9b8d70a5c3e1f2b6d",
+  "baseSha": "1b0dd7a4c9e2f6538a0c4b1e9d7f2a5c3e8b6d04" }
+```
+
+Omit `baseSha` from the same request and you get a whole-tree review of the checkout at `headSha`
+instead.
 
 ### JSON-RPC (preferred transport)
 
@@ -212,6 +239,10 @@ cancelled (the runner's self-cancel poll then stops the Job). Cancelling an alre
   rendering.
 - **`headSha` is required.** Omitting it yields `TASK_STATE_REJECTED` — this server can't resolve a
   head without forge credentials.
+- **Omitting `baseSha` silently changes *scope*, not just detail.** With it you get a diff-scoped
+  review of the PR's changes; without it the review runs against the *whole working tree* at `headSha`
+  (a full-repo audit, not the PR delta) — see [Scoping](#scoping-diff-vs-whole-tree). Send `baseSha`
+  for a PR review.
 - **An unapproved / unknown / unprovisioned repo → `TASK_STATE_REJECTED`.** A2A is not a side door
   around the repo-approval gate (ADR-0063). Also rejected: missing `a2a:review`, or a per-identity
   deep-run **quota** breach.
