@@ -30,8 +30,10 @@ pub struct FileConfig {
 /// Which path delivers `outbox` intents (RFC-0005 Phase A / ADR-0074). **Defaults to `Drain`** — the
 /// pre-existing reconciler drain (ADR-0059) stays the active egress path, so merging the pilot changes
 /// no production behavior. Flip to `Restate` to route egress through the `PlatformEgress` virtual object
-/// (the pilot). Both modes share the `outbox` table as the ledger, so switching direction is safe: any
-/// row not yet `posted` is picked up by whichever consumer is active.
+/// (the pilot). The mode is read once at startup — it is deploy-scoped, not live-reloadable (a flip
+/// takes effect on the next boot, like every other config knob). Both modes share the `outbox` table as
+/// the ledger, so switching direction **across a deploy** is safe: any row not yet `posted` is picked up
+/// by whichever consumer the new deploy runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum EgressMode {

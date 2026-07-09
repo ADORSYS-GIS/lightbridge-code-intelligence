@@ -75,8 +75,9 @@ pub async fn run(
         // `restate` egress mode: the drain is off (PlatformEgress owns egress). Keep the role alive so
         // the spawned feedback poll keeps running.
         tracing::info!("reconciler: outbound drain disabled (egress.mode = restate); poll-only");
-        std::future::pending::<()>().await;
-        return Ok(());
+        // Park forever so the spawned feedback poll keeps running. `pending` is typed to the fn's
+        // `Result` so it is the tail expression itself — no dead `return Ok(())` follows it.
+        return std::future::pending::<anyhow::Result<()>>().await;
     }
     run_outbox_drain(pool, platforms, review).await
 }

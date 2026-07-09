@@ -664,11 +664,15 @@ pub async fn load_pending_outbox_row(
 /// ([`enqueue_outbox_post`], which returns only whether it inserted) and the `PlatformEgress::post`
 /// invocation, which is keyed on the row id (RFC-0005 / ADR-0074). Read only on the `restate` egress
 /// path; the `drain` default never calls it, so the enqueue path is byte-for-byte unchanged by the pilot.
+///
+/// `dedup_key` is `UNIQUE` (the `ON CONFLICT (dedup_key)` in [`enqueue_outbox_post`]), so this already
+/// matches at most one row. The explicit `LIMIT 1` is defensive: it keeps the "one id per key" contract
+/// stated at the query if a future migration ever relaxes that constraint.
 pub async fn outbox_id_by_dedup_key(
     pool: &PgPool,
     dedup_key: &str,
 ) -> Result<Option<i64>, sqlx::Error> {
-    sqlx::query_scalar::<_, i64>("SELECT id FROM outbox WHERE dedup_key = $1")
+    sqlx::query_scalar::<_, i64>("SELECT id FROM outbox WHERE dedup_key = $1 LIMIT 1")
         .bind(dedup_key)
         .fetch_optional(pool)
         .await
@@ -679,6 +683,11 @@ pub async fn outbox_id_by_dedup_key(
 /// the engine's retry policy has already exhausted its ceiling, so unlike [`mark_outbox_failed`] (which
 /// re-derives `pending`-vs-`failed` from `attempts²`) this makes the row terminal in one step. Mirrors
 /// `mark_outbox_failed`'s dead-letter destination so both egress paths settle a give-up the same way.
+///
+/// The `AND status = 'pending'` guard is defensive: it makes the terminal write a no-op if another
+/// consumer already settled the row (`posted`/`failed`), so a give-up can never clobber a delivered row.
+/// Not reachable in steady state (the drain is off in `restate` mode and the virtual object is
+/// single-writer per key), but it costs nothing and keeps the settle-once invariant local to the query.
 pub async fn mark_outbox_dead_letter(
     pool: &PgPool,
     id: i64,
@@ -689,7 +698,7 @@ pub async fn mark_outbox_dead_letter(
              attempts = attempts + 1, \
              last_error = $2, \
              status = 'failed' \
-         WHERE id = $1",
+         WHERE id = $1 AND status = 'pending'",
     )
     .bind(id)
     .bind(error)
@@ -2618,6 +2627,26 @@ mod tests {
                 .unwrap();
         assert_eq!(status, "failed");
         assert_eq!(last_error.as_deref(), Some("PR was deleted (404)"));
+
+        // The `AND status = 'pending'` guard: dead-lettering a row another consumer already settled is a
+        // no-op — it must never clobber a `posted` row back to `failed`. `id` was marked `posted` above.
+        mark_outbox_dead_letter(&pool, id, "late dead-letter")
+            .await
+            .unwrap();
+        let (settled_status, settled_error): (String, Option<String>) =
+            sqlx::query_as("SELECT status, last_error FROM outbox WHERE id = $1")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            settled_status, "posted",
+            "dead-letter must not overwrite an already-posted row"
+        );
+        assert_eq!(
+            settled_error, None,
+            "the posted row's fields are untouched by the guarded no-op"
+        );
     }
 
     /// ADR-0068: the verdict path. A clean review enqueues a 👍 reaction targeting the @mention comment
