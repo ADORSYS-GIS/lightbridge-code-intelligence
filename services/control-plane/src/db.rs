@@ -1768,6 +1768,65 @@ pub async fn repository_installation_id(
     Ok(id.flatten())
 }
 
+/// A repository resolved by its platform + `owner/name` slug for an A2A review submission
+/// (RFC-0006). Carries just what the submission path needs to enforce the approval gate and build
+/// the review task **without a forge round-trip** (the `a2a` role holds no forge credentials).
+#[derive(Debug, sqlx::FromRow)]
+pub struct RepoForReview {
+    pub id: i64,
+    /// GitHub App installation id (or GitLab project id). `None` for a repo seen but never carried
+    /// through a PR/installation webhook that recorded it — the A2A path treats that as not runnable.
+    pub installation_id: Option<i64>,
+    /// Approval status: `pending` | `approved` | `disabled`. The A2A path rejects anything but
+    /// `approved` (the same gate as the webhook path, ADR-0063).
+    pub status: String,
+}
+
+/// Resolve an approved-or-not repository by platform + `owner`/`name`. `None` when no such repo has
+/// ever been connected (an A2A review of a never-seen repo → `TASK_STATE_REJECTED`, never a side
+/// door around the approval gate). Case-insensitive on owner/name to match forge slug behaviour.
+pub async fn find_repository(
+    pool: &PgPool,
+    platform: Platform,
+    owner: &str,
+    name: &str,
+) -> Result<Option<RepoForReview>, sqlx::Error> {
+    sqlx::query_as::<_, RepoForReview>(
+        "SELECT id, installation_id, status FROM repositories \
+         WHERE platform = $1 AND lower(owner) = lower($2) AND lower(name) = lower($3)",
+    )
+    .bind(platform)
+    .bind(owner)
+    .bind(name)
+    .fetch_optional(pool)
+    .await
+}
+
+/// Find the id of an already-existing task matching a [`NewTask`]'s idempotency tuple
+/// (`repository_id, target_type, target_id, command_text, head_sha, run_epoch`) — the same columns as
+/// `tasks_idempotency_idx`, `NULLS NOT DISTINCT` on `head_sha`. Used by the A2A review path so that
+/// when [`create_task`] dedups (returns `None`), the A2A task can still be mapped onto the existing
+/// underlying run instead of forking the idempotency logic.
+pub async fn find_task_id_by_idempotency(
+    pool: &PgPool,
+    task: &NewTask,
+) -> Result<Option<Uuid>, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT id FROM tasks \
+         WHERE repository_id = $1 AND target_type = $2 AND target_id = $3 \
+           AND command_text = $4 AND head_sha IS NOT DISTINCT FROM $5 AND run_epoch = $6 \
+         ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(task.repository_id)
+    .bind(&task.target_type)
+    .bind(task.target_id)
+    .bind(&task.command_text)
+    .bind(&task.head_sha)
+    .bind(task.run_epoch)
+    .fetch_optional(pool)
+    .await
+}
+
 /// Enqueue a standalone **index** task for a repository's default branch (Epic #75, Milestone B —
 /// runs on admin approval, and on every default-branch push via `handle_push`). Skips if an index task
 /// is already active for the repo (so a burst of pushes / a re-approve doesn't pile up duplicates).

@@ -287,6 +287,76 @@ pub fn from_env() -> Option<Arc<JwtValidator>> {
     OidcConfig::from_env().map(|config| Arc::new(JwtValidator::new(config)))
 }
 
+/// Cross-module test seam: a static-JWKS validator plus a matching token minter, so other modules
+/// (e.g. the `a2a` auth layer) can drive the real validation path in tests without a live IdP. The
+/// keypair is generated once at runtime — no private key is committed.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+    use jsonwebtoken::{encode, EncodingKey, Header};
+    use serde_json::json;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    pub const ISSUER: &str = "https://idp.test/realms/lightbridge";
+    pub const AUDIENCE: &str = "lightbridge-api";
+
+    /// `(PKCS#8 private PEM, JWKS JSON)`, generated once per process.
+    fn keys() -> &'static (String, String) {
+        use base64::Engine as _;
+        use rsa::pkcs8::EncodePrivateKey as _;
+        use rsa::traits::PublicKeyParts as _;
+
+        static KEYS: std::sync::OnceLock<(String, String)> = std::sync::OnceLock::new();
+        KEYS.get_or_init(|| {
+            let private = rsa::RsaPrivateKey::new(&mut rand::rngs::OsRng, 2048).expect("gen rsa");
+            let pem = private
+                .to_pkcs8_pem(rsa::pkcs8::LineEnding::LF)
+                .expect("pkcs8 pem")
+                .to_string();
+            let public = private.to_public_key();
+            let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+            let n = b64.encode(public.n().to_bytes_be());
+            let e = b64.encode(public.e().to_bytes_be());
+            let jwks = format!(
+                r#"{{"keys":[{{"kty":"RSA","n":"{n}","e":"{e}","kid":"a2a-test","alg":"RS256","use":"sig"}}]}}"#
+            );
+            (pem, jwks)
+        })
+    }
+
+    /// A validator that trusts [`keys`]'s JWKS (no network).
+    pub fn validator() -> JwtValidator {
+        JwtValidator::from_static_jwks(
+            OidcConfig {
+                issuer: ISSUER.to_string(),
+                audience: AUDIENCE.to_string(),
+                jwks_uri: "http://unused.invalid".to_string(),
+            },
+            &keys().1,
+        )
+    }
+
+    /// Mint an RS256 token for `sub` carrying `permissions` (under the default `permissions` claim).
+    pub fn mint(sub: &str, permissions: &[&str]) -> String {
+        let exp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as usize
+            + 3600;
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = Some("a2a-test".to_string());
+        let claims = json!({
+            "sub": sub,
+            "iss": ISSUER,
+            "aud": AUDIENCE,
+            "exp": exp,
+            "permissions": permissions,
+        });
+        let key = EncodingKey::from_rsa_pem(keys().0.as_bytes()).expect("test signing key");
+        encode(&header, &claims, &key).expect("sign token")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

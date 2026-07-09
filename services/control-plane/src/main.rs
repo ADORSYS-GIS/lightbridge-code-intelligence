@@ -25,6 +25,7 @@
 //! migrations), [`jwt`] (OIDC token validation), [`types`] (shared domain types), [`review`]
 //! (review validation).
 
+mod a2a;
 mod http;
 mod integrations;
 mod queue;
@@ -509,8 +510,10 @@ async fn main() -> anyhow::Result<()> {
     // One binary, several roles (RFC-0001): `serve` (HTTP) and `dispatcher` (queue consumer),
     // selected by the first CLI arg or `CONTROL_PLANE_ROLE`. Deployed as separate Deployments off
     // the same image so they scale independently. `scheduler` arrives in Phase 2. `restate-worker`
-    // (RFC-0005 / ADR-0074) serves the Restate SDK endpoint. All roles share the `ring` crypto
-    // provider installed above; `restate-worker` serves plain h2c and adds no TLS of its own.
+    // (RFC-0005 / ADR-0074) serves the Restate SDK endpoint. `a2a` (RFC-0006 / #299) serves the A2A
+    // agent surface (review skill, polling) — a fourth ingress face, holding no forge credentials.
+    // All roles share the `ring` crypto provider installed above; `restate-worker` serves plain h2c
+    // and adds no TLS of its own.
     let role = std::env::args()
         .nth(1)
         .or_else(|| std::env::var("CONTROL_PLANE_ROLE").ok())
@@ -524,8 +527,10 @@ async fn main() -> anyhow::Result<()> {
         // Deployment's role string can be flipped in either order across the rename rollout.
         "poller" | "reconciler" => run_reconciler(state).await,
         "restate-worker" => restate_worker::run(state).await,
+        // The A2A ingress face (RFC-0006 / #299): serves the `review` skill over polling.
+        "a2a" => a2a::run(state).await,
         other => anyhow::bail!(
-            "unknown role {other:?} (expected: serve | dispatcher | reconciler | restate-worker [| poller])"
+            "unknown role {other:?} (expected: serve | dispatcher | reconciler | restate-worker | a2a [| poller])"
         ),
     }
 }
