@@ -52,3 +52,5 @@ Copy [the template](0000-rfc-template.md) to `NNNN-kebab-title.md`, numbered seq
 | [0002](0002-incremental-layered-indexing.md) | Incremental, layered indexing (base branch + per-PR overlays) | Proposed |
 | [0003](0003-skip-auto-review-on-bot-authored-prs.md) | Skip the automatic review on bot-authored PRs | Accepted |
 | [0004](0004-durable-repo-memory-via-external-mcp.md) | Durable repo memory via an external, consolidating MCP memory service | Proposed |
+| [0005](0005-durable-orchestration-on-restate.md) | Durable task orchestration on Restate (strangler adoption; amends RFC-0001's later phases) | Proposed |
+| [0006](0006-a2a-agent-surface.md) | A2A-compliant agent surface (expose Lightbridge agents over the Agent2Agent protocol, on the RFC-0005 substrate) | Proposed |
