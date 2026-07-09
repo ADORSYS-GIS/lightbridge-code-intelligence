@@ -1,0 +1,237 @@
+# Calling the A2A `review` skill
+
+How to request a deep code review over Lightbridge's [A2A](https://a2a-protocol.org/latest/specification/)
+surface (spec **v1.0.1**). This is the concrete calling guide for the `review` skill introduced in
+[RFC-0006](rfc/0006-a2a-agent-surface.md) (Phase 1: card + `SendMessage` + `GetTask` +
+`CancelTask`, polling only).
+
+The `review` skill runs the **deep** tier through the *same* pipeline as an `@mention`: same
+idempotency, same repo-approval gate, same mediated posting to the PR. The A2A task **additionally**
+returns the summary + structured findings to the caller — it does not replace the PR review.
+
+The input contract (the authoritative schema) is also published inline in the agent card's `review`
+skill `description`, so a peer that only reads the card can still construct a valid request.
+
+---
+
+## 1. Get a token
+
+There is **no anonymous access**. Callers are Keycloak **service accounts** using the OIDC
+client-credentials grant. The token must:
+
+- carry audience **`code-intelligence`** (`aud`), and
+- carry the **`a2a:review`** permission (ADR-0023) in the configured permissions claim.
+
+```bash
+TOKEN=$(curl -s \
+  -d 'grant_type=client_credentials' \
+  -d "client_id=$A2A_CLIENT_ID" \
+  -d "client_secret=$A2A_CLIENT_SECRET" \
+  -d 'scope=code-intelligence' \
+  "$KEYCLOAK_BASE/realms/lightbridge/protocol/openid-connect/token" \
+  | jq -r .access_token)
+```
+
+The token is a `Bearer` credential on every protected call. A missing/invalid token is `401`; a
+transient JWKS outage is a retryable `503` (back off and retry). Authenticating fine but lacking
+`a2a:review` is **not** a transport error — it comes back as a `TASK_STATE_REJECTED` task (see §5).
+
+## 2. Discover the agent card (optional, public)
+
+The card is public discovery — no auth:
+
+```bash
+curl -s "$A2A_BASE/.well-known/agent-card.json" | jq '.skills[] | select(.id=="review")'
+```
+
+It advertises the two transports (JSON-RPC preferred, then REST/HTTP+JSON), the OIDC security
+scheme, and the `review` skill with its inline input schema + examples.
+
+## 3. Submit a review (`SendMessage`)
+
+The request object is carried in a **`data` part** of a **`ROLE_USER`** message. Both transports
+serve the same handler.
+
+### Request fields (the `data` object)
+
+| Field     | Type                | Required | Default    | Notes |
+|-----------|---------------------|----------|------------|-------|
+| `skill`   | string              | no       | `"review"` | Only `"review"` exists in this phase. |
+| `forge`   | string              | no       | `"github"` | `"github"` or `"gitlab"`. |
+| `repo`    | string              | **yes**  | —          | `"owner/name"` (surrounding whitespace trimmed). |
+| `pr`      | integer \| string   | **yes**  | —          | PR/MR number, `> 0`. A JSON integer **or** a numeric string (`164` or `"164"`). |
+| `headSha` | string              | **yes**  | —          | Commit SHA of the PR/MR head. Also accepted as `head_sha`. |
+| `baseSha` | string              | no       | —          | Base commit SHA. Also accepted as `base_sha`. |
+| `prompt`  | string              | no       | generic    | Focus prompt recorded as the run's intent. |
+
+`headSha` is **required**: this server holds no forge credentials and cannot resolve a PR head
+itself. A submission without one is `REJECTED` (a null head would otherwise silently review the
+repository's default branch and post a wrong review).
+
+### JSON-RPC (preferred transport)
+
+`POST /` with a JSON-RPC envelope. Method names are **PascalCase** (`SendMessage`). The envelope
+`id` may be a **string or a number**.
+
+```bash
+curl -s "$A2A_BASE/" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "jsonrpc": "2.0",
+    "id": "req-1",
+    "method": "SendMessage",
+    "params": {
+      "message": {
+        "messageId": "b7c1e0a2-8f3d-4e5a-9c1b-2d4f6a8e0c13",
+        "role": "ROLE_USER",
+        "parts": [
+          { "data": {
+              "skill": "review",
+              "forge": "github",
+              "repo": "acme/api",
+              "pr": "164",
+              "headSha": "9f2a1c4e8b7d6053a1f4c2e9b8d70a5c3e1f2b6d",
+              "baseSha": "1b0dd7a4c9e2f6538a0c4b1e9d7f2a5c3e8b6d04",
+              "prompt": "Focus on the auth changes and the new migration."
+          } }
+        ]
+      }
+    }
+  }'
+```
+
+Notes on the message envelope:
+
+- `messageId` is **required** on the wire (any unique id the caller mints).
+- `role` **must** be the ProtoJSON enum `"ROLE_USER"` — not `"user"`.
+- The review object is the `data` part; a plain `text` part is not accepted (Phase 1 takes
+  structured input).
+- `contextId` is optional; supply one to group related tasks into a conversation, else the server
+  mints one.
+
+### REST binding (equivalent)
+
+`POST /message:send` with the `SendMessageRequest` body (the JSON-RPC `params` above), e.g.:
+
+```bash
+curl -s "$A2A_BASE/message:send" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{ "message": { "messageId": "…", "role": "ROLE_USER", "parts": [ { "data": { "skill": "review", "repo": "acme/api", "pr": "164", "headSha": "9f2a…" } } ] } }'
+```
+
+### Response — `SUBMITTED`
+
+Both transports return a **Task**. Over JSON-RPC it is `result.task`; over REST it is the top-level
+`task`:
+
+```json
+{
+  "task": {
+    "id": "0190c3f2-....-....-....-............",
+    "contextId": "0190c3f2-....-....-....-............",
+    "status": { "state": "TASK_STATE_SUBMITTED" },
+    "metadata": { "lb.underlyingTaskId": "0190c3ee-....-....-....-............" }
+  }
+}
+```
+
+- `task.id` is the **server-generated** A2A task id you poll with (§4).
+- `metadata."lb.underlyingTaskId"` is your correlation handle onto the underlying review run (also
+  visible in the review dashboards). The caller identity is never leaked back.
+
+Malformed or unsupported requests are transport errors, not tasks: a body with no `data` part or a
+bad `repo`/`pr` is `INVALID_PARAMS`; a non-`review` skill is `UNSUPPORTED_OPERATION`.
+
+## 4. Poll to a terminal state (`GetTask`)
+
+Phase 1 is **polling only** (no streaming, no push notifications). Poll `GetTask` until the state is
+terminal.
+
+JSON-RPC:
+
+```bash
+curl -s "$A2A_BASE/" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{ "jsonrpc": "2.0", "id": 2, "method": "GetTask", "params": { "id": "'"$TASK_ID"'" } }'
+```
+
+REST: `GET /tasks/{id}`.
+
+Tasks are **caller-scoped**: an unknown id, or another caller's id, is a clean `TaskNotFound` (no
+existence leak).
+
+### State mapping (A2A ↔ Lightbridge)
+
+| A2A wire state              | Lightbridge status            | Terminal |
+|-----------------------------|-------------------------------|----------|
+| `TASK_STATE_SUBMITTED`      | `received`, `queued`, `waiting_for_index` | no |
+| `TASK_STATE_WORKING`        | `running`, `posting_result`   | no |
+| `TASK_STATE_COMPLETED`      | `succeeded`                   | yes |
+| `TASK_STATE_FAILED`         | `failed`, `timed_out`         | yes |
+| `TASK_STATE_CANCELED`       | `cancelled`                   | yes |
+| `TASK_STATE_REJECTED`       | refused at the submission gate | yes |
+
+An unrecognised underlying status maps to `WORKING` (never a terminal guess), so a new status
+literal can never make a poller believe a still-running review has finished.
+
+### Terminal `COMPLETED` — artifacts
+
+On completion, `GetTask` returns a single `review` artifact with two parts: a **text** summary and a
+**data** part carrying the structured findings (the ADR-0032 finding shape):
+
+```json
+{
+  "id": "0190c3f2-…",
+  "contextId": "0190c3f2-…",
+  "status": { "state": "TASK_STATE_COMPLETED" },
+  "artifacts": [
+    { "artifactId": "review", "name": "review",
+      "parts": [
+        { "text": "Reviewed 3 files. One P1 in the auth path…" },
+        { "data": [ { "path": "auth.rs", "severity": "P1", "…": "…" } ], "mediaType": "application/json" }
+      ] }
+  ]
+}
+```
+
+### Cancel (`CancelTask`)
+
+`POST /tasks/{id}/cancel` (REST) or the `CancelTask` JSON-RPC method flips the underlying run to
+cancelled (the runner's self-cancel poll then stops the Job). Cancelling an already-terminal task is
+`TaskNotCancelable`.
+
+## 5. Gotchas (learned the hard way)
+
+- **`role` is `ROLE_USER`, not `user`.** All A2A v1.0.1 enums are ProtoJSON SCREAMING_SNAKE. Task
+  states are likewise `TASK_STATE_*`.
+- **`pr` accepts an integer *or* a numeric string.** `"pr": 164` and `"pr": "164"` both parse; the
+  value must be `> 0`. Prefer the string form if your ProtoJSON codec is picky about number
+  rendering.
+- **`headSha` is required.** Omitting it yields `TASK_STATE_REJECTED` — this server can't resolve a
+  head without forge credentials.
+- **An unapproved / unknown / unprovisioned repo → `TASK_STATE_REJECTED`.** A2A is not a side door
+  around the repo-approval gate (ADR-0063). Also rejected: missing `a2a:review`, or a per-identity
+  deep-run **quota** breach.
+- **The JSON-RPC `id` may be a string or a number.** Both are echoed back as sent.
+- **`messageId` is mandatory** on the message envelope; mint any unique id.
+- **Same PR via webhook and A2A dedups to one run** — an A2A review of a head already under a
+  webhook-triggered review maps onto the existing run (`lb.underlyingTaskId` points at it).
+- **Multi-tenant requests are unsupported** — a `tenant` on the request is refused.
+
+## See also
+
+- [RFC-0006 — A2A-compliant agent surface](rfc/0006-a2a-agent-surface.md) (design, phases, risks).
+- Agent card: `GET /.well-known/agent-card.json` — the `review` skill `description` embeds the same
+  input schema as a machine-readable JSON-Schema block.
+
+### Future upgrade — a formal extension-based schema
+
+The input schema is published inline in the skill `description` because A2A's `AgentSkill` has no
+`inputSchema` field. A more formal, machine-discoverable route is to declare an A2A **extension**
+URI in the card's `capabilities.extensions` and attach the JSON-Schema under that URI in the skill
+metadata. That is deferred: the SDK's `AgentSkill` type currently exposes no `metadata` field to
+hang it on, and inline-in-description is discoverable enough for Phase 1. Revisit when a peer
+requires the formal extension form.
