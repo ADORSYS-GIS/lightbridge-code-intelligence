@@ -1,0 +1,40 @@
+# THROWAWAY evaluation crate — RFC-0006 Phase-1 enabler probe (ticket #298).
+#
+# This is NOT production code. It is deliberately EXCLUDED from the root workspace
+# (see the `exclude` entry in ../../Cargo.toml) so its heavy A2A dependency tree never
+# enters the real services' Cargo.lock or CI build. It has its own Cargo.lock, committed
+# alongside, and is built explicitly:  cargo build --manifest-path services/a2a-probe/Cargo.toml
+#
+# It exists solely to answer the R2 source-read gate: is `a2a-server-lf`'s task-store
+# abstraction pluggable enough to back with our own Postgres/Restate state, and does 0.4.0
+# cover A2A spec v1.0.1 wire shapes? The verdict lives on issue #298 and in the PR body.
+#
+# Delete this whole directory (and the `exclude` line) once the resulting ADR lands.
+# Empty table => this crate is its OWN workspace root, fully detached from the repo workspace.
+# Combined with the `exclude` in ../../Cargo.toml this guarantees the probe's dependency tree
+# never touches the real services' Cargo.lock or their `cargo build --workspace`.
+[workspace]
+
+[package]
+name = "a2a-probe"
+version = "0.0.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "Throwaway A2A SDK evaluation probe for RFC-0006 (do not depend on this)."
+
+[dependencies]
+# Pinned EXACTLY per the RFC-0006 R2 gate — evaluate these precise versions, nothing looser.
+a2a-lf = "=0.3.0"
+a2a-server-lf = "=0.4.0"
+async-trait = "0.1"
+# `build_card_router` returns an `axum::Router`, so axum is a library dep (not dev-only).
+axum = "0.8"
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread"] }
+
+[dev-dependencies]
+# Drive the card router + GetTask round-trip in-process (no network).
+futures = "0.3"
+http-body-util = "0.1"
+tower = { version = "0.5", features = ["util"] }
