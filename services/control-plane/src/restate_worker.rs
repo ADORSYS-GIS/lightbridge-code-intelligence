@@ -149,7 +149,16 @@ impl PlatformEgress for PlatformEgressImpl {
             let review = self.review.clone();
             ctx.run(|| async move { deliver_step(&pool, &platforms, &review, outbox_id).await })
                 .retry_policy(
-                    RunRetryPolicy::default().max_attempts(crate::db::OUTBOX_MAX_ATTEMPTS as u32),
+                    // Minute-scale backoff, matching the drain's recovery window. `default()` caps
+                    // `max_duration` at 50s (6 retries finish in ~7s), which would dead-letter a
+                    // rate-limit that recovers in minutes — where the drain (`attempts²` minutes)
+                    // would still deliver. Widen the envelope: keep the same `OUTBOX_MAX_ATTEMPTS`
+                    // ceiling, but let those attempts span up to an hour.
+                    RunRetryPolicy::default()
+                        .max_attempts(crate::db::OUTBOX_MAX_ATTEMPTS as u32)
+                        .initial_delay(std::time::Duration::from_secs(60))
+                        .max_delay(std::time::Duration::from_secs(15 * 60))
+                        .max_duration(std::time::Duration::from_secs(60 * 60)),
                 )
                 .name("deliver")
                 .await
@@ -166,7 +175,8 @@ impl PlatformEgress for PlatformEgressImpl {
                 }
                 DeliverOutcome::Posted { platform_ref_id } => {
                     // Step 2 — mark posted (records the platform id for the ADR-0035 feedback join). A
-                    // separate journaled step: a status-guarded UPDATE by id, idempotent under replay.
+                    // separate journaled step: an unconditional UPDATE by id (re-marking an
+                    // already-posted row just re-stamps posted_at — harmless under replay).
                     let pool = self.pool.clone();
                     ctx.run(
                         || async move { mark_posted_step(&pool, outbox_id, platform_ref_id).await },
