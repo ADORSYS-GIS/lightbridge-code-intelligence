@@ -38,6 +38,7 @@ metrics-exporter-prometheus.workspace = true
 neo4rs.workspace = true
 rmcp.workspace = true
 futures.workspace = true
+async-stream.workspace = true
 restate-sdk.workspace = true
 # A2A agent surface (RFC-0006 / #299): the `a2a` role serves these SDK traits over our Postgres state.
 a2a-lf.workspace = true

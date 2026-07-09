@@ -19,8 +19,9 @@
 //! The role's k8s Deployment/Ingress is an ai-helm follow-up; this module adds the role + logic.
 
 mod card;
+pub(crate) mod events;
 mod handler;
-mod mapping;
+pub(crate) mod mapping;
 mod store;
 
 use std::sync::Arc;

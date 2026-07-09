@@ -3,7 +3,8 @@
 How to request a deep code review over Lightbridge's [A2A](https://a2a-protocol.org/latest/specification/)
 surface (spec **v1.0.1**). This is the concrete calling guide for the `review` skill introduced in
 [RFC-0006](rfc/0006-a2a-agent-surface.md) (Phase 1: card + `SendMessage` + `GetTask` +
-`CancelTask`, polling only).
+`CancelTask`; Phase 2 adds **streaming** — `SubscribeToTask` + the streaming leg of `SendMessage`,
+see [ADR-0077](adr/0077-a2a-streaming-event-log.md) and §6 below).
 
 The `review` skill runs the **deep** tier through the *same* pipeline as an `@mention`: same
 idempotency, same repo-approval gate, same mediated posting to the PR. The A2A task **additionally**
@@ -174,8 +175,9 @@ bad `repo`/`pr` is `INVALID_PARAMS`; a non-`review` skill is `UNSUPPORTED_OPERAT
 
 ## 4. Poll to a terminal state (`GetTask`)
 
-Phase 1 is **polling only** (no streaming, no push notifications). Poll `GetTask` until the state is
-terminal.
+`GetTask` is the authoritative point read: poll it until the state is terminal. (Prefer **streaming**
+— §6 — for long deep runs; polling stays fully supported and you may freely mix the two on one task.
+Push notifications remain unsupported, Phase 3.)
 
 JSON-RPC:
 
@@ -256,7 +258,48 @@ stable either way.
 cancelled (the runner's self-cancel poll then stops the Job). Cancelling an already-terminal task is
 `TaskNotCancelable`.
 
-## 5. Gotchas (learned the hard way)
+## 5. Stream (`SubscribeToTask` / the streaming leg of `SendMessage`)
+
+Deep reviews can run up to two hours, so instead of tight-loop polling you can **hold a connection and
+watch the task progress**. Streaming is advertised on the card (`capabilities.streaming: true`) and
+implemented as a durable, replayable, per-task **event log** ([ADR-0077](adr/0077-a2a-streaming-event-log.md)).
+
+Two entry points:
+
+- **`SubscribeToTask`** — subscribe to an existing task (e.g. one you submitted earlier). REST:
+  `POST /tasks/{id}/subscribe`; JSON-RPC: `SubscribeToTask` with `{ "id": "<taskId>" }`.
+- **The streaming leg of `SendMessage`** — submit *and* stream in one call. REST:
+  `POST /message:stream`; JSON-RPC: `SendStreamingMessage`. It runs the same submission gate as
+  `SendMessage` (approval / quota / `headSha`), then streams the created task (a REJECTED submission
+  streams its single terminal event and closes).
+
+Both return a Server-Sent-Events stream of `StreamResponse` frames. The **ordered** sequence is:
+
+1. an initial **`task`** frame — the current `GetTask` snapshot (so a reconnect immediately re-grounds);
+2. then, in strict order, **`statusUpdate`** frames for each state transition
+   (`SUBMITTED → WORKING → …`) and, on completion, a **`artifactUpdate`** frame carrying the same
+   `review` artifact `GetTask` returns (summary + findings + review-context);
+3. the stream **closes** at the terminal state (`COMPLETED` / `FAILED` / `CANCELED` / `REJECTED`).
+
+Guarantees (RFC-0006 R6):
+
+- **Ordering is a property of the log**, not of your connection: every event has a per-task sequence
+  number, and *every* subscriber — on any server replica — reads the same rows in the same order. Two
+  concurrent subscribers see **identical, identically-ordered** events.
+- **Reconnect = re-subscribe.** There is no server-side resume cursor to manage: a fresh
+  `SubscribeToTask` replays the whole sequence from the start (the log outlives the connection), then
+  joins the live tail — no events are lost across a dropped connection.
+- **Streaming and polling never disagree.** Each event is appended in the *same database transaction*
+  that flips the underlying status, so an event exists for every transition a poller could observe. You
+  may freely mix `GetTask` and streaming on one task.
+
+Timing note: for a **posted** review the full artifact is written asynchronously (after the PR post),
+so a stream may close on `COMPLETED` *before* the artifact is available — do a single follow-up
+`GetTask` to fetch it. The terminal status and the ordered progress are always delivered on the stream.
+
+Not yet supported: **push notifications** (webhook callbacks) — Phase 3.
+
+## 6. Gotchas (learned the hard way)
 
 - **`role` is `ROLE_USER`, not `user`.** All A2A v1.0.1 enums are ProtoJSON SCREAMING_SNAKE. Task
   states are likewise `TASK_STATE_*`.
