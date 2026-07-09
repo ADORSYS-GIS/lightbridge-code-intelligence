@@ -124,10 +124,7 @@ pub enum ReactionTarget {
     /// parent (there is no global `/projects/{id}/notes/{note_id}` endpoint). GitHub ignores it
     /// (GitHub comment IDs are globally addressable). `None` for legacy outbox rows that predate
     /// this field; GitLab will fail with a clear error in that case.
-    Comment {
-        comment_id: i64,
-        iid: Option<i64>,
-    },
+    Comment { comment_id: i64, iid: Option<i64> },
 }
 
 /// A reaction found on a comment (for feedback polling).

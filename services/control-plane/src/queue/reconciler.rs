@@ -246,10 +246,7 @@ pub(crate) async fn deliver(
                     platform
                         .add_reaction(
                             repo,
-                            ReactionTarget::Comment {
-                                comment_id,
-                                iid,
-                            },
+                            ReactionTarget::Comment { comment_id, iid },
                             content,
                             noteable_type,
                         )
