@@ -503,12 +503,12 @@ impl CodePlatform for GitlabClient {
         let is_mr = noteable_type.map(|t| t == "pull_request").unwrap_or(true);
         let endpoint = if is_mr {
             format!(
-                "/projects/{}/merge_requests/{}/notes/{}/award_emoji",
+                "/projects/{}/merge_requests/{}/notes/{}/award_emoji?per_page=100",
                 project, iid, comment_id
             )
         } else {
             format!(
-                "/projects/{}/issues/{}/notes/{}/award_emoji",
+                "/projects/{}/issues/{}/notes/{}/award_emoji?per_page=100",
                 project, iid, comment_id
             )
         };
