@@ -131,6 +131,10 @@ stateDiagram-v2
 
 ### Skills (initial card)
 
+> **See also:** [Calling the A2A `review` skill](../a2a-review-skill.md) — the concrete calling
+> guide (token, `SendMessage` wire form, the input field table, `GetTask` polling, and the wire
+> gotchas). The same input schema is published inline in the card's `review` skill `description`.
+
 - **`review`** — input: forge, repo, PR reference (+ optional focus prompt); runs the **deep**
   tier ([ADR-0062](../adr/0062-two-tier-review-fast-auto-deep-on-demand.md)) through the
   *identical* pipeline as an `@mention`: same idempotency, same approval gate, same mediated
