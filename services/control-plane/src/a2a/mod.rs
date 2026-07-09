@@ -31,7 +31,7 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::Router;
 
-use crate::jwt::JwtValidator;
+use crate::jwt::{AuthError, JwtValidator};
 use crate::AppState;
 
 pub use handler::{A2aHandler, QuotaConfig};
@@ -144,6 +144,11 @@ async fn a2a_auth(State(auth): State<A2aAuthState>, mut req: Request, next: Next
 
     let claims = match auth.jwt.validate(&token).await {
         Ok(claims) => claims,
+        // A JWKS fetch failure is a *transient* server-side condition, not a bad token: return 503 so
+        // A2A callers back off and retry (4xx is non-retryable per HTTP conventions and most A2A SDKs).
+        // Reuse `AuthError::into_response`, which maps JwksUnavailable→503, matching the admin surface;
+        // every other variant is a genuine client error and stays 401.
+        Err(err @ AuthError::JwksUnavailable) => return err.into_response(),
         Err(_) => return (StatusCode::UNAUTHORIZED, "invalid token").into_response(),
     };
 
@@ -334,6 +339,52 @@ mod tests {
         assert_eq!(
             resp.text().await.unwrap(),
             "svc-account-9|a2a:review,other:perm"
+        );
+    }
+
+    /// A transient JWKS outage must surface as a retryable 503, not a 401 — otherwise A2A callers
+    /// (whose SDKs treat 4xx as non-retryable) would give up during an IdP blip. The token is
+    /// well-formed and correctly signed; the validator just cannot reach its JWKS to load the key.
+    #[tokio::test]
+    async fn jwks_outage_returns_503_not_401() {
+        use crate::jwt::{JwtValidator, OidcConfig};
+        use axum::routing::get;
+
+        // Empty static keyset + an unreachable JWKS uri: any real token's kid triggers a refresh that
+        // fails → JwksUnavailable.
+        let jwt = Arc::new(JwtValidator::from_static_jwks(
+            OidcConfig {
+                issuer: crate::jwt::test_support::ISSUER.to_string(),
+                audience: crate::jwt::test_support::AUDIENCE.to_string(),
+                jwks_uri: "http://unused.invalid".to_string(),
+            },
+            r#"{"keys":[]}"#,
+        ));
+        let auth_state = A2aAuthState {
+            jwt,
+            permissions_claim: Arc::new("permissions".to_string()),
+        };
+        let app = Router::new()
+            .route("/probe", get(|| async { "ok" }))
+            .layer(axum::middleware::from_fn_with_state(auth_state, a2a_auth));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let token = crate::jwt::test_support::mint("svc-a", &["a2a:review"]);
+        let resp = reqwest::Client::new()
+            .get(format!("http://{addr}/probe"))
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            503,
+            "JWKS outage must be a retryable 503, not a 401"
         );
     }
 

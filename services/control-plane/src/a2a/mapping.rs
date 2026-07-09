@@ -117,6 +117,7 @@ pub fn parse_review_request(parts: &[Part]) -> Result<ReviewInput, ParseError> {
     let repo = data
         .get("repo")
         .and_then(Value::as_str)
+        .map(str::trim)
         .ok_or(ParseError::BadField("repo"))?;
     let (owner, name) = split_repo(repo).ok_or(ParseError::BadField("repo"))?;
 
@@ -282,6 +283,16 @@ mod tests {
         assert_eq!(input.prompt, "focus on auth");
         assert_eq!(input.head_sha.as_deref(), Some("abc123"));
         assert_eq!(input.base_sha.as_deref(), Some("def456"));
+    }
+
+    #[test]
+    fn trims_surrounding_whitespace_on_repo() {
+        // A padded `repo` (e.g. copy-pasted with spaces) must still resolve to the same owner/name,
+        // not `" acme"` / `"api "` which would miss the repository lookup.
+        let parts = vec![data_part(json!({ "repo": "  acme/api  ", "pr": 1 }))];
+        let input = parse_review_request(&parts).unwrap();
+        assert_eq!(input.owner, "acme");
+        assert_eq!(input.name, "api");
     }
 
     #[test]

@@ -117,10 +117,13 @@ impl A2aHandler {
             .metadata
             .get_or_insert_with(Default::default)
             .insert(LB_SKILL.to_string(), Value::from(SKILL_REVIEW));
-        // Best-effort persist so a later GetTask can return the rejection; the response is returned
-        // regardless of a persistence hiccup.
+        // Persisting a rejection is INTENTIONALLY best-effort: the synchronous response below already
+        // carries TASK_STATE_REJECTED (the caller's authoritative outcome), so a store hiccup only
+        // costs the *later* GetTask retrievability of a terminal no-op — never a lost run (a rejection
+        // launches nothing). We log and swallow rather than fail the call, which would upgrade a benign
+        // storage blip into a hard error on a request that already succeeded.
         if let Err(error) = self.store.create(stored.clone()).await {
-            tracing::warn!(%error, a2a_task_id, "failed to persist rejected a2a task");
+            tracing::warn!(%error, a2a_task_id, "failed to persist rejected a2a task (best-effort)");
         }
         Ok(SendMessageResponse::Task(client_view(stored)))
     }
@@ -305,7 +308,20 @@ impl A2aHandler {
             LB_UNDERLYING.to_string(),
             Value::from(underlying.to_string()),
         );
-        self.store.create(stored.clone()).await?;
+        // If the mapping insert fails, the underlying run row already exists (and, having NOTIFY'd the
+        // dispatcher inside `create_task`, will still execute and post its review to the PR) — nothing
+        // is lost, but the caller gets an error and no pollable handle. We cannot wrap `create_task` +
+        // this insert in one transaction: `create_task` fires `pg_notify` on its own pooled connection
+        // and the SDK's `TaskStore::create` takes no transaction handle. So we log the orphaned run at
+        // ERROR (it is reconcilable by `a2a_task_id`/`webhook_delivery_id`) and surface the error.
+        if let Err(error) = self.store.create(stored.clone()).await {
+            tracing::error!(
+                %error, a2a_task_id, underlying = %underlying,
+                "a2a mapping insert failed AFTER the underlying run was created; the run will still \
+                 execute but the caller has no handle (orphaned underlying task)"
+            );
+            return Err(error);
+        }
 
         tracing::info!(
             caller = %caller.id, a2a_task_id, underlying = %underlying, pr = input.pr,
@@ -722,6 +738,38 @@ mod tests {
         assert_eq!(other.status.state, TaskState::Submitted);
     }
 
+    /// Regression (lightbridge): rejections are submission-gate no-ops that launch no run, so they
+    /// must not consume the caller's deep-run quota. A caller who hits unknown repos and burns
+    /// rejection rows can still submit a legitimate approved review.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn rejections_do_not_consume_quota(pool: PgPool) {
+        seed_approved_repo(&pool, "acme", "api", 111).await;
+        let h = handler(pool.clone(), 1); // a single deep-run slot per window
+        let ok = params("svc-a", &["a2a:review"]);
+
+        // Two submissions to an unknown repo → both REJECTED, both persist rejection rows.
+        for pr in 1..=2 {
+            let rejected = task_of(
+                h.send_message(&ok, review_req(json!({ "repo": "ghost/repo", "pr": pr })))
+                    .await
+                    .unwrap(),
+            );
+            assert_eq!(rejected.status.state, TaskState::Rejected, "reject {pr}");
+        }
+
+        // Despite max=1 and two prior rejection rows, a legitimate approved submission still lands —
+        // the rejections did not exhaust the quota.
+        let submitted = task_of(
+            h.send_message(
+                &ok,
+                review_req(json!({ "repo": "acme/api", "pr": 42, "headSha": "abc" })),
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(submitted.status.state, TaskState::Submitted);
+    }
+
     #[sqlx::test(migrations = "./migrations")]
     async fn unapproved_and_unknown_repos_are_rejected(pool: PgPool) {
         // A connected-but-pending repo.
@@ -1113,6 +1161,81 @@ mod tests {
             )
             .await
             .is_err());
+    }
+
+    /// Regression (Gemini HIGH): when the underlying `tasks` row is deleted, the FK's `ON DELETE SET
+    /// NULL` nulls `a2a_tasks.underlying_task_id`, but the serialized `task_json` still carries the dead
+    /// uuid in `lb.underlyingTaskId`. A naive `get`→`update` round-trip would write that stale uuid back
+    /// via `COALESCE(...)` and hit a foreign-key violation (23503 → 500). `get` now re-derives the
+    /// metadata from the column, so the round-trip stays FK-safe.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn get_update_is_fk_safe_after_underlying_task_deleted(pool: PgPool) {
+        let repo_id = seed_approved_repo(&pool, "acme", "api", 111).await;
+        db::record_delivery(&pool, Platform::GitHub, "wh-fk", "pull_request", &json!({}))
+            .await
+            .unwrap();
+        let underlying = db::create_task(
+            &pool,
+            &db::NewTask {
+                repository_id: repo_id,
+                installation_id: 111,
+                webhook_delivery_id: "wh-fk".to_string(),
+                target_type: "pull_request".to_string(),
+                target_id: 7,
+                command_text: "Deep review requested via A2A.".to_string(),
+                base_sha: None,
+                head_sha: Some("abc".to_string()),
+                run_epoch: 0,
+                tier: "deep".to_string(),
+                trigger_comment_id: None,
+            },
+        )
+        .await
+        .unwrap()
+        .expect("underlying task created");
+
+        // Persist an A2A mapping pointing at that underlying run.
+        let store = PgTaskStore::new(pool.clone());
+        let a2a_id = Uuid::now_v7();
+        let metadata = Map::from_iter([
+            (LB_CALLER.to_string(), Value::from("svc-a")),
+            (LB_SKILL.to_string(), Value::from(SKILL_REVIEW)),
+            (
+                LB_UNDERLYING.to_string(),
+                Value::from(underlying.to_string()),
+            ),
+        ]);
+        store
+            .create(build_task_view(
+                &a2a_id.to_string(),
+                "ctx-a",
+                TaskState::Submitted,
+                None,
+                Some(metadata),
+            ))
+            .await
+            .unwrap();
+
+        // Reap the underlying task → FK `ON DELETE SET NULL` nulls the column, but task_json is stale.
+        sqlx::query("DELETE FROM tasks WHERE id = $1")
+            .bind(underlying)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // get() must re-sync the metadata to the (now NULL) column — the stale uuid is stripped.
+        let mut got = store.get(&a2a_id.to_string()).await.unwrap().unwrap();
+        assert!(
+            underlying_of(&got).is_none(),
+            "stale lb.underlyingTaskId must be stripped after the underlying row is deleted"
+        );
+
+        // The load-bearing assertion: the subsequent CAS update no longer FK-violates.
+        got.status.state = TaskState::Working;
+        store
+            .update(got)
+            .await
+            .expect("update after underlying deletion must not hit a foreign-key violation");
     }
 
     async fn set_status(pool: &PgPool, task_id: Uuid, status: &str) {

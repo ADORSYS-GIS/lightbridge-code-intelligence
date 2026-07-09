@@ -1882,7 +1882,7 @@ pub async fn find_task_id_by_idempotency(
         "SELECT id FROM tasks \
          WHERE repository_id = $1 AND target_type = $2 AND target_id = $3 \
            AND command_text = $4 AND head_sha IS NOT DISTINCT FROM $5 AND run_epoch = $6 \
-         ORDER BY created_at DESC LIMIT 1",
+         ORDER BY created_at DESC, id DESC LIMIT 1",
     )
     .bind(task.repository_id)
     .bind(&task.target_type)

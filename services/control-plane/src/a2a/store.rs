@@ -87,6 +87,11 @@ impl PgTaskStore {
 
     /// Count a caller's submissions of `skill` within the last `window_secs` seconds — the per-identity
     /// rate limit (RFC-0006 R4). DB-backed so the limit holds across replicas, not per-pod.
+    ///
+    /// REJECTED rows are excluded: a rejection never launches an underlying run (it is a submission-gate
+    /// no-op), so counting it would let a caller who hits unapproved/unknown repos exhaust their own
+    /// quota without ever queuing an expensive deep run — the opposite of R4's intent ("a noisy client
+    /// cannot queue expensive deep runs without bound"). We bound *runs*, not *attempts*.
     pub async fn count_recent(
         &self,
         caller_id: &str,
@@ -96,6 +101,7 @@ impl PgTaskStore {
         sqlx::query_scalar(
             "SELECT count(*) FROM a2a_tasks \
              WHERE caller_id = $1 AND skill = $2 \
+               AND state <> 'TASK_STATE_REJECTED' \
                AND created_at > now() - make_interval(secs => $3::double precision)",
         )
         .bind(caller_id)
@@ -132,6 +138,13 @@ fn meta_i64(task: &Task, key: &str) -> Option<i64> {
 
 /// Set an integer metadata value on a task, creating the metadata map if absent.
 fn set_meta_i64(task: &mut Task, key: &str, value: i64) {
+    task.metadata
+        .get_or_insert_with(Default::default)
+        .insert(key.to_string(), Value::from(value));
+}
+
+/// Set a string metadata value on a task, creating the metadata map if absent.
+fn set_meta_str(task: &mut Task, key: &str, value: &str) {
     task.metadata
         .get_or_insert_with(Default::default)
         .insert(key.to_string(), Value::from(value));
@@ -256,22 +269,35 @@ impl TaskStore for PgTaskStore {
     }
 
     /// Fetch a task, stamping the current [`LB_VERSION`] into its metadata for a later CAS update.
+    ///
+    /// We also re-derive [`LB_UNDERLYING`] from the authoritative `underlying_task_id` **column**, not
+    /// from the serialized `task_json`. The FK is `ON DELETE SET NULL`: when the underlying `tasks` row
+    /// is reaped, the column goes NULL but `task_json` still carries the stale uuid. Without this sync,
+    /// a later [`Self::update`] would extract that dead uuid and write it back via
+    /// `COALESCE($4, underlying_task_id)` — a foreign-key violation (23503) surfacing as a 500. Syncing
+    /// here keeps the returned task consistent with the column so the round-trip stays FK-safe.
     async fn get(&self, task_id: &str) -> Result<Option<Task>, A2AError> {
         let Ok(id) = Uuid::parse_str(task_id) else {
             return Ok(None); // a non-uuid id can't be one of ours
         };
-        let row: Option<(Value, i64)> =
-            sqlx::query_as("SELECT task_json, version FROM a2a_tasks WHERE a2a_task_id = $1")
-                .bind(id)
-                .fetch_optional(&self.pool)
-                .await
-                .map_err(|e| A2AError::internal(format!("a2a store: get: {e}")))?;
+        let row: Option<(Value, i64, Option<Uuid>)> = sqlx::query_as(
+            "SELECT task_json, version, underlying_task_id FROM a2a_tasks WHERE a2a_task_id = $1",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| A2AError::internal(format!("a2a store: get: {e}")))?;
         match row {
             None => Ok(None),
-            Some((json, version)) => {
+            Some((json, version, underlying_task_id)) => {
                 let mut task: Task = serde_json::from_value(json)
                     .map_err(|e| A2AError::internal(format!("a2a store: deserialize task: {e}")))?;
                 set_meta_i64(&mut task, LB_VERSION, version);
+                // Keep lb.underlyingTaskId in lockstep with the column (see doc comment above).
+                match underlying_task_id {
+                    Some(u) => set_meta_str(&mut task, LB_UNDERLYING, &u.to_string()),
+                    None => strip_meta(&mut task, LB_UNDERLYING),
+                }
                 Ok(Some(task))
             }
         }
@@ -280,13 +306,21 @@ impl TaskStore for PgTaskStore {
     /// List stored tasks (trait completeness). Filters by contextId/status when given. The handler
     /// does not expose this in Phase 1 (ListTasks is Phase 4); it exists so the store satisfies the
     /// full trait and is covered end-to-end.
+    ///
+    /// SECURITY: this query is intentionally NOT caller-scoped — it returns rows across all callers.
+    /// That is safe ONLY because `A2aHandler::list_tasks` returns `unsupported_operation` in Phase 1,
+    /// so nothing behind the auth layer reaches it (only the store's own tests do). Before Phase 4
+    /// wires `ListTasks`, this MUST gain an `AND caller_id = $caller` predicate (threaded from
+    /// `ServiceParams`, exactly as `load_owned` scopes by `caller_id`) — otherwise it is a cross-caller
+    /// IDOR. The trait method takes no caller argument, so the filter has to be added when the endpoint
+    /// is turned on.
     async fn list(&self, req: &ListTasksRequest) -> Result<ListTasksResponse, A2AError> {
         let status_wire = req.status.as_ref().map(state_wire);
         let rows: Vec<(Value,)> = sqlx::query_as(
             "SELECT task_json FROM a2a_tasks \
              WHERE ($1::text IS NULL OR context_id = $1) \
                AND ($2::text IS NULL OR state = $2) \
-             ORDER BY created_at DESC",
+             ORDER BY created_at DESC, a2a_task_id DESC",
         )
         .bind(req.context_id.as_deref())
         .bind(status_wire.as_deref())
@@ -461,6 +495,32 @@ mod tests {
         assert_eq!(store.count_recent("svc-a", "ask", 3600).await.unwrap(), 0);
         // A zero-length window sees nothing.
         assert_eq!(store.count_recent("svc-a", "review", 0).await.unwrap(), 0);
+    }
+
+    /// Quota counts *runs*, not *attempts*: a REJECTED submission never launched an underlying run, so
+    /// it must not consume the caller's deep-run quota (RFC-0006 R4).
+    #[sqlx::test(migrations = "./migrations")]
+    async fn count_recent_excludes_rejections(pool: PgPool) {
+        let store = PgTaskStore::new(pool);
+        // Two real submissions…
+        for _ in 0..2 {
+            store
+                .create(task_with(Uuid::now_v7(), "svc-a", TaskState::Submitted))
+                .await
+                .unwrap();
+        }
+        // …and three rejections (unapproved/unknown repos, missing perms, quota etc.).
+        for _ in 0..3 {
+            store
+                .create(task_with(Uuid::now_v7(), "svc-a", TaskState::Rejected))
+                .await
+                .unwrap();
+        }
+        // Only the two non-rejected submissions count toward the quota.
+        assert_eq!(
+            store.count_recent("svc-a", "review", 3600).await.unwrap(),
+            2
+        );
     }
 
     #[sqlx::test(migrations = "./migrations")]

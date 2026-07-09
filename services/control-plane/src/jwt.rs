@@ -181,22 +181,27 @@ impl JwtValidator {
         Ok(())
     }
 
-    async fn decoding_key(&self, kid: &str) -> Option<DecodingKey> {
+    async fn decoding_key(&self, kid: &str) -> Result<DecodingKey, AuthError> {
         if let Some(key) = self.keys.read().await.get(kid).cloned() {
-            return Some(key);
+            return Ok(key);
         }
-        // Unknown kid → refresh once (handles rotation), then retry.
-        let _ = self.refresh().await;
-        self.keys.read().await.get(kid).cloned()
+        // Unknown kid → refresh once (handles rotation). A refresh *failure* is a transient JWKS
+        // outage (IdP unreachable / bad response) → `JwksUnavailable` (retryable, 503), which must NOT
+        // be collapsed into `InvalidToken` (a non-retryable 401). Only a kid that is still absent after
+        // a *successful* refresh is a genuine bad token.
+        self.refresh().await?;
+        self.keys
+            .read()
+            .await
+            .get(kid)
+            .cloned()
+            .ok_or(AuthError::InvalidToken)
     }
 
     pub async fn validate(&self, token: &str) -> Result<Claims, AuthError> {
         let header = decode_header(token).map_err(|_| AuthError::InvalidToken)?;
         let kid = header.kid.ok_or(AuthError::InvalidToken)?;
-        let key = self
-            .decoding_key(&kid)
-            .await
-            .ok_or(AuthError::InvalidToken)?;
+        let key = self.decoding_key(&kid).await?;
 
         let mut validation = Validation::new(Algorithm::RS256);
         validation.set_issuer(&[&self.config.issuer]);
@@ -498,12 +503,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unknown_kid_is_rejected() {
-        // kid not in the static JWKS; the network refresh fails (unused.invalid) → InvalidToken.
+    async fn unknown_kid_with_unreachable_idp_is_jwks_unavailable() {
+        // kid not in the static JWKS → a refresh is attempted; the IdP is unreachable
+        // (unused.invalid), so this is a transient JWKS outage, NOT a bad token. It must surface as
+        // `JwksUnavailable` (→ retryable 503), not `InvalidToken` (→ non-retryable 401): callers should
+        // back off and retry rather than treat the token as permanently invalid.
         let token = mint("rotated-key", ISSUER, AUDIENCE, now() + 3600);
         assert!(matches!(
             validator().validate(&token).await,
-            Err(AuthError::InvalidToken)
+            Err(AuthError::JwksUnavailable)
         ));
     }
 
