@@ -83,6 +83,17 @@ rmcp = { version = "2", default-features = false, features = [
     "transport-streamable-http-client-reqwest",
 ] }
 
+# --- control-plane: A2A agent surface (RFC-0006 / ADR pending, ticket #299) ---
+# The official Linux-Foundation A2A Rust SDK, pinned EXACTLY per the RFC-0006 R2 gate (the same
+# versions the #302 probe validated). `a2a-lf` = the v1.0.1 proto-derived wire types (lib name
+# `a2a`); `a2a-server-lf` = the Axum-native server framework (lib name `a2a_server`) whose
+# `TaskStore`/`RequestHandler` traits we back with our own Postgres state. Default features keep
+# `rustls-tls` on the SDK's (push-only) reqwest client; that rides reqwest 0.13 + rustls 0.23 on
+# aws-lc-rs — the SAME generation `rmcp` already pulls, so this adds NO third crypto provider beyond
+# the `ring` process-default `main` installs (verified by the probe's R2 rustls-lineage read).
+a2a-lf = "=0.3.0"
+a2a-server-lf = "=0.4.0"
+
 # --- agent-runner: indexing + MCP ---
 # tree-sitter grammars compile their C grammar via build script (cc in the builder image).
 tree-sitter = "0.24"

@@ -39,6 +39,9 @@ neo4rs.workspace = true
 rmcp.workspace = true
 futures.workspace = true
 restate-sdk.workspace = true
+# A2A agent surface (RFC-0006 / #299): the `a2a` role serves these SDK traits over our Postgres state.
+a2a-lf.workspace = true
+a2a-server-lf.workspace = true
 
 [dev-dependencies]
 # Test-only: generate an RSA keypair at runtime so no private key is committed (see src/jwt.rs).
