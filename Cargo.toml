@@ -5,6 +5,10 @@
 [workspace]
 resolver = "2"
 members = ["services/config", "services/control-plane", "services/agent-runner", "clients/lci", "xtask"]
+# `services/a2a-probe` is a THROWAWAY evaluation crate (RFC-0006 / #298), deliberately kept out of
+# the members list so it never builds in CI/release — build it explicitly with `-p a2a-probe`.
+# Remove the directory once the resulting ADR lands. Listed as an exclude to document intent.
+exclude = ["services/a2a-probe"]
 
 [workspace.package]
 edition = "2021"
