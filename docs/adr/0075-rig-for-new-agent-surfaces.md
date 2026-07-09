@@ -1,6 +1,6 @@
 # ADR-0075: Rig for new agent surfaces; the native review loop stays native
 
-- **Status:** Proposed
+- **Status:** Accepted (narrowed by the spike outcome — see [Spike outcome (2026-07-09)](#spike-outcome-2026-07-09))
 - **Date:** 2026-07-09
 - **Deciders:** @stephane-segning
 
@@ -83,6 +83,61 @@ Terms of adoption:
   Rig is a new ADR that must supersede ADR-0026 explicitly and demonstrate parity for the
   ADR-0037/0041/0043/0045/0060/0062/0069/0070 behaviors — not an incremental drift.
 
+### Spike outcome (2026-07-09)
+
+The gating spike ran and **failed the fidelity bar.** Rather than the blunt "status → Rejected"
+the original terms named, the decision is **amended**: Rig is *narrowed out* of the surfaces where
+the failure bites, and kept revisitable under two named upstream/gateway conditions. This subsection
+is the append-only record of that resolution; the terms above stand as the pre-spike text.
+
+- **What ran:** a transport-fidelity harness ([#303](https://github.com/vymalo/lightbridge-code-intelligence/pull/303),
+  merged) drove `rig-core` 0.39.0's **OpenAI-compatible Chat Completions** provider — the path our
+  eaig gateway speaks ([ADR-0018](0018-openai-compatible-embeddings.md)) — through a multi-turn
+  tool-use exchange, with an adversarial confirmation pass against rig's own source. The verdict is
+  recorded on the spike ticket ([#300](https://github.com/vymalo/lightbridge-code-intelligence/issues/300)).
+- **Result, per field:**
+
+  | Field (through the OpenAI-compatible / Chat Completions path) | Fidelity |
+  | --- | --- |
+  | Gemini-3 `thought_signature` / `extra_content` (tool-call round-trip) | **DROPPED** |
+  | bare `reasoning` alias | **DROPPED** |
+  | reasoning-token accounting (usage) | **DROPPED** |
+  | `reasoning_content` | Preserved |
+
+  The drop is structural, not a config miss: rig's OpenAI `ToolCall` deserializes into a typed
+  struct with **no `#[serde(flatten)]` catch-all**, so any nonstandard field on the tool call is
+  discarded on the way in — exactly the `thought_signature` failure family from
+  [#262](https://github.com/vymalo/lightbridge-code-intelligence/pull/262) / ADR-0060 territory
+  that the spike gate was written to probe.
+- **Calibration — which drop is load-bearing:** the reasoning-token-accounting drop is an
+  *observability* regression only, because review cost is billed from the eaig gateway's own logs,
+  not from the provider's per-response usage (the app-side price map was retired, `#281`/`#282`).
+  The **`thought_signature` drop is the load-bearing failure**: without verbatim round-trip, a
+  Gemini-3-class model hard-`400`s on the second turn of multi-turn tool use — a correctness break,
+  not a metrics gap.
+- **Nuance (why "revisitable", not "Rejected"):** rig's newer *Responses API* provider path *does*
+  preserve reasoning tokens — but eaig speaks **Chat Completions**, so that path is not reachable
+  for us today. Two changes would reopen Rig for the affected surfaces: (a) an upstream one-field
+  patch adding `extra_content` passthrough to rig's OpenAI `ToolCall` (restoring
+  `thought_signature`), or (b) eaig exposing the Responses API. Absent either, the narrowed decision
+  below holds.
+
+### Narrowed decision (post-spike)
+
+- **Rig is NOT adopted for eaig-backed (Chat Completions) tool-use surfaces that need Gemini
+  `thought_signature` round-trip.** New agent surfaces — e.g. the future A2A `ask` skill
+  ([RFC-0006](../rfc/0006-a2a-agent-surface.md)) — use the **native transport**
+  ([`chat.rs`](../../services/agent-runner/src/review/native/chat.rs)), which already handles
+  `thought_signature`/`extra_content`, the `reasoning`/`reasoning_content` pair, and gateway usage
+  fields. The choice in the original Decision ("adopt Rig for new surfaces") is thereby superseded
+  *for these surfaces* by its own spike gate; the framework-vs-hand-roll survey and boundary rule
+  above remain the standing rationale.
+- **The review loop was never in scope and stays native regardless** — ADR-0026 remains binding for
+  the review path, exactly as the pre-spike terms held.
+- **Revisitable only** under the two conditions named in the spike outcome (upstream `extra_content`
+  passthrough on rig's OpenAI `ToolCall`, or eaig exposing the Responses API). Either is a new ADR
+  that re-runs the fidelity bar; neither is incremental drift.
+
 ## Consequences
 
 - **Good:** new agent kinds start from a maintained loop/provider layer instead of a second
@@ -102,6 +157,12 @@ Terms of adoption:
   Retry-After, rate-limit header parsing, circuit breaker); new surfaces get Rig's equivalents
   and inherit our retry posture via hook-level wrapping where Rig's are thinner. Parity is not
   required — the surfaces have different stakes.
+- **Post-spike (2026-07-09):** the Good/Bad items above described the *adopt-Rig* branch; the spike
+  failed the fidelity bar, so the amended reality is simpler — **new agent surfaces run on the
+  native transport too**, and the runner keeps a *single* agent stack rather than native + Rig. This
+  trades the "maintained loop/provider layer on day one" upside for keeping `thought_signature`
+  correctness on Gemini-3 multi-turn tool use, which is non-negotiable; the two-stacks cognitive
+  cost and the churn treadmill are both avoided. See [Spike outcome (2026-07-09)](#spike-outcome-2026-07-09).
 
 ## Alternatives considered
 
@@ -135,3 +196,7 @@ Terms of adoption:
 - Upstream: [rig-core on crates.io](https://crates.io/crates/rig-core) ·
   [0xPlaygrounds/rig](https://github.com/0xPlaygrounds/rig) ·
   [rig#2026 (vertexai thoughtSignature drop)](https://github.com/0xPlaygrounds/rig/issues/2026).
+- Spike: [#300](https://github.com/vymalo/lightbridge-code-intelligence/issues/300) (the spike ticket
+  + recorded verdict) · [#303](https://github.com/vymalo/lightbridge-code-intelligence/pull/303) (the
+  transport-fidelity harness + adversarial confirmation) — see
+  [Spike outcome (2026-07-09)](#spike-outcome-2026-07-09).
