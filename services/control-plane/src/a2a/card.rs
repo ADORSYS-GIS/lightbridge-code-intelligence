@@ -34,16 +34,18 @@ Send the request as the JSON object below, carried in a `data` part of a `ROLE_U
   "type": "object",
   "required": ["repo", "pr", "headSha"],
   "properties": {
-    "skill":   { "type": "string", "enum": ["review"], "default": "review", "description": "Skill selector; only \"review\" exists in this phase." },
-    "forge":   { "type": "string", "enum": ["github", "gitlab"], "default": "github", "description": "Source forge." },
-    "repo":    { "type": "string", "pattern": "^[^/]+/[^/]+$", "description": "Repository as \"owner/name\" (surrounding whitespace is trimmed)." },
-    "pr":      { "type": ["integer", "string"], "description": "PR (GitHub) / MR (GitLab) number, > 0. Accepts a JSON integer or a numeric string, e.g. 164 or \"164\"." },
-    "headSha": { "type": "string", "minLength": 1, "description": "Commit SHA of the PR/MR head. REQUIRED: this server holds no forge credentials and cannot resolve a head itself, so an absent head is REJECTED (a null head would silently review the default branch). Also accepted under the key head_sha." },
-    "baseSha": { "type": "string", "minLength": 1, "description": "Optional base commit SHA. Also accepted under the key base_sha." },
-    "prompt":  { "type": "string", "description": "Optional focus prompt recorded as the run's intent; omitted → a generic deep-review intent." }
+    "skill":   { "type": "string", "enum": ["review"], "default": "review", "description": "OPTIONAL skill selector. Only \"review\" exists in this phase; any other value is rejected (UNSUPPORTED_OPERATION). Defaults to \"review\" when omitted." },
+    "forge":   { "type": "string", "enum": ["github", "gitlab"], "default": "github", "description": "OPTIONAL source forge, one of \"github\" | \"gitlab\". Selects which platform the repo/PR is resolved against. Defaults to \"github\"." },
+    "repo":    { "type": "string", "pattern": "^[^/]+/[^/]+$", "description": "REQUIRED repository slug as \"owner/name\" (exactly one slash; surrounding whitespace is trimmed). Must be an already-approved/provisioned repo on the selected forge, else the task is REJECTED." },
+    "pr":      { "type": ["integer", "string"], "description": "REQUIRED PR (GitHub) / MR (GitLab) number. Integer > 0, given as a JSON integer or a numeric string, e.g. 164 or \"164\". Identifies which change set to review." },
+    "headSha": { "type": "string", "minLength": 1, "description": "REQUIRED commit SHA to review — the exact PR/MR head. The repo is checked out at this commit and the review runs against it. This server holds NO forge credentials and cannot resolve a head itself, so an absent head is REJECTED (a null head would silently review the default branch). Also accepted under the snake_case key head_sha." },
+    "baseSha": { "type": "string", "minLength": 1, "description": "OPTIONAL but STRONGLY RECOMMENDED base commit SHA — the PR/MR's base (target-branch) commit. SCOPING EFFECT: when present, the review is DIFF-SCOPED to just the PR's changes (the runner computes git diff merge-base(baseSha, headSha)..headSha — the same three-dot 'Files changed' set the forge shows). When ABSENT, no diff can be computed and the review FALLS BACK to the WHOLE WORKING TREE at headSha — a broader, unfocused audit of the entire repo snapshot, NOT the PR's delta. The role can't resolve the base itself (no forge credentials), so the caller must supply it to get a diff-scoped review. Also accepted under the snake_case key base_sha." },
+    "prompt":  { "type": "string", "description": "OPTIONAL free-text focus prompt, recorded as the run's intent and shown to the agent (e.g. 'focus on the auth changes'). It steers emphasis but does NOT change scope (diff vs whole-tree is decided by baseSha). Omitted → a generic deep-review intent." }
   }
 }
 ```
+
+Scoping (diff vs whole-tree): supply `baseSha` for a review scoped to the PR's changes; omit it and the review runs against the whole working tree at `headSha` instead — see the `baseSha` description above.
 
 Wire note: enums are ProtoJSON SCREAMING_SNAKE — the message `role` is `ROLE_USER` and task states are `TASK_STATE_*`. Unknown keys are ignored (the parser also accepts the snake_case SHA aliases above). See `docs/a2a-review-skill.md` for a full curl walkthrough, the response shape, and the GetTask polling loop."#;
 
