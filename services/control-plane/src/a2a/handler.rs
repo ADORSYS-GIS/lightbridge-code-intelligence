@@ -32,7 +32,7 @@ use uuid::Uuid;
 
 use super::mapping::{
     build_task_view, parse_review_request, review_artifacts, task_state_from_status, ParseError,
-    ReviewInput,
+    ReviewContext, ReviewInput,
 };
 use super::store::{PgTaskStore, LB_CALLER, LB_SKILL, LB_UNDERLYING};
 use super::{HDR_CALLER, HDR_PERMS};
@@ -377,13 +377,31 @@ impl RequestHandler for A2aHandler {
 
         let state = self.current_state(&mapping).await?;
 
-        // On a completed review, additionally return the caller-scoped artifacts (summary + findings).
+        // On a completed review, additionally return the caller-scoped artifacts: the summary +
+        // findings, plus a context part echoing the effective base/head SHAs, the derived scope, and
+        // the posted-review permalink (so the caller can confirm what was reviewed and jump to it).
         let artifacts = if state == TaskState::Completed {
             match mapping.underlying_task_id {
-                Some(underlying) => db::get_review(&self.pool, underlying)
+                Some(underlying) => match db::get_review(&self.pool, underlying)
                     .await
                     .map_err(db_error)?
-                    .map(|review| review_artifacts(&review.summary, &review.findings)),
+                {
+                    Some(review) => {
+                        // The `tasks` row carries the effective SHAs / repo / pr for the context part.
+                        // It may have been reaped between the status read and here — an absent row just
+                        // yields a context with the review_url and null SHAs (ReviewContext handles it).
+                        let task = db::get_task(&self.pool, underlying)
+                            .await
+                            .map_err(db_error)?;
+                        let context = review_context(task.as_ref(), review.review_url.as_deref());
+                        Some(review_artifacts(
+                            &review.summary,
+                            &review.findings,
+                            &context,
+                        ))
+                    }
+                    None => None,
+                },
                 None => None,
             }
         } else {
@@ -523,6 +541,28 @@ impl RequestHandler for A2aHandler {
         Err(A2AError::unsupported_operation(
             "extended agent card is not configured",
         ))
+    }
+}
+
+/// Build the completed-review [`ReviewContext`] from the underlying `tasks` row (if it still exists)
+/// and the persisted review permalink. A reaped row yields a context that echoes only what survived
+/// (the `review_url`) with null SHAs/repo — the artifact shape stays stable either way.
+fn review_context(task: Option<&db::TaskRow>, review_url: Option<&str>) -> ReviewContext {
+    match task {
+        Some(task) => ReviewContext {
+            repo: match (&task.repo_owner, &task.repo_name) {
+                (Some(owner), Some(name)) => Some(format!("{owner}/{name}")),
+                _ => None,
+            },
+            pr: Some(task.target_id),
+            base_sha: task.base_sha.clone(),
+            head_sha: task.head_sha.clone(),
+            review_url: review_url.map(str::to_string),
+        },
+        None => ReviewContext {
+            review_url: review_url.map(str::to_string),
+            ..Default::default()
+        },
     }
 }
 
@@ -990,7 +1030,7 @@ mod tests {
             TaskState::Working
         );
 
-        // succeeded + a review row → COMPLETED with summary + findings artifacts
+        // succeeded + a review row → COMPLETED with summary + findings + context artifacts
         set_status(&pool, underlying, "succeeded").await;
         let findings = json!([{ "path": "auth.rs", "severity": "P1" }]);
         db::insert_review_if_absent(
@@ -1009,10 +1049,23 @@ mod tests {
         assert_eq!(done.status.state, TaskState::Completed);
         let arts = done.artifacts.expect("artifacts on completion");
         assert_eq!(arts.len(), 1);
+        assert_eq!(arts[0].parts.len(), 3);
         assert_eq!(arts[0].parts[0].as_text(), Some("Found an issue"));
         match &arts[0].parts[1].content {
             a2a::PartContent::Data(v) => assert_eq!(v, &findings),
             other => panic!("expected findings data part, got {other:?}"),
+        }
+        // The context part echoes the effective SHAs (headSha "abc", no base → whole-tree scope),
+        // the repo, and the PR — the caller can confirm exactly what was reviewed.
+        match &arts[0].parts[2].content {
+            a2a::PartContent::Data(v) => {
+                assert_eq!(v["repo"], json!("acme/api"));
+                assert_eq!(v["pr"], json!(7));
+                assert_eq!(v["headSha"], json!("abc"));
+                assert_eq!(v["baseSha"], json!(null));
+                assert_eq!(v["scope"], json!("whole-tree"));
+            }
+            other => panic!("expected context data part, got {other:?}"),
         }
     }
 

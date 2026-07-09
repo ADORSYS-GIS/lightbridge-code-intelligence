@@ -7,7 +7,8 @@ surface (spec **v1.0.1**). This is the concrete calling guide for the `review` s
 
 The `review` skill runs the **deep** tier through the *same* pipeline as an `@mention`: same
 idempotency, same repo-approval gate, same mediated posting to the PR. The A2A task **additionally**
-returns the summary + structured findings to the caller — it does not replace the PR review.
+returns the summary + structured findings + a review-context part (the effective base/head SHAs, the
+derived scope, and the posted-review permalink) to the caller — it does not replace the PR review.
 
 The input contract (the authoritative schema) is also published inline in the agent card's `review`
 skill `description`, so a peer that only reads the card can still construct a valid request.
@@ -206,8 +207,11 @@ literal can never make a poller believe a still-running review has finished.
 
 ### Terminal `COMPLETED` — artifacts
 
-On completion, `GetTask` returns a single `review` artifact with two parts: a **text** summary and a
-**data** part carrying the structured findings (the ADR-0032 finding shape):
+On completion, `GetTask` returns a single `review` artifact with **three** parts, in order:
+
+1. a **text** summary,
+2. a **data** part carrying the structured findings (the ADR-0032 finding shape), and
+3. a **data** `context` part echoing *what was actually reviewed* and where to find it:
 
 ```json
 {
@@ -218,11 +222,32 @@ On completion, `GetTask` returns a single `review` artifact with two parts: a **
     { "artifactId": "review", "name": "review",
       "parts": [
         { "text": "Reviewed 3 files. One P1 in the auth path…" },
-        { "data": [ { "path": "auth.rs", "severity": "P1", "…": "…" } ], "mediaType": "application/json" }
+        { "data": [ { "path": "auth.rs", "severity": "P1", "…": "…" } ], "mediaType": "application/json" },
+        { "data": {
+            "repo": "acme/api",
+            "pr": 164,
+            "baseSha": "1b0dd7a4c9e2f6538a0c4b1e9d7f2a5c3e8b6d04",
+            "headSha": "9f2a1c4e8b7d6053a1f4c2e9b8d70a5c3e1f2b6d",
+            "scope": "diff",
+            "reviewUrl": "https://github.com/acme/api/pull/164#pullrequestreview-1234567890"
+          }, "mediaType": "application/json" }
       ] }
   ]
 }
 ```
+
+The **context** part (part 3) closes the loop on the [scoping](#scoping-diff-vs-whole-tree) gotcha
+and links straight to the posted review:
+
+| Field       | Meaning |
+|-------------|---------|
+| `repo` / `pr` | The repository and PR/MR that were reviewed (echoed back). |
+| `baseSha` / `headSha` | The **effective** SHAs the run actually used. |
+| `scope`     | **Derived** from `baseSha`: `"diff"` (diff-scoped review of the PR's changes) when a base was supplied, `"whole-tree"` (whole working tree at `headSha`) when it was not. This tells you at a glance whether you got a PR review or a full-repo audit. |
+| `reviewUrl` | Permalink to the review posted on the PR — jump straight to it. `null` for older rows or if the forge omitted the URL. |
+
+If the underlying run row has been reaped by the time you poll, unknown fields come back `null` and
+only what survived (typically `reviewUrl`) is populated — the shape is stable either way.
 
 ### Cancel (`CancelTask`)
 
