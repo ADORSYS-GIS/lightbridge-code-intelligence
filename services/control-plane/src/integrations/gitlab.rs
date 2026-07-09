@@ -14,7 +14,6 @@
 //! Known limitations (Phase 4):
 //! - `list_comment_reactions` returns an empty Vec — feedback polling (👍/👎) requires the MR/issue
 //!   `iid` which we don't have from just a note ID. Phase 7 can store the iid alongside the note.
-//! - `add_reaction` on a `Comment` is a no-op (same reason). Issue/MR body reactions work.
 //! - `post_comment` tries MR notes first, then issue notes (the caller passes a single `issue_number`
 //!   which is the MR `iid` for PRs or the issue `iid` for issues — we don't know which, so we probe).
 
@@ -370,27 +369,28 @@ impl CodePlatform for GitlabClient {
                     .error_for_status()?;
                 Ok(())
             }
-            ReactionTarget::Comment { comment_id } => {
-                // Fetch the comment to get the MR/issue iid
-                let comment_url = format!("/projects/{}/notes/{}", project, comment_id);
-                let comment_resp = self
-                    .http
-                    .get(self.url(&comment_url))
-                    .headers(self.api_headers())
-                    .send()
-                    .await?
-                    .error_for_status()?;
-                let comment_v: serde_json::Value = comment_resp.json().await?;
-
-                // Extract the iid from the comment
-                let iid = comment_v
-                    .get("target_iid")
-                    .or_else(|| comment_v.get("target_id"))
-                    .and_then(|i| i.as_i64())
-                    .ok_or_else(|| anyhow::anyhow!("Comment missing iid"))?;
-
-                // Post award emoji using the iid
-                let endpoint = format!("/projects/{}/merge_requests/{}/award_emoji", project, iid);
+            ReactionTarget::Comment { comment_id, iid } => {
+                // GitLab notes are scoped to their parent (MR or issue) — there is NO global
+                // `/projects/{id}/notes/{note_id}` endpoint. The parent iid is carried in the
+                // outbox payload (the task's `target_id`) so we can address the note directly.
+                let iid = iid.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "GitLab comment reaction requires the parent MR/issue iid \
+                         (missing from outbox payload — legacy row?)"
+                    )
+                })?;
+                let is_mr = noteable_type.map(|t| t == "pull_request").unwrap_or(true);
+                let endpoint = if is_mr {
+                    format!(
+                        "/projects/{}/merge_requests/{}/notes/{}/award_emoji",
+                        project, iid, comment_id
+                    )
+                } else {
+                    format!(
+                        "/projects/{}/issues/{}/notes/{}/award_emoji",
+                        project, iid, comment_id
+                    )
+                };
                 let url = self.url(&endpoint);
                 let _ = self
                     .http

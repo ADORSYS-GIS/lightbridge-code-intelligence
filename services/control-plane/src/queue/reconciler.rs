@@ -239,10 +239,17 @@ pub(crate) async fn deliver(
             // comment; otherwise on the PR/issue body (the automatic-review case).
             match row.payload.get("comment_id").and_then(|x| x.as_i64()) {
                 Some(comment_id) => {
+                    // The parent MR/issue iid — already in the payload as `issue` (the task's
+                    // `target_id`). GitLab needs it to address a note through its parent (there is
+                    // no global note endpoint); GitHub ignores it (comment IDs are global).
+                    let iid = row.payload.get("issue").and_then(|x| x.as_i64());
                     platform
                         .add_reaction(
                             repo,
-                            ReactionTarget::Comment { comment_id },
+                            ReactionTarget::Comment {
+                                comment_id,
+                                iid,
+                            },
                             content,
                             noteable_type,
                         )

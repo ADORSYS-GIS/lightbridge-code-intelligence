@@ -728,7 +728,7 @@ impl CodePlatform for GithubApp {
             ReactionTarget::Issue { number } => {
                 self.add_reaction(&token, owner, name, number, emoji).await
             }
-            ReactionTarget::Comment { comment_id } => {
+            ReactionTarget::Comment { comment_id, .. } => {
                 self.add_comment_reaction(&token, owner, name, comment_id, emoji)
                     .await
             }
