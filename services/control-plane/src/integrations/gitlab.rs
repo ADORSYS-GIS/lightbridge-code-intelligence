@@ -11,9 +11,11 @@
 //! 3. **Webhook auth is a plain token** (`X-Gitlab-Token` header), not HMAC. `verify_webhook`
 //!    does a constant-time comparison against `GITLAB_WEBHOOK_SECRET`.
 //!
-//! Known limitations (Phase 4):
-//! - `list_comment_reactions` returns an empty Vec — feedback polling (👍/👎) requires the MR/issue
-//!   `iid` which we don't have from just a note ID. Phase 7 can store the iid alongside the note.
+//! Notes on note addressing:
+//! - GitLab notes are scoped to their parent (MR or issue) — there is NO global
+//!   `/projects/{id}/notes/{note_id}` endpoint. Both `add_reaction` and `list_comment_reactions`
+//!   require the parent MR/issue `iid`, which is carried from the task's `target_id` (in the
+//!   outbox payload for outbound, and in `PollableComment` for inbound polling).
 //! - `post_comment` tries MR notes first, then issue notes (the caller passes a single `issue_number`
 //!   which is the MR `iid` for PRs or the issue `iid` for issues — we don't know which, so we probe).
 
@@ -485,33 +487,32 @@ impl CodePlatform for GitlabClient {
         &self,
         repo: &RepoRef,
         comment_id: i64,
-        is_review_comment: bool,
+        _is_review_comment: bool,
+        iid: Option<i64>,
+        noteable_type: Option<&str>,
     ) -> anyhow::Result<Vec<Reaction>> {
         let project = Self::project_encoded(repo);
 
-        // Fetch the comment to get the MR/issue iid
-        let comment_url = format!("/projects/{}/notes/{}", project, comment_id);
-        let comment_resp = self
-            .http
-            .get(self.url(&comment_url))
-            .headers(self.api_headers())
-            .send()
-            .await?
-            .error_for_status()?;
-        let comment_v: serde_json::Value = comment_resp.json().await?;
-
-        // Extract the iid from the comment (GitLab uses target_iid for MRs, target_id for issues)
-        let iid = comment_v
-            .get("target_iid")
-            .or_else(|| comment_v.get("target_id"))
-            .and_then(|i| i.as_i64())
-            .ok_or_else(|| anyhow::anyhow!("Comment missing iid"))?;
-
-        // Fetch award emoji using the iid
-        let endpoint = if is_review_comment {
-            format!("/projects/{}/merge_requests/{}/award_emoji", project, iid)
+        // GitLab notes are scoped to their parent (MR or issue) — there is NO global
+        // `/projects/{id}/notes/{note_id}` endpoint. The parent iid is carried from the task's
+        // `target_id` (via `PollableComment`) so we can address the note's award emoji directly.
+        let iid = iid.ok_or_else(|| {
+            anyhow::anyhow!(
+                "GitLab list_comment_reactions requires the parent MR/issue iid \
+                 (missing from PollableComment — legacy row?)"
+            )
+        })?;
+        let is_mr = noteable_type.map(|t| t == "pull_request").unwrap_or(true);
+        let endpoint = if is_mr {
+            format!(
+                "/projects/{}/merge_requests/{}/notes/{}/award_emoji",
+                project, iid, comment_id
+            )
         } else {
-            format!("/projects/{}/issues/{}/award_emoji", project, iid)
+            format!(
+                "/projects/{}/issues/{}/notes/{}/award_emoji",
+                project, iid, comment_id
+            )
         };
         let url = self.url(&endpoint);
         let award_resp = self

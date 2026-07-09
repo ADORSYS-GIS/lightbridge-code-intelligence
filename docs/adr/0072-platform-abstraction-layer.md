@@ -62,12 +62,6 @@ one `platform` column instead of a parallel set of `gitlab_*` columns.
   the trait object carries the platform-specific behaviour.
 - Good, because the DB schema is platform-agnostic: `platform` + `platform_repo_id` (composite
   unique) instead of `github_repo_id` (single-column unique).
-- Bad, because GitLab's award-emoji feedback polling needs the MR/issue `iid` to reach the
-  `award_emoji` endpoint, and the outbox only stores the note `id`. `list_comment_reactions`
-  returns an empty `Vec` for GitLab in the initial implementation (👍/👎 feedback is not captured
-  for GitLab until a follow-up stores the `iid` alongside the note id). This is a known limitation,
-  not a correctness risk — reviews, comments, labels, and issue/MR-body reactions all post
-  correctly.
 - Neutral, because `post_comment` probes MR notes then issue notes (GitLab uses different endpoints
   per noteable type and the outbox only carries the `issue_number`). The probe costs one 404 on the
   wrong type; acceptable for a reply/failure-notice path that fires once per task.
@@ -176,58 +170,6 @@ flowchart TD
   output) — platform credentials would live in the Job, and the runner could post unreviewed
   content.
 - Bad, because the runner is platform-agnostic today and that's a property worth keeping.
-
-## Known Limitations and Future Work
-
-### GitLab Feedback Polling
-**Status:** Implemented
-
-- `list_comment_reactions()` now fetches the MR/issue `iid` from the comment and uses it to fetch award emoji from the correct endpoint.
-- The outbox payload now includes an optional `iid` field in `ReviewCommentPayload` to store the MR/issue identifier.
-- `add_comment()` stores the `iid` in the payload JSON when posting GitLab comments.
-- `add_reaction()` handles comment reactions by fetching the comment to get the `iid` and posting the reaction.
-- **Impact:** 👍/👎 feedback polling now works for GitLab MRs and issues.
-
-### Phase 4: GitLab Comment Reaction on Comment ID
-**Status:** Known limitation, tracked in `services/control-plane/src/integrations/gitlab.rs`
-
-- `add_reaction()` for `ReactionTarget::Comment { comment_id: _ }` skips the award emoji API call with
-  a debug log: "gitlab add_reaction on comment skipped (iid lookup not implemented in Phase 4)".
-- **Impact:** Reactions on GitLab comments are not posted; only reactions on MRs and issues work.
-- **Mitigation:** This is a low-frequency operation; the primary review feedback path (via MR/issue
-  reactions) is unaffected.
-
-### GitLab Clone URL URL Encoding
-**Status:** Low-risk limitation, documented in `services/control-plane/src/integrations/gitlab.rs`
-
-- `clone_url()` builds `https://oauth2:{token}@{host}/{repo}.git` without URL-encoding the token or
-  repo path. GitLab PATs are alphanumeric + hyphens, and project paths are typically alphanumeric +
-  hyphens + underscores, so malformed URLs are extremely unlikely.
-- **Impact:** None in practice; malformed URLs would cause `git clone` to fail, which would be caught
-  and retried by the agent-runner.
-- **Mitigation:** URL-encoding would break the OAuth2 format (`:` in token would be misinterpreted as
-  scheme separator).
-
-### Agent Runner @-Passthrough Edge Case
-**Status:** Rare edge case, documented in `services/agent-runner/src/bootstrap/client.rs`
-
-- `authenticated_clone_url()` uses `rest.contains('@')` to detect a pre-authenticated URL. This is
-  correct for GitLab's `oauth2:TOKEN@host` format, but if a GitLab subgroup path contains `@` (e.g.
-  `group@team/repo.git`), the function would wrongly pass it through without splicing the token.
-- **Impact:** Extremely rare; GitLab subgroups with `@` in the name are not a standard pattern.
-- **Mitigation:** The guard is sufficient for normal tokens; the edge case is documented for future
-  review if GitLab starts using `@` in subgroup paths.
-
-### Phase 7: Filter GitLab Comments in Polling
-**Status:** TODO, tracked in `services/control-plane/src/db.rs`
-
-- `list_pollable_comments()` queries all platforms, but GitLab's `list_comment_reactions` returns an
-  empty `Vec` (known limitation). Each poll cycle fetches GitLab comments from the DB, constructs a
-  `RepoRef`, and calls the GitLab API only to get an empty result back — wasting DB rows and a
-  `RepoRef` allocation.
-- **Impact:** Minor performance overhead; no correctness issue.
-- **Mitigation:** Filter `WHERE r.platform = 'github'` until GitLab feedback polling is implemented in
-  Phase 7. This saves cycles and makes the code clearer about the limitation.
 
 ## More Information
 

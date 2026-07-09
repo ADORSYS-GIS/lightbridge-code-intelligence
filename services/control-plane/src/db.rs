@@ -768,6 +768,11 @@ pub struct PollableComment {
     pub name: String,
     pub installation_id: i64,
     pub platform: Platform,
+    /// The PR/MR/issue number (GitLab `iid`) — needed by GitLab to address notes through their
+    /// parent (there is no global note endpoint). GitHub ignores it.
+    pub target_id: i64,
+    /// `"pull_request"` or `"issue"` — tells GitLab whether to use MR notes vs issue notes.
+    pub target_type: String,
 }
 
 /// Comments to poll this cycle (ADR-0035), within `within_days`, **tiered by age** so API usage stays
@@ -781,15 +786,13 @@ pub async fn list_pollable_comments(
     within_days: i32,
     interval_secs: i64,
 ) -> Result<Vec<PollableComment>, sqlx::Error> {
-    // Filter to GitHub only to avoid wasting cycles on no-op GitLab API calls (GitLab feedback polling
-    // requires MR/issue iid which is stored in the outbox payload).
     sqlx::query_as::<_, PollableComment>(
-        "SELECT rc.task_id, rc.platform_comment_id, rc.kind, r.owner, r.name, t.installation_id, r.platform \
+        "SELECT rc.task_id, rc.platform_comment_id, rc.kind, r.owner, r.name, t.installation_id, r.platform, \
+                t.target_id, t.target_type \
          FROM review_comments rc \
          JOIN tasks t ON t.id = rc.task_id \
          JOIN repositories r ON r.id = t.repository_id \
-         WHERE r.platform = 'github' \
-           AND t.created_at > now() - ($1 * interval '1 day') \
+         WHERE t.created_at > now() - ($1 * interval '1 day') \
            AND ( \
              rc.created_at > now() - interval '1 day' \
              OR (rc.created_at BETWEEN now() - interval '3 days' AND now() - interval '1 day' \
