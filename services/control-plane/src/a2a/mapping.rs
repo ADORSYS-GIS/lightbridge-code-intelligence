@@ -121,7 +121,8 @@ pub fn parse_review_request(parts: &[Part]) -> Result<ReviewInput, ParseError> {
         .ok_or(ParseError::BadField("repo"))?;
     let (owner, name) = split_repo(repo).ok_or(ParseError::BadField("repo"))?;
 
-    // `pr` may arrive as a JSON number or a numeric string; both are accepted, non-positive is not.
+    // `pr` may arrive as a JSON integer, an integral JSON float (the real A2A wire shape — see
+    // `json_to_i64`), or a numeric string; all are accepted, non-positive is not.
     let pr = data
         .get("pr")
         .and_then(json_to_i64)
@@ -175,10 +176,24 @@ fn opt_sha(map: &serde_json::Map<String, Value>, camel: &str, snake: &str) -> Op
 }
 
 /// Coerce a JSON number or numeric string to `i64`.
+///
+/// The float arm is load-bearing on the A2A wire, not defensive padding: A2A v1.0 carries a
+/// DataPart's `data` as a `google.protobuf.Struct`, whose only numeric type is `double` (f64). So a
+/// caller's `"pr": 128` is coerced to the float `128.0` by the ProtoJSON round-trip before it ever
+/// reaches this parser, and `serde_json::Value::as_i64` returns `None` for a float — even an
+/// integral one. We therefore accept an integral, in-range float as an `i64` (rejecting a
+/// fractional value like `128.5`, which is not a valid PR number). Net: `pr` parses whether it
+/// arrives as a JSON integer, an integral JSON float (the real wire case), or a numeric string.
 fn json_to_i64(value: &Value) -> Option<i64> {
     value
         .as_i64()
         .or_else(|| value.as_str().and_then(|s| s.trim().parse().ok()))
+        .or_else(|| {
+            value.as_f64().and_then(|f| {
+                (f.fract() == 0.0 && f >= i64::MIN as f64 && f <= i64::MAX as f64)
+                    .then_some(f as i64)
+            })
+        })
 }
 
 /// Build the caller-scoped A2A artifacts for a COMPLETED review: a text summary part plus a
@@ -303,6 +318,46 @@ mod tests {
         assert_eq!(input.pr, 7);
         assert_eq!(input.prompt, DEFAULT_REVIEW_PROMPT);
         assert!(input.head_sha.is_none() && input.base_sha.is_none());
+    }
+
+    #[test]
+    fn accepts_pr_as_an_integral_float_the_real_a2a_wire_shape() {
+        // Regression guard for the live `-32602 missing or invalid field: pr` (follow-up to #308).
+        // On the wire an A2A DataPart's `data` is a `google.protobuf.Struct`, whose only numeric
+        // type is `double`, so a caller's `"pr": 128` reaches this parser as the float `128.0` —
+        // NOT a JSON integer. `json!({"pr": 128.0})` reproduces exactly that post-deserialization
+        // `Value::Number(f64)`; the earlier tests used `json!({"pr": 128})` (a serde integer) and so
+        // never exercised the coercion the real caller hits.
+        let parts = vec![data_part(json!({ "repo": "o/n", "pr": 128.0 }))];
+        let input = parse_review_request(&parts).unwrap();
+        assert_eq!(input.pr, 128);
+    }
+
+    #[test]
+    fn json_to_i64_accepts_int_integral_float_and_numeric_string_rejects_fractional() {
+        // Integer, integral float, and numeric string all coerce...
+        assert_eq!(json_to_i64(&json!(128)), Some(128));
+        assert_eq!(json_to_i64(&json!(128.0)), Some(128)); // the ProtoJSON `double` case
+        assert_eq!(json_to_i64(&json!("128")), Some(128));
+        assert_eq!(json_to_i64(&json!("  128  ")), Some(128));
+        assert_eq!(json_to_i64(&json!(0)), Some(0)); // sign filtering is the caller's job
+        assert_eq!(json_to_i64(&json!(-4)), Some(-4));
+        assert_eq!(json_to_i64(&json!(-4.0)), Some(-4));
+        // ...but a fractional float is not a whole number and must be rejected.
+        assert_eq!(json_to_i64(&json!(128.5)), None);
+        // Non-numeric junk is rejected too.
+        assert_eq!(json_to_i64(&json!("nope")), None);
+        assert_eq!(json_to_i64(&json!(true)), None);
+        assert_eq!(json_to_i64(&json!(null)), None);
+    }
+
+    #[test]
+    fn rejects_a_fractional_float_pr() {
+        // A non-integral `pr` is not a valid PR number: it must not silently truncate to 128.
+        assert_eq!(
+            parse_review_request(&[data_part(json!({ "repo": "o/n", "pr": 128.5 }))]),
+            Err(ParseError::BadField("pr"))
+        );
     }
 
     #[test]

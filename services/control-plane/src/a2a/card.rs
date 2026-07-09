@@ -18,6 +18,35 @@ use a2a::{
 /// client-credentials access token (service accounts; no anonymous access).
 const OIDC_SCHEME_NAME: &str = "keycloak-oidc";
 
+/// The `review` skill description. A short prose intro, then an inline JSON-Schema (draft-07) that
+/// documents every field of the request object — `AgentSkill` has no `inputSchema` field, so the
+/// description is the discoverable place to publish the input contract. The schema mirrors
+/// [`super::mapping::parse_review_request`] exactly (its authoritative parser); keep the two in
+/// sync. Full calling guide: `docs/a2a-review-skill.md`.
+const REVIEW_SKILL_DESCRIPTION: &str = r#"Request a deep review of a pull/merge request. The review runs the deep tier through the same pipeline as an `@mention` and posts to the PR; the A2A task additionally returns a summary + structured findings to the caller.
+
+Send the request as the JSON object below, carried in a `data` part of a `ROLE_USER` message (`message.parts[].data`). Input schema (JSON Schema draft-07):
+
+```json
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "A2A review skill request",
+  "type": "object",
+  "required": ["repo", "pr", "headSha"],
+  "properties": {
+    "skill":   { "type": "string", "enum": ["review"], "default": "review", "description": "Skill selector; only \"review\" exists in this phase." },
+    "forge":   { "type": "string", "enum": ["github", "gitlab"], "default": "github", "description": "Source forge." },
+    "repo":    { "type": "string", "pattern": "^[^/]+/[^/]+$", "description": "Repository as \"owner/name\" (surrounding whitespace is trimmed)." },
+    "pr":      { "type": ["integer", "string"], "description": "PR (GitHub) / MR (GitLab) number, > 0. Accepts a JSON integer or a numeric string, e.g. 164 or \"164\"." },
+    "headSha": { "type": "string", "minLength": 1, "description": "Commit SHA of the PR/MR head. REQUIRED: this server holds no forge credentials and cannot resolve a head itself, so an absent head is REJECTED (a null head would silently review the default branch). Also accepted under the key head_sha." },
+    "baseSha": { "type": "string", "minLength": 1, "description": "Optional base commit SHA. Also accepted under the key base_sha." },
+    "prompt":  { "type": "string", "description": "Optional focus prompt recorded as the run's intent; omitted → a generic deep-review intent." }
+  }
+}
+```
+
+Wire note: enums are ProtoJSON SCREAMING_SNAKE — the message `role` is `ROLE_USER` and task states are `TASK_STATE_*`. Unknown keys are ignored (the parser also accepts the snake_case SHA aliases above). See `docs/a2a-review-skill.md` for a full curl walkthrough, the response shape, and the GetTask polling loop."#;
+
 /// Build the agent card the `a2a` role publishes.
 ///
 /// * `base_url` — the externally reachable base URL of this role's A2A endpoints (both transports
@@ -62,20 +91,23 @@ pub fn build_agent_card(base_url: &str, oidc_discovery_url: &str) -> AgentCard {
         skills: vec![AgentSkill {
             id: "review".to_string(),
             name: "Deep PR review".to_string(),
-            description: "Request a deep review of a pull/merge request. Input is a `data` part \
-                          with `repo` (owner/name), `pr`, and `headSha` (required — this server \
-                          holds no forge credentials and cannot resolve a PR head itself); optional \
-                          `forge` (default github), `prompt`, and `baseSha`. The review posts to the \
-                          PR through the existing pipeline; the A2A task additionally returns the \
-                          summary + findings."
-                .to_string(),
+            description: REVIEW_SKILL_DESCRIPTION.to_string(),
             tags: vec![
                 "code-review".to_string(),
                 "ci".to_string(),
                 "static-analysis".to_string(),
             ],
             examples: Some(vec![
-                "{\"skill\":\"review\",\"repo\":\"acme/api\",\"pr\":128,\"headSha\":\"abc123\"}"
+                // Minimal: the four required fields (skill defaults to `review`, forge to `github`).
+                // `pr` is shown as a numeric string — the accepted form regardless of how a peer's
+                // ProtoJSON codec renders numbers; a JSON integer works too.
+                r#"{"skill":"review","repo":"acme/api","pr":"164","headSha":"9f2a1c4e8b7d6053a1f4c2e9b8d70a5c3e1f2b6d"}"#
+                    .to_string(),
+                // Full: every optional field (forge, baseSha, prompt) alongside the required ones.
+                r#"{"skill":"review","forge":"github","repo":"acme/api","pr":"164","headSha":"9f2a1c4e8b7d6053a1f4c2e9b8d70a5c3e1f2b6d","baseSha":"1b0dd7a4c9e2f6538a0c4b1e9d7f2a5c3e8b6d04","prompt":"Focus on the auth changes and the new migration."}"#
+                    .to_string(),
+                // GitLab merge request, minimal.
+                r#"{"skill":"review","forge":"gitlab","repo":"acme/platform","pr":"57","headSha":"3e8b6d041b0dd7a4c9e2f6538a0c4b1e9d7f2a5c"}"#
                     .to_string(),
             ]),
             input_modes: Some(vec!["application/json".to_string()]),
@@ -151,6 +183,41 @@ mod tests {
         assert_eq!(
             skills[0]["securityRequirements"][0]["keycloak-oidc"][0],
             "a2a:review"
+        );
+
+        // Self-documenting: multiple examples of usage, each a parseable JSON object carrying the
+        // required fields; and an inline JSON-Schema in the description covering the input contract.
+        let examples = skills[0]["examples"].as_array().unwrap();
+        assert!(
+            examples.len() >= 2,
+            "review skill should advertise multiple usage examples"
+        );
+        for ex in examples {
+            let obj: serde_json::Value =
+                serde_json::from_str(ex.as_str().unwrap()).expect("example is valid JSON");
+            assert_eq!(obj["skill"], "review");
+            assert!(obj.get("repo").is_some() && obj.get("pr").is_some());
+            assert!(
+                obj["headSha"].as_str().is_some(),
+                "every example carries the required headSha"
+            );
+        }
+        let description = skills[0]["description"].as_str().unwrap();
+        assert!(
+            description.contains("json-schema.org/draft-07"),
+            "description embeds an inline JSON-Schema"
+        );
+        for field in [
+            "repo", "pr", "headSha", "baseSha", "forge", "prompt", "skill",
+        ] {
+            assert!(
+                description.contains(field),
+                "schema in description documents `{field}`"
+            );
+        }
+        assert!(
+            description.contains("ROLE_USER") && description.contains("data"),
+            "description states the ROLE_USER + data-part wire form"
         );
 
         // OIDC security scheme under the field-presence variant key.
