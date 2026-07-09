@@ -242,12 +242,13 @@ and links straight to the posted review:
 | Field       | Meaning |
 |-------------|---------|
 | `repo` / `pr` | The repository and PR/MR that were reviewed (echoed back). |
-| `baseSha` / `headSha` | The **effective** SHAs the run actually used. |
-| `scope`     | **Derived** from `baseSha`: `"diff"` (diff-scoped review of the PR's changes) when a base was supplied, `"whole-tree"` (whole working tree at `headSha`) when it was not. This tells you at a glance whether you got a PR review or a full-repo audit. |
+| `baseSha` / `headSha` | The base/head SHAs the run was **submitted with**. |
+| `scope`     | **Derived from the *request*:** `"diff"` when a `baseSha` was supplied (a diff-scoped review of the PR's changes was requested), `"whole-tree"` when it was not (whole working tree at `headSha`). Tells you at a glance whether you asked for a PR review or a full-repo audit. **Caveat:** `diff` reflects what was *requested*, not a readback of the runner — with a base, the runner still falls back to a whole-tree review when `baseSha == headSha`, the diff is empty, or the diff can't be computed. `whole-tree` (no base) is always accurate. |
 | `reviewUrl` | Permalink to the review posted on the PR — jump straight to it. `null` for older rows or if the forge omitted the URL. |
 
-If the underlying run row has been reaped by the time you poll, unknown fields come back `null` and
-only what survived (typically `reviewUrl`) is populated — the shape is stable either way.
+If the underlying run row is unavailable by the time you poll (a rare reap/delete race), unknown
+fields come back `null` and only what survived (typically `reviewUrl`) is populated — the shape is
+stable either way.
 
 ### Cancel (`CancelTask`)
 

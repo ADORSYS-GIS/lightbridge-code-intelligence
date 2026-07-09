@@ -196,17 +196,23 @@ fn json_to_i64(value: &Value) -> Option<i64> {
         })
 }
 
-/// The context echoed back on a COMPLETED review so the caller can confirm *exactly what was
-/// reviewed* and jump straight to the posted result:
+/// The context echoed back on a COMPLETED review so the caller can confirm *what was reviewed* and
+/// jump straight to the posted result:
 ///
-/// - `base_sha` / `head_sha` — the effective SHAs the run used (from the underlying `tasks` row).
-/// - **scope** is *derived* from the base: present → `diff` (diff-scoped review of
-///   `merge-base(base,head)..head`), absent → `whole-tree` (the whole working tree at `head` was
-///   reviewed). This is the [RFC-0006] `baseSha`-silently-determines-scope gotcha, surfaced back to
-///   the caller so a whole-tree review is never mistaken for a diff review.
+/// - `base_sha` / `head_sha` — the base/head SHAs the run was **submitted with** (from the
+///   underlying `tasks` row).
+/// - **scope** is derived from whether a base was **supplied on the request**: base present →
+///   `diff` (a diff-scoped review of `merge-base(base,head)..head` was *requested*), absent →
+///   `whole-tree` (no base, so the whole working tree at `head` is reviewed). **This reflects the
+///   *requested* scope, not a readback of the runner's decision:** the agent-runner (`pr_diff`)
+///   still falls back to a whole-tree review even with a base when `base == head`, the diff is
+///   empty, or the diff computation fails. So `diff` means "diff-scoping was requested" (not a
+///   guarantee the run diffed); `whole-tree` is always accurate (no base ⇒ never diff-scoped). The
+///   value still answers the [RFC-0006] `baseSha`-determines-scope question the caller cares about —
+///   just don't read `diff` as a hard promise.
 /// - `review_url` — the permalink to the review posted on the PR ([`ReviewRow::review_url`]).
 ///
-/// Every field is optional: when the underlying run row has been reaped, repo/pr/SHAs are unknown
+/// Every field is optional: when the underlying run row is unavailable, repo/pr/SHAs are unknown
 /// and only what survives (e.g. the persisted `review_url`) is echoed.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ReviewContext {
