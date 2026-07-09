@@ -15,6 +15,7 @@ use sqlx::PgPool;
 
 use crate::config::ReviewSection;
 use crate::db;
+use crate::egress::PlatformEgressRouter;
 use crate::integrations::k8s::TaskLauncher;
 use crate::queue::reaper;
 
@@ -122,6 +123,7 @@ pub async fn run<L: TaskLauncher>(
     cfg: DispatcherConfig,
     neo4j: Option<std::sync::Arc<neo4rs::Graph>>,
     review: Arc<ReviewSection>,
+    egress: Arc<PlatformEgressRouter>,
 ) -> anyhow::Result<()> {
     let mut listener = PgListener::connect_with(&pool).await?;
     listener.listen(db::TASK_QUEUED_CHANNEL).await?;
@@ -143,7 +145,7 @@ pub async fn run<L: TaskLauncher>(
     tracing::info!(owner, "dispatcher started");
 
     loop {
-        drain(&pool, &launcher, &owner, &cfg, &review).await;
+        drain(&pool, &launcher, &owner, &cfg, &review, &egress).await;
 
         // Wait for an enqueue notification, the reap tick, the poll fallback, or shutdown.
         tokio::select! {
@@ -155,7 +157,7 @@ pub async fn run<L: TaskLauncher>(
                 }
             }
             _ = reap_tick.tick() => {
-                if let Err(error) = reaper::reap_once(&pool, &launcher, &review).await {
+                if let Err(error) = reaper::reap_once(&pool, &launcher, &review, &egress).await {
                     tracing::error!(%error, "reaper cycle failed");
                 }
             }
@@ -244,10 +246,11 @@ async fn drain<L: TaskLauncher>(
     owner: &str,
     cfg: &DispatcherConfig,
     review: &ReviewSection,
+    egress: &PlatformEgressRouter,
 ) {
     loop {
         match db::claim_next_task(pool, owner, cfg.claim_lease).await {
-            Ok(Some(task)) => dispatch(pool, launcher, &task, cfg, review).await,
+            Ok(Some(task)) => dispatch(pool, launcher, &task, cfg, review, egress).await,
             Ok(None) => return,
             Err(error) => {
                 tracing::error!(%error, "failed to claim next task");
@@ -265,6 +268,7 @@ async fn dispatch<L: TaskLauncher>(
     task: &db::ClaimedTask,
     cfg: &DispatcherConfig,
     review: &ReviewSection,
+    egress: &PlatformEgressRouter,
 ) {
     let started = std::time::Instant::now();
     match launcher.launch(task).await {
@@ -283,7 +287,7 @@ async fn dispatch<L: TaskLauncher>(
             // queued→running-and-dispatched transition), not at webhook receipt. Best-effort: a failure
             // here must never fail the dispatch. PR tasks and @mention-triggered tasks react; the target
             // is the @mention comment when mention-triggered, else the PR body.
-            react_work_started(pool, task, review).await;
+            react_work_started(pool, task, review, egress).await;
         }
         Err(error) => {
             crate::http::metrics::dispatch_outcome("failed");
@@ -302,7 +306,12 @@ async fn dispatch<L: TaskLauncher>(
 /// its 👀 on the triggering comment (removing receipt-time 👀 must not leave issue asks
 /// unacknowledged). Index tasks (no human audience) never react. Needs owner/repo + the trigger comment
 /// id, which the lightweight `ClaimedTask` lacks, so it loads the task context.
-async fn react_work_started(pool: &PgPool, task: &db::ClaimedTask, review: &ReviewSection) {
+async fn react_work_started(
+    pool: &PgPool,
+    task: &db::ClaimedTask,
+    review: &ReviewSection,
+    egress: &PlatformEgressRouter,
+) {
     if !review.reactions_enabled() || task.command_text == "index" {
         return;
     }
@@ -323,6 +332,7 @@ async fn react_work_started(pool: &PgPool, task: &db::ClaimedTask, review: &Revi
         installation_id: context.installation_id,
         owner: &context.owner,
         repo: &context.name,
+        egress,
     };
     if let Err(error) = crate::outbox::enqueue_reaction(
         pool,
