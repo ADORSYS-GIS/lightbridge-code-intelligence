@@ -9,6 +9,7 @@ use serde_json::json;
 use sqlx::PgPool;
 use uuid::Uuid;
 
+use crate::egress::PlatformEgressRouter;
 use crate::integrations::platform::Platform;
 
 /// Who to post as and where — shared by every intent.
@@ -20,6 +21,10 @@ pub struct Target<'a> {
     pub installation_id: i64,
     pub owner: &'a str,
     pub repo: &'a str,
+    /// Egress router (RFC-0005 Phase A / ADR-0074). After the intent row is enqueued, each helper calls
+    /// [`PlatformEgressRouter::announce`] on this — a **no-op in the default `drain` mode** (so the
+    /// enqueue path is unchanged), or a `send` to the `PlatformEgress` virtual object in `restate` mode.
+    pub egress: &'a PlatformEgressRouter,
 }
 
 impl Target<'_> {
@@ -75,7 +80,7 @@ pub async fn enqueue_review(
 ) -> anyhow::Result<bool> {
     let key = format!("{}:review", t.key_prefix(payload.pr));
     let value = serde_json::to_value(payload)?;
-    crate::db::enqueue_outbox_post(
+    let inserted = crate::db::enqueue_outbox_post(
         pool,
         t.platform,
         t.task_id,
@@ -86,8 +91,11 @@ pub async fn enqueue_review(
         &value,
         &key,
     )
-    .await
-    .map_err(Into::into)
+    .await?;
+    t.egress
+        .announce(pool, t.platform, t.installation_id, &key)
+        .await?;
+    Ok(inserted)
 }
 
 /// Enqueue a consolidated reply / `ask` answer (issue comment) — one per task (`<task>:reply`).
@@ -97,10 +105,10 @@ pub async fn enqueue_reply(
     issue: i64,
     body: &str,
     target_type: &str,
-) -> Result<bool, sqlx::Error> {
+) -> anyhow::Result<bool> {
     let key = format!("{}:reply", t.key_prefix(issue));
     let value = json!({ "issue": issue, "body": body, "target_type": target_type });
-    crate::db::enqueue_outbox_post(
+    let inserted = crate::db::enqueue_outbox_post(
         pool,
         t.platform,
         t.task_id,
@@ -111,7 +119,11 @@ pub async fn enqueue_reply(
         &value,
         &key,
     )
-    .await
+    .await?;
+    t.egress
+        .announce(pool, t.platform, t.installation_id, &key)
+        .await?;
+    Ok(inserted)
 }
 
 /// Enqueue a lifecycle reaction (👀 `eyes` / 😕 `confused`, ADR-0068) — keyed by content so the distinct
@@ -127,10 +139,10 @@ pub async fn enqueue_reaction(
     content: &str,
     comment_id: Option<i64>,
     target_type: &str,
-) -> Result<bool, sqlx::Error> {
+) -> anyhow::Result<bool> {
     let key = format!("{}:reaction:{content}", t.key_prefix(issue));
     let value = reaction_payload(issue, content, comment_id, target_type);
-    crate::db::enqueue_outbox_post(
+    let inserted = crate::db::enqueue_outbox_post(
         pool,
         t.platform,
         t.task_id,
@@ -141,7 +153,11 @@ pub async fn enqueue_reaction(
         &value,
         &key,
     )
-    .await
+    .await?;
+    t.egress
+        .announce(pool, t.platform, t.installation_id, &key)
+        .await?;
+    Ok(inserted)
 }
 
 /// Enqueue the ADR-0068 **verdict** reaction (👍 `+1` clean / 👎 `-1` findings) under ONE shared dedup
@@ -156,10 +172,10 @@ pub async fn enqueue_verdict_reaction(
     content: &str,
     comment_id: Option<i64>,
     target_type: &str,
-) -> Result<bool, sqlx::Error> {
+) -> anyhow::Result<bool> {
     let key = format!("{}:reaction:verdict", t.key_prefix(issue));
     let value = reaction_payload(issue, content, comment_id, target_type);
-    crate::db::enqueue_outbox_post(
+    let inserted = crate::db::enqueue_outbox_post(
         pool,
         t.platform,
         t.task_id,
@@ -170,7 +186,11 @@ pub async fn enqueue_verdict_reaction(
         &value,
         &key,
     )
-    .await
+    .await?;
+    t.egress
+        .announce(pool, t.platform, t.installation_id, &key)
+        .await?;
+    Ok(inserted)
 }
 
 /// The `reaction` intent payload (ADR-0068). `comment_id` is included **only when `Some`**, so the
@@ -197,10 +217,10 @@ pub async fn enqueue_failure_notice(
     t: &Target<'_>,
     issue: i64,
     target_type: &str,
-) -> Result<bool, sqlx::Error> {
+) -> anyhow::Result<bool> {
     let key = format!("{}:failure_notice", t.key_prefix(issue));
     let value = json!({ "issue": issue, "body": crate::review::render_failure_notice(), "target_type": target_type });
-    crate::db::enqueue_outbox_post(
+    let inserted = crate::db::enqueue_outbox_post(
         pool,
         t.platform,
         t.task_id,
@@ -211,7 +231,11 @@ pub async fn enqueue_failure_notice(
         &value,
         &key,
     )
-    .await
+    .await?;
+    t.egress
+        .announce(pool, t.platform, t.installation_id, &key)
+        .await?;
+    Ok(inserted)
 }
 
 #[cfg(test)]

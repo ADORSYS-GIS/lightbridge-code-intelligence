@@ -640,6 +640,64 @@ pub async fn mark_outbox_failed(pool: &PgPool, id: i64, error: &str) -> Result<(
     .map(|_| ())
 }
 
+/// Load one outbox row **iff it is still `pending`**, by id — the status-guarded read the
+/// `PlatformEgress` virtual object runs inside `ctx.run` before posting (RFC-0005 / ADR-0074). Returns
+/// `None` when the row is absent (pruned) **or** already terminal (`posted`/`failed`) — either way the
+/// handler skips, which is what makes redelivery idempotent under the Restate path: a row a prior
+/// invocation (or a mode-flip drain) already settled is never re-posted. Mirrors the `status = 'pending'`
+/// filter the drain's [`claim_outbox_batch`] applies.
+pub async fn load_pending_outbox_row(
+    pool: &PgPool,
+    id: i64,
+) -> Result<Option<OutboxRow>, sqlx::Error> {
+    sqlx::query_as::<_, OutboxRow>(
+        "SELECT id, task_id, installation_id, owner, repo, kind, payload, attempts, platform \
+         FROM outbox \
+         WHERE id = $1 AND status = 'pending'",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await
+}
+
+/// Resolve the `outbox.id` for a `dedup_key` — the producer's bridge between the idempotent intent row
+/// ([`enqueue_outbox_post`], which returns only whether it inserted) and the `PlatformEgress::post`
+/// invocation, which is keyed on the row id (RFC-0005 / ADR-0074). Read only on the `restate` egress
+/// path; the `drain` default never calls it, so the enqueue path is byte-for-byte unchanged by the pilot.
+pub async fn outbox_id_by_dedup_key(
+    pool: &PgPool,
+    dedup_key: &str,
+) -> Result<Option<i64>, sqlx::Error> {
+    sqlx::query_scalar::<_, i64>("SELECT id FROM outbox WHERE dedup_key = $1")
+        .bind(dedup_key)
+        .fetch_optional(pool)
+        .await
+}
+
+/// Dead-letter an outbox row: park it `failed` **unconditionally** with the terminal error, recording
+/// the attempt. This is the `PlatformEgress` handler's `TerminalError` branch (RFC-0005 / ADR-0074) —
+/// the engine's retry policy has already exhausted its ceiling, so unlike [`mark_outbox_failed`] (which
+/// re-derives `pending`-vs-`failed` from `attempts²`) this makes the row terminal in one step. Mirrors
+/// `mark_outbox_failed`'s dead-letter destination so both egress paths settle a give-up the same way.
+pub async fn mark_outbox_dead_letter(
+    pool: &PgPool,
+    id: i64,
+    error: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE outbox SET \
+             attempts = attempts + 1, \
+             last_error = $2, \
+             status = 'failed' \
+         WHERE id = $1",
+    )
+    .bind(id)
+    .bind(error)
+    .execute(pool)
+    .await
+    .map(|_| ())
+}
+
 /// Prune terminal outbox rows past their retention window (ADR-0059 GC). `outbox` is
 /// append-mostly — every delivered intent settles to `posted` (a 👀 reaction alone leaves a permanent
 /// row per PR) and every dead-lettered one to `failed`, and nothing ever deletes them — so the table,
@@ -2460,6 +2518,108 @@ mod tests {
         );
     }
 
+    /// RFC-0005 / ADR-0074 — the `PlatformEgress` virtual object's DB helpers: the status-guarded load,
+    /// the id-by-dedup_key bridge, and the unconditional dead-letter. Verified against the same `outbox`
+    /// row lifecycle the drain uses, so both egress paths agree on what "pending / settled" means.
+    #[sqlx::test]
+    async fn platform_egress_db_helpers(pool: PgPool) {
+        let repo_id = seed(&pool).await;
+        let task = create_task(&pool, &pr_task(repo_id, "egress"))
+            .await
+            .unwrap()
+            .expect("task");
+        let payload = serde_json::json!({ "issue": 7, "content": "eyes" });
+        enqueue_outbox_post(
+            &pool,
+            Platform::GitHub,
+            Some(task),
+            99,
+            "o",
+            "r",
+            "reaction",
+            &payload,
+            "egress-k1",
+        )
+        .await
+        .unwrap();
+
+        // The producer bridge: resolve the row id from the dedup_key (what `announce` sends to Restate).
+        let id = outbox_id_by_dedup_key(&pool, "egress-k1")
+            .await
+            .unwrap()
+            .expect("a freshly-enqueued row is resolvable by dedup_key");
+        assert!(
+            outbox_id_by_dedup_key(&pool, "no-such-key")
+                .await
+                .unwrap()
+                .is_none(),
+            "an unknown dedup_key resolves to None, not an error"
+        );
+
+        // The status guard: a `pending` row loads (with the coordinates to post) …
+        let row = load_pending_outbox_row(&pool, id)
+            .await
+            .unwrap()
+            .expect("a pending row loads");
+        assert_eq!((row.id, row.kind.as_str()), (id, "reaction"));
+
+        // … a `posted` row does NOT (the guard is what makes redelivery an idempotent no-op — never a
+        // re-post) …
+        mark_outbox_posted(&pool, id, Some(555)).await.unwrap();
+        assert!(
+            load_pending_outbox_row(&pool, id).await.unwrap().is_none(),
+            "a posted row is not pending → the handler skips it"
+        );
+        // … and neither does an absent id.
+        assert!(load_pending_outbox_row(&pool, 10_000_000)
+            .await
+            .unwrap()
+            .is_none());
+
+        // Dead-letter: park a *pending* row `failed` unconditionally (the engine's retry ceiling already
+        // fired), recording the error and dropping it from the claim set — mirroring the drain's terminal
+        // state.
+        enqueue_outbox_post(
+            &pool,
+            Platform::GitHub,
+            Some(task),
+            99,
+            "o",
+            "r",
+            "reply",
+            &payload,
+            "egress-k2",
+        )
+        .await
+        .unwrap();
+        let dead_id = outbox_id_by_dedup_key(&pool, "egress-k2")
+            .await
+            .unwrap()
+            .unwrap();
+        mark_outbox_dead_letter(&pool, dead_id, "PR was deleted (404)")
+            .await
+            .unwrap();
+        assert!(
+            load_pending_outbox_row(&pool, dead_id)
+                .await
+                .unwrap()
+                .is_none(),
+            "a dead-lettered row is no longer pending"
+        );
+        assert!(
+            claim_outbox_batch(&pool, 10).await.unwrap().is_empty(),
+            "a dead-lettered row is not re-claimable by the drain either"
+        );
+        let (status, last_error): (String, Option<String>) =
+            sqlx::query_as("SELECT status, last_error FROM outbox WHERE id = $1")
+                .bind(dead_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(status, "failed");
+        assert_eq!(last_error.as_deref(), Some("PR was deleted (404)"));
+    }
+
     /// ADR-0068: the verdict path. A clean review enqueues a 👍 reaction targeting the @mention comment
     /// (a `comment_id` in the payload) and — crucially — **no** `review` intent, so the reconciler posts
     /// nothing but the reaction. A review with findings enqueues 👎 on the PR body (no `comment_id`).
@@ -2477,6 +2637,9 @@ mod tests {
             .unwrap()
             .expect("dirty task");
 
+        // The drain (no-op) egress router — this test exercises the enqueue/dedup ledger, not the
+        // Restate send-path (ADR-0074).
+        let egress = crate::egress::PlatformEgressRouter::disabled();
         // Clean pass: 👍 on the @mention comment, no review intent.
         let t_clean = crate::outbox::Target {
             task_id: Some(clean),
@@ -2484,6 +2647,7 @@ mod tests {
             installation_id: 99,
             owner: "o",
             repo: "r",
+            egress: &egress,
         };
         crate::outbox::enqueue_verdict_reaction(
             &pool,
@@ -2518,6 +2682,7 @@ mod tests {
             installation_id: 99,
             owner: "o",
             repo: "r",
+            egress: &egress,
         };
         crate::outbox::enqueue_verdict_reaction(&pool, &t_dirty, 8, "-1", None, "pull_request")
             .await

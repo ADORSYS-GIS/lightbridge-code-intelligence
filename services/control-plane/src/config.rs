@@ -24,6 +24,36 @@ pub struct FileConfig {
     pub review: ReviewSection,
     pub embeddings: EmbeddingsSection,
     pub knowledge_tools: KnowledgeToolsSection,
+    pub egress: EgressSection,
+}
+
+/// Which path delivers `outbox` intents (RFC-0005 Phase A / ADR-0074). **Defaults to `Drain`** — the
+/// pre-existing reconciler drain (ADR-0059) stays the active egress path, so merging the pilot changes
+/// no production behavior. Flip to `Restate` to route egress through the `PlatformEgress` virtual object
+/// (the pilot). Both modes share the `outbox` table as the ledger, so switching direction is safe: any
+/// row not yet `posted` is picked up by whichever consumer is active.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EgressMode {
+    /// The reconciler's `outbox` drain posts every intent (today's behavior). Default.
+    #[default]
+    Drain,
+    /// Producers additionally `send` `PlatformEgress::post(outbox_id)` to Restate, which posts each
+    /// intent through the per-`platform:installation` virtual object; the reconciler drain is disabled.
+    Restate,
+}
+
+/// Egress routing (RFC-0005 Phase A / ADR-0074). Absent → `Drain` (no behavior change). When `mode =
+/// restate`, `restate_ingress_url` must resolve (config or the `RESTATE_INGRESS_URL` env fallback) — the
+/// base URL of the Restate server's HTTP ingress the producer `send`s invocations to.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct EgressSection {
+    /// `drain` (default) | `restate`. See [`EgressMode`].
+    pub mode: EgressMode,
+    /// Base URL of the Restate ingress (e.g. `http://restate.converse.svc.cluster.local:8080`). Only
+    /// read in `restate` mode; falls back to the `RESTATE_INGRESS_URL` env var when unset.
+    pub restate_ingress_url: Option<String>,
 }
 
 /// External-knowledge MCP servers (ADR-0066) the review agent can dynamically discover and call as

@@ -1136,6 +1136,7 @@ pub async fn finalize_review(
         installation_id: context.installation_id,
         owner: &context.owner,
         repo: &context.name,
+        egress: &state.egress,
     };
 
     // Whether this run posts a PR review/verdict at all — findings, a verdict summary, or the
@@ -1652,6 +1653,7 @@ async fn handle_review_failure(state: &AppState, pool: &sqlx::PgPool, id: Uuid) 
         installation_id: context.installation_id,
         owner: &context.owner,
         repo: &context.name,
+        egress: &state.egress,
     };
     if state.review.reactions_enabled() {
         // ADR-0068: retarget 😕 to the @mention comment when the task was mention-triggered.

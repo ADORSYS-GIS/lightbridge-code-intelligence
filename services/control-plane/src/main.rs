@@ -32,6 +32,7 @@ mod queue;
 // Foundational modules the groups above build on.
 mod config;
 mod db;
+mod egress;
 mod jwt;
 mod mcp_client;
 mod outbox;
@@ -119,6 +120,11 @@ pub struct AppState {
     /// Dotted claim path the caller's **permissions** list is read from (ADR-0023), from
     /// `PERMISSIONS_CLAIM`. Default `permissions`. Endpoints authorize on permissions, not roles.
     pub permissions_claim: Arc<String>,
+    /// Egress router (RFC-0005 Phase A / ADR-0074). Default `drain` = today's reconciler drain owns
+    /// egress and this is a no-op; `restate` = producers additionally `send` `PlatformEgress::post` to
+    /// Restate. Shared by every producer (serve/finalize, dispatcher, reaper) so all egress routes the
+    /// same way.
+    pub egress: Arc<egress::PlatformEgressRouter>,
 }
 
 impl AppState {
@@ -142,6 +148,15 @@ impl AppState {
             .as_ref()
             .map(|f| f.knowledge_tools.clone())
             .unwrap_or_default();
+        // Egress routing (RFC-0005 Phase A / ADR-0074). Absent config → `drain` (no behavior change).
+        // Built once and shared by every producer; fails loud if `restate` mode lacks an ingress URL.
+        let egress = egress::PlatformEgressRouter::from_config(
+            &file_config
+                .as_ref()
+                .map(|f| &f.egress)
+                .cloned()
+                .unwrap_or_default(),
+        )?;
         let db = db::connect_from_env().await?;
         // Embedding-dimension safety (ADR-0018): if configured and the live column differs, either
         // reindex-from-scratch (when allowed) or fail loud — never silently mismatch.
@@ -236,6 +251,7 @@ impl AppState {
                     .filter(|c| !c.trim().is_empty())
                     .unwrap_or_else(|| "permissions".to_string()),
             ),
+            egress: Arc::new(egress),
         })
     }
 }
@@ -581,7 +597,25 @@ async fn run_reconciler(state: AppState) -> anyhow::Result<()> {
     } else {
         within_days
     };
-    queue::reconciler::run(pool, platforms, state.review.clone(), interval, within_days).await
+    // RFC-0005 Phase A / ADR-0074: when egress routes through Restate, the reconciler keeps its inbound
+    // feedback poll (ADR-0035) but its outbound `outbox` drain is DISABLED — the `PlatformEgress` virtual
+    // object owns egress. Default `drain` mode keeps the drain on (no behavior change). The drain code is
+    // retained either way (the rollback path).
+    let drain_enabled = !state.egress.is_restate();
+    if !drain_enabled {
+        tracing::info!(
+            "reconciler: egress.mode = restate — outbound drain disabled; running feedback poll only"
+        );
+    }
+    queue::reconciler::run(
+        pool,
+        platforms,
+        state.review.clone(),
+        interval,
+        within_days,
+        drain_enabled,
+    )
+    .await
 }
 
 /// The HTTP control surface (webhook ingress, `/tasks`, health, OIDC-protected routes).
@@ -622,6 +656,7 @@ async fn run_dispatcher(state: AppState) -> anyhow::Result<()> {
         dispatcher_config,
         state.neo4j.clone(),
         state.review.clone(),
+        state.egress.clone(),
     )
     .await
 }
