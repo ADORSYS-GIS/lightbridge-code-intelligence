@@ -306,12 +306,10 @@ impl CodePlatform for GitlabClient {
         issue_number: i64,
         body: &str,
         noteable_type: Option<&str>,
-        iid: Option<i64>,
     ) -> anyhow::Result<PostedComment> {
         let project = Self::project_encoded(repo);
         let payload = serde_json::json!({
-            "body": body,
-            "iid": iid
+            "body": body
         });
 
         let is_mr = noteable_type.map(|t| t == "pull_request").unwrap_or(true);
@@ -527,8 +525,8 @@ impl CodePlatform for GitlabClient {
         // Parse award emoji
         let reactions: Vec<Reaction> = award_v
             .as_array()
-            .unwrap_or(&vec![])
-            .iter()
+            .into_iter()
+            .flatten()
             .filter_map(|item| {
                 let name = item.get("name")?.as_str()?;
                 let user = item.get("user")?.get("username")?.as_str()?;

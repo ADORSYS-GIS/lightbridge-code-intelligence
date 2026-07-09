@@ -48,10 +48,6 @@ pub struct ReviewCommentPayload {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub start_line: Option<u32>,
     pub body: String,
-    /// GitLab MR/issue identifier for award emoji API calls. Required for GitLab feedback polling.
-    /// Nullable to maintain backward compatibility with existing outbox rows.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub iid: Option<i64>,
 }
 
 /// The `review` intent: everything the reconciler needs to post the grouped review **and** its success
