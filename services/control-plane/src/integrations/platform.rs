@@ -215,6 +215,7 @@ pub trait CodePlatform: Send + Sync {
         issue_number: i64,
         body: &str,
         noteable_type: Option<&str>,
+        iid: Option<i64>,
     ) -> anyhow::Result<PostedComment>;
 
     /// Add a reaction (emoji) to an issue/PR/MR body or to a comment.

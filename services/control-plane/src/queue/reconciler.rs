@@ -265,8 +265,9 @@ pub(crate) async fn deliver(
         "reply" => {
             let issue = payload_i64(&row.payload, "issue")?;
             let body = payload_str(&row.payload, "body")?;
+            let iid = payload_i64(&row.payload, "iid").ok();
             let posted = platform
-                .post_comment(repo, issue, body, noteable_type)
+                .post_comment(repo, issue, body, noteable_type, iid)
                 .await?;
             record_comment(pool, row.task_id, posted.id, "reply").await;
             Ok(posted.id)
@@ -287,8 +288,9 @@ pub(crate) async fn deliver(
             }
             let issue = payload_i64(&row.payload, "issue")?;
             let body = payload_str(&row.payload, "body")?;
+            let iid = payload_i64(&row.payload, "iid").ok();
             let posted = platform
-                .post_comment(repo, issue, body, noteable_type)
+                .post_comment(repo, issue, body, noteable_type, iid)
                 .await?;
             record_comment(pool, row.task_id, posted.id, "failure_notice").await;
             Ok(posted.id)

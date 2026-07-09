@@ -305,15 +305,14 @@ impl CodePlatform for GitlabClient {
         issue_number: i64,
         body: &str,
         noteable_type: Option<&str>,
+        iid: Option<i64>,
     ) -> anyhow::Result<PostedComment> {
         let project = Self::project_encoded(repo);
-        let payload = serde_json::json!({ "body": body });
+        let payload = serde_json::json!({
+            "body": body,
+            "iid": iid
+        });
 
-        // Phase A (ADR-0072): use `noteable_type` to route directly — no probe.
-        // GitLab MRs and issues share iid sequences (both start at 1), so a probe would
-        // succeed on the wrong noteable. `target_type` is `"pull_request"` or `"issue"`.
-        // Note: old outbox rows may not have `target_type` in their payload; default to MR
-        // (the common case for reviews). This is a low-risk fallback for in-flight rows.
         let is_mr = noteable_type.map(|t| t == "pull_request").unwrap_or(true);
 
         let endpoint = if is_mr {
@@ -350,9 +349,6 @@ impl CodePlatform for GitlabClient {
         let project = Self::project_encoded(repo);
         match target {
             ReactionTarget::Issue { number } => {
-                // Phase A (ADR-0072): use `noteable_type` to route directly — no probe.
-                // Note: old outbox rows may not have `target_type` in their payload; default to MR
-                // (the common case for reviews). This is a low-risk fallback for in-flight rows.
                 let is_mr = noteable_type.map(|t| t == "pull_request").unwrap_or(true);
 
                 let endpoint = if is_mr {
@@ -374,12 +370,36 @@ impl CodePlatform for GitlabClient {
                     .error_for_status()?;
                 Ok(())
             }
-            ReactionTarget::Comment { comment_id: _ } => {
-                // Known limitation (Phase 4): awarding emoji on a note requires the MR/issue iid,
-                // which we don't have from just the note ID. Logged, skipped.
-                tracing::debug!(
-                    "gitlab add_reaction on comment skipped (iid lookup not implemented in Phase 4)"
-                );
+            ReactionTarget::Comment { comment_id } => {
+                // Fetch the comment to get the MR/issue iid
+                let comment_url = format!("/projects/{}/notes/{}", project, comment_id);
+                let comment_resp = self
+                    .http
+                    .get(self.url(&comment_url))
+                    .headers(self.api_headers())
+                    .send()
+                    .await?
+                    .error_for_status()?;
+                let comment_v: serde_json::Value = comment_resp.json().await?;
+
+                // Extract the iid from the comment
+                let iid = comment_v
+                    .get("target_iid")
+                    .or_else(|| comment_v.get("target_id"))
+                    .and_then(|i| i.as_i64())
+                    .ok_or_else(|| anyhow::anyhow!("Comment missing iid"))?;
+
+                // Post award emoji using the iid
+                let endpoint = format!("/projects/{}/merge_requests/{}/award_emoji", project, iid);
+                let url = self.url(&endpoint);
+                let _ = self
+                    .http
+                    .post(&url)
+                    .headers(self.api_headers())
+                    .json(&serde_json::json!({ "name": emoji }))
+                    .send()
+                    .await?
+                    .error_for_status()?;
                 Ok(())
             }
         }
@@ -463,14 +483,62 @@ impl CodePlatform for GitlabClient {
 
     async fn list_comment_reactions(
         &self,
-        _repo: &RepoRef,
-        _comment_id: i64,
-        _is_review_comment: bool,
+        repo: &RepoRef,
+        comment_id: i64,
+        is_review_comment: bool,
     ) -> anyhow::Result<Vec<Reaction>> {
-        // Known limitation (Phase 4): listing award emoji on a note requires the MR/issue iid,
-        // which we don't have from just the note ID. Feedback polling (👍/👎) is a no-op for GitLab
-        // until Phase 7 stores the iid alongside the note.
-        Ok(Vec::new())
+        let project = Self::project_encoded(repo);
+
+        // Fetch the comment to get the MR/issue iid
+        let comment_url = format!("/projects/{}/notes/{}", project, comment_id);
+        let comment_resp = self
+            .http
+            .get(self.url(&comment_url))
+            .headers(self.api_headers())
+            .send()
+            .await?
+            .error_for_status()?;
+        let comment_v: serde_json::Value = comment_resp.json().await?;
+
+        // Extract the iid from the comment (GitLab uses target_iid for MRs, target_id for issues)
+        let iid = comment_v
+            .get("target_iid")
+            .or_else(|| comment_v.get("target_id"))
+            .and_then(|i| i.as_i64())
+            .ok_or_else(|| anyhow::anyhow!("Comment missing iid"))?;
+
+        // Fetch award emoji using the iid
+        let endpoint = if is_review_comment {
+            format!("/projects/{}/merge_requests/{}/award_emoji", project, iid)
+        } else {
+            format!("/projects/{}/issues/{}/award_emoji", project, iid)
+        };
+        let url = self.url(&endpoint);
+        let award_resp = self
+            .http
+            .get(&url)
+            .headers(self.api_headers())
+            .send()
+            .await?
+            .error_for_status()?;
+        let award_v: serde_json::Value = award_resp.json().await?;
+
+        // Parse award emoji
+        let reactions: Vec<Reaction> = award_v
+            .as_array()
+            .unwrap_or(&vec![])
+            .iter()
+            .filter_map(|item| {
+                let name = item.get("name")?.as_str()?;
+                let user = item.get("user")?.get("username")?.as_str()?;
+                Some(Reaction {
+                    content: name.to_string(),
+                    user_login: user.to_string(),
+                })
+            })
+            .collect();
+
+        Ok(reactions)
     }
 
     fn clone_url(&self, repo: &RepoRef) -> String {

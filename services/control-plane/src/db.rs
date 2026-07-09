@@ -781,8 +781,8 @@ pub async fn list_pollable_comments(
     within_days: i32,
     interval_secs: i64,
 ) -> Result<Vec<PollableComment>, sqlx::Error> {
-    // Phase 7 TODO: GitLab feedback polling is not implemented yet (list_comment_reactions returns empty).
-    // Filter to GitHub only to avoid wasting cycles on no-op GitLab API calls.
+    // Filter to GitHub only to avoid wasting cycles on no-op GitLab API calls (GitLab feedback polling
+    // requires MR/issue iid which is stored in the outbox payload).
     sqlx::query_as::<_, PollableComment>(
         "SELECT rc.task_id, rc.platform_comment_id, rc.kind, r.owner, r.name, t.installation_id, r.platform \
          FROM review_comments rc \

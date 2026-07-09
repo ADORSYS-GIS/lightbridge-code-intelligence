@@ -179,16 +179,14 @@ flowchart TD
 
 ## Known Limitations and Future Work
 
-### Phase 4: GitLab Feedback Polling
-**Status:** Known limitation, tracked in `services/control-plane/src/integrations/gitlab.rs`
+### GitLab Feedback Polling
+**Status:** Implemented
 
-- `list_comment_reactions()` returns an empty `Vec` for GitLab because award emoji requires the MR/issue
-  `iid`, which is not stored from the note `id`. The outbox payload only carries the `issue_number` and
-  `target_type` (MR vs issue), but not the `iid` itself.
-- **Impact:** 👍/👎 feedback polling is a no-op for GitLab until Phase 7 stores the `iid` alongside the
-  note id in the outbox payload.
-- **Mitigation:** GitLab review posting (comments, reactions, labels) works correctly; only the feedback
-  polling is affected.
+- `list_comment_reactions()` now fetches the MR/issue `iid` from the comment and uses it to fetch award emoji from the correct endpoint.
+- The outbox payload now includes an optional `iid` field in `ReviewCommentPayload` to store the MR/issue identifier.
+- `add_comment()` stores the `iid` in the payload JSON when posting GitLab comments.
+- `add_reaction()` handles comment reactions by fetching the comment to get the `iid` and posting the reaction.
+- **Impact:** 👍/👎 feedback polling now works for GitLab MRs and issues.
 
 ### Phase 4: GitLab Comment Reaction on Comment ID
 **Status:** Known limitation, tracked in `services/control-plane/src/integrations/gitlab.rs`

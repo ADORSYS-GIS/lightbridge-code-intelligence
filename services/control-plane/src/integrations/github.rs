@@ -702,6 +702,7 @@ impl CodePlatform for GithubApp {
         issue_number: i64,
         body: &str,
         _noteable_type: Option<&str>,
+        _iid: Option<i64>,
     ) -> anyhow::Result<PostedComment> {
         let (owner, name) = repo.owner_repo();
         let token = self.token_for(repo).await?;

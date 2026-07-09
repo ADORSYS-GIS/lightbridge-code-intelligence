@@ -1355,6 +1355,7 @@ pub async fn finalize_review(
                 line: c.line,
                 start_line: c.start_line,
                 body: c.body.clone(),
+                iid: None,
             })
             .collect();
         let (inline_n, deferred_n, out_of_scope_n) = (
