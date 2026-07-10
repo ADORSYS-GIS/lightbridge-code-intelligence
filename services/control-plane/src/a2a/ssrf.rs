@@ -450,7 +450,7 @@ mod tests {
     #[test]
     fn resolver_error_is_resolution() {
         let err = validate_webhook_url("https://example.com/", &SsrfPolicy::default(), |_h| {
-            Err(std::io::Error::new(std::io::ErrorKind::Other, "boom"))
+            Err(std::io::Error::other("boom"))
         })
         .unwrap_err();
         assert_eq!(err, SsrfError::Resolution);
