@@ -32,7 +32,7 @@ use uuid::Uuid;
 
 use super::mapping::{
     build_task_view, parse_review_request, review_artifacts, task_state_from_status, ParseError,
-    ReviewInput,
+    ReviewContext, ReviewInput,
 };
 use super::store::{PgTaskStore, LB_CALLER, LB_SKILL, LB_UNDERLYING};
 use super::{HDR_CALLER, HDR_PERMS};
@@ -331,20 +331,28 @@ impl A2aHandler {
     }
 
     /// Derive the current A2A state for a mapping — live from the underlying task when present,
-    /// else the stored terminal snapshot (e.g. a REJECTED submission).
-    async fn current_state(&self, mapping: &super::store::Mapping) -> Result<TaskState, A2AError> {
+    /// else the stored terminal snapshot (e.g. a REJECTED submission). Returns the fetched `tasks`
+    /// row alongside the state so a caller that also needs the row (the completed-review path wants
+    /// the SHAs/repo for the context part) reuses this single fetch instead of a second round-trip —
+    /// and so state and context are read from the *same* row, with no window for a concurrent delete
+    /// to slip between them.
+    async fn current_state(
+        &self,
+        mapping: &super::store::Mapping,
+    ) -> Result<(TaskState, Option<db::TaskRow>), A2AError> {
         match mapping.underlying_task_id {
             Some(underlying) => {
                 let row = db::get_task(&self.pool, underlying)
                     .await
                     .map_err(db_error)?;
-                Ok(match row {
+                let state = match &row {
                     Some(task) => task_state_from_status(&task.status),
                     // The underlying row was purged/reaped — fall back to the stored snapshot.
                     None => state_from_wire(&mapping.state),
-                })
+                };
+                Ok((state, row))
             }
-            None => Ok(state_from_wire(&mapping.state)),
+            None => Ok((state_from_wire(&mapping.state), None)),
         }
     }
 }
@@ -375,15 +383,32 @@ impl RequestHandler for A2aHandler {
             .map_err(db_error)?
             .ok_or_else(|| A2AError::task_not_found(&req.id))?;
 
-        let state = self.current_state(&mapping).await?;
+        let (state, task_row) = self.current_state(&mapping).await?;
 
-        // On a completed review, additionally return the caller-scoped artifacts (summary + findings).
+        // On a completed review, additionally return the caller-scoped artifacts: the summary +
+        // findings, plus a context part echoing the submitted base/head SHAs, the derived scope, and
+        // the posted-review permalink (so the caller can confirm what was reviewed and jump to it).
         let artifacts = if state == TaskState::Completed {
             match mapping.underlying_task_id {
-                Some(underlying) => db::get_review(&self.pool, underlying)
+                Some(underlying) => match db::get_review(&self.pool, underlying)
                     .await
                     .map_err(db_error)?
-                    .map(|review| review_artifacts(&review.summary, &review.findings)),
+                {
+                    Some(review) => {
+                        // Reuse the `tasks` row already fetched for the state read (it carries the
+                        // SHAs / repo / pr for the context part) — no second round-trip. `None` only
+                        // if the row was concurrently deleted after the state fetch, in which case the
+                        // context carries just the review_url with null SHAs (ReviewContext handles it).
+                        let context =
+                            review_context(task_row.as_ref(), review.review_url.as_deref());
+                        Some(review_artifacts(
+                            &review.summary,
+                            &review.findings,
+                            &context,
+                        ))
+                    }
+                    None => None,
+                },
                 None => None,
             }
         } else {
@@ -416,8 +441,8 @@ impl RequestHandler for A2aHandler {
             .map_err(db_error)?
             .ok_or_else(|| A2AError::task_not_found(&req.id))?;
 
-        // Already terminal → not cancelable (spec).
-        let state = self.current_state(&mapping).await?;
+        // Already terminal → not cancelable (spec). (The fetched row is unused on the cancel path.)
+        let (state, _) = self.current_state(&mapping).await?;
         if state.is_terminal() {
             return Err(A2AError::task_not_cancelable(&req.id));
         }
@@ -523,6 +548,29 @@ impl RequestHandler for A2aHandler {
         Err(A2AError::unsupported_operation(
             "extended agent card is not configured",
         ))
+    }
+}
+
+/// Build the completed-review [`ReviewContext`] from the underlying `tasks` row and the persisted
+/// review permalink. The row is normally present (the state read that decided COMPLETED fetched it);
+/// `None` only on a concurrent delete racing between that fetch and here, in which case the context
+/// echoes just the `review_url` with null SHAs/repo — the artifact shape stays stable either way.
+fn review_context(task: Option<&db::TaskRow>, review_url: Option<&str>) -> ReviewContext {
+    match task {
+        Some(task) => ReviewContext {
+            repo: match (&task.repo_owner, &task.repo_name) {
+                (Some(owner), Some(name)) => Some(format!("{owner}/{name}")),
+                _ => None,
+            },
+            pr: Some(task.target_id),
+            base_sha: task.base_sha.clone(),
+            head_sha: task.head_sha.clone(),
+            review_url: review_url.map(str::to_string),
+        },
+        None => ReviewContext {
+            review_url: review_url.map(str::to_string),
+            ..Default::default()
+        },
     }
 }
 
@@ -990,7 +1038,7 @@ mod tests {
             TaskState::Working
         );
 
-        // succeeded + a review row → COMPLETED with summary + findings artifacts
+        // succeeded + a review row → COMPLETED with summary + findings + context artifacts
         set_status(&pool, underlying, "succeeded").await;
         let findings = json!([{ "path": "auth.rs", "severity": "P1" }]);
         db::insert_review_if_absent(
@@ -1009,10 +1057,69 @@ mod tests {
         assert_eq!(done.status.state, TaskState::Completed);
         let arts = done.artifacts.expect("artifacts on completion");
         assert_eq!(arts.len(), 1);
+        assert_eq!(arts[0].parts.len(), 3);
         assert_eq!(arts[0].parts[0].as_text(), Some("Found an issue"));
         match &arts[0].parts[1].content {
             a2a::PartContent::Data(v) => assert_eq!(v, &findings),
             other => panic!("expected findings data part, got {other:?}"),
+        }
+        // The context part echoes the effective SHAs (headSha "abc", no base → whole-tree scope),
+        // the repo, and the PR — the caller can confirm exactly what was reviewed.
+        match &arts[0].parts[2].content {
+            a2a::PartContent::Data(v) => {
+                assert_eq!(v["repo"], json!("acme/api"));
+                assert_eq!(v["pr"], json!(7));
+                assert_eq!(v["headSha"], json!("abc"));
+                assert_eq!(v["baseSha"], json!(null));
+                assert_eq!(v["scope"], json!("whole-tree"));
+            }
+            other => panic!("expected context data part, got {other:?}"),
+        }
+    }
+
+    /// Companion to the whole-tree completion test: a run submitted WITH a base SHA echoes a
+    /// diff-scoped context (`baseSha` present ⇒ `scope: "diff"`). Exercises the base-present branch
+    /// of the derived scope through the full handler path, not just the pure builder. (The `scope`
+    /// is derived from the *request*; see the `ReviewContext` docs for the runner-fallback caveat.)
+    #[sqlx::test(migrations = "./migrations")]
+    async fn completed_review_with_base_echoes_diff_scoped_context(pool: PgPool) {
+        seed_approved_repo(&pool, "acme", "api", 111).await;
+        let h = handler(pool.clone(), 10);
+        let caller = params("svc-a", &["a2a:review"]);
+        let submitted = task_of(
+            h.send_message(
+                &caller,
+                review_req(
+                    json!({ "repo": "acme/api", "pr": 9, "headSha": "head9", "baseSha": "base9" }),
+                ),
+            )
+            .await
+            .unwrap(),
+        );
+        let underlying = underlying_of(&submitted).unwrap();
+        set_status(&pool, underlying, "succeeded").await;
+        db::insert_review_if_absent(&pool, underlying, "ok", "body", 0, 0, 0, &json!([]))
+            .await
+            .unwrap();
+        let done = h
+            .get_task(
+                &caller,
+                GetTaskRequest {
+                    id: submitted.id.clone(),
+                    history_length: None,
+                    tenant: None,
+                },
+            )
+            .await
+            .unwrap();
+        let arts = done.artifacts.expect("artifacts on completion");
+        match &arts[0].parts[2].content {
+            a2a::PartContent::Data(v) => {
+                assert_eq!(v["baseSha"], json!("base9"));
+                assert_eq!(v["headSha"], json!("head9"));
+                assert_eq!(v["scope"], json!("diff"));
+            }
+            other => panic!("expected context data part, got {other:?}"),
         }
     }
 

@@ -196,10 +196,67 @@ fn json_to_i64(value: &Value) -> Option<i64> {
         })
 }
 
-/// Build the caller-scoped A2A artifacts for a COMPLETED review: a text summary part plus a
-/// structured `data` part carrying the findings JSON (ADR-0032 shape). These are an ADDITIONAL
-/// output to the caller — the PR review itself still posts through the existing pipeline.
-pub fn review_artifacts(summary: &str, findings: &Value) -> Vec<Artifact> {
+/// The context echoed back on a COMPLETED review so the caller can confirm *what was reviewed* and
+/// jump straight to the posted result:
+///
+/// - `base_sha` / `head_sha` — the base/head SHAs the run was **submitted with** (from the
+///   underlying `tasks` row).
+/// - **scope** is derived from whether a base was **supplied on the request**: base present →
+///   `diff` (a diff-scoped review of `merge-base(base,head)..head` was *requested*), absent →
+///   `whole-tree` (no base, so the whole working tree at `head` is reviewed). **This reflects the
+///   *requested* scope, not a readback of the runner's decision:** the agent-runner (`pr_diff`)
+///   still falls back to a whole-tree review even with a base when `base == head`, the diff is
+///   empty, or the diff computation fails. So `diff` means "diff-scoping was requested" (not a
+///   guarantee the run diffed); `whole-tree` is always accurate (no base ⇒ never diff-scoped). The
+///   value still answers the [RFC-0006] `baseSha`-determines-scope question the caller cares about —
+///   just don't read `diff` as a hard promise.
+/// - `review_url` — the permalink to the review posted on the PR ([`ReviewRow::review_url`]).
+///
+/// Every field is optional: when the underlying run row is unavailable, repo/pr/SHAs are unknown
+/// and only what survives (e.g. the persisted `review_url`) is echoed.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ReviewContext {
+    pub repo: Option<String>,
+    pub pr: Option<i64>,
+    pub base_sha: Option<String>,
+    pub head_sha: Option<String>,
+    pub review_url: Option<String>,
+}
+
+impl ReviewContext {
+    /// The review scope the base SHA implies. A real run always carried a head (the handler requires
+    /// one at submit), so `head_sha.is_some()` distinguishes "row present, no base → whole-tree" from
+    /// "row reaped → scope unknowable (`None`)".
+    fn scope(&self) -> Option<&'static str> {
+        if self.base_sha.is_some() {
+            Some("diff")
+        } else if self.head_sha.is_some() {
+            Some("whole-tree")
+        } else {
+            None
+        }
+    }
+
+    /// The context `data` part body: nulls where a field is unknown (JSON `null`), so the shape is
+    /// stable for callers regardless of whether the row was reaped.
+    fn to_data(&self) -> Value {
+        serde_json::json!({
+            "repo": self.repo,
+            "pr": self.pr,
+            "baseSha": self.base_sha,
+            "headSha": self.head_sha,
+            "scope": self.scope(),
+            "reviewUrl": self.review_url,
+        })
+    }
+}
+
+/// Build the caller-scoped A2A artifacts for a COMPLETED review: a text summary part, a structured
+/// `data` part carrying the findings JSON (ADR-0032 shape), and a `data` context part carrying the
+/// effective base/head SHAs, the derived scope, and the review permalink (see [`ReviewContext`]).
+/// These are an ADDITIONAL output to the caller — the PR review itself still posts through the
+/// existing pipeline.
+pub fn review_artifacts(summary: &str, findings: &Value, context: &ReviewContext) -> Vec<Artifact> {
     let summary_text = if summary.trim().is_empty() {
         "Review completed with no summary.".to_string()
     } else {
@@ -208,10 +265,15 @@ pub fn review_artifacts(summary: &str, findings: &Value) -> Vec<Artifact> {
     vec![Artifact {
         artifact_id: "review".to_string(),
         name: Some("review".to_string()),
-        description: Some("Deep review summary and structured findings.".to_string()),
+        description: Some(
+            "Deep review summary, structured findings, and the review context (effective \
+             base/head SHAs, scope, and the posted-review permalink)."
+                .to_string(),
+        ),
         parts: vec![
             Part::text(summary_text),
             Part::data(findings.clone()).with_media_type("application/json"),
+            Part::data(context.to_data()).with_media_type("application/json"),
         ],
         metadata: None,
         extensions: None,
@@ -403,23 +465,76 @@ mod tests {
         );
     }
 
-    #[test]
-    fn review_artifacts_carry_summary_and_findings() {
-        let findings = json!([{ "path": "a.rs", "severity": "P1" }]);
-        let arts = review_artifacts("Looks risky", &findings);
-        assert_eq!(arts.len(), 1);
-        assert_eq!(arts[0].artifact_id, "review");
-        assert_eq!(arts[0].parts.len(), 2);
-        assert_eq!(arts[0].parts[0].as_text(), Some("Looks risky"));
-        match &arts[0].parts[1].content {
-            a2a::PartContent::Data(v) => assert_eq!(v, &findings),
-            other => panic!("expected data part, got {other:?}"),
+    fn ctx(base: Option<&str>, head: Option<&str>, url: Option<&str>) -> ReviewContext {
+        ReviewContext {
+            repo: Some("acme/api".to_string()),
+            pr: Some(42),
+            base_sha: base.map(str::to_string),
+            head_sha: head.map(str::to_string),
+            review_url: url.map(str::to_string),
         }
     }
 
     #[test]
+    fn review_artifacts_carry_summary_findings_and_context() {
+        let findings = json!([{ "path": "a.rs", "severity": "P1" }]);
+        let arts = review_artifacts(
+            "Looks risky",
+            &findings,
+            &ctx(
+                Some("base1"),
+                Some("head1"),
+                Some("https://github.com/acme/api/pull/42#pullrequestreview-9"),
+            ),
+        );
+        assert_eq!(arts.len(), 1);
+        assert_eq!(arts[0].artifact_id, "review");
+        assert_eq!(arts[0].parts.len(), 3);
+        assert_eq!(arts[0].parts[0].as_text(), Some("Looks risky"));
+        match &arts[0].parts[1].content {
+            a2a::PartContent::Data(v) => assert_eq!(v, &findings),
+            other => panic!("expected findings data part, got {other:?}"),
+        }
+        // The context part echoes the effective SHAs, the derived scope, and the review permalink.
+        match &arts[0].parts[2].content {
+            a2a::PartContent::Data(v) => {
+                assert_eq!(v["repo"], json!("acme/api"));
+                assert_eq!(v["pr"], json!(42));
+                assert_eq!(v["baseSha"], json!("base1"));
+                assert_eq!(v["headSha"], json!("head1"));
+                assert_eq!(v["scope"], json!("diff"));
+                assert_eq!(
+                    v["reviewUrl"],
+                    json!("https://github.com/acme/api/pull/42#pullrequestreview-9")
+                );
+            }
+            other => panic!("expected context data part, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn context_scope_is_derived_from_the_base_sha() {
+        // Base present → diff-scoped.
+        assert_eq!(ctx(Some("b"), Some("h"), None).scope(), Some("diff"));
+        // No base but a head → whole working tree at head.
+        assert_eq!(ctx(None, Some("h"), None).scope(), Some("whole-tree"));
+        // Row reaped (no head either) → scope is unknowable, not a false whole-tree.
+        assert_eq!(ReviewContext::default().scope(), None);
+        // The reaped shape still carries whatever survived (e.g. the persisted review_url) and nulls
+        // the rest — a stable shape for callers.
+        let reaped = ReviewContext {
+            review_url: Some("https://example/pr/1".to_string()),
+            ..Default::default()
+        };
+        let data = reaped.to_data();
+        assert_eq!(data["scope"], json!(null));
+        assert_eq!(data["baseSha"], json!(null));
+        assert_eq!(data["reviewUrl"], json!("https://example/pr/1"));
+    }
+
+    #[test]
     fn empty_summary_gets_a_placeholder() {
-        let arts = review_artifacts("   ", &json!([]));
+        let arts = review_artifacts("   ", &json!([]), &ReviewContext::default());
         assert_eq!(
             arts[0].parts[0].as_text(),
             Some("Review completed with no summary.")

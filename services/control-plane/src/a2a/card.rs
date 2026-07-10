@@ -23,7 +23,7 @@ const OIDC_SCHEME_NAME: &str = "keycloak-oidc";
 /// description is the discoverable place to publish the input contract. The schema mirrors
 /// [`super::mapping::parse_review_request`] exactly (its authoritative parser); keep the two in
 /// sync. Full calling guide: `docs/a2a-review-skill.md`.
-const REVIEW_SKILL_DESCRIPTION: &str = r#"Request a deep review of a pull/merge request. The review runs the deep tier through the same pipeline as an `@mention` and posts to the PR; the A2A task additionally returns a summary + structured findings to the caller.
+const REVIEW_SKILL_DESCRIPTION: &str = r#"Request a deep review of a pull/merge request. The review runs the deep tier through the same pipeline as an `@mention` and posts to the PR; the A2A task additionally returns, on completion, a summary + structured findings + a review-context part (the submitted baseSha/headSha, the request-derived scope diff|whole-tree, and the posted-review permalink) to the caller.
 
 Send the request as the JSON object below, carried in a `data` part of a `ROLE_USER` message (`message.parts[].data`). Input schema (JSON Schema draft-07):
 
