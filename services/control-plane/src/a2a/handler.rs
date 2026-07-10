@@ -27,6 +27,7 @@ use a2a_server::TaskStore;
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 use serde_json::{json, Map, Value};
+use sqlx::postgres::{PgListener, PgPoolOptions};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -42,6 +43,23 @@ use crate::db;
 const REVIEW_PERMISSION: &str = "a2a:review";
 /// The A2A skill id this handler serves.
 const SKILL_REVIEW: &str = "review";
+
+/// Fallback poll cadence for a streaming tail when no `NOTIFY` arrives (mirrors the dispatcher's
+/// `LISTEN`-with-timeout loop). A missed notify costs at most this much latency, never correctness.
+const TAIL_POLL_FALLBACK: std::time::Duration = std::time::Duration::from_secs(5);
+/// Hard cap on a single streaming connection's lifetime — a backstop for a tail that never sees its
+/// terminal event (ADR-0077 S2/S7). Comfortably longer than a 2 h deep run (ADR-0062) so it never cuts
+/// a legitimate long tail short.
+const MAX_STREAM_LIFETIME: std::time::Duration = std::time::Duration::from_secs(3 * 60 * 60);
+/// Streaming subscriptions get their OWN small connection pool, separate from the request pool that
+/// serves `SendMessage`/`GetTask`/`CancelTask`. A [`PgListener`] holds its connection for the whole
+/// stream lifetime (up to [`MAX_STREAM_LIFETIME`] = 3 h), so serving tails from the request pool would
+/// let a handful of long-lived streams starve every other query on the replica. This size therefore
+/// doubles as the **per-replica cap on concurrent streams**: past it a new subscription fails fast
+/// (a short acquire timeout) with a clear "capacity reached" error rather than pinning a request
+/// connection or an unbounded Postgres backend. A global cap, not per-caller — per-caller fairness is
+/// a later refinement (RFC-0006).
+const MAX_CONCURRENT_STREAMS: u32 = 64;
 
 /// Per-identity rate limit on deep-run submission (RFC-0006 R4).
 #[derive(Debug, Clone, Copy)]
@@ -61,6 +79,10 @@ struct CallerCtx {
 /// The A2A review request handler.
 pub struct A2aHandler {
     pool: PgPool,
+    /// Dedicated pool for streaming `LISTEN` connections — isolated from `pool` and bounded to
+    /// [`MAX_CONCURRENT_STREAMS`] so long-lived tails can neither starve the request pool nor open
+    /// unbounded Postgres backends (see the const).
+    listener_pool: PgPool,
     store: PgTaskStore,
     quota: QuotaConfig,
 }
@@ -68,7 +90,20 @@ pub struct A2aHandler {
 impl A2aHandler {
     pub fn new(pool: PgPool, quota: QuotaConfig) -> Self {
         let store = PgTaskStore::new(pool.clone());
-        Self { pool, store, quota }
+        // Derived from the request pool's own connect options (so it targets the same database,
+        // including in tests) but with its own small cap and a short acquire timeout, so a saturated
+        // stream pool surfaces as a fast, explicit error instead of blocking. `connect_lazy_with`
+        // opens nothing until the first subscription.
+        let listener_pool = PgPoolOptions::new()
+            .max_connections(MAX_CONCURRENT_STREAMS)
+            .acquire_timeout(std::time::Duration::from_millis(250))
+            .connect_lazy_with((*pool.connect_options()).clone());
+        Self {
+            pool,
+            listener_pool,
+            store,
+            quota,
+        }
     }
 
     /// Extract the caller identity from the middleware-injected params. The middleware validated the
@@ -124,6 +159,21 @@ impl A2aHandler {
         // storage blip into a hard error on a request that already succeeded.
         if let Err(error) = self.store.create(stored.clone()).await {
             tracing::warn!(%error, a2a_task_id, "failed to persist rejected a2a task (best-effort)");
+        } else if let Ok(id) = Uuid::parse_str(a2a_task_id) {
+            // ADR-0077: a REJECTED submission never flows through `set_task_status` (it launches no
+            // run), so append its single terminal stream event here — a stream opened on it replays one
+            // event and closes. Best-effort, like the mapping snapshot above.
+            if let Err(error) = crate::a2a::events::append_terminal_status(
+                &self.pool,
+                id,
+                context_id,
+                TaskState::Rejected,
+                None,
+            )
+            .await
+            {
+                tracing::warn!(%error, a2a_task_id, "failed to append REJECTED stream event (best-effort)");
+            }
         }
         Ok(SendMessageResponse::Task(client_view(stored)))
     }
@@ -355,35 +405,19 @@ impl A2aHandler {
             None => Ok((state_from_wire(&mapping.state), None)),
         }
     }
-}
 
-#[async_trait]
-impl RequestHandler for A2aHandler {
-    async fn send_message(
+    /// Build the current A2A [`Task`] view for a mapping — the same snapshot `GetTask` returns and the
+    /// initial frame of a stream. On a completed review it additionally attaches the caller-scoped
+    /// artifacts (summary + findings + the review context echo).
+    async fn build_task_snapshot(
         &self,
-        params: &ServiceParams,
-        req: SendMessageRequest,
-    ) -> Result<SendMessageResponse, A2AError> {
-        let caller = Self::caller(params)?;
-        self.submit_review(&caller, req).await
-    }
-
-    async fn get_task(
-        &self,
-        params: &ServiceParams,
-        req: GetTaskRequest,
+        a2a_task_id: &str,
+        mapping: &super::store::Mapping,
     ) -> Result<Task, A2AError> {
-        let caller = Self::caller(params)?;
-        let id = Uuid::parse_str(&req.id).map_err(|_| A2AError::task_not_found(&req.id))?;
-        // Caller-scoped load — an unknown-or-not-owned id is a clean TaskNotFound (no existence leak).
-        let mapping = self
-            .store
-            .load_owned(id, &caller.id)
-            .await
-            .map_err(db_error)?
-            .ok_or_else(|| A2AError::task_not_found(&req.id))?;
-
-        let (state, task_row) = self.current_state(&mapping).await?;
+        // `mapping` is already caller-scope-loaded by the caller (`get_task` / `stream_task`); this
+        // helper only projects it. Reuse the single `tasks` fetch from `current_state` (returns the
+        // row) so the completed-review context echo needs no second round-trip.
+        let (state, task_row) = self.current_state(mapping).await?;
 
         // On a completed review, additionally return the caller-scoped artifacts: the summary +
         // findings, plus a context part echoing the submitted base/head SHAs, the derived scope, and
@@ -419,12 +453,206 @@ impl RequestHandler for A2aHandler {
             .underlying_task_id
             .map(|u| Map::from_iter([(LB_UNDERLYING.to_string(), Value::from(u.to_string()))]));
         Ok(build_task_view(
-            &req.id,
+            a2a_task_id,
             &mapping.context_id,
             state,
             artifacts,
             metadata,
         ))
+    }
+
+    /// The replay-then-tail SSE stream backing `SubscribeToTask` and the streaming leg of
+    /// `SendStreamingMessage` (ADR-0077). Same caller-scoped ownership check as `GetTask`
+    /// (unknown/foreign id → `TaskNotFound`); then: emit the initial `Task` snapshot, **replay** the
+    /// task's `a2a_task_events` in `seq` order, then **tail** — waking on the per-task `NOTIFY` channel
+    /// with a bounded fallback poll, re-querying `seq > last_emitted` each wake, and closing on the
+    /// `final = true` event (or the terminal-state backstop). The `seq`-cursor SELECT is the source of
+    /// truth; `NOTIFY` is only a wake hint, so a missed notify costs latency, never a lost/misordered
+    /// event.
+    async fn stream_task(
+        &self,
+        caller: &CallerCtx,
+        a2a_task_id: &str,
+    ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, A2AError> {
+        let id = Uuid::parse_str(a2a_task_id).map_err(|_| A2AError::task_not_found(a2a_task_id))?;
+        let mapping = self
+            .store
+            .load_owned(id, &caller.id)
+            .await
+            .map_err(db_error)?
+            .ok_or_else(|| A2AError::task_not_found(a2a_task_id))?;
+
+        let snapshot = self.build_task_snapshot(a2a_task_id, &mapping).await?;
+        let already_terminal = snapshot.status.state.is_terminal();
+        let pool = self.pool.clone();
+        // Streams LISTEN on the dedicated, bounded listener pool — never the request pool (see
+        // MAX_CONCURRENT_STREAMS): a long tail must not hold a request connection.
+        let listener_pool = self.listener_pool.clone();
+        let underlying = mapping.underlying_task_id;
+        let channel = crate::a2a::events::task_channel(&id);
+
+        let stream = async_stream::stream! {
+            // 1) Initial Task snapshot (the current GetTask view).
+            yield Ok(StreamResponse::Task(snapshot));
+
+            let mut last_seq: i64 = 0;
+
+            // 2) Replay everything already logged (seq > 0), strictly in seq order.
+            match crate::a2a::events::fetch_events_after(&pool, id, last_seq).await {
+                Ok(events) => {
+                    for (seq, payload, is_final) in events {
+                        match serde_json::from_value::<StreamResponse>(payload) {
+                            Ok(event) => yield Ok(event),
+                            Err(error) => {
+                                tracing::error!(%error, a2a_task_id = %id, seq, "a2a: corrupt stream event payload");
+                                yield Err(A2AError::internal("internal error"));
+                                return;
+                            }
+                        }
+                        last_seq = seq;
+                        if is_final {
+                            return; // terminal event → close
+                        }
+                    }
+                }
+                Err(error) => {
+                    yield Err(db_error(error));
+                    return;
+                }
+            }
+
+            // A task already terminal at subscribe replays its sequence and closes without tailing.
+            if already_terminal {
+                return;
+            }
+
+            // 3) Tail: NOTIFY-wake with a bounded fallback poll; the seq-cursor SELECT is authoritative.
+            // The listener draws from the dedicated stream pool; when it is saturated (too many
+            // concurrent streams on this replica) the acquire times out fast — surface that as a clear,
+            // retryable "capacity" error rather than a generic internal failure.
+            let mut listener = match PgListener::connect_with(&listener_pool).await {
+                Ok(listener) => listener,
+                Err(error) => {
+                    tracing::warn!(%error, a2a_task_id = %id, "a2a: stream listener pool saturated or unavailable");
+                    yield Err(A2AError::internal(
+                        "streaming capacity reached; retry shortly or poll GetTask",
+                    ));
+                    return;
+                }
+            };
+            if let Err(error) = listener.listen(&channel).await {
+                tracing::error!(%error, a2a_task_id = %id, "a2a: stream LISTEN failed");
+                yield Err(A2AError::internal("internal error"));
+                return;
+            }
+
+            let start = tokio::time::Instant::now();
+            loop {
+                // Drain any events past the cursor (also covers events that landed between replay and
+                // LISTEN — a missed notify never loses them because the cursor SELECT is the truth).
+                match crate::a2a::events::fetch_events_after(&pool, id, last_seq).await {
+                    Ok(events) => {
+                        for (seq, payload, is_final) in events {
+                            match serde_json::from_value::<StreamResponse>(payload) {
+                                Ok(event) => yield Ok(event),
+                                Err(error) => {
+                                    tracing::error!(%error, a2a_task_id = %id, seq, "a2a: corrupt stream event payload");
+                                    yield Err(A2AError::internal("internal error"));
+                                    return;
+                                }
+                            }
+                            last_seq = seq;
+                            if is_final {
+                                return;
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        yield Err(db_error(error));
+                        return;
+                    }
+                }
+
+                // Backstop (ADR-0077 risk S7): if the live state is already terminal, do one FINAL
+                // drain before closing. The terminal `set_task_status` transaction commits the status
+                // flip and its terminal events (COMPLETED + any artifact) atomically, so a
+                // live-terminal read means those events are already durable. Returning here WITHOUT
+                // re-draining would drop them whenever the completion commits in the window between the
+                // drain at the top of this loop and this check — the stream would close after WORKING,
+                // never delivering the terminal event (an R6 violation: the stream must close *at* the
+                // terminal state, delivering it). Re-fetch once; in the genuine crash case (the run
+                // finished but no terminal event was ever appended) this finds nothing and we still
+                // close rather than tail forever.
+                if is_live_terminal(&pool, underlying).await {
+                    match crate::a2a::events::fetch_events_after(&pool, id, last_seq).await {
+                        Ok(events) => {
+                            // Final drain: emit whatever the terminal commit left past the cursor, then
+                            // close unconditionally (no need to advance `last_seq` — we never loop again).
+                            for (seq, payload, is_final) in events {
+                                match serde_json::from_value::<StreamResponse>(payload) {
+                                    Ok(event) => yield Ok(event),
+                                    Err(error) => {
+                                        tracing::error!(%error, a2a_task_id = %id, seq, "a2a: corrupt stream event payload");
+                                        yield Err(A2AError::internal("internal error"));
+                                        return;
+                                    }
+                                }
+                                if is_final {
+                                    return;
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            yield Err(db_error(error));
+                            return;
+                        }
+                    }
+                    return;
+                }
+
+                // Per-connection max lifetime caps a truly stuck tail (ADR-0077 S2/S7).
+                if start.elapsed() >= MAX_STREAM_LIFETIME {
+                    tracing::warn!(a2a_task_id = %id, "a2a: stream hit max lifetime; closing tail");
+                    return;
+                }
+
+                // Wake on NOTIFY or the fallback poll, whichever first. Errors/timeouts just re-loop and
+                // re-query the cursor.
+                let _ = tokio::time::timeout(TAIL_POLL_FALLBACK, listener.recv()).await;
+            }
+        };
+
+        Ok(Box::pin(stream))
+    }
+}
+
+#[async_trait]
+impl RequestHandler for A2aHandler {
+    async fn send_message(
+        &self,
+        params: &ServiceParams,
+        req: SendMessageRequest,
+    ) -> Result<SendMessageResponse, A2AError> {
+        let caller = Self::caller(params)?;
+        self.submit_review(&caller, req).await
+    }
+
+    async fn get_task(
+        &self,
+        params: &ServiceParams,
+        req: GetTaskRequest,
+    ) -> Result<Task, A2AError> {
+        let caller = Self::caller(params)?;
+        let id = Uuid::parse_str(&req.id).map_err(|_| A2AError::task_not_found(&req.id))?;
+        // Caller-scoped load — an unknown-or-not-owned id is a clean TaskNotFound (no existence leak).
+        let mapping = self
+            .store
+            .load_owned(id, &caller.id)
+            .await
+            .map_err(db_error)?
+            .ok_or_else(|| A2AError::task_not_found(&req.id))?;
+
+        self.build_task_snapshot(&req.id, &mapping).await
     }
 
     async fn cancel_task(
@@ -464,6 +692,21 @@ impl RequestHandler for A2aHandler {
             }
         }
 
+        // ADR-0077: the underlying flip above bypasses `set_task_status`, so append the terminal CANCELED
+        // stream event here (locking the run row so it serializes against a concurrent status append; the
+        // `has_final` guard then makes whichever runs second a no-op). Best-effort, like the CAS snapshot.
+        if let Err(error) = crate::a2a::events::append_terminal_status(
+            &self.pool,
+            id,
+            &mapping.context_id,
+            TaskState::Canceled,
+            mapping.underlying_task_id,
+        )
+        .await
+        {
+            tracing::warn!(%error, a2a_task_id = %req.id, "failed to append CANCELED stream event (best-effort)");
+        }
+
         let metadata = mapping
             .underlying_task_id
             .map(|u| Map::from_iter([(LB_UNDERLYING.to_string(), Value::from(u.to_string()))]));
@@ -476,27 +719,34 @@ impl RequestHandler for A2aHandler {
         ))
     }
 
-    // --- Later-phase surface: explicitly unsupported in Phase 1 (polling only) ---
+    // --- Streaming (RFC-0006 Phase 2, ADR-0077): replay-then-tail the append-only event log ---
 
     async fn send_streaming_message(
         &self,
-        _params: &ServiceParams,
-        _req: SendMessageRequest,
+        params: &ServiceParams,
+        req: SendMessageRequest,
     ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, A2AError> {
-        Err(A2AError::unsupported_operation(
-            "streaming is not supported in this phase (polling only)",
-        ))
+        // The streaming leg of SendMessage submits via the Phase-1 path first, then streams the task it
+        // created (a REJECTED submission streams its single terminal event and closes).
+        let caller = Self::caller(params)?;
+        let SendMessageResponse::Task(task) = self.submit_review(&caller, req).await? else {
+            return Err(A2AError::internal(
+                "a2a: streaming submit did not yield a task handle",
+            ));
+        };
+        self.stream_task(&caller, &task.id).await
     }
 
     async fn subscribe_to_task(
         &self,
-        _params: &ServiceParams,
-        _req: SubscribeToTaskRequest,
+        params: &ServiceParams,
+        req: SubscribeToTaskRequest,
     ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, A2AError> {
-        Err(A2AError::unsupported_operation(
-            "task subscription is not supported in this phase (polling only)",
-        ))
+        let caller = Self::caller(params)?;
+        self.stream_task(&caller, &req.id).await
     }
+
+    // --- Later-phase surface: explicitly unsupported ---
 
     async fn list_tasks(
         &self,
@@ -578,6 +828,24 @@ fn review_context(task: Option<&db::TaskRow>, review_url: Option<&str>) -> Revie
 fn db_error(error: sqlx::Error) -> A2AError {
     tracing::error!(%error, "a2a: database error");
     A2AError::internal("internal error")
+}
+
+/// Whether the live underlying-task state is terminal — the streaming tail's terminal-close backstop
+/// (ADR-0077 S7). A reaped underlying row (or no underlying at all) reads as terminal (nothing more can
+/// happen); a transient DB error reads as NOT terminal so the tail keeps polling rather than closing
+/// early on a blip.
+async fn is_live_terminal(pool: &PgPool, underlying: Option<Uuid>) -> bool {
+    match underlying {
+        Some(underlying) => match db::get_task(pool, underlying).await {
+            Ok(Some(task)) => task_state_from_status(&task.status).is_terminal(),
+            Ok(None) => true,
+            Err(error) => {
+                tracing::warn!(%error, "a2a: stream terminal backstop query failed (keep tailing)");
+                false
+            }
+        },
+        None => true,
+    }
 }
 
 /// Parse a SCREAMING_SNAKE wire state back to a [`TaskState`] (for stored terminal snapshots).
@@ -1352,5 +1620,362 @@ mod tests {
             .execute(pool)
             .await
             .unwrap();
+    }
+
+    // ---------------------------------------------------------------------------
+    // Streaming (RFC-0006 Phase 2, ADR-0077)
+    // ---------------------------------------------------------------------------
+
+    use a2a::StreamResponse;
+    use futures::stream::BoxStream;
+    use futures::StreamExt;
+    use std::time::Duration;
+
+    /// A bounded-timeout stream collector: drains a `BoxStream` to completion, but if any single item
+    /// (or the close) takes longer than `budget`, the test FAILS rather than hanging forever.
+    async fn drain_stream(
+        stream: BoxStream<'static, Result<StreamResponse, A2AError>>,
+        budget: Duration,
+    ) -> Vec<StreamResponse> {
+        let mut stream = stream;
+        let mut out = Vec::new();
+        loop {
+            match tokio::time::timeout(budget, stream.next()).await {
+                Ok(Some(Ok(event))) => out.push(event),
+                Ok(Some(Err(error))) => panic!("stream yielded an error: {error:?}"),
+                Ok(None) => break, // the stream closed
+                Err(_) => panic!(
+                    "stream did not produce the next item / close within {budget:?} (hang guard)"
+                ),
+            }
+        }
+        out
+    }
+
+    /// The A2A state carried by a status-bearing stream event (a `Task` snapshot or a status-update).
+    fn event_state(event: &StreamResponse) -> Option<TaskState> {
+        match event {
+            StreamResponse::Task(task) => Some(task.status.state.clone()),
+            StreamResponse::StatusUpdate(update) => Some(update.status.state.clone()),
+            _ => None,
+        }
+    }
+
+    /// Submit an approved A2A review and return `(a2a_id, underlying_task_id)`.
+    async fn submit(h: &A2aHandler, caller: &ServiceParams, pr: i64) -> (String, Uuid) {
+        let task = task_of(
+            h.send_message(
+                caller,
+                review_req(json!({ "repo": "acme/api", "pr": pr, "headSha": "abc" })),
+            )
+            .await
+            .unwrap(),
+        );
+        let underlying = underlying_of(&task).expect("underlying id");
+        (task.id, underlying)
+    }
+
+    async fn event_rows(pool: &PgPool, a2a_id: &str) -> Vec<(i64, String, Option<String>, bool)> {
+        let id = Uuid::parse_str(a2a_id).unwrap();
+        sqlx::query_as(
+            "SELECT seq, kind, state, final FROM a2a_task_events WHERE a2a_task_id = $1 ORDER BY seq",
+        )
+        .bind(id)
+        .fetch_all(pool)
+        .await
+        .unwrap()
+    }
+
+    fn subscribe_req(id: &str) -> SubscribeToTaskRequest {
+        SubscribeToTaskRequest {
+            id: id.to_string(),
+            tenant: None,
+        }
+    }
+
+    /// A status transition on an A2A-fronted task appends exactly one gap-free, monotonic event; a
+    /// non-A2A task appends none.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn transitions_append_gapfree_events_and_non_a2a_appends_none(pool: PgPool) {
+        seed_approved_repo(&pool, "acme", "api", 111).await;
+        let h = handler(pool.clone(), 10);
+        let (a2a_id, underlying) = submit(&h, &params("svc-a", &["a2a:review"]), 7).await;
+
+        // Submission alone appends nothing — the initial state is carried by the Task snapshot.
+        assert!(event_rows(&pool, &a2a_id).await.is_empty());
+
+        // Each transition through set_task_status appends exactly one status-update.
+        db::set_task_status(&pool, underlying, "running", None)
+            .await
+            .unwrap();
+        db::set_task_status(&pool, underlying, "succeeded", None)
+            .await
+            .unwrap();
+
+        let rows = event_rows(&pool, &a2a_id).await;
+        let seqs: Vec<i64> = rows.iter().map(|(s, ..)| *s).collect();
+        assert_eq!(seqs, vec![1, 2], "seq is gap-free and monotonic from 1");
+        assert_eq!(rows[0].2.as_deref(), Some("TASK_STATE_WORKING"));
+        assert!(!rows[0].3, "WORKING is not terminal");
+        assert_eq!(rows[1].2.as_deref(), Some("TASK_STATE_COMPLETED"));
+        assert!(rows[1].3, "COMPLETED is the terminal event (final=true)");
+
+        // A non-A2A task (no a2a_tasks front) appends no events.
+        db::record_delivery(
+            &pool,
+            Platform::GitHub,
+            "wh-plain",
+            "pull_request",
+            &json!({}),
+        )
+        .await
+        .unwrap();
+        let plain = db::create_task(
+            &pool,
+            &db::NewTask {
+                repository_id: seed_approved_repo(&pool, "acme", "api", 111).await,
+                installation_id: 111,
+                webhook_delivery_id: "wh-plain".to_string(),
+                target_type: "pull_request".to_string(),
+                target_id: 999,
+                command_text: "plain".to_string(),
+                base_sha: None,
+                head_sha: Some("zzz".to_string()),
+                run_epoch: 0,
+                tier: "deep".to_string(),
+                trigger_comment_id: None,
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        db::set_task_status(&pool, plain, "running", None)
+            .await
+            .unwrap();
+        db::set_task_status(&pool, plain, "succeeded", None)
+            .await
+            .unwrap();
+        let total: i64 = sqlx::query_scalar("SELECT count(*) FROM a2a_task_events")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(total, 2, "only the A2A-fronted task produced events");
+    }
+
+    /// A task already terminal at subscribe replays its full sequence in order and closes on `final`,
+    /// with no tailing. The silent-clean ordering (review row present before succeeded) puts the
+    /// artifact-update before the terminal status-update.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn terminal_task_replays_in_order_and_closes(pool: PgPool) {
+        seed_approved_repo(&pool, "acme", "api", 111).await;
+        let h = handler(pool.clone(), 10);
+        let caller = params("svc-a", &["a2a:review"]);
+        let (a2a_id, underlying) = submit(&h, &caller, 7).await;
+
+        db::set_task_status(&pool, underlying, "running", None)
+            .await
+            .unwrap();
+        // Persist the review BEFORE succeeded (the silent-clean path) so the artifact rides the stream.
+        let findings = json!([{ "path": "auth.rs", "severity": "P1" }]);
+        db::insert_review_if_absent(&pool, underlying, "Found it", "body", 1, 0, 0, &findings)
+            .await
+            .unwrap();
+        db::set_task_status(&pool, underlying, "succeeded", None)
+            .await
+            .unwrap();
+
+        let stream = h
+            .subscribe_to_task(&caller, subscribe_req(&a2a_id))
+            .await
+            .unwrap();
+        let events = drain_stream(stream, Duration::from_secs(5)).await;
+
+        // Task snapshot, then WORKING, then the artifact-update, then the terminal COMPLETED — closed.
+        assert!(matches!(events[0], StreamResponse::Task(_)));
+        assert_eq!(event_state(&events[0]), Some(TaskState::Completed));
+        assert_eq!(event_state(&events[1]), Some(TaskState::Working));
+        assert!(matches!(events[2], StreamResponse::ArtifactUpdate(_)));
+        assert_eq!(event_state(&events[3]), Some(TaskState::Completed));
+        assert_eq!(
+            events.len(),
+            4,
+            "stream closed right after the terminal event"
+        );
+        // The artifact carries the summary + findings the caller expects.
+        if let StreamResponse::ArtifactUpdate(update) = &events[2] {
+            assert_eq!(update.artifact.parts[0].as_text(), Some("Found it"));
+        } else {
+            panic!("expected an artifact-update at index 2");
+        }
+    }
+
+    /// Two subscribers on the same task see identical, identically-ordered event sequences.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn two_subscribers_see_identical_ordered_sequences(pool: PgPool) {
+        seed_approved_repo(&pool, "acme", "api", 111).await;
+        let h = handler(pool.clone(), 10);
+        let caller = params("svc-a", &["a2a:review"]);
+        let (a2a_id, underlying) = submit(&h, &caller, 7).await;
+        db::set_task_status(&pool, underlying, "running", None)
+            .await
+            .unwrap();
+        db::set_task_status(&pool, underlying, "succeeded", None)
+            .await
+            .unwrap();
+
+        let s1 = h
+            .subscribe_to_task(&caller, subscribe_req(&a2a_id))
+            .await
+            .unwrap();
+        let s2 = h
+            .subscribe_to_task(&caller, subscribe_req(&a2a_id))
+            .await
+            .unwrap();
+        let e1 = drain_stream(s1, Duration::from_secs(5)).await;
+        let e2 = drain_stream(s2, Duration::from_secs(5)).await;
+
+        let states1: Vec<_> = e1.iter().filter_map(event_state).collect();
+        let states2: Vec<_> = e2.iter().filter_map(event_state).collect();
+        assert_eq!(
+            states1, states2,
+            "concurrent subscribers converge on one order"
+        );
+        assert_eq!(
+            states1,
+            vec![
+                TaskState::Completed,
+                TaskState::Working,
+                TaskState::Completed
+            ]
+        );
+    }
+
+    /// Streaming and polling never disagree: an event exists for every transition a poller could
+    /// observe (WORKING, then the terminal COMPLETED).
+    #[sqlx::test(migrations = "./migrations")]
+    async fn streaming_and_polling_agree_on_transitions(pool: PgPool) {
+        seed_approved_repo(&pool, "acme", "api", 111).await;
+        let h = handler(pool.clone(), 10);
+        let caller = params("svc-a", &["a2a:review"]);
+        let (a2a_id, underlying) = submit(&h, &caller, 7).await;
+
+        // Poll after each transition; collect the states a poller observes.
+        let mut polled = Vec::new();
+        for status in ["running", "succeeded"] {
+            db::set_task_status(&pool, underlying, status, None)
+                .await
+                .unwrap();
+            let view = h
+                .get_task(
+                    &caller,
+                    GetTaskRequest {
+                        id: a2a_id.clone(),
+                        history_length: None,
+                        tenant: None,
+                    },
+                )
+                .await
+                .unwrap();
+            polled.push(view.status.state);
+        }
+        assert_eq!(polled, vec![TaskState::Working, TaskState::Completed]);
+
+        // Every polled transition has a matching status-update event in the log.
+        let logged: Vec<TaskState> = event_rows(&pool, &a2a_id)
+            .await
+            .into_iter()
+            .filter(|(_, kind, ..)| kind == "status-update")
+            .map(|(_, _, state, _)| state_from_wire(&state.unwrap()))
+            .collect();
+        assert_eq!(
+            logged, polled,
+            "the event log carries exactly the transitions a poller sees"
+        );
+    }
+
+    /// A foreign or unknown id subscription is `TaskNotFound` (no existence leak), same as GetTask.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn foreign_or_unknown_subscription_is_task_not_found(pool: PgPool) {
+        seed_approved_repo(&pool, "acme", "api", 111).await;
+        let h = handler(pool.clone(), 10);
+        let (a2a_id, _) = submit(&h, &params("svc-a", &["a2a:review"]), 7).await;
+
+        // Another caller cannot subscribe to my task.
+        let foreign = h
+            .subscribe_to_task(&params("svc-b", &["a2a:review"]), subscribe_req(&a2a_id))
+            .await;
+        assert_eq!(
+            foreign.err().map(|e| e.code),
+            Some(a2a::error_code::TASK_NOT_FOUND)
+        );
+
+        // An unknown id is also TaskNotFound.
+        let unknown = h
+            .subscribe_to_task(
+                &params("svc-a", &["a2a:review"]),
+                subscribe_req(&Uuid::now_v7().to_string()),
+            )
+            .await;
+        assert_eq!(
+            unknown.err().map(|e| e.code),
+            Some(a2a::error_code::TASK_NOT_FOUND)
+        );
+    }
+
+    /// A REJECTED submission (via the streaming leg of SendMessage) streams its single terminal event
+    /// and closes.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn rejected_streaming_submission_closes_on_one_terminal_event(pool: PgPool) {
+        seed_approved_repo(&pool, "acme", "api", 111).await;
+        let h = handler(pool.clone(), 10);
+        // Missing the a2a:review permission → REJECTED at the gate, but still streamable by its owner.
+        let caller = params("svc-a", &["some:other"]);
+        let stream = h
+            .send_streaming_message(&caller, review_req(json!({ "repo": "acme/api", "pr": 1 })))
+            .await
+            .unwrap();
+        let events = drain_stream(stream, Duration::from_secs(5)).await;
+
+        // Snapshot (REJECTED) + the single terminal status-update, then close.
+        assert_eq!(event_state(&events[0]), Some(TaskState::Rejected));
+        assert!(matches!(events[1], StreamResponse::StatusUpdate(_)));
+        assert_eq!(event_state(&events[1]), Some(TaskState::Rejected));
+        assert_eq!(events.len(), 2, "a rejection replays one event and closes");
+    }
+
+    /// Subscribing while the task is still WORKING replays the history and then TAILS: a live
+    /// transition driven after subscribe is delivered, and the stream closes on the terminal event.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn subscribe_then_tail_delivers_a_live_transition(pool: PgPool) {
+        seed_approved_repo(&pool, "acme", "api", 111).await;
+        let h = handler(pool.clone(), 10);
+        let caller = params("svc-a", &["a2a:review"]);
+        let (a2a_id, underlying) = submit(&h, &caller, 7).await;
+        // Move to running (WORKING, non-terminal) BEFORE subscribing.
+        db::set_task_status(&pool, underlying, "running", None)
+            .await
+            .unwrap();
+
+        let stream = h
+            .subscribe_to_task(&caller, subscribe_req(&a2a_id))
+            .await
+            .unwrap();
+
+        // Drive the terminal transition shortly after the subscription is tailing.
+        let pool2 = pool.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            db::set_task_status(&pool2, underlying, "succeeded", None)
+                .await
+                .unwrap();
+        });
+
+        let events = drain_stream(stream, Duration::from_secs(10)).await;
+        let states: Vec<_> = events.iter().filter_map(event_state).collect();
+        // Snapshot(WORKING), replayed WORKING, then the tailed COMPLETED — closed on final.
+        assert_eq!(
+            states,
+            vec![TaskState::Working, TaskState::Working, TaskState::Completed]
+        );
     }
 }

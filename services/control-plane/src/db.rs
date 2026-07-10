@@ -2143,6 +2143,11 @@ pub async fn set_task_status(
     detail: Option<&str>,
 ) -> Result<bool, sqlx::Error> {
     let terminal = matches!(status, "succeeded" | "failed" | "timed_out" | "cancelled");
+    // ADR-0077: the status flip and the A2A stream-event append share ONE transaction, so an event
+    // exists for every transition a poller could observe (streaming and polling can never disagree).
+    // The `UPDATE tasks … WHERE id = $1` takes the row write-lock, serializing concurrent producers on
+    // this task; the event append then runs under that lock (see `a2a::events`).
+    let mut tx = pool.begin().await?;
     let result = sqlx::query(
         "UPDATE tasks SET \
              status = $2, \
@@ -2157,9 +2162,16 @@ pub async fn set_task_status(
     .bind(status)
     .bind(terminal)
     .bind(detail)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
-    // ADR-0055: a completed index task releases the repo's reviews that were parked behind it.
+    // Project the transition onto the A2A event log for any A2A task fronting this run (no-op for a
+    // non-A2A task). Atomic with the status flip above; a failure rolls back both, so the runner's
+    // retry re-applies the transition and its event together.
+    crate::a2a::events::append_transition_events(&mut tx, id, status).await?;
+    tx.commit().await?;
+    // ADR-0055: a completed index task releases the repo's reviews that were parked behind it. Kept
+    // outside the transaction (unchanged behaviour) — it is an independent queue nudge, not part of the
+    // status/event atomicity.
     if terminal {
         release_reviews_waiting_on_index(pool, id).await;
     }

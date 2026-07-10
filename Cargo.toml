@@ -26,6 +26,8 @@ serde_json = "1"
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+# Ergonomic async generators — used by the a2a role's SSE replay-then-tail stream (ADR-0077).
+async-stream = "0.3"
 # rustls everywhere (no OpenSSL in the runtime images).
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 # Explicit rustls handle so the control-plane binary can pin ONE crypto provider at startup. Two are

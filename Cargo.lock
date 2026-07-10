@@ -618,6 +618,7 @@ dependencies = [
  "a2a-lf",
  "a2a-server-lf",
  "anyhow",
+ "async-stream",
  "async-trait",
  "axum",
  "base64",

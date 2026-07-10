@@ -81,9 +81,10 @@ pub fn build_agent_card(base_url: &str, oidc_discovery_url: &str) -> AgentCard {
             AgentInterface::new(base_url.to_string(), TRANSPORT_PROTOCOL_JSONRPC),
             AgentInterface::new(base_url.to_string(), TRANSPORT_PROTOCOL_HTTP_JSON),
         ],
-        // Phase 1 is polling-only: no streaming, no push notifications, no extended card.
+        // Phase 2 (ADR-0077): streaming is live (SubscribeToTask + the streaming leg of SendMessage).
+        // Push notifications stay unadvertised (Phase 3); no extended card.
         capabilities: AgentCapabilities {
-            streaming: Some(false),
+            streaming: Some(true),
             push_notifications: Some(false),
             extensions: None,
             extended_agent_card: None,
@@ -174,8 +175,8 @@ mod tests {
             assert!(iface["protocolVersion"].as_str().is_some());
         }
 
-        // Phase 1 capabilities: no streaming, no push.
-        assert_eq!(card["capabilities"]["streaming"], false);
+        // Phase 2 capabilities: streaming on (ADR-0077); push still off (Phase 3).
+        assert_eq!(card["capabilities"]["streaming"], true);
         assert_eq!(card["capabilities"]["pushNotifications"], false);
 
         // Exactly the `review` skill, gated by `a2a:review`.
