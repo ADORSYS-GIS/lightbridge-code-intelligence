@@ -45,7 +45,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     fi; \
     cargo build --release --locked -p control-plane \
     && cp target/release/control-plane /usr/local/bin/control-plane \
-    && { command -v sccache >/dev/null && sccache --show-stats || true; }
+    && if [ "$RUSTC_WRAPPER" = sccache ]; then sccache --show-stats; sccache --stop-server || true; fi
 
 FROM debian:bookworm-slim AS runtime
 RUN apt-get update \

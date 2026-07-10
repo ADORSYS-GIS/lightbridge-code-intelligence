@@ -58,7 +58,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     fi; \
     cargo build --release --locked -p agent-runner \
     && cp target/release/agent-runner /usr/local/bin/ \
-    && { command -v sccache >/dev/null && sccache --show-stats || true; }
+    && if [ "$RUSTC_WRAPPER" = sccache ]; then sccache --show-stats; sccache --stop-server || true; fi
 
 # ── Stage 2: install Graphify into a self-contained venv ────────────────────────────────────────
 # Built with compilers present (some tree-sitter grammars may ship sdists) but the toolchain is

@@ -5,19 +5,24 @@
 # caches the crate *registry* + git deps (the download side) — the two do not overlap.
 #
 # Credentials are the SCCACHE_S3_* repo secrets, aliased into the AWS_* env vars sccache reads for
-# its S3 backend (the plain AWS_* secrets are reserved for other uses). If `access-key-id` is empty
-# — e.g. a fork PR, where secrets are not exposed — this action installs the binary but does NOT set
-# RUSTC_WRAPPER, so the build proceeds uncached instead of failing on an unauthenticated S3 call.
+# its S3 backend (the plain AWS_* secrets are reserved for other uses). If any of the bucket /
+# endpoint / access-key are empty — e.g. a fork PR, where secrets are not exposed — this action
+# installs the binary but does NOT set RUSTC_WRAPPER, so the build proceeds uncached instead of
+# failing on an unauthenticated S3 call. (mozilla-actions/sccache-action does not set RUSTC_WRAPPER
+# itself — it only adds sccache to PATH — so leaving it unset here is sufficient; the explicit
+# empty-assign on the skip path is future-proofing against that changing.)
 name: Rust sccache
 description: Install sccache and configure the shared S3 compiler cache for cargo builds.
 
 inputs:
   bucket:
-    description: S3 bucket name (vars.SCCACHE_BUCKET).
-    required: true
+    description: S3 bucket name (vars.SCCACHE_BUCKET). Empty → cache disabled.
+    required: false
+    default: ""
   endpoint:
-    description: S3 endpoint host (vars.SCCACHE_ENDPOINT).
-    required: true
+    description: S3 endpoint host (vars.SCCACHE_ENDPOINT). Empty → cache disabled.
+    required: false
+    default: ""
   access-key-id:
     description: S3 access key (secrets.SCCACHE_S3_ACCESS_KEY_ID). Empty on fork PRs → cache disabled.
     required: false
@@ -34,12 +39,18 @@ runs:
       uses: mozilla-actions/sccache-action@v0.0.10
     - name: Configure sccache S3 backend
       shell: bash
+      # Pass every value through env (not inline ${{ }} in the script body) so an empty or
+      # special-character value can never break the shell.
       env:
+        SCCACHE_S3_BUCKET: ${{ inputs.bucket }}
+        SCCACHE_S3_ENDPOINT: ${{ inputs.endpoint }}
         SCCACHE_ACCESS_KEY_ID: ${{ inputs.access-key-id }}
         SCCACHE_SECRET_ACCESS_KEY: ${{ inputs.secret-access-key }}
       run: |
-        if [ -z "$SCCACHE_ACCESS_KEY_ID" ]; then
-          echo "::notice::sccache credentials absent (fork PR?) — compiling without the shared cache."
+        if [ -z "$SCCACHE_S3_BUCKET" ] || [ -z "$SCCACHE_S3_ENDPOINT" ] || [ -z "$SCCACHE_ACCESS_KEY_ID" ]; then
+          echo "::notice::sccache config/credentials absent (fork PR?) — compiling without the shared cache."
+          # Neutralize any wrapper a future sccache-action version might set; cargo ignores an empty value.
+          echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
           exit 0
         fi
         {
@@ -47,8 +58,8 @@ runs:
           # Incremental compilation and sccache are mutually exclusive; incremental artifacts are not
           # cacheable, so disabling it lets sccache cache every codegen unit.
           echo "CARGO_INCREMENTAL=0"
-          echo "SCCACHE_BUCKET=${{ inputs.bucket }}"
-          echo "SCCACHE_ENDPOINT=${{ inputs.endpoint }}"
+          echo "SCCACHE_BUCKET=$SCCACHE_S3_BUCKET"
+          echo "SCCACHE_ENDPOINT=$SCCACHE_S3_ENDPOINT"
           echo "SCCACHE_S3_USE_SSL=true"
           # opendal's S3 backend has no region auto-detection against a custom endpoint and errors
           # "region is missing" without this. MinIO accepts (and defaults to) us-east-1.
@@ -56,4 +67,4 @@ runs:
           echo "AWS_ACCESS_KEY_ID=$SCCACHE_ACCESS_KEY_ID"
           echo "AWS_SECRET_ACCESS_KEY=$SCCACHE_SECRET_ACCESS_KEY"
         } >> "$GITHUB_ENV"
-        echo "sccache enabled → s3://${{ inputs.bucket }} @ ${{ inputs.endpoint }}"
+        echo "sccache enabled → s3://$SCCACHE_S3_BUCKET @ $SCCACHE_S3_ENDPOINT"
