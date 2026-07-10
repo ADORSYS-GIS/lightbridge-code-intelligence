@@ -727,7 +727,7 @@ impl CodePlatform for GithubApp {
             ReactionTarget::Issue { number } => {
                 self.add_reaction(&token, owner, name, number, emoji).await
             }
-            ReactionTarget::Comment { comment_id } => {
+            ReactionTarget::Comment { comment_id, .. } => {
                 self.add_comment_reaction(&token, owner, name, comment_id, emoji)
                     .await
             }
@@ -763,6 +763,8 @@ impl CodePlatform for GithubApp {
         repo: &RepoRef,
         comment_id: i64,
         is_review_comment: bool,
+        _iid: Option<i64>,
+        _noteable_type: Option<&str>,
     ) -> anyhow::Result<Vec<Reaction>> {
         let (owner, name) = repo.owner_repo();
         let token = self.token_for(repo).await?;

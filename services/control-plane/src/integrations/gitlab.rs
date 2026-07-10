@@ -11,10 +11,11 @@
 //! 3. **Webhook auth is a plain token** (`X-Gitlab-Token` header), not HMAC. `verify_webhook`
 //!    does a constant-time comparison against `GITLAB_WEBHOOK_SECRET`.
 //!
-//! Known limitations (Phase 4):
-//! - `list_comment_reactions` returns an empty Vec — feedback polling (👍/👎) requires the MR/issue
-//!   `iid` which we don't have from just a note ID. Phase 7 can store the iid alongside the note.
-//! - `add_reaction` on a `Comment` is a no-op (same reason). Issue/MR body reactions work.
+//! Notes on note addressing:
+//! - GitLab notes are scoped to their parent (MR or issue) — there is NO global
+//!   `/projects/{id}/notes/{note_id}` endpoint. Both `add_reaction` and `list_comment_reactions`
+//!   require the parent MR/issue `iid`, which is carried from the task's `target_id` (in the
+//!   outbox payload for outbound, and in `PollableComment` for inbound polling).
 //! - `post_comment` tries MR notes first, then issue notes (the caller passes a single `issue_number`
 //!   which is the MR `iid` for PRs or the issue `iid` for issues — we don't know which, so we probe).
 
@@ -77,6 +78,43 @@ impl GitlabClient {
 
     fn url(&self, path: &str) -> String {
         format!("{}{}", self.api_url, path)
+    }
+
+    /// Build the base API path for a noteable's parent (MR or issue).
+    /// `noteable_type` is the task's `target_type` (`"pull_request"` → MR, anything else → issue).
+    /// Defaults to MR when `noteable_type` is `None` (legacy rows).
+    fn noteable_base(project: &str, iid: i64, noteable_type: Option<&str>) -> String {
+        let is_mr = noteable_type.map(|t| t == "pull_request").unwrap_or(true);
+        if is_mr {
+            format!("/projects/{}/merge_requests/{}", project, iid)
+        } else {
+            format!("/projects/{}/issues/{}", project, iid)
+        }
+    }
+
+    /// Build the award-emoji endpoint for a note on an MR or issue.
+    fn note_award_emoji_path(
+        project: &str,
+        iid: i64,
+        note_id: i64,
+        noteable_type: Option<&str>,
+    ) -> String {
+        format!(
+            "{}/notes/{}/award_emoji",
+            Self::noteable_base(project, iid, noteable_type),
+            note_id
+        )
+    }
+
+    /// Normalize GitLab award-emoji names to the GitHub vocabulary used by the
+    /// feedback-memory consumer (`rejected_findings_for_repo` filters `reaction = '-1'`).
+    /// GitLab returns `"thumbsup"`/`"thumbsdown"`; GitHub returns `"+1"`/`"-1"`.
+    fn normalize_emoji_name(name: &str) -> String {
+        match name {
+            "thumbsup" => "+1".to_string(),
+            "thumbsdown" => "-1".to_string(),
+            other => other.to_string(),
+        }
     }
 
     /// Standard headers for every GitLab API call.
@@ -307,23 +345,14 @@ impl CodePlatform for GitlabClient {
         noteable_type: Option<&str>,
     ) -> anyhow::Result<PostedComment> {
         let project = Self::project_encoded(repo);
-        let payload = serde_json::json!({ "body": body });
+        let payload = serde_json::json!({
+            "body": body
+        });
 
-        // Phase A (ADR-0072): use `noteable_type` to route directly — no probe.
-        // GitLab MRs and issues share iid sequences (both start at 1), so a probe would
-        // succeed on the wrong noteable. `target_type` is `"pull_request"` or `"issue"`.
-        // Note: old outbox rows may not have `target_type` in their payload; default to MR
-        // (the common case for reviews). This is a low-risk fallback for in-flight rows.
-        let is_mr = noteable_type.map(|t| t == "pull_request").unwrap_or(true);
-
-        let endpoint = if is_mr {
-            format!(
-                "/projects/{}/merge_requests/{}/notes",
-                project, issue_number
-            )
-        } else {
-            format!("/projects/{}/issues/{}/notes", project, issue_number)
-        };
+        let endpoint = format!(
+            "{}/notes",
+            Self::noteable_base(&project, issue_number, noteable_type)
+        );
         let url = self.url(&endpoint);
         let resp = self
             .http
@@ -350,19 +379,10 @@ impl CodePlatform for GitlabClient {
         let project = Self::project_encoded(repo);
         match target {
             ReactionTarget::Issue { number } => {
-                // Phase A (ADR-0072): use `noteable_type` to route directly — no probe.
-                // Note: old outbox rows may not have `target_type` in their payload; default to MR
-                // (the common case for reviews). This is a low-risk fallback for in-flight rows.
-                let is_mr = noteable_type.map(|t| t == "pull_request").unwrap_or(true);
-
-                let endpoint = if is_mr {
-                    format!(
-                        "/projects/{}/merge_requests/{}/award_emoji",
-                        project, number
-                    )
-                } else {
-                    format!("/projects/{}/issues/{}/award_emoji", project, number)
-                };
+                let endpoint = format!(
+                    "{}/award_emoji",
+                    Self::noteable_base(&project, number, noteable_type)
+                );
                 let url = self.url(&endpoint);
                 let _ = self
                     .http
@@ -374,12 +394,27 @@ impl CodePlatform for GitlabClient {
                     .error_for_status()?;
                 Ok(())
             }
-            ReactionTarget::Comment { comment_id: _ } => {
-                // Known limitation (Phase 4): awarding emoji on a note requires the MR/issue iid,
-                // which we don't have from just the note ID. Logged, skipped.
-                tracing::debug!(
-                    "gitlab add_reaction on comment skipped (iid lookup not implemented in Phase 4)"
-                );
+            ReactionTarget::Comment { comment_id, iid } => {
+                // GitLab notes are scoped to their parent (MR or issue) — there is NO global
+                // `/projects/{id}/notes/{note_id}` endpoint. The parent iid is carried in the
+                // outbox payload (the task's `target_id`) so we can address the note directly.
+                let iid = iid.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "GitLab comment reaction requires the parent MR/issue iid \
+                         (missing from outbox payload — legacy row?)"
+                    )
+                })?;
+                let endpoint =
+                    Self::note_award_emoji_path(&project, iid, comment_id, noteable_type);
+                let url = self.url(&endpoint);
+                let _ = self
+                    .http
+                    .post(&url)
+                    .headers(self.api_headers())
+                    .json(&serde_json::json!({ "name": emoji }))
+                    .send()
+                    .await?
+                    .error_for_status()?;
                 Ok(())
             }
         }
@@ -463,14 +498,62 @@ impl CodePlatform for GitlabClient {
 
     async fn list_comment_reactions(
         &self,
-        _repo: &RepoRef,
-        _comment_id: i64,
+        repo: &RepoRef,
+        comment_id: i64,
         _is_review_comment: bool,
+        iid: Option<i64>,
+        noteable_type: Option<&str>,
     ) -> anyhow::Result<Vec<Reaction>> {
-        // Known limitation (Phase 4): listing award emoji on a note requires the MR/issue iid,
-        // which we don't have from just the note ID. Feedback polling (👍/👎) is a no-op for GitLab
-        // until Phase 7 stores the iid alongside the note.
-        Ok(Vec::new())
+        let project = Self::project_encoded(repo);
+
+        // GitLab notes are scoped to their parent (MR or issue) — there is NO global
+        // `/projects/{id}/notes/{note_id}` endpoint. The parent iid is carried from the task's
+        // `target_id` (via `PollableComment`) so we can address the note's award emoji directly.
+        let iid = iid.ok_or_else(|| {
+            anyhow::anyhow!(
+                "GitLab list_comment_reactions requires the parent MR/issue iid \
+                 (missing from PollableComment — legacy row?)"
+            )
+        })?;
+        let endpoint = format!(
+            "{}?per_page=100",
+            Self::note_award_emoji_path(&project, iid, comment_id, noteable_type)
+        );
+        let url = self.url(&endpoint);
+        let resp = self
+            .http
+            .get(&url)
+            .headers(self.api_headers())
+            .send()
+            .await?;
+
+        // A 404 means the note was deleted (or never existed). Treat it as "no reactions"
+        // so that `reconcile_comment_feedback` still runs and prunes stale feedback rows
+        // (e.g. a 👎 the user has since removed). Without this, a deleted note would
+        // error every poll cycle and the stale rejection would suppress the finding forever.
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(vec![]);
+        }
+        let resp = resp.error_for_status()?;
+        let award_v: serde_json::Value = resp.json().await?;
+
+        // Parse award emoji — normalize GitLab names to the GitHub vocabulary so
+        // downstream filters (`reaction = '-1'`) fire correctly (ADR-0044).
+        let reactions: Vec<Reaction> = award_v
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|item| {
+                let name = item.get("name")?.as_str()?;
+                let user = item.get("user")?.get("username")?.as_str()?;
+                Some(Reaction {
+                    content: Self::normalize_emoji_name(name),
+                    user_login: user.to_string(),
+                })
+            })
+            .collect();
+
+        Ok(reactions)
     }
 
     fn clone_url(&self, repo: &RepoRef) -> String {

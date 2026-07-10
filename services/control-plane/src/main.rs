@@ -561,9 +561,9 @@ async fn main() -> anyhow::Result<()> {
 /// as ONE replica so egress isn't double-posted and reactions aren't double-polled.
 ///
 /// Platform dispatch: the reconciler receives a `HashMap<Platform, Arc<dyn CodePlatform>>` mapping
-/// each configured platform to its implementation. GitHub is wired today; GitLab will be added in
-/// Phase 4. An outbox row whose `platform` has no registered implementation is backed off with a
-/// clear error rather than crashing the loop.
+/// each configured platform to its implementation. Both GitHub (`GithubApp`) and GitLab
+/// (`GitlabClient`) are wired; an outbox row whose `platform` has no registered implementation is
+/// backed off with a clear error rather than crashing the loop.
 async fn run_reconciler(state: AppState) -> anyhow::Result<()> {
     let pool = state
         .db

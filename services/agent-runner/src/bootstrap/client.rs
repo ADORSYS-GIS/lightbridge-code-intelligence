@@ -119,6 +119,11 @@ impl TaskContext {
     /// - **GitLab** (and any platform that pre-authenticates): the control plane sends a
     ///   `clone_url` that already has credentials embedded (e.g. `https://oauth2:<token>@...`);
     ///   we detect the `@` and pass it through unchanged.
+    ///
+    ///   Edge case: URLs with `@` in the path (e.g. `https://github.com/owner@team/repo.git`)
+    ///   will be incorrectly passed through. This is extremely rare for GitHub (subgroups with `@`
+    ///   in the name are not a standard pattern) and doesn't affect GitLab (where `@` is the
+    ///   credential separator).
     pub fn authenticated_clone_url(&self) -> String {
         match self.clone_url.strip_prefix("https://") {
             // Already authenticated by the control plane — use as-is.

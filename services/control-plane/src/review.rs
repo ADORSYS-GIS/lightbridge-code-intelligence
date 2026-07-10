@@ -634,11 +634,13 @@ const FEEDBACK_FOOTER: &str = "\n\n> Was this useful? React 👍/👎 to give us
 // `suggestion` (never synthesized here).
 fn inline_body(finding: &Finding) -> String {
     // Standardized finding format (epic #89): badge row → titled finding → explanation → committable
-    // suggestion → resources. The badges sit on their OWN line above the bold title (a single newline,
-    // which GitHub renders as a line break in comments) so the level reads as a header, not a prefix
-    // crowding the title.
+    // suggestion → resources. The badges sit on their OWN line above the bold title, separated by a
+    // paragraph break (`\n\n`) so the level reads as a header, not a prefix crowding the title. A
+    // paragraph break is used (not a single `\n`) because GitLab's CommonMark renderer does NOT
+    // treat a single newline as a line break (GitHub's comment renderer does, but that is a
+    // GitHub-specific behavior) — `\n\n` renders correctly on BOTH platforms.
     let mut body = format!(
-        "{}\n**{}**\n\n{}",
+        "{}\n\n**{}**\n\n{}",
         finding.level_badges(),
         strip_model_artifacts(&finding.title),
         strip_model_artifacts(&finding.body)
@@ -702,13 +704,16 @@ const REVIEW_DISCLOSURE: &str =
 /// Append the "Notes on changed files" (deferred findings) and the collapsed out-of-scope section to a
 /// review body. Factored out of [`render_body`] so the fast-pass body renders findings identically.
 fn append_finding_sections(body: &mut String, deferred: &[Finding], out_of_scope: &[Finding]) {
-    // A finding as a bullet whose first line is the badge row, with the bold title + `file:line` on the
-    // next (indented) line and the body under that — so the badges never share a line with the title,
-    // matching the inline rendering. The 2-space indent keeps the continuation lines inside the list
-    // item (Gemini #153). Shared by the changed-files notes and the out-of-scope section.
+    // A finding as a bullet whose first paragraph is the badge row, with the bold title + `file:line`
+    // in a separate paragraph (indented to the list-item content column) and the body under that — so
+    // the badges never share a line with the title, matching the inline rendering. A paragraph break
+    // (`\n\n`) is used (not a single `\n`) because GitLab's CommonMark renderer does NOT treat a single
+    // newline as a line break — `\n\n` renders correctly on BOTH platforms. The 2-space indent keeps
+    // the continuation paragraphs inside the list item (Gemini #153). Shared by the changed-files
+    // notes and the out-of-scope section.
     let render_finding = |body: &mut String, f: &Finding| {
         body.push_str(&format!(
-            "\n- {}\n  **{}** — `{}:{}`\n  {}",
+            "\n- {}\n\n  **{}** — `{}:{}`\n\n  {}",
             f.level_badges(),
             strip_model_artifacts(&f.title),
             f.file,
@@ -717,7 +722,7 @@ fn append_finding_sections(body: &mut String, deferred: &[Finding], out_of_scope
             strip_model_artifacts(&f.body).replace('\n', "\n  ")
         ));
         for link in f.resources.iter().filter(|r| !r.trim().is_empty()) {
-            body.push_str(&format!("\n  - {link}"));
+            body.push_str(&format!("\n\n  - {link}"));
         }
     };
 
@@ -854,10 +859,12 @@ mod tests {
         );
         assert!(body.contains("![security](https://img.shields.io/badge/security-red)"));
         assert!(body.contains("**Null deref**"));
-        // The badge row sits on its own line, with the bold title on the next line (not crowding it).
+        // The badge row sits on its own paragraph, with the bold title in the next paragraph (not
+        // crowding it). A paragraph break (`\n\n`) is used because GitLab's CommonMark renderer does
+        // NOT treat a single `\n` as a line break (GitHub does, but that's GitHub-specific).
         assert!(
-            body.contains(")\n**Null deref**"),
-            "badges and title on separate lines: {body}"
+            body.contains(")\n\n**Null deref**"),
+            "badges and title on separate paragraphs: {body}"
         );
         assert!(body.contains("\n\nexplanation"));
         assert!(body.contains("```suggestion\nlet x = y;\n```"));

@@ -13,7 +13,7 @@
 //!
 //! Platform dispatch: each outbox row carries a `platform` column; the reconciler looks up the
 //! matching `CodePlatform` implementation from a `HashMap` supplied at startup. GitHub rows use the
-//! `GithubApp` impl; GitLab rows (Phase 4+) use the `GitlabClient` impl.
+//! `GithubApp` impl; GitLab rows use the `GitlabClient` impl.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -239,10 +239,14 @@ pub(crate) async fn deliver(
             // comment; otherwise on the PR/issue body (the automatic-review case).
             match row.payload.get("comment_id").and_then(|x| x.as_i64()) {
                 Some(comment_id) => {
+                    // The parent MR/issue iid — already in the payload as `issue` (the task's
+                    // `target_id`). GitLab needs it to address a note through its parent (there is
+                    // no global note endpoint); GitHub ignores it (comment IDs are global).
+                    let iid = row.payload.get("issue").and_then(|x| x.as_i64());
                     platform
                         .add_reaction(
                             repo,
-                            ReactionTarget::Comment { comment_id },
+                            ReactionTarget::Comment { comment_id, iid },
                             content,
                             noteable_type,
                         )
@@ -466,7 +470,13 @@ async fn poll_once(
         };
         let is_review_comment = c.kind == "inline";
         match platform
-            .list_comment_reactions(&repo, c.platform_comment_id, is_review_comment)
+            .list_comment_reactions(
+                &repo,
+                c.platform_comment_id,
+                is_review_comment,
+                Some(c.target_id),
+                Some(&c.target_type),
+            )
             .await
         {
             Ok(reactions) => {

@@ -119,7 +119,12 @@ pub enum ReactionTarget {
     /// React to the PR/MR/issue body (the "description").
     Issue { number: i64 },
     /// React to a specific comment/note.
-    Comment { comment_id: i64 },
+    ///
+    /// `iid` is the parent MR/issue iid — required by GitLab, whose notes are scoped to their
+    /// parent (there is no global `/projects/{id}/notes/{note_id}` endpoint). GitHub ignores it
+    /// (GitHub comment IDs are globally addressable). `None` for legacy outbox rows that predate
+    /// this field; GitLab will fail with a clear error in that case.
+    Comment { comment_id: i64, iid: Option<i64> },
 }
 
 /// A reaction found on a comment (for feedback polling).
@@ -248,11 +253,17 @@ pub trait CodePlatform: Send + Sync {
     /// List reactions on a comment (for 👍/👎 feedback polling, ADR-0035).
     /// `is_review_comment` distinguishes inline PR review comments from plain issue comments
     /// (GitHub uses different endpoints; GitLab uses award emoji on notes).
+    /// `iid` is the parent MR/issue iid — required by GitLab (notes are scoped to their parent;
+    /// there is no global `/projects/{id}/notes/{note_id}` endpoint). GitHub ignores it.
+    /// `noteable_type` carries the task's `target_type` (`"pull_request"` or `"issue"`) for GitLab
+    /// routing (MR notes vs issue notes), matching `post_comment` / `add_reaction`.
     async fn list_comment_reactions(
         &self,
         repo: &RepoRef,
         comment_id: i64,
         is_review_comment: bool,
+        iid: Option<i64>,
+        noteable_type: Option<&str>,
     ) -> anyhow::Result<Vec<Reaction>>;
 
     // --- Clone ---

@@ -76,13 +76,14 @@ role — see the `match role` dispatch in `services/control-plane/src/main.rs`:
 |---|---|---|
 | `serve` | many | HTTP: webhooks in, the runner's internal API (context + status). Holds the GitHub App key for **reads** + token-mints only — it no longer posts content (ADR-0059). |
 | `dispatcher` | one | Claims queued tasks and creates **one Kubernetes Job per task**; runs the reaper (Job GC + data purge) and the storage-GC sweepers (index snapshots, outbox). Keyless — has DB but no GitHub App key. |
-| `reconciler` | one | The **sole GitHub egress**: drains the `github_outbox` and posts every review/reply/reaction/label/failure-notice; also reads inbound 👍/👎 reactions into `review_feedback`. |
+| `reconciler` | one | The **sole platform egress**: drains the `outbox` and posts every review/reply/reaction/label/failure-notice to GitHub **or GitLab** (ADR-0072); also reads inbound 👍/👎 reactions into `review_feedback` for both platforms. |
 
 `reconciler` was renamed from `poller` ([ADR-0058](adr/0058-rename-poller-role-to-reconciler.md)); the
 binary still accepts `poller` as a legacy alias (the role string is a deploy contract, so an unknown
 role `bail!`s — the alias lets the binary and the Deployment `args` roll over independently). All
-outbound GitHub writes funnel through the reconciler's transactional outbox
-([ADR-0059](adr/0059-reconciler-owns-all-github-egress.md)); the single-replica invariant is now
+outbound platform writes (GitHub and GitLab) funnel through the reconciler's transactional outbox
+([ADR-0059](adr/0059-reconciler-owns-all-github-egress.md),
+[ADR-0072](adr/0072-platform-abstraction-layer.md)); the single-replica invariant is now
 load-bearing because the drain preserves per-task `(created_at, id)` ordering.
 
 > **Why the control plane doesn't scale freely yet.** The webhook handler holds delivery-dedup in
@@ -186,16 +187,40 @@ The dispatcher mounts, into every agent Job (`job_manifest`):
 ### ExternalSecrets
 
 Cluster Secrets (e.g. `lightbridge-agent-secrets` with the embeddings + review-LLM keys, the GitHub
-App key, the internal CA) are projected from the external secret store via **ExternalSecrets** rather
-than committed to the GitOps repos. The chart references Secret **names**; the values + ExternalSecret
-definitions live in ai-helm-values.
+App key, the GitLab API token + webhook secret, the internal CA) are projected from the external secret
+store via **ExternalSecrets** rather than committed to the GitOps repos. The chart references Secret
+**names**; the values + ExternalSecret definitions live in ai-helm-values.
 
 ### CNPG (Postgres)
 
 Postgres is run in-cluster by **CloudNativePG (CNPG)**: a managed cluster with primary/replica,
 backups, and connection routing. The control plane reaches it via `DATABASE_URL`. Postgres is the
-backbone — task queue, `github_outbox`, `code_chunks` (pgvector), `review_feedback`, and the snapshot
+backbone — task queue, `outbox`, `code_chunks` (pgvector), `review_feedback`, and the snapshot
 state the review tiers read.
+
+### GitLab configuration (ADR-0072)
+
+GitLab support is built behind the same `CodePlatform` trait as GitHub
+([ADR-0072](adr/0072-platform-abstraction-layer.md)). The control plane talks to GitLab through a
+static access token (no App/installation dance), and the reconciler dispatches each outbox row to the
+matching platform implementation. The following env vars configure GitLab (all optional — GitLab is
+disabled when `GITLAB_API_TOKEN` is unset/empty):
+
+| Env var | Default | Purpose |
+|---|---|---|
+| `GITLAB_API_TOKEN` | — | GitLab access token (PAT, project/group token). Sent as the `PRIVATE-TOKEN` header. Unset/empty → GitLab disabled. |
+| `GITLAB_API_URL` | `https://gitlab.com/api/v4` | Base API URL. Self-hosted instances set this to `https://<host>/api/v4`. |
+| `GITLAB_WEBHOOK_SECRET` | — | Shared secret for `X-Gitlab-Token` webhook verification (plain token comparison, not HMAC). |
+| `GITLAB_BOT_HANDLE` | `lightbridge-bot` | The bot's `@handle` on GitLab. An MR note starting with `@<handle>` triggers a deep review (the first review is automatic on MR open). |
+
+The bot handle is **per-platform**: GitHub uses `GITHUB_APP_HANDLE` (default `lightbridge-assistant`),
+GitLab uses `GITLAB_BOT_HANDLE` (default `lightbridge-bot`). The fast-tier framing ("🅵 quick pass —
+mention @handle for a deeper review") renders the correct handle per platform at `finalize_review`.
+
+GitLab notes are scoped to their parent MR/issue — there is no global `/projects/{id}/notes/{note_id}`
+endpoint. Both the outbound 👀 reaction and the inbound 👍/👎 feedback polling carry the parent `iid`
+(the task's `target_id`) so the reconciler can address the scoped `…/notes/{note_id}/award_emoji`
+endpoint directly.
 
 ## Deploy ordering (the `deny_unknown_fields` 3-repo dance)
 
@@ -223,9 +248,12 @@ The trigger picks the tier, carried as a `tier` column to the runner:
   diff-only LLM pass, **no retrieval tools registered**, short turn cap (`max_turns` clamped to ≤5,
   not 1) + job timeout (≲ 2 min). The
   fast-tier framing ("🅵 quick pass — mention @handle for a deeper review") is rendered control-plane-
-  side at `finalize_review` (`render_fast_body`), where the real `GITHUB_APP_HANDLE` lives.
+  side at `finalize_review` (`render_fast_body`), where the real `GITHUB_APP_HANDLE` (GitHub) or
+  `GITLAB_BOT_HANDLE` (GitLab) lives.
 - **`@mention` → deep** — manual. Full graph + vector retrieval, `read_file`, generous turns,
-  streaming on, long job deadline (2h acceptable, since it is user-requested and async).
+  streaming on, long job deadline (2h acceptable, since it is user-requested and async). On GitHub
+  the `@<GITHUB_APP_HANDLE>` mention on a PR comment triggers it; on GitLab the `@<GITLAB_BOT_HANDLE>`
+  mention on an MR note triggers it.
 
 Both tiers post through the **single** review channel
 ([ADR-0056](adr/0056-control-plane-owns-the-posted-output.md)) via the egress outbox. SAST findings
@@ -241,6 +269,8 @@ is the k8s-side backstop. For an **uncatchable** kill (OOM/SIGKILL/eviction) the
 post, so it enqueues a `failure_notice` outbox intent that the reconciler drains
 ([ADR-0059](adr/0059-reconciler-owns-all-github-egress.md), superseding the
 [ADR-0057](adr/0057-poller-posts-failure-notice-on-uncatchable-kill.md) dual-poster + settle buffer).
+The same outbox path serves GitLab (ADR-0072) — the reconciler dispatches each row to the matching
+platform implementation.
 The dispatcher also runs the index-snapshot sweeper
 ([ADR-0052](adr/0052-index-snapshot-pruning.md)) and the outbox retention sweeper.
 
