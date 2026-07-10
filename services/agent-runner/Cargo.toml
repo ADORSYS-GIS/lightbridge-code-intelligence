@@ -14,6 +14,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 lightbridge-config = { path = "../config" }
+mimalloc.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

@@ -41,6 +41,12 @@ mod restate_worker;
 mod review;
 mod types;
 
+// Global allocator. The release images are static-musl (ADR-0080); musl's built-in malloc regresses
+// sharply under this server's multithreaded allocation load, so we route every allocation through
+// mimalloc, which restores glibc-class throughput. Harmless on glibc builds too.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
