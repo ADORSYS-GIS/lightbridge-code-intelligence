@@ -674,6 +674,29 @@ async fn run_dispatcher(state: AppState) -> anyhow::Result<()> {
 /// turns the `a2a_task_events` log into ordered, at-least-once webhook POSTs to caller-registered URLs
 /// — the control plane's first outbound egress to untrusted, arbitrary-internet destinations. Requires
 /// a database (the queue + the config store); holds no forge credentials.
+/// Parse the operator's extra SSRF deny-CIDRs for push delivery from `A2A_PUSH_DENIED_CIDRS`
+/// (comma-separated — the cluster Service/Pod CIDRs, ADR-0079 §2 / slice 3). Unset → empty (the fixed
+/// ranges still block loopback/RFC1918/metadata/…). A malformed entry is a hard startup error
+/// (fail-closed: refuse to run with a gap in the SSRF policy rather than deliver silently).
+fn push_denied_cidrs_from_env() -> anyhow::Result<Vec<ipnet::IpNet>> {
+    match std::env::var("A2A_PUSH_DENIED_CIDRS") {
+        Ok(v) => parse_denied_cidrs(&v),
+        Err(_) => Ok(Vec::new()),
+    }
+}
+
+/// Parse a comma-separated CIDR list; blanks are skipped, a malformed entry is an error (fail-closed).
+fn parse_denied_cidrs(raw: &str) -> anyhow::Result<Vec<ipnet::IpNet>> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            s.parse::<ipnet::IpNet>()
+                .map_err(|e| anyhow::anyhow!("invalid CIDR {s:?} in A2A_PUSH_DENIED_CIDRS: {e}"))
+        })
+        .collect()
+}
+
 async fn run_notifier(state: AppState) -> anyhow::Result<()> {
     let pool = state
         .db
@@ -686,10 +709,25 @@ async fn run_notifier(state: AppState) -> anyhow::Result<()> {
     // unaffected. Reuses the same fail-soft loader as the `a2a` role so both interpret the env identically.
     let key = a2a::push_token_key_from_env();
     // The SSRF policy enforced at every delivery (DNS-rebinding/TOCTOU re-validation, ADR-0079 §2).
-    // TODO(ADR-0079 §2, slice 3): thread the operator-configured extra deny-CIDRs (cluster Service/Pod
-    // CIDRs) via `SsrfPolicy::with_extra_denied` from config; the fixed blocked ranges always apply, so
-    // `default()` is safe-but-narrower until the deploy slice wires the cluster CIDRs + NetworkPolicy.
-    let policy = a2a::ssrf::SsrfPolicy::default();
+    // The fixed blocked ranges (loopback/RFC1918/link-local+metadata/ULA/…) always apply; on top the
+    // operator supplies the cluster Service/Pod CIDRs via `A2A_PUSH_DENIED_CIDRS` (the app-level half of
+    // the defence-in-depth; the deny-internal NetworkPolicy is the network-level half). A cluster whose
+    // internal ranges sit outside RFC1918 depends on this being set.
+    let denied = push_denied_cidrs_from_env()?;
+    let policy = if denied.is_empty() {
+        tracing::warn!(
+            "notifier: A2A_PUSH_DENIED_CIDRS is unset — only the fixed SSRF ranges apply. A non-RFC1918 \
+             cluster CIDR would be reachable; set it (+ the deny-internal NetworkPolicy) before enabling \
+             push in such a cluster."
+        );
+        a2a::ssrf::SsrfPolicy::default()
+    } else {
+        tracing::info!(
+            count = denied.len(),
+            "notifier: SSRF policy loaded operator extra deny-CIDRs"
+        );
+        a2a::ssrf::SsrfPolicy::with_extra_denied(denied)
+    };
     let sender = std::sync::Arc::new(queue::notifier::ReqwestWebhookSender::new())
         as std::sync::Arc<dyn queue::notifier::WebhookSender>;
     let cfg = queue::notifier::NotifierConfig::from_env();
@@ -729,6 +767,21 @@ fn spawn_metrics_server(handle: PrometheusHandle) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_denied_cidrs_accepts_a_list_and_rejects_a_bad_entry() {
+        // A valid v4 + v6 list parses; blanks/whitespace are ignored.
+        let ok = parse_denied_cidrs(" 10.42.0.0/16 , 10.43.0.0/16 ,, fd00::/8 ").unwrap();
+        assert_eq!(ok.len(), 3);
+        assert!(ok.contains(&"10.42.0.0/16".parse().unwrap()));
+        assert!(ok.contains(&"fd00::/8".parse().unwrap()));
+        // Empty / unset → no extra CIDRs (the fixed ranges still apply).
+        assert!(parse_denied_cidrs("").unwrap().is_empty());
+        assert!(parse_denied_cidrs("  ,  ").unwrap().is_empty());
+        // A malformed entry is a hard error — the notifier fails closed rather than run with a gap.
+        assert!(parse_denied_cidrs("10.42.0.0/16,not-a-cidr").is_err());
+        assert!(parse_denied_cidrs("10.42.0.0/99").is_err());
+    }
 
     // The workspace links two rustls crypto providers (`ring` via sqlx, `aws-lc-rs` via rmcp's
     // reqwest 0.13), so rustls can't auto-pick a process default and panics on the first TLS
