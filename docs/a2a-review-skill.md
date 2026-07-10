@@ -97,6 +97,41 @@ A diff-scoped request (both SHAs):
 Omit `baseSha` from the same request and you get a whole-tree review of the checkout at `headSha`
 instead.
 
+### Natural-language instruction (`text` + `data`) — ADR-0078
+
+You may carry the review **instruction** as one or more natural-language **`text`** parts alongside
+the structured **`data`** target, instead of stuffing it into `data.prompt`
+([ADR-0078](adr/0078-a2a-natural-language-text-part.md)). This lets a chat/agent peer drive a review
+with a sentence plus a small structured target:
+
+```json
+{ "message": { "messageId": "…", "role": "ROLE_USER", "parts": [
+  { "text": "Focus on the auth changes and the new migration; check the token TTL." },
+  { "data": { "skill": "review", "repo": "acme/api", "pr": "164",
+              "headSha": "9f2a1c4e8b7d6053a1f4c2e9b8d70a5c3e1f2b6d",
+              "baseSha": "1b0dd7a4c9e2f6538a0c4b1e9d7f2a5c3e8b6d04" } }
+] } }
+```
+
+The split is deliberate and safety-critical:
+
+- **`data` is the authoritative target + scope.** `repo`/`pr`/`forge`/`headSha`/`baseSha` are read
+  **only** from the `data` part, exactly as above. A `text` part **cannot** set or override them: prose
+  saying "actually review PR 999" while `data.pr` is `1` still reviews PR 1, and "review the whole
+  tree" cannot flip a diff-scoped (`baseSha` present) review. The role holds no forge credentials, so
+  a target is never inferred from prose.
+- **`text` is the instruction, and it wins over `data.prompt`.** When one or more `text` parts are
+  present, the prompt is those parts **concatenated in message order, newline-joined, and trimmed**;
+  any `data.prompt` supplied alongside is a lower-priority hint the text overrides. With no `text`
+  part, `data.prompt` is used (unchanged); with neither, a generic deep-review intent. In all cases
+  the instruction only steers **emphasis** — it never changes what is reviewed or how widely.
+- **A `text`-only message (no `data` part) is rejected — with guidance.** The error
+  (`INVALID_PARAMS`) names the minimum precise fields you must supply in a `data` part (`repo`, `pr`,
+  `headSha`) and points back here, rather than a silent dead-end. (A future Phase-4 upgrade replaces
+  this rejection with an `input-required` clarify-then-confirm loop: the server asks for the missing
+  precise fields and you confirm.)
+- **`file` parts are ignored** (reserved).
+
 ### JSON-RPC (preferred transport)
 
 `POST /` with a JSON-RPC envelope. Method names are **PascalCase** (`SendMessage`). The envelope
@@ -134,8 +169,9 @@ Notes on the message envelope:
 
 - `messageId` is **required** on the wire (any unique id the caller mints).
 - `role` **must** be the ProtoJSON enum `"ROLE_USER"` — not `"user"`.
-- The review object is the `data` part; a plain `text` part is not accepted (Phase 1 takes
-  structured input).
+- The review **target** is the `data` part. A natural-language `text` part may carry the
+  **instruction** alongside it (ADR-0078; see [Natural-language instruction](#natural-language-instruction-text--data--adr-0078)) —
+  but a `text`-**only** message (no `data` target) is rejected with guidance.
 - `contextId` is optional; supply one to group related tasks into a conversation, else the server
   mints one.
 

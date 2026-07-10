@@ -1145,6 +1145,17 @@ mod tests {
         }
     }
 
+    /// A review request in the ADR-0078 `text` + `data` form: a natural-language instruction part
+    /// ahead of the structured target part.
+    fn review_req_with_text(text: &str, data: Value) -> SendMessageRequest {
+        SendMessageRequest {
+            message: Message::new(Role::User, vec![Part::text(text), Part::data(data)]),
+            configuration: None,
+            metadata: None,
+            tenant: None,
+        }
+    }
+
     async fn seed_approved_repo(pool: &PgPool, owner: &str, name: &str, installation: i64) -> i64 {
         let id = db::upsert_repository(
             pool,
@@ -1209,6 +1220,57 @@ mod tests {
         assert_eq!(row.target_id, 42);
         assert_eq!(row.command_text, "focus on auth");
         assert_eq!(row.status, "queued");
+    }
+
+    /// ADR-0078: a natural-language `text` instruction reaches the run's `command_text` (winning over
+    /// `data.prompt`), while the target still comes solely from the `data` part.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn text_instruction_becomes_command_text_over_data_prompt(pool: PgPool) {
+        seed_approved_repo(&pool, "acme", "api", 111).await;
+        let h = handler(pool.clone(), 10);
+        let task = task_of(
+            h.send_message(
+                &params("svc-a", &["a2a:review"]),
+                review_req_with_text(
+                    "Focus on the auth changes.",
+                    json!({ "repo": "acme/api", "pr": 42, "prompt": "ignored hint", "headSha": "deadbeef" }),
+                ),
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(task.status.state, TaskState::Submitted);
+        let underlying = underlying_of(&task).expect("underlying task id");
+        let row = db::get_task(&pool, underlying).await.unwrap().unwrap();
+        // The text wins over `data.prompt`; the target is still PR 42 from the data part.
+        assert_eq!(row.command_text, "Focus on the auth changes.");
+        assert_eq!(row.target_id, 42);
+    }
+
+    /// ADR-0078: a `text`-only message (no `data` target) is a guided `INVALID_PARAMS`, not a task —
+    /// the role cannot resolve a target from prose.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn text_only_message_is_invalid_params_with_guidance(pool: PgPool) {
+        let h = handler(pool.clone(), 10);
+        let err = h
+            .send_message(
+                &params("svc-a", &["a2a:review"]),
+                SendMessageRequest {
+                    message: Message::new(
+                        Role::User,
+                        vec![Part::text("review PR 128, focus on auth")],
+                    ),
+                    configuration: None,
+                    metadata: None,
+                    tenant: None,
+                },
+            )
+            .await
+            .expect_err("text-only must be an error, not a task");
+        let msg = err.to_string();
+        for field in ["repo", "pr", "headSha"] {
+            assert!(msg.contains(field), "guided error names `{field}`: {msg}");
+        }
     }
 
     #[sqlx::test(migrations = "./migrations")]
