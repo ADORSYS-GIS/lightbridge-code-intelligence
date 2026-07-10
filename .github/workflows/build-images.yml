@@ -57,11 +57,13 @@ jobs:
       - name: sccache stats
         if: always()
         run: sccache --show-stats || true
-      - uses: actions/upload-artifact@v4
+      # Hand the binaries to the images job via Actions cache (run-unique key), NOT upload-artifact:
+      # artifact storage is a hard quota that fails closed, whereas cache is a separate LRU store that
+      # never blocks the build.
+      - uses: actions/cache/save@v4
         with:
-          name: rust-bins
-          path: dist/
-          retention-days: 1
+          path: dist
+          key: rust-bins-${{ github.run_id }}
 
   # ── Compile the Next.js app natively → the standalone bundle ──────────────────────────────────────
   web-build:
@@ -86,11 +88,10 @@ jobs:
           cp -a apps/web/.next/standalone/. web/standalone/
           cp -a apps/web/.next/static/.     web/static/
           cp -a apps/web/public/.           web/public/
-      - uses: actions/upload-artifact@v4
+      - uses: actions/cache/save@v4
         with:
-          name: web-bundle
-          path: web/
-          retention-days: 1
+          path: web
+          key: web-bundle-${{ github.run_id }}
 
   # ── Assemble images from the prebuilt artifacts, daemonless, with buildah ─────────────────────────
   images:
@@ -124,10 +125,11 @@ jobs:
             artifact: rust-bins
     steps:
       - uses: actions/checkout@v4 # the Dockerfiles
-      - uses: actions/download-artifact@v4
+      - uses: actions/cache/restore@v4
         with:
-          name: ${{ matrix.artifact }}
-          path: artifact
+          path: ${{ matrix.artifact == 'rust-bins' && 'dist' || 'web' }}
+          key: ${{ matrix.artifact }}-${{ github.run_id }}
+          fail-on-cache-miss: true
       - name: Install buildah
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends buildah
       - uses: sigstore/cosign-installer@v3
@@ -145,8 +147,8 @@ jobs:
         run: |
           ctx="$(mktemp -d)"
           case "${{ matrix.artifact }}" in
-            rust-bins)  cp artifact/* "$ctx"/ && chmod +x "$ctx"/* ;;
-            web-bundle) cp -a artifact/standalone artifact/static artifact/public "$ctx"/ ;;
+            rust-bins)  cp dist/* "$ctx"/ && chmod +x "$ctx"/* ;;
+            web-bundle) cp -a web/standalone web/static web/public "$ctx"/ ;;
           esac
           echo "dir=$ctx" >> "$GITHUB_OUTPUT"
       # Tag strings only — metadata-action needs no Docker daemon.
