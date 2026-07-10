@@ -1,8 +1,9 @@
 # ADR-0079: A2A push notifications via an SSRF-guarded webhook egress (RFC-0006 Phase 3)
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-07-10
 - **Deciders:** @stephane-segning
+- **Accepted 2026-07-10.** Implementation began with slice 1 (SSRF validator + `a2a_push_configs` migration).
 
 ## Context and Problem Statement
 

@@ -22,6 +22,9 @@ mod card;
 pub(crate) mod events;
 mod handler;
 pub(crate) mod mapping;
+// SSRF-guarded webhook-URL validation for push notifications (RFC-0006 Phase 3, ADR-0079 §2). Slice
+// 1 lands the validator + tests; the `create` handler and delivery client wire it in slice 2.
+pub(crate) mod ssrf;
 mod store;
 
 use std::sync::Arc;

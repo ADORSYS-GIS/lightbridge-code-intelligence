@@ -109,6 +109,9 @@ regex = "1"
 # userinfo/query credentials from the persisted base_url. (base64 is also used by control-plane tests.)
 base64 = "0.22"
 url = "2"
+# Parse + containment-test the configurable extra SSRF deny-list CIDRs (ADR-0079 §2). The fixed
+# blocked ranges stay hand-rolled and auditable; ipnet only backs the operator-supplied extra list.
+ipnet = "2"
 
 # --- Dev / test only ---
 tempfile = "3"
