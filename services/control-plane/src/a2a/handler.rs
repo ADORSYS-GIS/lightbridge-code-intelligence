@@ -758,36 +758,176 @@ impl RequestHandler for A2aHandler {
         ))
     }
 
+    // --- Push notifications (RFC-0006 Phase 3, ADR-0079 §1/§3): config CRUD ---
+    //
+    // Every method is CALLER-SCOPED exactly like `GetTask`: it resolves the target `a2a_task_id` and
+    // `load_owned(task_id, caller)`s it, so an unknown/foreign task — or a config whose task the caller
+    // does not own — is a clean `TaskNotFound` (no existence leak, ADR-0079 P9). `create` additionally
+    // validates the webhook URL synchronously (ADR-0079 §2) BEFORE any DB write, so a private/invalid
+    // URL is rejected and stores nothing. Delivery/notifier code and the card flip are slice 2b.
+
     async fn create_push_config(
         &self,
-        _params: &ServiceParams,
-        _req: TaskPushNotificationConfig,
+        params: &ServiceParams,
+        req: TaskPushNotificationConfig,
     ) -> Result<TaskPushNotificationConfig, A2AError> {
-        Err(A2AError::push_notification_not_supported())
+        let caller = Self::caller(params)?;
+        // Single-tenant deployment (RFC-0006), mirroring `submit_review`.
+        if req.tenant.is_some() {
+            return Err(A2AError::unsupported_operation(
+                "multi-tenant A2A requests are not supported",
+            ));
+        }
+        // Caller-scoped ownership check on the parent task (same as GetTask) — before anything else.
+        let task_id =
+            Uuid::parse_str(&req.task_id).map_err(|_| A2AError::task_not_found(&req.task_id))?;
+        self.store
+            .load_owned(task_id, &caller.id)
+            .await
+            .map_err(db_error)?
+            .ok_or_else(|| A2AError::task_not_found(&req.task_id))?;
+
+        // SSRF validation at REGISTRATION (ADR-0079 §2), synchronously and BEFORE any DB write: a
+        // non-HTTPS / private / metadata / cluster-CIDR / invalid URL is rejected as `invalid_params`
+        // and nothing is stored. The validator re-runs at every delivery attempt (slice 2b) for the
+        // DNS-rebinding/TOCTOU defence. `SsrfPolicy::default()` enforces the fixed blocked ranges; the
+        // operator extra-CIDR list (cluster Service/Pod CIDRs) is config-wired in the deploy slice.
+        // TODO(ADR-0079 §2, slice 3): thread the operator-configured `SsrfPolicy` here instead of default.
+        let policy = crate::a2a::ssrf::SsrfPolicy::default();
+        crate::a2a::ssrf::validate_webhook_url(
+            &req.url,
+            &policy,
+            crate::a2a::ssrf::system_resolver,
+        )
+        .map_err(|error| A2AError::invalid_params(error.to_string()))?;
+
+        // TODO(ADR-0079 §3): encrypt the token at rest. No app-level secret-encryption helper exists in
+        // this repo yet, so the caller-supplied token is stored RAW in `token_enc` for this slice — it
+        // is never logged and is only ever sent over the policy-guaranteed HTTPS. Tracked as a PR
+        // follow-up; do NOT roll a custom crypto scheme here.
+        let token_enc = req.token.as_ref().map(|t| t.as_bytes().to_vec());
+        // Multiple configs per task are allowed (spec) — mint a fresh server-side id every time.
+        let config_id = Uuid::now_v7();
+        db::insert_push_config(
+            &self.pool,
+            config_id,
+            task_id,
+            &req.url,
+            token_enc.as_deref(),
+            &caller.id,
+        )
+        .await
+        .map_err(db_error)?;
+
+        tracing::info!(
+            caller = %caller.id, a2a_task_id = %task_id, config_id = %config_id,
+            "a2a push config registered"
+        );
+        // Echo the stored config back with its server-assigned id and the normalized task id.
+        Ok(TaskPushNotificationConfig {
+            id: Some(config_id.to_string()),
+            task_id: task_id.to_string(),
+            ..req
+        })
     }
 
     async fn get_push_config(
         &self,
-        _params: &ServiceParams,
-        _req: GetTaskPushNotificationConfigRequest,
+        params: &ServiceParams,
+        req: GetTaskPushNotificationConfigRequest,
     ) -> Result<TaskPushNotificationConfig, A2AError> {
-        Err(A2AError::push_notification_not_supported())
+        let caller = Self::caller(params)?;
+        if req.tenant.is_some() {
+            return Err(A2AError::unsupported_operation(
+                "multi-tenant A2A requests are not supported",
+            ));
+        }
+        let task_id =
+            Uuid::parse_str(&req.task_id).map_err(|_| A2AError::task_not_found(&req.task_id))?;
+        self.store
+            .load_owned(task_id, &caller.id)
+            .await
+            .map_err(db_error)?
+            .ok_or_else(|| A2AError::task_not_found(&req.task_id))?;
+
+        let config_id = Uuid::parse_str(&req.id).map_err(|_| A2AError::task_not_found(&req.id))?;
+        // The config must belong to the task the caller just proved it owns — a config on any other
+        // task (even the caller's own) reads as TaskNotFound, no existence leak.
+        let row = db::get_push_config(&self.pool, config_id)
+            .await
+            .map_err(db_error)?
+            .filter(|row| row.a2a_task_id == task_id)
+            .ok_or_else(|| A2AError::task_not_found(&req.id))?;
+        Ok(push_config_view(row))
     }
 
     async fn list_push_configs(
         &self,
-        _params: &ServiceParams,
-        _req: ListTaskPushNotificationConfigsRequest,
+        params: &ServiceParams,
+        req: ListTaskPushNotificationConfigsRequest,
     ) -> Result<ListTaskPushNotificationConfigsResponse, A2AError> {
-        Err(A2AError::push_notification_not_supported())
+        let caller = Self::caller(params)?;
+        if req.tenant.is_some() {
+            return Err(A2AError::unsupported_operation(
+                "multi-tenant A2A requests are not supported",
+            ));
+        }
+        let task_id =
+            Uuid::parse_str(&req.task_id).map_err(|_| A2AError::task_not_found(&req.task_id))?;
+        self.store
+            .load_owned(task_id, &caller.id)
+            .await
+            .map_err(db_error)?
+            .ok_or_else(|| A2AError::task_not_found(&req.task_id))?;
+
+        let configs = db::list_push_configs_for_task(&self.pool, task_id)
+            .await
+            .map_err(db_error)?
+            .into_iter()
+            .map(push_config_view)
+            .collect();
+        // No pagination in this slice: all of a task's configs fit in one page (per-task config caps
+        // are the abuse bound — ADR-0079 P7). A `next_page_token` is a later refinement.
+        Ok(ListTaskPushNotificationConfigsResponse {
+            configs,
+            next_page_token: None,
+        })
     }
 
     async fn delete_push_config(
         &self,
-        _params: &ServiceParams,
-        _req: DeleteTaskPushNotificationConfigRequest,
+        params: &ServiceParams,
+        req: DeleteTaskPushNotificationConfigRequest,
     ) -> Result<(), A2AError> {
-        Err(A2AError::push_notification_not_supported())
+        let caller = Self::caller(params)?;
+        if req.tenant.is_some() {
+            return Err(A2AError::unsupported_operation(
+                "multi-tenant A2A requests are not supported",
+            ));
+        }
+        let task_id =
+            Uuid::parse_str(&req.task_id).map_err(|_| A2AError::task_not_found(&req.task_id))?;
+        self.store
+            .load_owned(task_id, &caller.id)
+            .await
+            .map_err(db_error)?
+            .ok_or_else(|| A2AError::task_not_found(&req.task_id))?;
+
+        let config_id = Uuid::parse_str(&req.id).map_err(|_| A2AError::task_not_found(&req.id))?;
+        // Delete scoped to the proven-owned task in a single query: a config on another task (or a
+        // guessed id) matches zero rows → TaskNotFound. No pre-SELECT is needed — this is the last
+        // operation, so there is no later INSERT that could FK-violate on a missing row.
+        let deleted = db::delete_push_config(&self.pool, config_id, task_id)
+            .await
+            .map_err(db_error)?;
+        if !deleted {
+            return Err(A2AError::task_not_found(&req.id));
+        }
+        tracing::info!(
+            caller = %caller.id, a2a_task_id = %task_id, config_id = %config_id,
+            "a2a push config deleted"
+        );
+        Ok(())
     }
 
     async fn get_extended_agent_card(
@@ -870,6 +1010,23 @@ fn submitted_metadata(caller: &CallerCtx, underlying: &Uuid) -> Map<String, Valu
             Value::from(underlying.to_string()),
         ),
     ])
+}
+
+/// Project a stored push-config row into the A2A [`TaskPushNotificationConfig`] wire type (ADR-0079
+/// §1). Echoes the caller's own token back — it is the caller's secret and the read is caller-scoped —
+/// so a `create`→`get` round-trip is faithful. `authentication` is not persisted separately in this
+/// slice (only the caller `token`; see the migration), so it comes back `None`.
+fn push_config_view(row: db::PushConfigRow) -> TaskPushNotificationConfig {
+    TaskPushNotificationConfig {
+        url: row.url,
+        id: Some(row.config_id.to_string()),
+        task_id: row.a2a_task_id.to_string(),
+        token: row
+            .token_enc
+            .and_then(|bytes| String::from_utf8(bytes).ok()),
+        authentication: None,
+        tenant: None,
+    }
 }
 
 /// Strip internal `lb.*` linkage metadata (caller id, skill) from a task before it goes back to the
@@ -1977,5 +2134,301 @@ mod tests {
             states,
             vec![TaskState::Working, TaskState::Working, TaskState::Completed]
         );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Push notifications (RFC-0006 Phase 3, ADR-0079 §1/§3): config CRUD
+    // ---------------------------------------------------------------------------
+
+    use a2a::{
+        DeleteTaskPushNotificationConfigRequest, GetTaskPushNotificationConfigRequest,
+        ListTaskPushNotificationConfigsRequest, TaskPushNotificationConfig,
+    };
+
+    /// A public literal-IP webhook URL that passes the SSRF validator WITHOUT any DNS (93.184.216.34 =
+    /// example.com's address, used in the ssrf.rs tests as the canonical public IP). Using a literal IP
+    /// keeps these tests hermetic — no real resolver call, no CI DNS dependency.
+    const OK_WEBHOOK: &str = "https://93.184.216.34/webhook";
+
+    fn push_config(task_id: &str, url: &str, token: Option<&str>) -> TaskPushNotificationConfig {
+        TaskPushNotificationConfig {
+            url: url.to_string(),
+            id: None,
+            task_id: task_id.to_string(),
+            token: token.map(str::to_string),
+            authentication: None,
+            tenant: None,
+        }
+    }
+
+    fn get_cfg_req(task_id: &str, id: &str) -> GetTaskPushNotificationConfigRequest {
+        GetTaskPushNotificationConfigRequest {
+            task_id: task_id.to_string(),
+            id: id.to_string(),
+            tenant: None,
+        }
+    }
+
+    fn list_cfg_req(task_id: &str) -> ListTaskPushNotificationConfigsRequest {
+        ListTaskPushNotificationConfigsRequest {
+            task_id: task_id.to_string(),
+            page_size: None,
+            page_token: None,
+            tenant: None,
+        }
+    }
+
+    fn del_cfg_req(task_id: &str, id: &str) -> DeleteTaskPushNotificationConfigRequest {
+        DeleteTaskPushNotificationConfigRequest {
+            task_id: task_id.to_string(),
+            id: id.to_string(),
+            tenant: None,
+        }
+    }
+
+    /// Count the push-config rows for a task (a raw DB probe the handler layer doesn't expose).
+    async fn config_count(pool: &PgPool, a2a_id: &str) -> i64 {
+        let id = Uuid::parse_str(a2a_id).unwrap();
+        sqlx::query_scalar("SELECT count(*) FROM a2a_push_configs WHERE a2a_task_id = $1")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// create stores a config, returns it with a server-assigned id, and the row lands with the
+    /// table defaults (`state='active'`, `delivered_seq=0`) and the caller as `created_by`.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn create_push_config_stores_and_returns_with_id(pool: PgPool) {
+        seed_approved_repo(&pool, "acme", "api", 111).await;
+        let h = handler(pool.clone(), 10);
+        let caller = params("svc-a", &["a2a:review"]);
+        let (a2a_id, _) = submit(&h, &caller, 7).await;
+
+        let created = h
+            .create_push_config(&caller, push_config(&a2a_id, OK_WEBHOOK, Some("s3cr3t")))
+            .await
+            .unwrap();
+        let config_id = created.id.clone().expect("server-assigned config id");
+        assert!(Uuid::parse_str(&config_id).is_ok(), "config id is a uuid");
+        assert_eq!(created.url, OK_WEBHOOK);
+        assert_eq!(created.task_id, a2a_id);
+
+        // The stored row exists with the expected defaults + caller ownership + token bytes.
+        let row = db::get_push_config(&pool, Uuid::parse_str(&config_id).unwrap())
+            .await
+            .unwrap()
+            .expect("row persisted");
+        assert_eq!(row.a2a_task_id.to_string(), a2a_id);
+        assert_eq!(row.url, OK_WEBHOOK);
+        assert_eq!(row.state, "active");
+        assert_eq!(row.delivered_seq, 0);
+        assert_eq!(row.attempts, 0);
+        assert_eq!(row.created_by, "svc-a");
+        assert_eq!(row.token_enc.as_deref(), Some(b"s3cr3t".as_ref()));
+    }
+
+    /// The security-relevant path: a non-HTTPS / metadata / private URL is rejected as `invalid_params`
+    /// and NOTHING is stored (the SSRF validator runs before any DB write).
+    #[sqlx::test(migrations = "./migrations")]
+    async fn create_push_config_rejects_ssrf_urls_and_stores_nothing(pool: PgPool) {
+        seed_approved_repo(&pool, "acme", "api", 111).await;
+        let h = handler(pool.clone(), 10);
+        let caller = params("svc-a", &["a2a:review"]);
+        let (a2a_id, _) = submit(&h, &caller, 7).await;
+
+        for bad in [
+            "http://93.184.216.34/webhook",        // plaintext scheme
+            "https://169.254.169.254/latest/meta", // cloud metadata IP
+            "https://10.0.0.1/webhook",            // RFC 1918 private
+        ] {
+            let err = h
+                .create_push_config(&caller, push_config(&a2a_id, bad, None))
+                .await
+                .expect_err("SSRF URL must be rejected");
+            assert_eq!(
+                err.code,
+                a2a::error_code::INVALID_PARAMS,
+                "{bad} should be invalid_params"
+            );
+        }
+        assert_eq!(
+            config_count(&pool, &a2a_id).await,
+            0,
+            "a rejected webhook URL must store no config row"
+        );
+    }
+
+    /// Multiple configs per task coexist; list returns them all; get fetches one; delete removes it and
+    /// a subsequent get is TaskNotFound.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn multiple_configs_list_get_and_delete(pool: PgPool) {
+        seed_approved_repo(&pool, "acme", "api", 111).await;
+        let h = handler(pool.clone(), 10);
+        let caller = params("svc-a", &["a2a:review"]);
+        let (a2a_id, _) = submit(&h, &caller, 7).await;
+
+        let c1 = h
+            .create_push_config(&caller, push_config(&a2a_id, OK_WEBHOOK, Some("t1")))
+            .await
+            .unwrap()
+            .id
+            .unwrap();
+        let c2 = h
+            .create_push_config(
+                &caller,
+                push_config(&a2a_id, "https://93.184.216.34/second", None),
+            )
+            .await
+            .unwrap()
+            .id
+            .unwrap();
+        assert_ne!(c1, c2, "each config gets its own id");
+
+        // list returns both.
+        let listed = h
+            .list_push_configs(&caller, list_cfg_req(&a2a_id))
+            .await
+            .unwrap();
+        let mut ids: Vec<String> = listed
+            .configs
+            .iter()
+            .map(|c| c.id.clone().unwrap())
+            .collect();
+        ids.sort();
+        let mut want = vec![c1.clone(), c2.clone()];
+        want.sort();
+        assert_eq!(ids, want);
+        assert!(listed.next_page_token.is_none());
+
+        // get returns c1 with its stored token echoed back.
+        let got = h
+            .get_push_config(&caller, get_cfg_req(&a2a_id, &c1))
+            .await
+            .unwrap();
+        assert_eq!(got.id.as_deref(), Some(c1.as_str()));
+        assert_eq!(got.url, OK_WEBHOOK);
+        assert_eq!(got.token.as_deref(), Some("t1"));
+
+        // delete c1, then a get on it is TaskNotFound and list has only c2 left.
+        h.delete_push_config(&caller, del_cfg_req(&a2a_id, &c1))
+            .await
+            .unwrap();
+        let after = h.get_push_config(&caller, get_cfg_req(&a2a_id, &c1)).await;
+        assert_eq!(
+            after.unwrap_err().code,
+            a2a::error_code::TASK_NOT_FOUND,
+            "a deleted config reads as TaskNotFound"
+        );
+        let remaining = h
+            .list_push_configs(&caller, list_cfg_req(&a2a_id))
+            .await
+            .unwrap();
+        assert_eq!(remaining.configs.len(), 1);
+        assert_eq!(remaining.configs[0].id.as_deref(), Some(c2.as_str()));
+    }
+
+    /// Caller-scoping (ADR-0079 P9): caller B cannot create/get/list/delete on caller A's task — every
+    /// method returns TaskNotFound (no existence leak), exactly like GetTask.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn push_config_crud_is_caller_scoped(pool: PgPool) {
+        seed_approved_repo(&pool, "acme", "api", 111).await;
+        let h = handler(pool.clone(), 10);
+        let alice = params("svc-a", &["a2a:review"]);
+        let bob = params("svc-b", &["a2a:review"]);
+        let (a2a_id, _) = submit(&h, &alice, 7).await;
+
+        // Alice registers a config; Bob cannot see or touch it.
+        let cfg_id = h
+            .create_push_config(&alice, push_config(&a2a_id, OK_WEBHOOK, None))
+            .await
+            .unwrap()
+            .id
+            .unwrap();
+
+        // Bob create on Alice's task → TaskNotFound (and stores nothing).
+        let bob_create = h
+            .create_push_config(&bob, push_config(&a2a_id, OK_WEBHOOK, None))
+            .await;
+        assert_eq!(
+            bob_create.unwrap_err().code,
+            a2a::error_code::TASK_NOT_FOUND
+        );
+        assert_eq!(
+            config_count(&pool, &a2a_id).await,
+            1,
+            "Bob's foreign create must not add a row"
+        );
+
+        // Bob get / list / delete on Alice's task → all TaskNotFound.
+        assert_eq!(
+            h.get_push_config(&bob, get_cfg_req(&a2a_id, &cfg_id))
+                .await
+                .unwrap_err()
+                .code,
+            a2a::error_code::TASK_NOT_FOUND
+        );
+        assert_eq!(
+            h.list_push_configs(&bob, list_cfg_req(&a2a_id))
+                .await
+                .unwrap_err()
+                .code,
+            a2a::error_code::TASK_NOT_FOUND
+        );
+        assert_eq!(
+            h.delete_push_config(&bob, del_cfg_req(&a2a_id, &cfg_id))
+                .await
+                .unwrap_err()
+                .code,
+            a2a::error_code::TASK_NOT_FOUND
+        );
+        // Alice's config survived Bob's delete attempt.
+        assert_eq!(config_count(&pool, &a2a_id).await, 1);
+    }
+
+    /// An unknown task id, and a config id that belongs to a *different* task, both read as
+    /// TaskNotFound — the config must belong to the proven-owned task.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn push_config_unknown_task_and_cross_task_config_are_not_found(pool: PgPool) {
+        seed_approved_repo(&pool, "acme", "api", 111).await;
+        let h = handler(pool.clone(), 10);
+        let caller = params("svc-a", &["a2a:review"]);
+        let (task_a, _) = submit(&h, &caller, 7).await;
+        let (task_b, _) = submit(&h, &caller, 8).await;
+
+        // Unknown task id → TaskNotFound on create.
+        let unknown = Uuid::now_v7().to_string();
+        assert_eq!(
+            h.create_push_config(&caller, push_config(&unknown, OK_WEBHOOK, None))
+                .await
+                .unwrap_err()
+                .code,
+            a2a::error_code::TASK_NOT_FOUND
+        );
+
+        // A config registered on task_b is not reachable via task_a (same caller, different task).
+        let cfg_on_b = h
+            .create_push_config(&caller, push_config(&task_b, OK_WEBHOOK, None))
+            .await
+            .unwrap()
+            .id
+            .unwrap();
+        assert_eq!(
+            h.get_push_config(&caller, get_cfg_req(&task_a, &cfg_on_b))
+                .await
+                .unwrap_err()
+                .code,
+            a2a::error_code::TASK_NOT_FOUND,
+            "a config id from another task must not resolve under task_a"
+        );
+        assert_eq!(
+            h.delete_push_config(&caller, del_cfg_req(&task_a, &cfg_on_b))
+                .await
+                .unwrap_err()
+                .code,
+            a2a::error_code::TASK_NOT_FOUND
+        );
+        // The cross-task delete attempt did not remove the real config on task_b.
+        assert_eq!(config_count(&pool, &task_b).await, 1);
     }
 }
