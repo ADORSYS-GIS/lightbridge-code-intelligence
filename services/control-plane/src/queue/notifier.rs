@@ -683,6 +683,38 @@ mod tests {
         .unwrap());
     }
 
+    /// Regression: `advance_push_delivered` is strictly monotonic. A stale worker whose lease
+    /// expired mid-delivery (after another worker re-claimed and advanced the config) cannot rewind
+    /// the cursor by writing a lower seq — the `AND delivered_seq < $2` guard makes it a no-op, so no
+    /// already-delivered event is re-sent out of order.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn advance_delivered_is_monotonic(pool: PgPool) {
+        let task = seed_a2a_task(&pool).await;
+        let config = insert_config(&pool, task, PUBLIC_URL, None).await;
+        let lease = std::time::Duration::from_secs(60);
+
+        db::advance_push_delivered(&pool, config, 5, lease)
+            .await
+            .unwrap();
+        assert_eq!(config_state(&pool, config).await.0, 5);
+
+        // A stale write of a LOWER seq must not rewind the cursor.
+        db::advance_push_delivered(&pool, config, 3, lease)
+            .await
+            .unwrap();
+        assert_eq!(
+            config_state(&pool, config).await.0,
+            5,
+            "cursor must not rewind on a stale lower-seq advance"
+        );
+
+        // A forward write still advances.
+        db::advance_push_delivered(&pool, config, 7, lease)
+            .await
+            .unwrap();
+        assert_eq!(config_state(&pool, config).await.0, 7);
+    }
+
     /// Backpressure: a failure on event 2 blocks the config at seq 1 (does NOT skip 2); attempts
     /// increments and next_attempt_at moves out. A later success delivers 2 then 3.
     #[sqlx::test(migrations = "./migrations")]

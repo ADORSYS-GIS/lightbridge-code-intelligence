@@ -2498,11 +2498,16 @@ pub async fn advance_push_delivered(
     seq: i64,
     lease: Duration,
 ) -> Result<(), sqlx::Error> {
+    // `AND delivered_seq < $2` keeps the cursor strictly monotonic: if this worker's lease expired
+    // mid-delivery and another worker re-claimed the config and advanced past $2, this stale write
+    // is a no-op (it neither rewinds the cursor nor renews a lease it no longer holds). Without the
+    // guard a >lease-duration stall could rewind delivered_seq and re-send an already-delivered event
+    // out of order.
     sqlx::query(
         "UPDATE a2a_push_configs \
          SET delivered_seq = $2, attempts = 0, next_attempt_at = now(), \
              lease_expires_at = now() + ($3 * interval '1 second') \
-         WHERE config_id = $1",
+         WHERE config_id = $1 AND delivered_seq < $2",
     )
     .bind(config_id)
     .bind(seq)
