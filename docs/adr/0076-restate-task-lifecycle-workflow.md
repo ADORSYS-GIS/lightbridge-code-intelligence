@@ -3,6 +3,12 @@
 - **Status:** Proposed
 - **Date:** 2026-07-09
 - **Deciders:** @stephane-segning
+- **Amended 2026-07-10:** re-anchored the R2 entry gate from "restatedev/sdk-rust#89 resolved" to "the
+  `ctx.select` primitive verified safe under crash/replay." restatedev/sdk-rust#89 was confirmed open and, per the
+  maintainer, a by-design journal constraint unlikely ever to close, so the original wording would
+  have deadlocked Phase B on an issue that never moves; the real dependency is the primitive's replay
+  safety on our `=0.10.0` pin. See the determinism rules and R2 below, and the
+  [Phase B implementation plan](../restate-phase-b-implementation-plan.md).
 
 ## Context and Problem Statement
 
@@ -146,12 +152,14 @@ so they bind harder here. Reviews enforce them:
   config re-reads that can differ across replays. Deadlines use `ctx.sleep` and journaled values,
   not `Instant::now()`. The reaper's current `requeue_backoff(attempts)` is already a pure
   function of `attempts`, so it ports cleanly.
-- **No concurrent `Context` fan-out** until [sdk-rust #89](https://github.com/restatedev/sdk-rust/issues/89)
-  (buffered-stream freeze) is resolved. The completion-vs-timeout race in step 4 is the one place
-  Phase B *needs* to await two futures; use the SDK's own select/`DurableFuturesUnordered`
-  (0.10+), never a hand-rolled `futures` combinator over `Context` operations. **This must be
-  verified against #89 before implementation** — it is the single riskiest primitive in the
-  design (R2 below).
+- **No concurrent `Context` fan-out via a hand-rolled combinator.** The completion-vs-timeout race
+  in step 4 is the one place Phase B *needs* to await two futures; use the SDK's own
+  `ctx.select`/`DurableFuturesUnordered` (0.10+) — the engine's **journaled** select, distinct from
+  the buffered-stream freeze [restatedev/sdk-rust#89](https://github.com/restatedev/sdk-rust/issues/89)
+  describes — never a `futures` combinator over `Context` operations. This is the single riskiest
+  primitive (R2 below): the entry gate is verifying `ctx.select` is crash/replay-safe on the
+  `=0.10.0` pin, *not* waiting for restatedev/sdk-rust#89 to close. See the
+  [Phase B implementation plan](../restate-phase-b-implementation-plan.md).
 - **Journal-compatible evolution:** changing the order/set of journaled steps in a handler with
   in-flight invocations is a breaking change, managed by deployment versioning (register the new
   revision, drain old ones on their pinned revision). Handlers stay short; anything long-lived
@@ -236,7 +244,7 @@ sharpened for the lifecycle path. IDs align with the RFC.
 
 | # | Risk | Likelihood | Impact | Mitigation |
 |---|---|---|---|---|
-| R2 | [sdk-rust #89](https://github.com/restatedev/sdk-rust/issues/89): concurrent `Context` use freezes a handler — and step 4's completion-vs-timeout race is where Phase B *needs* two awaited futures | Medium | High (stuck workflow on the critical path) | The race uses **only** the SDK's own select / `DurableFuturesUnordered` (0.10+), never a hand-rolled `futures` combinator over `Context`; verify #89 is resolved (or the select primitive is unaffected) **before** implementation — this is a hard entry gate for Phase B, above and beyond ADR-0074's |
+| R2 | [restatedev/sdk-rust#89](https://github.com/restatedev/sdk-rust/issues/89): concurrent `Context` use freezes a handler — and step 4's completion-vs-timeout race needs two awaited futures | Medium | High (stuck workflow on the critical path) | Use **only** the SDK's `ctx.select`/`DurableFuturesUnordered` (0.10+) — the engine's journaled select, distinct from restatedev/sdk-rust#89's buffered-stream path — never a hand-rolled `futures` combinator. **Entry gate (re-anchored 2026-07-10): verify `ctx.select` is crash/replay-safe on the `=0.10.0` pin, NOT "wait for restatedev/sdk-rust#89 to close"** — it is a by-design journal constraint the maintainer will likely never close, so gating on closure would deadlock Phase B. Hard entry gate, above ADR-0074's |
 | R4 | Journal replay vs code evolution: a hotfix reorders a journaled step and breaks in-flight 2 h deep reviews | Medium | Medium | Immutable-deployment versioning + operator drain of old revisions; short handlers, awakeables for the long wait; rollout rule: never edit a handler's journaled step sequence in a patch release |
 | R8 | Migration-window confusion: two paths own tasks over one `tasks` table | High | Medium | Hard partition by creation flag (a task is born on exactly one engine and stays there); per-run engine stamping (`run_config_b64`-style); dashboards show engine-per-task; legacy tasks drain on the old path, never handed mid-flight |
 | R11 | Index-gate cross-engine handoff drops a release (a legacy index fails to wake an engine-parked review, or vice-versa) | Medium | Medium (a review stalls parked) | All releases flow through the internal API, never engine-to-engine (see above); the legacy `release_reviews_waiting_on_index` already logs loudly on failure so a stall is visible; workflow-parked reviews also carry the deadline timer as a backstop |
@@ -268,7 +276,7 @@ sharpened for the lifecycle path. IDs align with the RFC.
 ## More Information
 
 - [Restate Phase B — implementation plan](../restate-phase-b-implementation-plan.md) — the
-  code-grounded, gated build sequence for this ADR (entry-gate assessment incl. sdk-rust #89,
+  code-grounded, gated build sequence for this ADR (entry-gate assessment incl. restatedev/sdk-rust#89,
   file-by-file change map, handler sketch, cutover mechanics, test/runbook plan). **Not yet
   authorized to build** — see its "do not start until" banner.
 - [RFC-0005](../rfc/0005-durable-orchestration-on-restate.md) — the proposal this ADR implements
