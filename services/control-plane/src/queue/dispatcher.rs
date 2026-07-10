@@ -31,6 +31,13 @@ const DEFAULT_PRUNE_INTERVAL_SECS: u64 = 600;
 /// month so a post-mortem can still read them.
 const DEFAULT_OUTBOX_POSTED_RETENTION_DAYS: i64 = 7;
 const DEFAULT_OUTBOX_FAILED_RETENTION_DAYS: i64 = 30;
+/// A2A task-mapping retention (ADR-0077 §S3 / #321): terminal `a2a_tasks` (+ their cascaded events and
+/// push configs) are reaped after this TTL. A month errs toward retention — a completed review stays
+/// pollable/streamable well past any realistic caller follow-up. From `A2A_TASK_TTL_DAYS`.
+const DEFAULT_A2A_TASK_TTL_DAYS: i64 = 30;
+/// Bounded rows-per-sweep so one GC tick never holds a long lock on `a2a_tasks`; a large backlog drains
+/// across ticks. From `A2A_TASK_SWEEP_BATCH`.
+const DEFAULT_A2A_TASK_SWEEP_BATCH: i64 = 500;
 /// The data-purge backstop is a rare recovery net (a spawned purge lost to a restart), so it runs on
 /// its own slow tick — 10 min — instead of riding the ~30s reaper cadence. Its "which disabled repos
 /// still have data?" scan probes `code_chunks` once per ever-disabled repo, which is cheap warm but
@@ -59,6 +66,11 @@ pub struct DispatcherConfig {
     pub outbox_posted_retention_days: i64,
     /// Days a dead-lettered (`failed`) `outbox` row is kept — longer, for inspection.
     pub outbox_failed_retention_days: i64,
+    /// Days a terminal `a2a_tasks` mapping is kept before the A2A sweeper reaps it (with its cascaded
+    /// events + push configs). From `A2A_TASK_TTL_DAYS`; a non-positive value skips the sweep.
+    pub a2a_task_ttl_days: i64,
+    /// Max terminal `a2a_tasks` mappings deleted per GC tick. From `A2A_TASK_SWEEP_BATCH`.
+    pub a2a_task_sweep_batch: i64,
 }
 
 impl DispatcherConfig {
@@ -71,6 +83,15 @@ impl DispatcherConfig {
         // Retention windows are in days; a zero/negative value falls back to the default rather than
         // pruning everything (`interval '0 days'` would delete every terminal row).
         let days = |value: Option<i64>, default: i64| value.filter(|&d| d > 0).unwrap_or(default);
+        // A2A task retention is env-configured (like the notifier's knobs), not file-config: an
+        // unset/blank/non-positive value falls back to the default (the sweep never runs with a 0 TTL).
+        let env_days = |name: &str, default: i64| {
+            std::env::var(name)
+                .ok()
+                .and_then(|v| v.parse::<i64>().ok())
+                .filter(|&d| d > 0)
+                .unwrap_or(default)
+        };
         Self {
             claim_lease: secs(
                 section.and_then(|s| s.claim_lease_seconds),
@@ -104,6 +125,8 @@ impl DispatcherConfig {
                 section.and_then(|s| s.outbox_failed_retention_days),
                 DEFAULT_OUTBOX_FAILED_RETENTION_DAYS,
             ),
+            a2a_task_ttl_days: env_days("A2A_TASK_TTL_DAYS", DEFAULT_A2A_TASK_TTL_DAYS),
+            a2a_task_sweep_batch: env_days("A2A_TASK_SWEEP_BATCH", DEFAULT_A2A_TASK_SWEEP_BATCH),
         }
     }
 }
@@ -195,6 +218,19 @@ pub async fn run<L: TaskLauncher>(
                     tokio::spawn(async move {
                         if let Err(error) = crate::queue::outbox_sweeper::sweep_once(&pool, posted_days, failed_days).await {
                             tracing::error!(%error, "outbox sweeper cycle failed");
+                        }
+                    });
+                }
+                {
+                    // Reap terminal `a2a_tasks` mappings past their TTL (ADR-0077 §S3 / #321); their
+                    // `a2a_task_events` + `a2a_push_configs` cascade. Append-only otherwise — every A2A
+                    // submission leaves a permanent mapping + event log. Bounded batch per tick.
+                    let pool = pool.clone();
+                    let ttl_days = cfg.a2a_task_ttl_days;
+                    let batch = cfg.a2a_task_sweep_batch;
+                    tokio::spawn(async move {
+                        if let Err(error) = crate::queue::a2a_sweeper::sweep_once(&pool, ttl_days, batch).await {
+                            tracing::error!(%error, "a2a task sweeper cycle failed");
                         }
                     });
                 }
@@ -388,5 +424,32 @@ mod tests {
             zeroed.purge_reconcile_interval,
             Duration::from_secs(DEFAULT_PURGE_RECONCILE_INTERVAL_SECS)
         );
+    }
+
+    // The A2A task-retention knobs come from env (like the notifier's), defaulting when unset/blank and
+    // a non-positive value falling back to the default rather than a 0-day sweep-everything window.
+    // Serialized to avoid env cross-talk with other tests reading the same vars.
+    #[test]
+    fn a2a_task_retention_from_env_defaults_and_overrides() {
+        std::env::remove_var("A2A_TASK_TTL_DAYS");
+        std::env::remove_var("A2A_TASK_SWEEP_BATCH");
+        let cfg = DispatcherConfig::default();
+        assert_eq!(cfg.a2a_task_ttl_days, DEFAULT_A2A_TASK_TTL_DAYS);
+        assert_eq!(cfg.a2a_task_sweep_batch, DEFAULT_A2A_TASK_SWEEP_BATCH);
+
+        std::env::set_var("A2A_TASK_TTL_DAYS", "7");
+        std::env::set_var("A2A_TASK_SWEEP_BATCH", "100");
+        let cfg = DispatcherConfig::default();
+        assert_eq!(cfg.a2a_task_ttl_days, 7);
+        assert_eq!(cfg.a2a_task_sweep_batch, 100);
+
+        // A non-positive TTL falls back to the default (never a 0-day delete-everything sweep).
+        std::env::set_var("A2A_TASK_TTL_DAYS", "0");
+        assert_eq!(
+            DispatcherConfig::default().a2a_task_ttl_days,
+            DEFAULT_A2A_TASK_TTL_DAYS
+        );
+        std::env::remove_var("A2A_TASK_TTL_DAYS");
+        std::env::remove_var("A2A_TASK_SWEEP_BATCH");
     }
 }

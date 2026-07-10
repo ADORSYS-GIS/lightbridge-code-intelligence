@@ -12,7 +12,8 @@
 //! path as the webhook handler ([`crate::db::create_task`], deep tier, `run_epoch = 0`) and returns
 //! a handle. Egress stays on the reconciler/Restate path; this role holds no forge credentials.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 
 use a2a::{
     A2AError, AgentCard, CancelTaskRequest, DeleteTaskPushNotificationConfigRequest,
@@ -57,9 +58,20 @@ const MAX_STREAM_LIFETIME: std::time::Duration = std::time::Duration::from_secs(
 /// let a handful of long-lived streams starve every other query on the replica. This size therefore
 /// doubles as the **per-replica cap on concurrent streams**: past it a new subscription fails fast
 /// (a short acquire timeout) with a clear "capacity reached" error rather than pinning a request
-/// connection or an unbounded Postgres backend. A global cap, not per-caller — per-caller fairness is
-/// a later refinement (RFC-0006).
+/// connection or an unbounded Postgres backend. This is the GLOBAL cap; a per-caller cap
+/// ([`HandlerLimits::max_streams_per_caller`]) sits in front of it so one caller cannot consume the
+/// whole global pool.
 const MAX_CONCURRENT_STREAMS: u32 = 64;
+
+/// Default per-caller concurrent-subscription cap (RFC-0006): one caller may hold at most this many
+/// live streams on a replica, so it can never monopolize the global [`MAX_CONCURRENT_STREAMS`] pool.
+/// From `A2A_MAX_STREAMS_PER_CALLER`.
+const DEFAULT_MAX_STREAMS_PER_CALLER: u32 = 8;
+
+/// Default per-caller, per-task cap on active push-notification configs (ADR-0079 P7): a caller may
+/// register at most this many webhooks on any one task, bounding webhook fan-out abuse. From
+/// `A2A_MAX_PUSH_CONFIGS_PER_TASK`.
+const DEFAULT_PUSH_CONFIG_CAP: i64 = 10;
 
 /// Per-identity rate limit on deep-run submission (RFC-0006 R4).
 #[derive(Debug, Clone, Copy)]
@@ -68,6 +80,109 @@ pub struct QuotaConfig {
     pub max: i64,
     /// Rolling window in seconds.
     pub window_secs: i64,
+}
+
+/// Per-caller abuse bounds for push + streaming (ADR-0079 P7 / RFC-0006 streaming fairness), resolved
+/// from env at role startup. Separate from [`QuotaConfig`] (deep-run submission quota) — these bound
+/// *resource* fan-out (webhooks per task, concurrent streams per caller), not run submission.
+#[derive(Debug, Clone, Copy)]
+pub struct HandlerLimits {
+    /// Max **active** push configs one caller may hold on a single task.
+    pub push_config_cap: i64,
+    /// Max concurrent streaming subscriptions one caller may hold on this replica.
+    pub max_streams_per_caller: u32,
+}
+
+impl Default for HandlerLimits {
+    fn default() -> Self {
+        Self {
+            push_config_cap: DEFAULT_PUSH_CONFIG_CAP,
+            max_streams_per_caller: DEFAULT_MAX_STREAMS_PER_CALLER,
+        }
+    }
+}
+
+impl HandlerLimits {
+    /// Resolve from env: `A2A_MAX_PUSH_CONFIGS_PER_TASK` and `A2A_MAX_STREAMS_PER_CALLER`. A
+    /// non-positive / unparseable value falls back to the default, and both are floored to 1 so the
+    /// role can never be configured into a zero-cap (every request rejected) or unbounded state.
+    pub fn from_env() -> Self {
+        let push_config_cap = std::env::var("A2A_MAX_PUSH_CONFIGS_PER_TASK")
+            .ok()
+            .and_then(|v| v.parse::<i64>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(DEFAULT_PUSH_CONFIG_CAP)
+            .max(1);
+        let max_streams_per_caller = std::env::var("A2A_MAX_STREAMS_PER_CALLER")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(DEFAULT_MAX_STREAMS_PER_CALLER)
+            .max(1);
+        Self {
+            push_config_cap,
+            max_streams_per_caller,
+        }
+    }
+}
+
+/// In-memory per-caller live-stream counter (RFC-0006 streaming fairness). A subscription acquires a
+/// slot at subscribe and releases it when the stream ends — via a [`StreamSlot`] RAII guard, so the
+/// decrement happens on disconnect / clean close / error alike (the guard is dropped when the SSE
+/// generator is dropped, whichever way it ends). Per-replica: the cap bounds one caller's concurrent
+/// streams on THIS pod, which is exactly what protects the pod's [`MAX_CONCURRENT_STREAMS`] pool.
+#[derive(Clone, Default)]
+struct StreamCounters {
+    inner: Arc<Mutex<HashMap<String, u32>>>,
+}
+
+impl StreamCounters {
+    /// Try to take a slot for `caller_id` under `cap`. `Some(guard)` when the caller is below the cap
+    /// (count incremented; released on guard drop); `None` when already at the cap (nothing changes).
+    fn try_acquire(&self, caller_id: &str, cap: u32) -> Option<StreamSlot> {
+        // A poisoned lock only means a prior holder panicked mid-update; the counter is still coherent
+        // enough to keep bounding, so recover the guard rather than propagating the panic.
+        let mut map = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let count = map.entry(caller_id.to_string()).or_insert(0);
+        if *count >= cap {
+            // Don't leave a stray 0-entry we just inserted for a capped caller (only possible when the
+            // caller had an entry already, since a fresh entry is 0 < cap≥1 — but be explicit).
+            if *count == 0 {
+                map.remove(caller_id);
+            }
+            return None;
+        }
+        *count += 1;
+        Some(StreamSlot {
+            counters: self.inner.clone(),
+            caller_id: caller_id.to_string(),
+        })
+    }
+
+    #[cfg(test)]
+    fn count(&self, caller_id: &str) -> u32 {
+        let map = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        map.get(caller_id).copied().unwrap_or(0)
+    }
+}
+
+/// RAII slot for one live stream: decrements its caller's counter on drop (disconnect / close / error),
+/// removing the map entry when it hits zero so the map never accumulates idle callers.
+struct StreamSlot {
+    counters: Arc<Mutex<HashMap<String, u32>>>,
+    caller_id: String,
+}
+
+impl Drop for StreamSlot {
+    fn drop(&mut self) {
+        let mut map = self.counters.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(count) = map.get_mut(&self.caller_id) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                map.remove(&self.caller_id);
+            }
+        }
+    }
 }
 
 /// The authenticated caller, as injected by the auth middleware (never trusted from the raw request).
@@ -85,6 +200,10 @@ pub struct A2aHandler {
     listener_pool: PgPool,
     store: PgTaskStore,
     quota: QuotaConfig,
+    /// Per-caller push + streaming abuse bounds (ADR-0079 P7 / RFC-0006 streaming fairness).
+    limits: HandlerLimits,
+    /// Per-caller live-stream counter enforcing [`HandlerLimits::max_streams_per_caller`].
+    stream_counters: StreamCounters,
     /// The AEAD key for webhook-token encryption-at-rest (ADR-0079 §3), loaded from
     /// `A2A_PUSH_TOKEN_KEY` at role startup. `None` when unconfigured: a `create` carrying a token
     /// then **fails closed** (never storing plaintext), while a tokenless config still works.
@@ -95,6 +214,7 @@ impl A2aHandler {
     pub fn new(
         pool: PgPool,
         quota: QuotaConfig,
+        limits: HandlerLimits,
         push_key: Option<super::push_crypto::Key>,
     ) -> Self {
         let store = PgTaskStore::new(pool.clone());
@@ -111,6 +231,8 @@ impl A2aHandler {
             listener_pool,
             store,
             quota,
+            limits,
+            stream_counters: StreamCounters::default(),
             push_key,
         }
     }
@@ -493,6 +615,24 @@ impl A2aHandler {
 
         let snapshot = self.build_task_snapshot(a2a_task_id, &mapping).await?;
         let already_terminal = snapshot.status.state.is_terminal();
+
+        // Per-caller concurrent-stream cap (RFC-0006 streaming fairness): take a slot up front so one
+        // caller cannot hold more than `max_streams_per_caller` live streams on this replica — which is
+        // what keeps a single caller from consuming the whole global `MAX_CONCURRENT_STREAMS` pool.
+        // Acquired AFTER the ownership check (a not-found subscription consumes no slot) and the RAII
+        // guard is moved INTO the stream below, so it releases when the stream ends: disconnect, clean
+        // close, or error — whichever way the generator is dropped. Over the cap → the same clean
+        // "capacity" error the global pool-saturation path returns.
+        let Some(stream_slot) = self
+            .stream_counters
+            .try_acquire(&caller.id, self.limits.max_streams_per_caller)
+        else {
+            tracing::info!(caller = %caller.id, a2a_task_id = %id, "a2a: per-caller concurrent-stream cap reached");
+            return Err(A2AError::internal(
+                "streaming capacity reached; retry shortly or poll GetTask",
+            ));
+        };
+
         let pool = self.pool.clone();
         // Streams LISTEN on the dedicated, bounded listener pool — never the request pool (see
         // MAX_CONCURRENT_STREAMS): a long tail must not hold a request connection.
@@ -501,6 +641,10 @@ impl A2aHandler {
         let channel = crate::a2a::events::task_channel(&id);
 
         let stream = async_stream::stream! {
+            // Own the per-caller stream slot for the whole generator lifetime: it decrements the
+            // caller's live-stream count when this stream is dropped (disconnect / close / error).
+            let _stream_slot = stream_slot;
+
             // 1) Initial Task snapshot (the current GetTask view).
             yield Ok(StreamResponse::Task(snapshot));
 
@@ -795,6 +939,28 @@ impl RequestHandler for A2aHandler {
             .await
             .map_err(db_error)?
             .ok_or_else(|| A2AError::task_not_found(&req.task_id))?;
+
+        // Per-caller, per-task cap (ADR-0079 P7): a caller may hold at most `push_config_cap` ACTIVE
+        // webhooks on one task, bounding webhook fan-out abuse. Checked (on the caller's own configs,
+        // via `created_by`) BEFORE the SSRF resolution + DB write, so an over-cap create is a cheap
+        // fast reject that resolves no DNS and stores nothing. Counting only `active` configs lets a
+        // caller replace ones that were dead-lettered by repeated delivery failure. Other callers'
+        // configs on the same task never count against this caller (the cap is per-caller).
+        let active = db::count_active_push_configs_for_caller(&self.pool, task_id, &caller.id)
+            .await
+            .map_err(db_error)?;
+        if active >= self.limits.push_config_cap {
+            tracing::info!(
+                caller = %caller.id, a2a_task_id = %task_id, active,
+                cap = self.limits.push_config_cap,
+                "a2a push config create rejected: per-caller per-task cap reached"
+            );
+            return Err(A2AError::invalid_params(format!(
+                "push-notification config limit reached for this task ({} of {} used); \
+                 delete an existing config before registering another",
+                active, self.limits.push_config_cap
+            )));
+        }
 
         // SSRF validation at REGISTRATION (ADR-0079 §2), synchronously and BEFORE any DB write: a
         // non-HTTPS / private / metadata / cluster-CIDR / invalid URL is rejected as `invalid_params`
@@ -1105,26 +1271,30 @@ mod tests {
 
     /// The default test handler: a configured encryption key, so tokened push configs work.
     fn handler(pool: PgPool, max: i64) -> A2aHandler {
-        A2aHandler::new(
-            pool,
-            QuotaConfig {
-                max,
-                window_secs: 3600,
-            },
-            Some(test_key()),
-        )
+        handler_with_limits(pool, max, HandlerLimits::default(), Some(test_key()))
     }
 
     /// A handler with NO encryption key — exercises the fail-closed path (a tokened `create` is
     /// rejected and stores nothing).
     fn handler_no_key(pool: PgPool, max: i64) -> A2aHandler {
+        handler_with_limits(pool, max, HandlerLimits::default(), None)
+    }
+
+    /// A handler with explicit per-caller limits, for the cap tests.
+    fn handler_with_limits(
+        pool: PgPool,
+        max: i64,
+        limits: HandlerLimits,
+        key: Option<super::super::push_crypto::Key>,
+    ) -> A2aHandler {
         A2aHandler::new(
             pool,
             QuotaConfig {
                 max,
                 window_secs: 3600,
             },
-            None,
+            limits,
+            key,
         )
     }
 
@@ -2578,5 +2748,149 @@ mod tests {
         );
         // The cross-task delete attempt did not remove the real config on task_b.
         assert_eq!(config_count(&pool, &task_b).await, 1);
+    }
+
+    /// Per-caller, per-task push-config cap (ADR-0079 P7): the N+1th ACTIVE config on a task is
+    /// rejected (`invalid_params`) and stores nothing; the cap is independent per task; and deleting a
+    /// config frees a slot (only active configs count).
+    #[sqlx::test(migrations = "./migrations")]
+    async fn push_config_per_caller_cap_is_enforced(pool: PgPool) {
+        seed_approved_repo(&pool, "acme", "api", 111).await;
+        // Cap = 2 active configs per caller per task.
+        let h = handler_with_limits(
+            pool.clone(),
+            10,
+            HandlerLimits {
+                push_config_cap: 2,
+                ..HandlerLimits::default()
+            },
+            Some(test_key()),
+        );
+        let caller = params("svc-a", &["a2a:review"]);
+        let (task_a, _) = submit(&h, &caller, 7).await;
+        let (task_b, _) = submit(&h, &caller, 8).await;
+
+        // Two configs on task_a fill the cap.
+        let c1 = h
+            .create_push_config(&caller, push_config(&task_a, OK_WEBHOOK, None))
+            .await
+            .unwrap()
+            .id
+            .unwrap();
+        h.create_push_config(&caller, push_config(&task_a, OK_WEBHOOK, None))
+            .await
+            .unwrap();
+
+        // The 3rd is rejected and stores nothing (still exactly 2 rows on task_a).
+        let over = h
+            .create_push_config(&caller, push_config(&task_a, OK_WEBHOOK, None))
+            .await;
+        assert_eq!(
+            over.unwrap_err().code,
+            a2a::error_code::INVALID_PARAMS,
+            "the N+1th config on a task is rejected"
+        );
+        assert_eq!(
+            config_count(&pool, &task_a).await,
+            2,
+            "the over-cap create stored no row"
+        );
+
+        // The cap is per-task: task_b has its own independent budget.
+        h.create_push_config(&caller, push_config(&task_b, OK_WEBHOOK, None))
+            .await
+            .expect("a different task has its own cap");
+        assert_eq!(config_count(&pool, &task_b).await, 1);
+
+        // Deleting a config on task_a frees a slot (only ACTIVE configs count) → a new create lands.
+        h.delete_push_config(&caller, del_cfg_req(&task_a, &c1))
+            .await
+            .unwrap();
+        h.create_push_config(&caller, push_config(&task_a, OK_WEBHOOK, None))
+            .await
+            .expect("a freed slot admits a new config");
+        assert_eq!(config_count(&pool, &task_a).await, 2);
+    }
+
+    /// The per-caller stream counter: increments on acquire, rejects beyond the cap, and decrements
+    /// (frees a slot) when a slot guard is dropped — the RAII release the live stream relies on.
+    #[test]
+    fn stream_counter_increments_rejects_and_decrements_on_drop() {
+        let counters = StreamCounters::default();
+        let cap = 2;
+
+        let s1 = counters.try_acquire("alice", cap).expect("1st slot");
+        let s2 = counters.try_acquire("alice", cap).expect("2nd slot");
+        assert_eq!(counters.count("alice"), 2);
+
+        // A 3rd for the same caller is rejected — nothing changes.
+        assert!(
+            counters.try_acquire("alice", cap).is_none(),
+            "beyond the cap is rejected"
+        );
+        assert_eq!(counters.count("alice"), 2);
+
+        // A different caller has its own budget.
+        let b1 = counters.try_acquire("bob", cap).expect("bob's own slot");
+        assert_eq!(counters.count("bob"), 1);
+
+        // Dropping a slot frees it (the on-close/disconnect release) → a re-acquire succeeds.
+        drop(s2);
+        assert_eq!(counters.count("alice"), 1);
+        let _s3 = counters
+            .try_acquire("alice", cap)
+            .expect("a freed slot re-acquires");
+        assert_eq!(counters.count("alice"), 2);
+
+        // Dropping the last slot for a caller removes the map entry (no idle-caller accumulation).
+        drop(b1);
+        assert_eq!(counters.count("bob"), 0);
+
+        drop(s1);
+        drop(_s3);
+        assert_eq!(counters.count("alice"), 0);
+    }
+
+    /// End-to-end wiring: with a per-caller stream cap of 1, a second concurrent subscription for the
+    /// same caller is refused with the clean "capacity" error, and dropping the first stream frees the
+    /// slot so a subsequent subscription succeeds (the RAII release on stream end).
+    #[sqlx::test(migrations = "./migrations")]
+    async fn per_caller_stream_cap_refuses_second_and_frees_on_drop(pool: PgPool) {
+        seed_approved_repo(&pool, "acme", "api", 111).await;
+        let h = handler_with_limits(
+            pool.clone(),
+            10,
+            HandlerLimits {
+                max_streams_per_caller: 1,
+                ..HandlerLimits::default()
+            },
+            Some(test_key()),
+        );
+        let caller = params("svc-a", &["a2a:review"]);
+        let (a2a_id, _) = submit(&h, &caller, 7).await;
+
+        // First subscription takes the one available slot (held open, not drained).
+        let s1 = h
+            .subscribe_to_task(&caller, subscribe_req(&a2a_id))
+            .await
+            .expect("first subscription acquires the slot");
+
+        // A second concurrent subscription for the same caller is refused (capacity), no existence leak
+        // of a different kind — same message the global-saturation path uses.
+        let second = h.subscribe_to_task(&caller, subscribe_req(&a2a_id)).await;
+        let err = second.err().expect("second subscription is refused");
+        assert_eq!(err.code, a2a::error_code::INTERNAL_ERROR);
+        assert!(
+            err.message.contains("capacity"),
+            "the clean capacity error is returned, got: {}",
+            err.message
+        );
+
+        // Dropping the first stream releases its slot (RAII), so a fresh subscription now succeeds.
+        drop(s1);
+        let _s3 = h
+            .subscribe_to_task(&caller, subscribe_req(&a2a_id))
+            .await
+            .expect("a freed slot admits a new subscription");
     }
 }

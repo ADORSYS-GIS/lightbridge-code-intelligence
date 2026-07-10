@@ -4,6 +4,7 @@
 //! The `notifier` role (ADR-0079) also lives here: it mirrors the same claim/lease discipline to
 //! deliver A2A push-notification webhooks from the `a2a_task_events` log.
 
+pub(crate) mod a2a_sweeper;
 pub(crate) mod dispatcher;
 pub(crate) mod index_sweeper;
 pub(crate) mod lifecycle;

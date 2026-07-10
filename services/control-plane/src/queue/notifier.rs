@@ -20,7 +20,9 @@
 //!    cursor after each success. A failure on event N blocks the config at N (backoff) and never skips
 //!    it, so ordering holds (backpressure, not reorder).
 //! 3. At each delivery it **re-validates and pins** the URL (DNS-rebinding/TOCTOU — §2/P2), decrypts
-//!    the caller token (§3), and POSTs through the hardened, redirect-disabled, IP-pinned client.
+//!    the caller token (§3) — **failing the attempt closed** if a configured token cannot be decrypted
+//!    rather than POSTing without it — and POSTs through the hardened, redirect-disabled, IP-pinned
+//!    client.
 //!
 //! ## SSRF hardening (the load-bearing part — ADR-0079 §2)
 //!
@@ -64,6 +66,11 @@ const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(3);
 /// Backoff = BASE × 2^(attempts−1), capped — mirrors the reaper's `requeue_backoff`.
 const BACKOFF_BASE: Duration = Duration::from_secs(15);
 const BACKOFF_CAP: Duration = Duration::from_secs(3600);
+/// Head-of-line fairness cap (ADR-0079 P10): a single claim delivers at most this many events before
+/// yielding its lease so other due configs get a turn on the single worker. One config with a huge
+/// backlog therefore can't monopolize delivery — it resumes (from its cursor) on the next claim. High
+/// enough that the common small catch-up completes in one claim.
+const DEFAULT_MAX_EVENTS_PER_CLAIM: usize = 50;
 /// Hardened HTTPS client timeouts (ADR-0079 §2): a slow/hostile receiver must not pin a worker.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const TOTAL_TIMEOUT: Duration = Duration::from_secs(20);
@@ -79,6 +86,8 @@ pub struct NotifierConfig {
     pub lease: Duration,
     /// Consecutive-failure cutoff before dead-lettering a config.
     pub max_attempts: i32,
+    /// Head-of-line fairness cap: events delivered per claim before yielding the lease (see the const).
+    pub max_events_per_claim: usize,
 }
 
 impl Default for NotifierConfig {
@@ -87,6 +96,7 @@ impl Default for NotifierConfig {
             poll_interval: DEFAULT_POLL_INTERVAL,
             lease: DEFAULT_LEASE,
             max_attempts: DEFAULT_MAX_ATTEMPTS,
+            max_events_per_claim: DEFAULT_MAX_EVENTS_PER_CLAIM,
         }
     }
 }
@@ -107,10 +117,16 @@ impl NotifierConfig {
             .and_then(|v| v.parse::<i32>().ok())
             .filter(|&m| m > 0)
             .unwrap_or(DEFAULT_MAX_ATTEMPTS);
+        let max_events_per_claim = std::env::var("NOTIFIER_MAX_EVENTS_PER_CLAIM")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&m| m > 0)
+            .unwrap_or(DEFAULT_MAX_EVENTS_PER_CLAIM);
         Self {
             poll_interval: secs("NOTIFIER_POLL_SECS", DEFAULT_POLL_INTERVAL),
             lease: secs("NOTIFIER_LEASE_SECS", DEFAULT_LEASE),
             max_attempts,
+            max_events_per_claim,
         }
     }
 }
@@ -300,6 +316,7 @@ async fn deliver_claimed(
     config: &db::ClaimedPushConfig,
 ) {
     let mut delivered_seq = config.delivered_seq;
+    let mut delivered_this_claim: usize = 0;
     loop {
         let next = match db::next_push_event(pool, config.a2a_task_id, delivered_seq).await {
             Ok(Some(event)) => event,
@@ -327,6 +344,19 @@ async fn deliver_claimed(
                     return;
                 }
                 delivered_seq = seq;
+                delivered_this_claim += 1;
+
+                // Head-of-line fairness (ADR-0079 P10): after a bounded run of events, yield the lease so
+                // other due configs get a turn on the single worker. `advance_push_delivered` already set
+                // `next_attempt_at = now()`, so this config is immediately re-claimable and resumes from
+                // its cursor (`delivered_seq`) — no event is skipped, ordering holds. Without this, one
+                // config with a large backlog could monopolize the worker until fully caught up.
+                if delivered_this_claim >= cfg.max_events_per_claim {
+                    if let Err(error) = db::release_push_config(pool, config.config_id).await {
+                        tracing::warn!(%error, config_id = %config.config_id, "notifier: release lease on head-of-line yield failed (lease will expire)");
+                    }
+                    return;
+                }
             }
             Err(error) => {
                 record_failure(pool, cfg, config, seq, &error).await;
@@ -336,10 +366,12 @@ async fn deliver_claimed(
     }
 }
 
-/// Attempt one event's delivery: re-validate + pin the URL (DNS-rebinding/TOCTOU — §2/P2), decrypt the
+/// Attempt one event's delivery: re-validate + pin the URL (DNS-rebinding/TOCTOU — §2/P2), resolve the
 /// caller token (§3), and hand the sender the validated webhook. An SSRF re-block is a failed attempt
-/// (the sender is never called). A token that fails to decrypt (wrong/rotated/absent key) sends
-/// *without* auth and warns — never panics, never logs the token.
+/// (the sender is never called). A configured token that fails to resolve (wrong/rotated/absent key) is
+/// **also** a failed attempt — we fail CLOSED rather than POST without the auth the caller configured
+/// (that could leak a task update to a receiver that only accepts authenticated calls, or let an
+/// attacker who cannot forge the token still receive the payload). Never panics, never logs the token.
 async fn deliver_one(
     sender: &dyn WebhookSender,
     key: Option<&Key>,
@@ -355,35 +387,50 @@ async fn deliver_one(
             SendError(format!("SSRF re-validation blocked delivery: {error}"))
         })?;
 
-    let token = decrypt_token(config, key);
+    // Fail closed on a token that won't decrypt: a `?` here makes it a failed attempt (backoff →
+    // dead-letter), never an unauthenticated send.
+    let token = resolve_token(config, key)?;
     let event_id = format!("{}:{}", config.a2a_task_id, seq);
     sender
         .send(&validated, token.as_deref(), &event_id, payload)
         .await
 }
 
-/// Decrypt the config's stored auth token for presentation as a bearer. `None` when the config carries
-/// no token, when no key is configured, or when decryption fails (wrong/rotated key) — the last two
-/// warn and fall through to an unauthenticated send. The token bytes and key are never logged.
-fn decrypt_token(config: &db::ClaimedPushConfig, key: Option<&Key>) -> Option<String> {
-    let token_enc = config.token_enc.as_deref()?;
+/// Resolve the config's stored auth token for presentation as a bearer, **failing closed** (ADR-0079
+/// §3). Three outcomes:
+/// - `Ok(None)`  — the config carries NO token: a tokenless webhook sends none, unchanged.
+/// - `Ok(Some)`  — a stored token decrypted cleanly with the role key.
+/// - `Err`       — a token IS configured but cannot be presented (wrong/rotated key, or no key
+///   configured). We refuse to send: delivering without the caller's auth is worse than a retryable
+///   failure. Warns with the `config_id` only — the token bytes and key are never logged.
+fn resolve_token(
+    config: &db::ClaimedPushConfig,
+    key: Option<&Key>,
+) -> Result<Option<String>, SendError> {
+    let Some(token_enc) = config.token_enc.as_deref() else {
+        return Ok(None); // tokenless config: nothing to present, send unauthenticated as configured
+    };
     match key {
-        Some(key) => {
-            let decoded = push_crypto::decrypt(token_enc, key);
-            if decoded.is_none() {
+        Some(key) => match push_crypto::decrypt(token_enc, key) {
+            Some(token) => Ok(Some(token)),
+            None => {
                 tracing::warn!(
                     config_id = %config.config_id,
-                    "notifier: stored webhook token failed to decrypt (wrong/rotated key?); sending without auth"
+                    "notifier: stored webhook token failed to decrypt (wrong/rotated key?); failing delivery closed (not sending unauthenticated)"
                 );
+                Err(SendError(
+                    "configured webhook auth token failed to decrypt".to_string(),
+                ))
             }
-            decoded
-        }
+        },
         None => {
             tracing::warn!(
                 config_id = %config.config_id,
-                "notifier: webhook token present but no encryption key is configured; sending without auth"
+                "notifier: webhook token present but no encryption key is configured; failing delivery closed (not sending unauthenticated)"
             );
-            None
+            Err(SendError(
+                "configured webhook auth token cannot be decrypted (no key)".to_string(),
+            ))
         }
     }
 }
@@ -470,22 +517,27 @@ mod tests {
         std::env::remove_var("NOTIFIER_POLL_SECS");
         std::env::remove_var("NOTIFIER_LEASE_SECS");
         std::env::remove_var("NOTIFIER_MAX_ATTEMPTS");
+        std::env::remove_var("NOTIFIER_MAX_EVENTS_PER_CLAIM");
         let cfg = NotifierConfig::from_env();
         assert_eq!(cfg.poll_interval, DEFAULT_POLL_INTERVAL);
         assert_eq!(cfg.lease, DEFAULT_LEASE);
         assert_eq!(cfg.max_attempts, DEFAULT_MAX_ATTEMPTS);
+        assert_eq!(cfg.max_events_per_claim, DEFAULT_MAX_EVENTS_PER_CLAIM);
 
         std::env::set_var("NOTIFIER_POLL_SECS", "7");
         std::env::set_var("NOTIFIER_MAX_ATTEMPTS", "3");
+        std::env::set_var("NOTIFIER_MAX_EVENTS_PER_CLAIM", "5");
         // A zero is invalid and falls back to the default (never a busy-loop / zero-attempt state).
         std::env::set_var("NOTIFIER_LEASE_SECS", "0");
         let cfg = NotifierConfig::from_env();
         assert_eq!(cfg.poll_interval, Duration::from_secs(7));
         assert_eq!(cfg.lease, DEFAULT_LEASE);
         assert_eq!(cfg.max_attempts, 3);
+        assert_eq!(cfg.max_events_per_claim, 5);
         std::env::remove_var("NOTIFIER_POLL_SECS");
         std::env::remove_var("NOTIFIER_LEASE_SECS");
         std::env::remove_var("NOTIFIER_MAX_ATTEMPTS");
+        std::env::remove_var("NOTIFIER_MAX_EVENTS_PER_CLAIM");
     }
 
     /// The hardened client builds for both a domain (pinned via `resolve`) and a literal-IP webhook.
@@ -566,6 +618,7 @@ mod tests {
             poll_interval: Duration::from_millis(10),
             lease: Duration::from_secs(60),
             max_attempts: 3,
+            max_events_per_claim: DEFAULT_MAX_EVENTS_PER_CLAIM,
         }
     }
 
@@ -982,6 +1035,109 @@ mod tests {
             sender2.calls.lock().unwrap()[0].1,
             None,
             "a tokenless config sends no bearer"
+        );
+    }
+
+    /// Fail CLOSED on a token that won't decrypt (ADR-0079 §3): a config whose `token_enc` was
+    /// encrypted under a DIFFERENT key (a rotated/wrong key) is NOT delivered — the sender is never
+    /// called — and it records a failed attempt (backoff → eventually dead-letter). Delivering the
+    /// payload WITHOUT the caller's configured auth would be worse than a retryable failure.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn undecryptable_token_fails_closed_and_is_not_sent(pool: PgPool) {
+        let role_key = test_key();
+        let other_key = Key::from_bytes(&[9u8; 32]).unwrap(); // a different (rotated) key
+        let task = seed_a2a_task(&pool).await;
+        seed_events(&pool, task, 1).await;
+        // Store a token the ROLE key cannot decrypt (encrypted under `other_key`).
+        let token_enc = push_crypto::encrypt(b"s3cr3t-bearer", &other_key);
+        let config = insert_config(&pool, task, PUBLIC_URL, Some(&token_enc)).await;
+        let sender = MockSender::default();
+        let cfg = test_cfg();
+
+        deliver_next_due(
+            &pool,
+            &sender,
+            Some(&role_key),
+            &SsrfPolicy::default(),
+            "owner-a",
+            &cfg,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            sender.calls.lock().unwrap().is_empty(),
+            "a config whose token won't decrypt is NEVER POSTed (no unauthenticated fallback)"
+        );
+        let (delivered, attempts, state) = config_state(&pool, config).await;
+        assert_eq!(
+            (delivered, attempts, state.as_str()),
+            (0, 1, "active"),
+            "the undecryptable-token config records a failed attempt, cursor unmoved"
+        );
+    }
+
+    /// Head-of-line fairness (ADR-0079 P10): a claim delivers at most `max_events_per_claim` events,
+    /// then yields the lease (clearing `lease_owner`) so other configs get a turn. The config resumes
+    /// from its cursor on the next claim — no event skipped, ordering preserved.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn claim_yields_after_max_events_per_claim(pool: PgPool) {
+        let task = seed_a2a_task(&pool).await;
+        seed_events(&pool, task, 5).await;
+        let config = insert_config(&pool, task, PUBLIC_URL, None).await;
+        let cfg = NotifierConfig {
+            max_events_per_claim: 2,
+            ..test_cfg()
+        };
+
+        // First claim delivers exactly 2 (the cap), then yields the lease.
+        let first = MockSender::default();
+        deliver_next_due(&pool, &first, None, &SsrfPolicy::default(), "owner-a", &cfg)
+            .await
+            .unwrap();
+        assert_eq!(
+            first.event_ids(),
+            vec![format!("{task}:1"), format!("{task}:2")],
+            "capped at 2 events this claim"
+        );
+        let (delivered, _, _) = config_state(&pool, config).await;
+        assert_eq!(delivered, 2, "cursor advanced to the cap");
+        // Lease was yielded (cleared), so the config is immediately re-claimable.
+        let lease_owner: Option<String> =
+            sqlx::query_scalar("SELECT lease_owner FROM a2a_push_configs WHERE config_id = $1")
+                .bind(config)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(lease_owner, None, "lease released on head-of-line yield");
+
+        // Next claim resumes at 3 and delivers the next 2 (3,4); a third claim finishes 5.
+        let second = MockSender::default();
+        deliver_next_due(
+            &pool,
+            &second,
+            None,
+            &SsrfPolicy::default(),
+            "owner-a",
+            &cfg,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            second.event_ids(),
+            vec![format!("{task}:3"), format!("{task}:4")],
+            "resumes from the cursor, in order"
+        );
+        let third = MockSender::default();
+        deliver_next_due(&pool, &third, None, &SsrfPolicy::default(), "owner-a", &cfg)
+            .await
+            .unwrap();
+        assert_eq!(third.event_ids(), vec![format!("{task}:5")]);
+        let (delivered, _, state) = config_state(&pool, config).await;
+        assert_eq!(
+            (delivered, state.as_str()),
+            (5, "active"),
+            "all 5 delivered"
         );
     }
 

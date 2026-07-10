@@ -2574,6 +2574,79 @@ pub async fn schedule_push_retry(
     .map(|_| ())
 }
 
+/// Count the **active** push configs a caller has registered on one task (ADR-0079 P7). The handler
+/// enforces a per-caller, per-task cap with this before an `insert_push_config`, so a single caller
+/// cannot register an unbounded fan-out of webhooks on one task. Dead-lettered (`disabled`) configs
+/// are excluded so a caller can always replace ones that were disabled by repeated delivery failure.
+/// Caller-scoping of the *task* is the handler's job (it `load_owned`s first); this narrows to the
+/// caller's own configs via `created_by` so one caller's configs never count against another's.
+pub async fn count_active_push_configs_for_caller(
+    pool: &PgPool,
+    a2a_task_id: Uuid,
+    created_by: &str,
+) -> Result<i64, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM a2a_push_configs \
+         WHERE a2a_task_id = $1 AND created_by = $2 AND state = 'active'",
+    )
+    .bind(a2a_task_id)
+    .bind(created_by)
+    .fetch_one(pool)
+    .await
+}
+
+/// Retention sweep for terminal A2A task mappings (ADR-0077 §S3 / #321). `a2a_tasks` (and, via
+/// `ON DELETE CASCADE`, its `a2a_task_events` and `a2a_push_configs`) is otherwise append-only — every
+/// A2A submission leaves a permanent mapping row plus its whole event log. Left alone it grows without
+/// bound. This deletes **terminal** mappings older than `ttl_days`, a bounded `batch` per call so one
+/// sweep never locks the table for long; the dispatcher's slow GC tick calls it repeatedly.
+///
+/// A mapping is treated as terminal when its append-only event log is **frozen** — a `final = true`
+/// event exists (every COMPLETED / FAILED / CANCELED / REJECTED outcome appends one; ADR-0077) — OR its
+/// last-persisted snapshot `state` is a terminal wire value (the belt-and-braces case where a
+/// best-effort terminal-event append was lost, e.g. a REJECTED gate outcome). A still-running
+/// (SUBMITTED / WORKING) mapping has neither and is **never** swept, whatever its age — the load-bearing
+/// safety property (retention must never reap a live task out from under a subscriber/poller). The age
+/// is anchored on `created_at`: an A2A review's whole lifetime is bounded by the deep-run cap (≤ ~2 h,
+/// ADR-0062) plus the 3 h stream backstop, so `created_at` is within hours of completion while `ttl_days`
+/// is in days — the distinction is immaterial and `created_at` cannot be newer than the true completion.
+///
+/// A non-positive `ttl_days` is a **skip** (returns 0), never "delete everything" — `now() -
+/// make_interval(days => 0)` is `now()`, which would match every terminal row. A non-positive `batch`
+/// likewise skips. Returns the number of mappings deleted.
+pub async fn sweep_terminal_a2a_tasks(
+    pool: &PgPool,
+    ttl_days: i64,
+    batch: i64,
+) -> Result<u64, sqlx::Error> {
+    if ttl_days <= 0 || batch <= 0 {
+        return Ok(0);
+    }
+    let deleted = sqlx::query(
+        "DELETE FROM a2a_tasks \
+         WHERE a2a_task_id IN ( \
+           SELECT t.a2a_task_id FROM a2a_tasks t \
+           WHERE t.created_at < now() - make_interval(days => $1::int) \
+             AND ( \
+               EXISTS (SELECT 1 FROM a2a_task_events e \
+                       WHERE e.a2a_task_id = t.a2a_task_id AND e.final) \
+               OR t.state IN ( \
+                 'TASK_STATE_COMPLETED', 'TASK_STATE_FAILED', \
+                 'TASK_STATE_CANCELED', 'TASK_STATE_REJECTED' \
+               ) \
+             ) \
+           ORDER BY t.created_at \
+           LIMIT $2 \
+         )",
+    )
+    .bind(ttl_days)
+    .bind(batch)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(deleted)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
