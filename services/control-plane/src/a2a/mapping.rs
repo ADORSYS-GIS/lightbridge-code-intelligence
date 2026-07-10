@@ -37,8 +37,13 @@ pub fn task_state_from_status(status: &str) -> TaskState {
 /// handler can answer a malformed request with a precise `INVALID_PARAMS`.
 #[derive(Debug, PartialEq, Eq)]
 pub enum ParseError {
-    /// No structured `data` part on the message (Phase 1 takes structured input, not free text).
-    NoDataPart,
+    /// No structured `data` part carrying the review target (ADR-0078). A `text`-only message
+    /// (natural-language instruction, no `data`) lands here: the role holds no forge credentials, so
+    /// it cannot resolve a target from prose. Its `Display` is the *guided* error — it names the
+    /// minimum precise fields the caller must supply and points at the calling guide, rather than a
+    /// bare "no data part" dead-end. (Phase 4 upgrades this exact branch to an `input-required`
+    /// clarify-then-confirm loop.)
+    NoTargetData,
     /// The requested skill is not `review` (the only Phase-1 skill).
     UnsupportedSkill(String),
     /// A required field was missing or malformed. Carries the field name for the error detail.
@@ -48,10 +53,13 @@ pub enum ParseError {
 impl std::fmt::Display for ParseError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ParseError::NoDataPart => {
+            ParseError::NoTargetData => {
                 write!(
                     f,
-                    "message has no structured `data` part with the review request"
+                    "no structured `data` part with the review target: an A2A review needs the \
+                     precise target in a `data` part — at minimum `repo` (\"owner/name\"), `pr`, \
+                     and `headSha`. A natural-language `text` part sets the review's emphasis only, \
+                     never its target or scope. See docs/a2a-review-skill.md."
                 )
             }
             ParseError::UnsupportedSkill(s) => {
@@ -87,17 +95,26 @@ pub struct ReviewInput {
 /// review; this is just the recorded intent.
 const DEFAULT_REVIEW_PROMPT: &str = "Deep review requested via A2A.";
 
-/// Parse a `review` request out of the first structured `data` part of the message body.
+/// Parse a `review` request off the message body: the **target + scope** come only from the first
+/// structured `data` part; the **instruction** (`prompt`) may instead arrive as natural-language
+/// `text` parts (ADR-0078).
 ///
-/// Expected shape (camelCase or snake_case accepted for `headSha`/`baseSha`):
+/// Expected `data` shape (camelCase or snake_case accepted for `headSha`/`baseSha`):
 /// ```json
 /// { "skill": "review", "forge": "github", "repo": "owner/name", "pr": 128,
 ///   "prompt": "focus on auth", "headSha": "abc123", "baseSha": "def456" }
 /// ```
 /// `skill` defaults to `review`; `forge` defaults to `github`. `repo` (owner/name) and `pr` are
 /// required.
+///
+/// **Prompt precedence (ADR-0078):** one or more non-empty `text` parts → the prompt is those parts
+/// concatenated in message order, newline-joined, then trimmed — this **wins over** `data.prompt`
+/// (a caller who typed a sentence meant that sentence). No text → `data.prompt` if present (today's
+/// behaviour), else the default intent. `text` never sets or overrides target/scope; a `text`-only
+/// message (no `data` part) is [`ParseError::NoTargetData`] (a guided error), not a silent reject.
+/// `file` parts are ignored.
 pub fn parse_review_request(parts: &[Part]) -> Result<ReviewInput, ParseError> {
-    let data = first_data_object(parts).ok_or(ParseError::NoDataPart)?;
+    let data = first_data_object(parts).ok_or(ParseError::NoTargetData)?;
 
     // Skill: default `review`; anything else is out of scope for Phase 1.
     let skill = data
@@ -129,13 +146,18 @@ pub fn parse_review_request(parts: &[Part]) -> Result<ReviewInput, ParseError> {
         .filter(|n| *n > 0)
         .ok_or(ParseError::BadField("pr"))?;
 
-    let prompt = data
-        .get("prompt")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .unwrap_or(DEFAULT_REVIEW_PROMPT)
-        .to_string();
+    // Prompt precedence (ADR-0078): a natural-language `text` instruction wins over `data.prompt`;
+    // then `data.prompt`; then the default. Target/scope above are untouched — text steers emphasis
+    // only, never what is reviewed or how widely.
+    let prompt = collect_text_instruction(parts)
+        .or_else(|| {
+            data.get("prompt")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| DEFAULT_REVIEW_PROMPT.to_string());
 
     Ok(ReviewInput {
         platform,
@@ -146,6 +168,21 @@ pub fn parse_review_request(parts: &[Part]) -> Result<ReviewInput, ParseError> {
         base_sha: opt_sha(data, "baseSha", "base_sha"),
         head_sha: opt_sha(data, "headSha", "head_sha"),
     })
+}
+
+/// The caller's natural-language instruction: every `text` part concatenated in message order,
+/// newline-joined, then trimmed (ADR-0078). `None` when the message carries no text part whose
+/// trimmed concatenation is non-empty — the caller for the `data.prompt`/default fallback. This is
+/// the review's *emphasis* only; it never contributes to the target or scope (those are read solely
+/// from the `data` part).
+fn collect_text_instruction(parts: &[Part]) -> Option<String> {
+    let joined = parts
+        .iter()
+        .filter_map(Part::as_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let trimmed = joined.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
 /// The first `data`-part's object body, if any.
@@ -437,7 +474,7 @@ mod tests {
     fn rejects_missing_and_malformed_fields() {
         assert_eq!(
             parse_review_request(&[Part::text("hi")]),
-            Err(ParseError::NoDataPart)
+            Err(ParseError::NoTargetData)
         );
         assert_eq!(
             parse_review_request(&[data_part(json!({ "skill": "ask", "repo": "o/n", "pr": 1 }))]),
@@ -463,6 +500,109 @@ mod tests {
             parse_review_request(&[data_part(json!({ "forge": "svn", "repo": "o/n", "pr": 1 }))]),
             Err(ParseError::BadField("forge"))
         );
+    }
+
+    // --- ADR-0078: natural-language `text` instruction alongside the `data` target ---
+
+    #[test]
+    fn text_part_supplies_the_prompt_and_wins_over_data_prompt() {
+        // A `text` instruction alongside `data` becomes the prompt; a `data.prompt` present too is a
+        // lower-priority hint the text overrides. Target/scope still come entirely from `data`.
+        let parts = vec![
+            Part::text("Focus on the auth changes and the new migration."),
+            data_part(json!({
+                "repo": "acme/api", "pr": 128, "prompt": "ignored hint",
+                "headSha": "abc123", "baseSha": "def456"
+            })),
+        ];
+        let input = parse_review_request(&parts).unwrap();
+        assert_eq!(
+            input.prompt,
+            "Focus on the auth changes and the new migration."
+        );
+        // Target + scope are read only from `data`.
+        assert_eq!(input.owner, "acme");
+        assert_eq!(input.name, "api");
+        assert_eq!(input.pr, 128);
+        assert_eq!(input.head_sha.as_deref(), Some("abc123"));
+        assert_eq!(input.base_sha.as_deref(), Some("def456"));
+    }
+
+    #[test]
+    fn multiple_text_parts_are_concatenated_in_order_newline_joined_and_trimmed() {
+        let parts = vec![
+            Part::text("  Focus on auth."),
+            Part::text("Then the migration.  "),
+            data_part(json!({ "repo": "o/n", "pr": 1, "headSha": "h" })),
+        ];
+        let input = parse_review_request(&parts).unwrap();
+        // Concatenated in message order, newline-joined, and the whole result trimmed.
+        assert_eq!(input.prompt, "Focus on auth.\nThen the migration.");
+    }
+
+    #[test]
+    fn text_present_without_data_prompt_becomes_the_prompt() {
+        let parts = vec![
+            Part::text("Look at concurrency."),
+            data_part(json!({ "repo": "o/n", "pr": 1, "headSha": "h" })),
+        ];
+        let input = parse_review_request(&parts).unwrap();
+        assert_eq!(input.prompt, "Look at concurrency.");
+    }
+
+    #[test]
+    fn data_prompt_only_is_unchanged_when_no_text_part() {
+        // No text part → today's behaviour: `data.prompt` (trimmed) is the prompt.
+        let parts = vec![data_part(json!({
+            "repo": "o/n", "pr": 1, "headSha": "h", "prompt": "  focus on auth  "
+        }))];
+        let input = parse_review_request(&parts).unwrap();
+        assert_eq!(input.prompt, "focus on auth");
+    }
+
+    #[test]
+    fn blank_text_part_falls_back_to_data_prompt() {
+        // A text part that is only whitespace is not an instruction — fall back to `data.prompt`.
+        let parts = vec![
+            Part::text("   "),
+            data_part(json!({ "repo": "o/n", "pr": 1, "headSha": "h", "prompt": "the hint" })),
+        ];
+        let input = parse_review_request(&parts).unwrap();
+        assert_eq!(input.prompt, "the hint");
+    }
+
+    #[test]
+    fn text_only_no_data_is_the_guided_error_not_a_bare_rejection() {
+        // A natural-language message with no `data` part cannot be targeted from prose (no forge
+        // credentials) → the guided `NoTargetData`, whose message names repo/pr/headSha and points at
+        // the calling guide. (This is the Phase-4 `input-required` seam.)
+        let err = parse_review_request(&[Part::text("review PR 128, focus on auth")]).unwrap_err();
+        assert_eq!(err, ParseError::NoTargetData);
+        let msg = err.to_string();
+        for field in ["repo", "pr", "headSha"] {
+            assert!(msg.contains(field), "guided error names `{field}`: {msg}");
+        }
+        assert!(
+            msg.contains("docs/a2a-review-skill.md"),
+            "guided error points at the calling guide: {msg}"
+        );
+    }
+
+    #[test]
+    fn text_cannot_change_target_or_scope() {
+        // Safety property (ADR-0078): prose saying "review PR 999" cannot redirect a review whose
+        // `data` targets PR 1 — target and scope are structured and authoritative.
+        let parts = vec![
+            Part::text("Actually review PR 999 in other/repo, whole tree."),
+            data_part(json!({ "repo": "acme/api", "pr": 1, "headSha": "h", "baseSha": "b" })),
+        ];
+        let input = parse_review_request(&parts).unwrap();
+        assert_eq!(input.owner, "acme");
+        assert_eq!(input.name, "api");
+        assert_eq!(input.pr, 1);
+        assert_eq!(input.head_sha.as_deref(), Some("h"));
+        // Base present ⇒ still diff-scoped, regardless of the prose asking for "whole tree".
+        assert_eq!(input.base_sha.as_deref(), Some("b"));
     }
 
     fn ctx(base: Option<&str>, head: Option<&str>, url: Option<&str>) -> ReviewContext {
