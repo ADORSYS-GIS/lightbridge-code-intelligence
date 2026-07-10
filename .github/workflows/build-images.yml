@@ -189,7 +189,10 @@ jobs:
           # own GHCR login (separate auth stores).
           sudo buildah login -u "${{ github.actor }}" -p "${{ secrets.GITHUB_TOKEN }}" ghcr.io
           cosign login ghcr.io -u "${{ github.actor }}" -p "${{ secrets.GITHUB_TOKEN }}"
-          digestfile="$(mktemp)"
+          # buildah runs the push in a mount/user namespace even under sudo, so --digestfile must land
+          # in a world-writable dir the namespaced uid can create into — a runner-owned mktemp file
+          # (mode 0600) is not writable by that uid ("permission denied"). Let buildah create the file.
+          dgdir="$(mktemp -d)"; chmod 777 "$dgdir"; digestfile="$dgdir/digest"
           first=1
           while IFS= read -r tag; do
             [ -z "$tag" ] && continue
