@@ -24,6 +24,9 @@ axum.workspace = true
 jsonwebtoken.workspace = true
 reqwest.workspace = true
 rustls.workspace = true
+# A2A push-notification webhook egress (ADR-0079): URL parsing + SSRF extra-CIDR deny-list.
+url.workspace = true
+ipnet.workspace = true
 hmac.workspace = true
 sha2.workspace = true
 hex.workspace = true
