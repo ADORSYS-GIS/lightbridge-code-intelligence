@@ -297,7 +297,36 @@ Timing note: for a **posted** review the full artifact is written asynchronously
 so a stream may close on `COMPLETED` *before* the artifact is available — do a single follow-up
 `GetTask` to fetch it. The terminal status and the ordered progress are always delivered on the stream.
 
-Not yet supported: **push notifications** (webhook callbacks) — Phase 3.
+## 5b. Push notifications (`CreateTaskPushNotificationConfig`) — webhook callbacks
+
+Instead of holding a stream or polling, you can **register a webhook** and have the server POST task
+updates to it as they happen (advertised on the card as `capabilities.pushNotifications: true`,
+[ADR-0079](adr/0079-a2a-push-notifications-webhook-egress.md)). Register one (or several) per task:
+
+- **`CreateTaskPushNotificationConfig`** — JSON-RPC method / REST `POST /tasks/{id}/pushNotificationConfigs`,
+  carrying `{ "taskId": "<taskId>", "url": "https://…", "token": "<optional-secret>" }`. `GetTask…`,
+  `ListTask…`, and `DeleteTaskPushNotificationConfig` manage them; all are **caller-scoped** to your own
+  tasks (a foreign/unknown task or config id is `TaskNotFound`, no existence leak).
+
+The POST the receiver gets, and the delivery contract:
+
+- **Body** — the same `StreamResponse` frame the stream emits (a `statusUpdate` or `artifactUpdate`
+  object), so push and streaming deliver the identical payload for a given event.
+- **Stable event id** — the `X-A2A-Notification-Id: {taskId}:{seq}` header. `seq` is the task's
+  per-event sequence number (the same ordering authority the stream uses).
+- **Ordered, at-least-once.** Events are delivered strictly in `seq` order; a stuck event blocks only
+  its own webhook (backpressure) and is never skipped or reordered. Delivery is **at-least-once** — a
+  crash between a successful POST and the server's cursor advance re-delivers that event (a duplicate,
+  never a loss), so **dedupe on the `{taskId}:{seq}` id**.
+- **Authentication.** If you set a `token`, every POST presents it as `Authorization: Bearer <token>`
+  so you can verify the call is from Lightbridge. The token is stored **encrypted at rest** and sent
+  only over the HTTPS the URL policy guarantees.
+- **URL policy (SSRF).** The `url` **must be HTTPS on port 443 and resolve to a public address** — it
+  is validated at registration *and* re-validated at every delivery (DNS-rebinding defence), the
+  connect is pinned to the checked IP, and redirects are **not followed**. A non-HTTPS / private /
+  loopback / link-local (incl. cloud-metadata) / cluster-internal URL is rejected.
+- **Dead-lettering.** A webhook that keeps failing is retried with exponential backoff and, after
+  repeated failures, **disabled** (dead-lettered) — re-create it once your endpoint is healthy.
 
 ## 6. Gotchas (learned the hard way)
 

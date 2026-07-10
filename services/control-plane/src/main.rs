@@ -528,6 +528,8 @@ async fn main() -> anyhow::Result<()> {
     // the same image so they scale independently. `scheduler` arrives in Phase 2. `restate-worker`
     // (RFC-0005 / ADR-0074) serves the Restate SDK endpoint. `a2a` (RFC-0006 / #299) serves the A2A
     // agent surface (review skill, polling) — a fourth ingress face, holding no forge credentials.
+    // `notifier` (RFC-0006 Phase 3 / ADR-0079) delivers A2A push-notification webhooks — the first
+    // untrusted-destination egress role, isolated so its restrictive NetworkPolicy is enforceable.
     // All roles share the `ring` crypto provider installed above; `restate-worker` serves plain h2c
     // and adds no TLS of its own.
     let role = std::env::args()
@@ -545,8 +547,10 @@ async fn main() -> anyhow::Result<()> {
         "restate-worker" => restate_worker::run(state).await,
         // The A2A ingress face (RFC-0006 / #299): serves the `review` skill over polling.
         "a2a" => a2a::run(state).await,
+        // The A2A push-notification webhook-delivery actor (RFC-0006 Phase 3 / ADR-0079).
+        "notifier" => run_notifier(state).await,
         other => anyhow::bail!(
-            "unknown role {other:?} (expected: serve | dispatcher | reconciler | restate-worker | a2a [| poller])"
+            "unknown role {other:?} (expected: serve | dispatcher | reconciler | restate-worker | a2a | notifier [| poller])"
         ),
     }
 }
@@ -664,6 +668,34 @@ async fn run_dispatcher(state: AppState) -> anyhow::Result<()> {
         state.egress.clone(),
     )
     .await
+}
+
+/// The `notifier` role (RFC-0006 Phase 3 / ADR-0079 §4): the SSRF-guarded webhook-delivery actor. It
+/// turns the `a2a_task_events` log into ordered, at-least-once webhook POSTs to caller-registered URLs
+/// — the control plane's first outbound egress to untrusted, arbitrary-internet destinations. Requires
+/// a database (the queue + the config store); holds no forge credentials.
+async fn run_notifier(state: AppState) -> anyhow::Result<()> {
+    let pool = state
+        .db
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("notifier requires DATABASE_URL"))?;
+    // Headless role: stand up the metrics-only listener like the dispatcher/reconciler.
+    spawn_metrics_server(state.metrics.clone());
+    // The token-decryption key (ADR-0079 §3). `None` when unconfigured: a config that carries a token
+    // then delivers WITHOUT auth (warned), never plaintext and never a panic; a tokenless config is
+    // unaffected. Reuses the same fail-soft loader as the `a2a` role so both interpret the env identically.
+    let key = a2a::push_token_key_from_env();
+    // The SSRF policy enforced at every delivery (DNS-rebinding/TOCTOU re-validation, ADR-0079 §2).
+    // TODO(ADR-0079 §2, slice 3): thread the operator-configured extra deny-CIDRs (cluster Service/Pod
+    // CIDRs) via `SsrfPolicy::with_extra_denied` from config; the fixed blocked ranges always apply, so
+    // `default()` is safe-but-narrower until the deploy slice wires the cluster CIDRs + NetworkPolicy.
+    let policy = a2a::ssrf::SsrfPolicy::default();
+    let sender = std::sync::Arc::new(queue::notifier::ReqwestWebhookSender::new())
+        as std::sync::Arc<dyn queue::notifier::WebhookSender>;
+    let cfg = queue::notifier::NotifierConfig::from_env();
+    // The pod name is a natural, unique lease owner; fall back off-cluster.
+    let owner = std::env::var("HOSTNAME").unwrap_or_else(|_| "notifier".to_string());
+    queue::notifier::run(pool, sender, key, policy, owner, cfg).await
 }
 
 /// Serve `/metrics` (+ `/healthz`) on `METRICS_ADDR` for roles without a main HTTP server.

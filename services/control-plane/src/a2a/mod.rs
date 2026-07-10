@@ -86,7 +86,7 @@ fn quota_from_env() -> QuotaConfig {
 /// key (bad base64 / wrong length) also yields `None` here and is logged once at startup, so the
 /// operator sees the misconfiguration rather than it silently disabling tokened webhooks — decode
 /// details are never logged (they could echo key bytes).
-fn push_token_key_from_env() -> Option<push_crypto::Key> {
+pub(crate) fn push_token_key_from_env() -> Option<push_crypto::Key> {
     let raw = std::env::var("A2A_PUSH_TOKEN_KEY").ok()?;
     if raw.trim().is_empty() {
         return None;

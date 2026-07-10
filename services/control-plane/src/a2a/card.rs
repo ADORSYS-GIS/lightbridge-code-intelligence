@@ -82,10 +82,12 @@ pub fn build_agent_card(base_url: &str, oidc_discovery_url: &str) -> AgentCard {
             AgentInterface::new(base_url.to_string(), TRANSPORT_PROTOCOL_HTTP_JSON),
         ],
         // Phase 2 (ADR-0077): streaming is live (SubscribeToTask + the streaming leg of SendMessage).
-        // Push notifications stay unadvertised (Phase 3); no extended card.
+        // Phase 3 (ADR-0079): push notifications are live — a caller registers a webhook via
+        // `CreateTaskPushNotificationConfig` and the `notifier` role POSTs task updates to it. No
+        // extended card.
         capabilities: AgentCapabilities {
             streaming: Some(true),
-            push_notifications: Some(false),
+            push_notifications: Some(true),
             extensions: None,
             extended_agent_card: None,
         },
@@ -175,9 +177,9 @@ mod tests {
             assert!(iface["protocolVersion"].as_str().is_some());
         }
 
-        // Phase 2 capabilities: streaming on (ADR-0077); push still off (Phase 3).
+        // Phase 2/3 capabilities: streaming on (ADR-0077); push on (ADR-0079, delivery now exists).
         assert_eq!(card["capabilities"]["streaming"], true);
-        assert_eq!(card["capabilities"]["pushNotifications"], false);
+        assert_eq!(card["capabilities"]["pushNotifications"], true);
 
         // Exactly the `review` skill, gated by `a2a:review`.
         let skills = card["skills"].as_array().unwrap();
