@@ -186,18 +186,17 @@ fn is_blocked(ip: IpAddr, policy: &SsrfPolicy) -> bool {
     {
         return true;
     }
-    // …and, for a v4-in-v6 form, the embedded v4 too, so `::ffff:<cluster-ip>` cannot slip past a
-    // v4 CIDR entry in the extra list.
+    // …and, for a v4-in-v6 transition form (mapped/compatible/NAT64/6to4/Teredo), the embedded v4
+    // too, so `::ffff:<cluster-ip>` or `64:ff9b::<cluster-ip>` cannot slip past a v4 CIDR entry in
+    // the extra list.
     if let IpAddr::V6(v6) = ip {
-        if let Some(v4) = v6.to_ipv4() {
-            let mapped = IpAddr::V4(v4);
-            if policy
+        if embedded_v4s(v6).into_iter().any(|v4| {
+            policy
                 .extra_denied_cidrs
                 .iter()
-                .any(|n| n.contains(&mapped))
-            {
-                return true;
-            }
+                .any(|n| n.contains(&IpAddr::V4(v4)))
+        }) {
+            return true;
         }
     }
 
@@ -281,18 +280,54 @@ fn is_blocked_v6(ip: Ipv6Addr) -> bool {
         return true;
     }
 
-    // ::ffff:0:0/96 IPv4-mapped — the classic bypass: unwrap and re-run the IPv4 table so
-    // ::ffff:10.0.0.1 is blocked exactly like 10.0.0.1.
-    if let Some(v4) = ip.to_ipv4_mapped() {
-        return is_blocked_v4(v4);
-    }
-    // Deprecated ::/96 IPv4-compatible form (::a.b.c.d) — cheap to close the twin bypass; `to_ipv4`
-    // covers both mapped (handled above) and compatible. A normal global v6 yields `None` here.
-    if let Some(v4) = ip.to_ipv4() {
-        return is_blocked_v4(v4);
+    // Any IPv6 transition form that embeds an IPv4 (mapped/compatible, NAT64, 6to4, Teredo) is
+    // unwrapped and re-run through the IPv4 table, so an internal or metadata v4 cannot be smuggled
+    // inside a global-looking v6. This matters doubly for these forms: they leave the pod as a
+    // *global* IPv6 destination, so a NetworkPolicy that denies internal CIDRs does NOT drop them —
+    // this app-level check is the only guard. (A transition wrapper of a genuinely public v4 is left
+    // alone; only an embedded *blocked* v4 rejects.)
+    if embedded_v4s(ip).into_iter().any(is_blocked_v4) {
+        return true;
     }
 
     false
+}
+
+/// Every IPv4 address embedded in an IPv6 transition form; empty for a native v6.
+///
+/// - **IPv4-mapped** `::ffff:a.b.c.d` and deprecated **IPv4-compatible** `::a.b.c.d` (`to_ipv4`
+///   covers both).
+/// - **NAT64** well-known prefix `64:ff9b::/96` (RFC 6052): the v4 is the low 32 bits.
+/// - **6to4** `2002::/16` (RFC 3056): the v4 is bytes 2..6.
+/// - **Teredo** `2001:0000::/32` (RFC 4380): both the *server* v4 (bytes 4..8) and the bit-inverted
+///   *client* v4 (low 32 bits) — either can be an internal address.
+///
+/// Returning the embedded v4(s) rather than blocking the whole prefix avoids over-blocking a
+/// transition wrapper of a legitimately public v4 (e.g. DNS64 in a NAT64 cluster maps every public
+/// v4 into `64:ff9b::/96`).
+fn embedded_v4s(v6: Ipv6Addr) -> Vec<Ipv4Addr> {
+    // Mapped (`::ffff:0:0/96`) + compatible (`::/96`); a native v6 yields `None`.
+    if let Some(v4) = v6.to_ipv4() {
+        return vec![v4];
+    }
+    let seg = v6.segments();
+    let o = v6.octets();
+    // NAT64 well-known `64:ff9b::/96` (and the `64:ff9b:1::/48` superset shares the high segments).
+    if seg[0] == 0x0064 && seg[1] == 0xff9b {
+        return vec![Ipv4Addr::new(o[12], o[13], o[14], o[15])];
+    }
+    // 6to4 `2002::/16` — v4 in bytes 2..6.
+    if seg[0] == 0x2002 {
+        return vec![Ipv4Addr::new(o[2], o[3], o[4], o[5])];
+    }
+    // Teredo `2001:0000::/32` — server v4 (bytes 4..8) and client v4 (low 32 bits, bit-inverted).
+    if seg[0] == 0x2001 && seg[1] == 0x0000 {
+        return vec![
+            Ipv4Addr::new(o[4], o[5], o[6], o[7]),
+            Ipv4Addr::new(!o[12], !o[13], !o[14], !o[15]),
+        ];
+    }
+    Vec::new()
 }
 
 /// Production DNS resolver: resolve `host` to its address set via the system resolver. The port is
@@ -544,6 +579,80 @@ mod tests {
         );
     }
 
+    // ---- IPv6 transition forms embedding an internal v4 (NAT64 / 6to4 / Teredo) ---------------
+
+    #[test]
+    fn blocks_ipv6_transition_forms_embedding_internal_v4() {
+        // Each is a global-looking v6 that embeds an internal or metadata IPv4 (so a deny-internal
+        // NetworkPolicy would miss it — this app check is the only guard). All must be blocked.
+        for raw in [
+            "https://[64:ff9b::a9fe:a9fe]/hook", // NAT64 of 169.254.169.254 (metadata)
+            "https://[64:ff9b::a00:1]/hook",     // NAT64 of 10.0.0.1
+            "https://[2002:a9fe:a9fe::1]/hook",  // 6to4 of 169.254.169.254 (metadata)
+            "https://[2002:a00:1::1]/hook",      // 6to4 of 10.0.0.1
+            "https://[2001:0:a00:1::]/hook",     // Teredo with server v4 = 10.0.0.1
+        ] {
+            assert!(
+                matches!(validate(raw).unwrap_err(), SsrfError::BlockedAddress(_)),
+                "{raw} embeds an internal v4 and must be blocked"
+            );
+        }
+    }
+
+    #[test]
+    fn allows_ipv6_transition_form_of_public_v4() {
+        // NAT64/6to4 of a genuinely public v4 (93.184.216.34 = 5db8:d822) must NOT be over-blocked —
+        // in a NAT64 cluster, DNS64 maps every public v4 into 64:ff9b::/96 at delivery time.
+        validate("https://[64:ff9b::5db8:d822]/hook").expect("NAT64 of a public v4 is allowed");
+        validate("https://[2002:5db8:d822::1]/hook").expect("6to4 of a public v4 is allowed");
+    }
+
+    // ---- alternate IPv4 textual forms (the classic "validator sees a hostname, connector sees an
+    // int-form IP" gap — the `url` crate normalizes these to an IPv4 host BEFORE the check) --------
+
+    #[test]
+    fn blocks_alternate_ipv4_textual_forms() {
+        // `url` normalizes each to `Host::Ipv4` of a blocked address (so `never_resolve` is not
+        // called — a literal IP takes no DNS). If a future `url` bump changed host parsing, this
+        // fails loudly rather than silently reopening the SSRF gap.
+        for raw in [
+            "https://2130706433/hook", // decimal 127.0.0.1
+            "https://0x7f.0.0.1/hook", // hex first octet
+            "https://127.1/hook",      // short form
+            "https://0177.0.0.1/hook", // octal first octet
+        ] {
+            assert_eq!(
+                validate(raw).unwrap_err(),
+                SsrfError::BlockedAddress(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))),
+                "{raw} must normalize to 127.0.0.1 and be blocked"
+            );
+        }
+        // Trailing dot on a private literal still normalizes to the IPv4.
+        assert_eq!(
+            validate("https://10.0.0.1./hook").unwrap_err(),
+            SsrfError::BlockedAddress(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)))
+        );
+    }
+
+    // ---- userinfo does not mask the host ------------------------------------------------------
+
+    #[test]
+    fn userinfo_does_not_mask_a_blocked_host() {
+        // `evil.com@` is userinfo; the real host is the metadata IP → blocked.
+        assert_eq!(
+            validate("https://evil.com@169.254.169.254/hook").unwrap_err(),
+            SsrfError::BlockedAddress(IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254)))
+        );
+        // Conversely, a blocked-looking string in the userinfo with a PUBLIC host uses the host.
+        let out = validate_webhook_url(
+            "https://169.254.169.254@hooks.example.com/hook",
+            &SsrfPolicy::default(),
+            resolver_to(vec![public_v4()]),
+        )
+        .expect("userinfo is not the host; the public host is used");
+        assert_eq!(out.pinned_ips, vec![public_v4()]);
+    }
+
     // ---- configurable extra deny-list ---------------------------------------------------------
 
     #[test]
@@ -566,6 +675,16 @@ mod tests {
         // The mapped form ::ffff:203.0.113.5 must not slip past a v4 extra-CIDR entry.
         let policy = SsrfPolicy::with_extra_denied(vec!["203.0.113.0/24".parse().unwrap()]);
         let err = validate_webhook_url("https://[::ffff:203.0.113.5]/hook", &policy, never_resolve)
+            .unwrap_err();
+        assert!(matches!(err, SsrfError::BlockedAddress(_)));
+    }
+
+    #[test]
+    fn extra_cidr_also_blocks_nat64_embedded_v4() {
+        // A NAT64 wrapper of a cluster-CIDR v4 (203.0.113.5 = cb00:7105) must not slip past the
+        // operator extra deny-list either.
+        let policy = SsrfPolicy::with_extra_denied(vec!["203.0.113.0/24".parse().unwrap()]);
+        let err = validate_webhook_url("https://[64:ff9b::cb00:7105]/hook", &policy, never_resolve)
             .unwrap_err();
         assert!(matches!(err, SsrfError::BlockedAddress(_)));
     }
