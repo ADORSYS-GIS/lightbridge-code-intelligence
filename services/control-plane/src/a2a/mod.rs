@@ -22,6 +22,8 @@ mod card;
 pub(crate) mod events;
 mod handler;
 pub(crate) mod mapping;
+// AEAD encryption-at-rest for the caller-supplied webhook auth token (RFC-0006 Phase 3, ADR-0079 §3).
+pub(crate) mod push_crypto;
 // SSRF-guarded webhook-URL validation for push notifications (RFC-0006 Phase 3, ADR-0079 §2). Slice
 // 1 lands the validator + tests; the `create` handler and delivery client wire it in slice 2.
 pub(crate) mod ssrf;
@@ -77,6 +79,30 @@ fn quota_from_env() -> QuotaConfig {
     QuotaConfig { max, window_secs }
 }
 
+/// Load the webhook-token encryption key from `A2A_PUSH_TOKEN_KEY` (ADR-0079 §3): a **standard-base64
+/// 32-byte** key. `None` when unset/blank — the role runs fine without it (webhook configs that carry
+/// no token need no key), and the `create` handler **fails closed** (rejects) only when a caller
+/// actually supplies a token with no key configured, never storing plaintext. A present-but-malformed
+/// key (bad base64 / wrong length) also yields `None` here and is logged once at startup, so the
+/// operator sees the misconfiguration rather than it silently disabling tokened webhooks — decode
+/// details are never logged (they could echo key bytes).
+fn push_token_key_from_env() -> Option<push_crypto::Key> {
+    let raw = std::env::var("A2A_PUSH_TOKEN_KEY").ok()?;
+    if raw.trim().is_empty() {
+        return None;
+    }
+    match push_crypto::Key::from_base64(&raw) {
+        Some(key) => Some(key),
+        None => {
+            tracing::error!(
+                "A2A_PUSH_TOKEN_KEY is set but is not valid standard-base64 for a 32-byte key; \
+                 webhook auth tokens will be refused (fail-closed) until it is fixed"
+            );
+            None
+        }
+    }
+}
+
 /// The externally reachable base URL advertised in the card's `supportedInterfaces` (`A2A_BASE_URL`).
 /// The real Ingress host is an ai-helm concern; this is a config value, not a binding decision.
 fn base_url_from_env() -> String {
@@ -103,7 +129,11 @@ fn build_router(state: AppState, jwt: Arc<JwtValidator>) -> Router {
         .clone()
         .expect("build_router requires a database (checked by run)");
 
-    let handler = Arc::new(A2aHandler::new(pool, quota_from_env()));
+    let handler = Arc::new(A2aHandler::new(
+        pool,
+        quota_from_env(),
+        push_token_key_from_env(),
+    ));
 
     let issuer = std::env::var("OIDC_ISSUER").ok();
     let card = card::build_agent_card(

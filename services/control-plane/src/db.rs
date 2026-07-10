@@ -2315,9 +2315,10 @@ pub struct PushConfigRow {
     pub config_id: Uuid,
     pub a2a_task_id: Uuid,
     pub url: String,
-    /// Caller-supplied auth token bytes (ADR-0079 §3). NULL when the caller registered no token.
-    /// TODO(ADR-0079 §3): encrypt at rest — stored raw in this slice (no app-level secret-encryption
-    /// helper exists in this repo yet); see the PR follow-up note. Never logged.
+    /// Caller-supplied auth token, **encrypted at rest** (ADR-0079 §3): the AEAD `nonce || ciphertext
+    /// || tag` produced by `crate::a2a::push_crypto` (ChaCha20-Poly1305). NULL when the caller
+    /// registered no token. Opaque bytes at this layer — the handler decrypts with the role key on
+    /// read. Never logged.
     pub token_enc: Option<Vec<u8>>,
     // The delivery-state columns are populated at insert (table defaults) and asserted by this
     // slice's tests, but the CRUD handler does not yet READ them — the notifier (slice 2b) consumes
