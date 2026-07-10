@@ -99,6 +99,9 @@ Mechanics (details and sequence diagram in RFC-0005; this ADR fixes the decision
 
 ## References
 
+- [Runbook — activating the Restate egress pilot](../runbooks/restate-egress-pilot-activation.md) —
+  the concrete operator steps to turn this pilot on/off (credentials → register endpoint → flip
+  `egress.mode`), the verification checklist, and the exit-gate criteria.
 - [RFC-0005](../rfc/0005-durable-orchestration-on-restate.md) — the proposal this ADR implements
   Phase A of; risk register and determinism rules live there.
 - [ADR-0059](0059-reconciler-owns-all-github-egress.md) — the single-writer egress decision
