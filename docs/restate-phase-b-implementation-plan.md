@@ -10,8 +10,8 @@
 >    **deployed but flag-OFF** (`egress.mode = drain` by default — `restate-worker` serves
 >    `PlatformEgress` but nothing invokes it). The soak clock has **not started**. → **NOT MET.**
 > 2. **The completion-vs-timeout race primitive must be verified safe** against
->    [sdk-rust #89](https://github.com/restatedev/sdk-rust/issues/89). See §1 — the gate as ADR-0076
->    literally words it ("#89 resolved") is **BLOCKED** (issue open), but the substantive risk is
+>    [restatedev/sdk-rust#89](https://github.com/restatedev/sdk-rust/issues/89). See §1 — the gate as ADR-0076
+>    literally words it ("restatedev/sdk-rust#89 resolved") is **BLOCKED** (issue open), but the substantive risk is
 >    likely mis-anchored; read §1 before acting on it.
 >
 > This document is the "ready when it is" build sequence: it turns ADR-0076's design into a
@@ -31,7 +31,7 @@
 
 All must be green *before any code lands.* Today: **one BLOCKED, one NOT MET.**
 
-### 1.1 sdk-rust #89 — the completion-vs-timeout race primitive (ADR-0076 risk R2)
+### 1.1 restatedev/sdk-rust#89 — the completion-vs-timeout race primitive (ADR-0076 risk R2)
 
 **Verdict: BLOCKED as literally worded; but the gate is probably mis-framed — read the mechanism.**
 
@@ -49,7 +49,7 @@ All must be green *before any code lands.* Today: **one BLOCKED, one NOT MET.**
   non-deterministic and corrupts the index-based journal. Recommendation: **don't use `n > 1`.** The
   freeze itself is an internal concurrent-use guard tripping, not a race that a patch will remove.
 
-**Why the ADR's own R2 mitigation is the actual answer, and why #89 does not block it:**
+**Why the ADR's own R2 mitigation is the actual answer, and why restatedev/sdk-rust#89 does not block it:**
 
 ADR-0076 already says the race must use "the SDK's own select / `DurableFuturesUnordered` (0.10+),
 never a hand-rolled `futures` combinator over `Context` operations." That is the correct — and
@@ -65,27 +65,27 @@ categorically different — mechanism, and it is **present in our exact pin, res
 
 So the completion-vs-timeout race in step 4 (await the runner awakeable **vs** a `ctx.sleep`
 deadline) is exactly the two-handle case `ctx.select` exists for. It never constructs a
-`FuturesUnordered`/`buffered` over `Context` ops, so it never enters the code path #89 describes.
-**#89 and the select primitive are different mechanisms;** the open issue is evidence *against*
+`FuturesUnordered`/`buffered` over `Context` ops, so it never enters the code path restatedev/sdk-rust#89 describes.
+**restatedev/sdk-rust#89 and the select primitive are different mechanisms;** the open issue is evidence *against*
 hand-rolled combinators (which we already forbid), not evidence against `ctx.select`.
 
 **Therefore, calibrated:**
 
-- **The gate as ADR-0076 phrases it ("verify #89 is resolved before implementation") will likely
-  never go green** — by the maintainer's own diagnosis #89 is a by-design constraint, not a bug
-  awaiting a fix, and may sit open indefinitely. Treating "#89 closed" as the trigger would deadlock
+- **The gate as ADR-0076 phrases it ("verify restatedev/sdk-rust#89 is resolved before implementation") will likely
+  never go green** — by the maintainer's own diagnosis restatedev/sdk-rust#89 is a by-design constraint, not a bug
+  awaiting a fix, and may sit open indefinitely. Treating "restatedev/sdk-rust#89 closed" as the trigger would deadlock
   Phase B forever.
 - **The gate should be re-scoped** to its real intent: *"the completion-vs-timeout race uses only
   `ctx.select` / `DurableFuturesUnordered`, and that primitive is verified safe under crash/replay on
   our pinned server+SDK."* On paper that sub-gate reads **PASS** (the primitive exists, is journaled,
-  and sidesteps #89's mechanism).
+  and sidesteps restatedev/sdk-rust#89's mechanism).
 - **What is NOT yet proven, and blocks the build:** this assessment is a **source read, not a
   runtime proof.** No one has yet run the two-handle awakeable-vs-`ctx.sleep` race against a live
   Restate server, killed the worker mid-race, and confirmed the journal replays to the same winner.
   That live proof is a **build-entry deliverable** (see §5 test strategy, "completion-vs-timeout
   race"). Until it exists, treat R2 as **open**.
 
-**Owner action:** decide whether to keep ADR-0076's literal "#89 resolved" wording (which will not
+**Owner action:** decide whether to keep ADR-0076's literal "restatedev/sdk-rust#89 resolved" wording (which will not
 happen) or amend R2 to the re-scoped primitive-safety gate above. This plan assumes the latter.
 
 ### 1.2 Phase A exit gate (ADR-0074) — **NOT MET**
@@ -254,7 +254,7 @@ Workflow ID = `repository_id, target_type, target_id, command_text, head_sha, ru
 4. **Await completion, racing a deadline** — `ctx.select` over two durable futures.
    Await the **runner-completion awakeable** (resolved by the control plane in `set_status`, §2.5)
    **vs** a `ctx.sleep(active_deadline + slack)` durable timer. Use **`DurableFuturesUnordered` /
-   `ctx.select`** (0.10.0), **never** a `futures` combinator over `Context` (the #89 mechanism, §1).
+   `ctx.select`** (0.10.0), **never** a `futures` combinator over `Context` (the restatedev/sdk-rust#89 mechanism, §1).
    - **Awakeable wins →** the report carries the terminal status → step 5.
    - **Timer wins →** the timer firing does **not** prove death. Run `decide(liveness, attempts,
      MAX_ATTEMPTS)` (ported reaper, §2.3) after a `ctx.run("job_liveness", …)` real k8s liveness
@@ -391,7 +391,7 @@ detector; engine-parked reviews also carry the step-4 deadline timer as a backst
 
 This is a plan, so the risk is **plan inaccuracy**, not runtime failure. Lower-confidence points:
 
-1. **R2 framing (highest).** ADR-0076's literal "verify #89 resolved" gate will likely never go green
+1. **R2 framing (highest).** ADR-0076's literal "verify restatedev/sdk-rust#89 resolved" gate will likely never go green
    (§1.1 — the maintainer calls it by-design). I re-scoped it to "the `ctx.select` primitive is
    verified safe," which reads PASS *on a source read* but has **no live crash/replay proof yet**. If
    the owner insists on the literal wording, Phase B is blocked indefinitely on an issue that will not
@@ -421,5 +421,5 @@ promises (the sketch assumes workflow durable promises exist and are externally 
 - [ADR-0074](adr/0074-restate-egress-pilot.md) — Phase A, whose exit gate this plan waits on.
 - [RFC-0005](rfc/0005-durable-orchestration-on-restate.md) — the strangler proposal and base risk
   register.
-- sdk-rust #89 — `https://github.com/restatedev/sdk-rust/issues/89` (open; see §1.1 for the calibrated
+- restatedev/sdk-rust#89 — `https://github.com/restatedev/sdk-rust/issues/89` (open; see §1.1 for the calibrated
   read).
