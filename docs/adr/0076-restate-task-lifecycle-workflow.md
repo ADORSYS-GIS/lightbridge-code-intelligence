@@ -267,6 +267,10 @@ sharpened for the lifecycle path. IDs align with the RFC.
 
 ## More Information
 
+- [Restate Phase B — implementation plan](../restate-phase-b-implementation-plan.md) — the
+  code-grounded, gated build sequence for this ADR (entry-gate assessment incl. sdk-rust #89,
+  file-by-file change map, handler sketch, cutover mechanics, test/runbook plan). **Not yet
+  authorized to build** — see its "do not start until" banner.
 - [RFC-0005](../rfc/0005-durable-orchestration-on-restate.md) — the proposal this ADR implements
   Phase B of; the determinism rules and the base risk register live there.
 - [ADR-0074](0074-restate-egress-pilot.md) — Phase A (deployed); the `PlatformEgress` object this
