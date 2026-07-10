@@ -210,7 +210,9 @@ values, no `kind` discriminators, `supportedInterfaces[]` on the card, REST medi
   the same `taskId`+`contextId` (spec §3.4), which resolves the awakeable. This unlocks
   human/agent-in-the-loop review flows (e.g. "this PR touches a migration — confirm the intent
   before I judge it") that have no home in the webhook model. `ListTasks` (cursor-paginated) is
-  a filtered read over the caller's own tasks.
+  a filtered read over the caller's own tasks. Designed in
+  [ADR-0081](../adr/0081-a2a-input-required-and-list-tasks.md) (ListTasks decoupled and shippable
+  first; `input-required` gated on RFC-0005 Phase B / ADR-0076).
 
 Deliberately deferred: signed agent cards (JWS/JCS, §8.4 — add when a counterparty requires
 verification), gRPC binding, A2A *client* capability (Lightbridge calling other agents — a
