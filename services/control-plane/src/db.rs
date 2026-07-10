@@ -2297,6 +2297,110 @@ pub async fn search_code_chunks(
     .await
 }
 
+// ---------------------------------------------------------------------------
+// A2A push-notification configs (RFC-0006 Phase 3, ADR-0079 §1)
+// ---------------------------------------------------------------------------
+
+/// A stored A2A push-notification config (ADR-0079 §1), the subset of `a2a_push_configs` the CRUD
+/// handler needs. The delivery-cursor / lease columns (`next_attempt_at`, `lease_*`) are the
+/// notifier's (slice 2b) and are not projected here.
+///
+/// These queries are keyed on `config_id` / `a2a_task_id` and are **not** caller-scoped in SQL: the
+/// handler proves task ownership first (via [`crate::a2a::store::PgTaskStore::load_owned`] on the
+/// parent `a2a_tasks` row, exactly like `GetTask`) and only then reads/writes a config, verifying the
+/// config's `a2a_task_id` matches the proven-owned task. That keeps the ownership check in one place
+/// (the store) rather than duplicating the caller-id join here.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct PushConfigRow {
+    pub config_id: Uuid,
+    pub a2a_task_id: Uuid,
+    pub url: String,
+    /// Caller-supplied auth token bytes (ADR-0079 §3). NULL when the caller registered no token.
+    /// TODO(ADR-0079 §3): encrypt at rest — stored raw in this slice (no app-level secret-encryption
+    /// helper exists in this repo yet); see the PR follow-up note. Never logged.
+    pub token_enc: Option<Vec<u8>>,
+    // The delivery-state columns are populated at insert (table defaults) and asserted by this
+    // slice's tests, but the CRUD handler does not yet READ them — the notifier (slice 2b) consumes
+    // `delivered_seq`/`attempts`/`state` to drive the cursor, backoff, and dead-lettering. Kept on the
+    // typed row now so the projection is complete; `allow(dead_code)` until slice 2b wires the reader.
+    #[allow(dead_code)]
+    pub delivered_seq: i64,
+    #[allow(dead_code)]
+    pub attempts: i32,
+    #[allow(dead_code)]
+    pub state: String,
+    #[allow(dead_code)]
+    pub created_by: String,
+}
+
+/// Column list shared by the push-config point/list reads, matching [`PushConfigRow`]'s fields.
+const PUSH_CONFIG_SELECT: &str =
+    "SELECT config_id, a2a_task_id, url, token_enc, delivered_seq, attempts, state, created_by \
+     FROM a2a_push_configs";
+
+/// Insert a new push-notification config for a task (ADR-0079 §1). The caller MUST already have proven
+/// ownership of `a2a_task_id` (the handler does, via `load_owned`, before calling). `delivered_seq`
+/// (0), `attempts` (0), `next_attempt_at` (`now()`), and `state` (`active`) take their table defaults.
+pub async fn insert_push_config(
+    pool: &PgPool,
+    config_id: Uuid,
+    a2a_task_id: Uuid,
+    url: &str,
+    token_enc: Option<&[u8]>,
+    created_by: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO a2a_push_configs (config_id, a2a_task_id, url, token_enc, created_by) \
+         VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(config_id)
+    .bind(a2a_task_id)
+    .bind(url)
+    .bind(token_enc)
+    .bind(created_by)
+    .execute(pool)
+    .await
+    .map(|_| ())
+}
+
+/// Fetch a single push config by its id (or `None` if unknown). The handler verifies the returned
+/// `a2a_task_id` matches the task it already proved the caller owns (ADR-0079 §1).
+pub async fn get_push_config(
+    pool: &PgPool,
+    config_id: Uuid,
+) -> Result<Option<PushConfigRow>, sqlx::Error> {
+    let sql = format!("{PUSH_CONFIG_SELECT} WHERE config_id = $1");
+    sqlx::query_as::<_, PushConfigRow>(&sql)
+        .bind(config_id)
+        .fetch_optional(pool)
+        .await
+}
+
+/// List every push config registered on a task, oldest first. Caller-scoping is the handler's job
+/// (it proves ownership of `a2a_task_id` first).
+pub async fn list_push_configs_for_task(
+    pool: &PgPool,
+    a2a_task_id: Uuid,
+) -> Result<Vec<PushConfigRow>, sqlx::Error> {
+    let sql = format!(
+        "{PUSH_CONFIG_SELECT} WHERE a2a_task_id = $1 ORDER BY created_at ASC, config_id ASC"
+    );
+    sqlx::query_as::<_, PushConfigRow>(&sql)
+        .bind(a2a_task_id)
+        .fetch_all(pool)
+        .await
+}
+
+/// Delete a push config by id. Returns whether a row was removed (`false` = already gone). The handler
+/// confirms the config belongs to the proven-owned task before calling.
+pub async fn delete_push_config(pool: &PgPool, config_id: Uuid) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query("DELETE FROM a2a_push_configs WHERE config_id = $1")
+        .bind(config_id)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected() > 0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
