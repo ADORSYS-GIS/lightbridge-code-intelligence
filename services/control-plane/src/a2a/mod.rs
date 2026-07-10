@@ -40,7 +40,7 @@ use axum::Router;
 use crate::jwt::{AuthError, JwtValidator};
 use crate::AppState;
 
-pub use handler::{A2aHandler, QuotaConfig};
+pub use handler::{A2aHandler, HandlerLimits, QuotaConfig};
 
 /// Internal request header carrying the authenticated caller's stable identity (OIDC `sub`). Set by
 /// [`a2a_auth`] after token validation and read by the handler via `ServiceParams`. Any inbound copy
@@ -132,6 +132,7 @@ fn build_router(state: AppState, jwt: Arc<JwtValidator>) -> Router {
     let handler = Arc::new(A2aHandler::new(
         pool,
         quota_from_env(),
+        HandlerLimits::from_env(),
         push_token_key_from_env(),
     ));
 
