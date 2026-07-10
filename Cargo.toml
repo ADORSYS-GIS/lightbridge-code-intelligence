@@ -24,6 +24,11 @@ anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
+# Global allocator for the two long-running service binaries. We ship static-musl images (ADR-0080),
+# and musl's built-in malloc regresses badly under multithreaded allocation load; mimalloc restores
+# glibc-class throughput. Wired via #[global_allocator] in each binary's main (control-plane,
+# agent-runner) — not the TUI/xtask, which are short-lived.
+mimalloc = "0.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 # Ergonomic async generators — used by the a2a role's SSE replay-then-tail stream (ADR-0077).

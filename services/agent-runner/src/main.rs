@@ -19,6 +19,11 @@ use agent_runner::clone;
 use agent_runner::indexer::embeddings::EmbeddingsClient;
 use agent_runner::{indexer, review, sast};
 
+// Global allocator — static-musl images (ADR-0080). The runner is allocation-heavy (clone walk,
+// tree-sitter parse, embedding batches); mimalloc avoids musl malloc's multithreaded regression.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
     tracing_subscriber::fmt()

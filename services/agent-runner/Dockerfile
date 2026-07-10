@@ -1,8 +1,11 @@
 # Lightbridge agent runner. The per-task Job image the dispatcher launches.
 #
-# This Dockerfile has TWO final targets (runner-differentiation, RFC-0001) that share one Rust
-# `builder` stage so the runner binary is compiled once:
+# Assembly only — the Rust runner binary is compiled on the CI runner (native static-musl, sccache)
+# and delivered in the build CONTEXT (ADR-0080); this file does NOT compile Rust. Because the binary
+# is fully static it runs unchanged on the glibc bases below (it only *spawns* glibc subprocesses —
+# git, python/graphify, opengrep — which use the image's own libc).
 #
+# TWO final targets (runner-differentiation, RFC-0001):
 #   • `indexer` (DEFAULT) — the full image. Bundles (ADR-0019):
 #       1. the Rust runner binary (orchestration: clone, embed→pgvector, report)
 #       2. Python + Graphify (`graphifyy`) — the 36-language structural-graph extractor it spawns
@@ -12,55 +15,11 @@
 #       the runner binary + opengrep). The review path never invokes Graphify, so it needs no Python
 #       runtime, but it IS where the SAST pass runs, so it carries opengrep + the rules.
 #
-# Build context = repo root (the Cargo workspace). Pick a target with `--target`:
-#   docker build -f services/agent-runner/Dockerfile --target indexer -t lightbridge-agent-runner .
-#   docker build -f services/agent-runner/Dockerfile --target review  -t lightbridge-agent-review .
+# Assemble (daemonless) with a context that contains the `agent-runner` binary at its root:
+#   buildah bud -f services/agent-runner/Dockerfile --target indexer -t lightbridge-agent-runner <ctx>
+#   buildah bud -f services/agent-runner/Dockerfile --target review  -t lightbridge-agent-review  <ctx>
 
-# ── Stage 1: build the Rust runner ──────────────────────────────────────────────────────────────
-FROM rust:1-slim-bookworm AS builder
-WORKDIR /build
-# sccache: shared S3 compiler cache (see services/control-plane/Dockerfile for the rationale — GHA
-# layer cache does not persist BuildKit cache mounts, so CI otherwise recompiles from cold). Enabled
-# only when CI passes SCCACHE_BUCKET + creds; a bare local build stays uncached.
-ARG SCCACHE_VERSION=v0.8.2
-RUN set -eux; \
-    apt-get update && apt-get install -y --no-install-recommends curl ca-certificates; \
-    case "$(dpkg --print-architecture)" in \
-      amd64) t=x86_64-unknown-linux-musl;; \
-      arm64) t=aarch64-unknown-linux-musl;; \
-      *) echo "unsupported arch" >&2; exit 1;; \
-    esac; \
-    curl -fsSL "https://github.com/mozilla/sccache/releases/download/${SCCACHE_VERSION}/sccache-${SCCACHE_VERSION}-${t}.tar.gz" \
-      | tar -xz -C /tmp; \
-    install -m0755 "/tmp/sccache-${SCCACHE_VERSION}-${t}/sccache" /usr/local/bin/sccache; \
-    rm -rf /var/lib/apt/lists/* /tmp/sccache-*
-# Every workspace member's manifest must be present for cargo to load the workspace, even when
-# building a single package — hence `clients` (the `lci` TUI) is copied too though it isn't built here.
-COPY Cargo.toml Cargo.lock ./
-COPY services services
-COPY clients clients
-COPY xtask xtask
-# CI passes these; empty on a bare local build (sccache then stays off).
-ARG SCCACHE_BUCKET=""
-ARG SCCACHE_ENDPOINT=""
-# Copy the runner out before the cached target dir vanishes. S3 creds arrive as BuildKit secrets
-# (not build-args) so they never land in a layer or `docker history`.
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/usr/local/cargo/git \
-    --mount=type=cache,target=/build/target \
-    --mount=type=secret,id=sccache_s3_access_key_id \
-    --mount=type=secret,id=sccache_s3_secret_access_key \
-    if [ -n "$SCCACHE_BUCKET" ] && [ -s /run/secrets/sccache_s3_access_key_id ]; then \
-      export RUSTC_WRAPPER=sccache CARGO_INCREMENTAL=0 SCCACHE_S3_USE_SSL=true \
-             SCCACHE_ENDPOINT="$SCCACHE_ENDPOINT" SCCACHE_REGION=us-east-1 \
-             AWS_ACCESS_KEY_ID="$(cat /run/secrets/sccache_s3_access_key_id)" \
-             AWS_SECRET_ACCESS_KEY="$(cat /run/secrets/sccache_s3_secret_access_key)"; \
-    fi; \
-    cargo build --release --locked -p agent-runner \
-    && cp target/release/agent-runner /usr/local/bin/ \
-    && if [ "$RUSTC_WRAPPER" = sccache ]; then sccache --show-stats; sccache --stop-server || true; fi
-
-# ── Stage 2: install Graphify into a self-contained venv ────────────────────────────────────────
+# ── Stage 1: install Graphify into a self-contained venv ────────────────────────────────────────
 # Built with compilers present (some tree-sitter grammars may ship sdists) but the toolchain is
 # left behind — only the venv is copied into the runtime image.
 FROM python:3.12-slim-bookworm AS pybuild
@@ -73,7 +32,7 @@ ENV PATH="/opt/venv/bin:$PATH"
 RUN pip install --no-cache-dir "graphifyy==0.8.44" \
   && graphify --help >/dev/null
 
-# ── Stage 2b: opengrep (SAST engine + vendored rules, ADR-0061) ───────────────────────────────────
+# ── Stage 2: opengrep (SAST engine + vendored rules, ADR-0061) ────────────────────────────────────
 # opengrep (the LGPL Semgrep fork) has NO official image, so we fetch the release binary by arch and
 # vendor a pinned ruleset, so scans are hermetic — no registry fetch at runtime. The Linux asset arch
 # token is `x86`/`aarch64` (NOT Docker's `amd64`/`arm64`), so we map `TARGETARCH`; `manylinux` = glibc,
@@ -118,7 +77,7 @@ RUN apt-get update \
   && mkdir -p /workspace && chown 1000:1000 /workspace
 # Graphify (venv) + the Rust runner.
 COPY --from=pybuild /opt/venv /opt/venv
-COPY --from=builder /usr/local/bin/agent-runner /usr/local/bin/agent-runner
+COPY agent-runner /usr/local/bin/agent-runner
 # opengrep + vendored rules for the deterministic SAST pass (ADR-0061).
 COPY --from=opengrep /usr/local/bin/opengrep /usr/local/bin/opengrep
 COPY --from=opengrep /opt/opengrep-rules /opt/opengrep-rules
@@ -145,7 +104,7 @@ RUN apt-get update \
   && rm -rf /var/lib/apt/lists/* \
   && useradd --uid 1000 --create-home --user-group app \
   && mkdir -p /workspace && chown 1000:1000 /workspace
-COPY --from=builder /usr/local/bin/agent-runner /usr/local/bin/agent-runner
+COPY agent-runner /usr/local/bin/agent-runner
 # opengrep + vendored rules for the deterministic SAST pass (ADR-0061). The review path is where SAST
 # runs, so this leaner image carries it too.
 COPY --from=opengrep /usr/local/bin/opengrep /usr/local/bin/opengrep
