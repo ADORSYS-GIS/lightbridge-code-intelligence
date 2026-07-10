@@ -71,6 +71,19 @@ jobs:
           tags: ${{ matrix.image }}:pr
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          # Shared caches. The Rust Dockerfiles read the SCCACHE_* / sccache_s3_* pair; the web
+          # Dockerfile reads TURBO_* / turbo_token. Each Dockerfile consumes only what it declares
+          # (unused args just warn). Secrets are empty on fork PRs → the Dockerfile guards fall back
+          # to an uncached build rather than failing.
+          build-args: |
+            SCCACHE_BUCKET=${{ vars.SCCACHE_BUCKET }}
+            SCCACHE_ENDPOINT=${{ vars.SCCACHE_ENDPOINT }}
+            TURBO_API=${{ vars.TURBO_API }}
+            TURBO_TEAM=${{ vars.TURBO_TEAM }}
+          secrets: |
+            sccache_s3_access_key_id=${{ secrets.SCCACHE_S3_ACCESS_KEY_ID }}
+            sccache_s3_secret_access_key=${{ secrets.SCCACHE_S3_SECRET_ACCESS_KEY }}
+            turbo_token=${{ secrets.TURBO_TOKEN }}
       # Surface the image size in the PR run summary so size regressions are visible at review time
       # (optimization tracking, epic #89). Uncompressed (on-disk) size.
       - name: Report image size
@@ -144,6 +157,17 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          # Shared caches — see the PR `build` job for the arg/secret split. On main/tag builds the
+          # secrets are always present, so every published image compiles against the warm cache.
+          build-args: |
+            SCCACHE_BUCKET=${{ vars.SCCACHE_BUCKET }}
+            SCCACHE_ENDPOINT=${{ vars.SCCACHE_ENDPOINT }}
+            TURBO_API=${{ vars.TURBO_API }}
+            TURBO_TEAM=${{ vars.TURBO_TEAM }}
+          secrets: |
+            sccache_s3_access_key_id=${{ secrets.SCCACHE_S3_ACCESS_KEY_ID }}
+            sccache_s3_secret_access_key=${{ secrets.SCCACHE_S3_SECRET_ACCESS_KEY }}
+            turbo_token=${{ secrets.TURBO_TOKEN }}
       # Compressed (registry pull) size of the pushed image — what clusters actually pull. Surfaced in
       # the run summary for optimization tracking (epic #89). NEVER fail the job over a size report:
       # it runs before the signing step, and a broken report must not leave an unsigned (un-promotable)

@@ -44,7 +44,19 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: "."
+      # sccache caches dependency codegen (the bulk of clippy's wall-clock). The final clippy-driver
+      # pass on the workspace crates is not sccache-cacheable, and fmt does not compile — so the win
+      # here is the dependency graph, still worth it and free.
+      - uses: ./.github/actions/rust-sccache
+        with:
+          bucket: ${{ vars.SCCACHE_BUCKET }}
+          endpoint: ${{ vars.SCCACHE_ENDPOINT }}
+          access-key-id: ${{ secrets.SCCACHE_S3_ACCESS_KEY_ID }}
+          secret-access-key: ${{ secrets.SCCACHE_S3_SECRET_ACCESS_KEY }}
       - name: cargo fmt --all --check
         run: cargo fmt --all -- --check
       - name: cargo clippy --workspace -D warnings
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats || true

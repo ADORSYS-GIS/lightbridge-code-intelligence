@@ -56,9 +56,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      # Cache the registry, git deps, and target/ keyed on Cargo.lock for fast reruns.
+      # Registry + git-dep download cache (the fetch side). sccache below caches compiler output.
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: "."
+      # Shared S3 compiler cache — persists codegen across runners/branches (target/ cache mounts do not).
+      - uses: ./.github/actions/rust-sccache
+        with:
+          bucket: ${{ vars.SCCACHE_BUCKET }}
+          endpoint: ${{ vars.SCCACHE_ENDPOINT }}
+          access-key-id: ${{ secrets.SCCACHE_S3_ACCESS_KEY_ID }}
+          secret-access-key: ${{ secrets.SCCACHE_S3_SECRET_ACCESS_KEY }}
       - name: cargo test -p control-plane
         run: cargo test -p control-plane --locked
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats || true

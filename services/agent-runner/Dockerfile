@@ -19,18 +19,46 @@
 # ── Stage 1: build the Rust runner ──────────────────────────────────────────────────────────────
 FROM rust:1-slim-bookworm AS builder
 WORKDIR /build
+# sccache: shared S3 compiler cache (see services/control-plane/Dockerfile for the rationale — GHA
+# layer cache does not persist BuildKit cache mounts, so CI otherwise recompiles from cold). Enabled
+# only when CI passes SCCACHE_BUCKET + creds; a bare local build stays uncached.
+ARG SCCACHE_VERSION=v0.8.2
+RUN set -eux; \
+    apt-get update && apt-get install -y --no-install-recommends curl ca-certificates; \
+    case "$(dpkg --print-architecture)" in \
+      amd64) t=x86_64-unknown-linux-musl;; \
+      arm64) t=aarch64-unknown-linux-musl;; \
+      *) echo "unsupported arch" >&2; exit 1;; \
+    esac; \
+    curl -fsSL "https://github.com/mozilla/sccache/releases/download/${SCCACHE_VERSION}/sccache-${SCCACHE_VERSION}-${t}.tar.gz" \
+      | tar -xz -C /tmp; \
+    install -m0755 "/tmp/sccache-${SCCACHE_VERSION}-${t}/sccache" /usr/local/bin/sccache; \
+    rm -rf /var/lib/apt/lists/* /tmp/sccache-*
 # Every workspace member's manifest must be present for cargo to load the workspace, even when
 # building a single package — hence `clients` (the `lci` TUI) is copied too though it isn't built here.
 COPY Cargo.toml Cargo.lock ./
 COPY services services
 COPY clients clients
 COPY xtask xtask
-# Copy the runner out before the cached target dir vanishes.
+# CI passes these; empty on a bare local build (sccache then stays off).
+ARG SCCACHE_BUCKET=""
+ARG SCCACHE_ENDPOINT=""
+# Copy the runner out before the cached target dir vanishes. S3 creds arrive as BuildKit secrets
+# (not build-args) so they never land in a layer or `docker history`.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/build/target \
+    --mount=type=secret,id=sccache_s3_access_key_id \
+    --mount=type=secret,id=sccache_s3_secret_access_key \
+    if [ -n "$SCCACHE_BUCKET" ] && [ -s /run/secrets/sccache_s3_access_key_id ]; then \
+      export RUSTC_WRAPPER=sccache CARGO_INCREMENTAL=0 SCCACHE_S3_USE_SSL=true \
+             SCCACHE_ENDPOINT="$SCCACHE_ENDPOINT" \
+             AWS_ACCESS_KEY_ID="$(cat /run/secrets/sccache_s3_access_key_id)" \
+             AWS_SECRET_ACCESS_KEY="$(cat /run/secrets/sccache_s3_secret_access_key)"; \
+    fi; \
     cargo build --release --locked -p agent-runner \
-    && cp target/release/agent-runner /usr/local/bin/
+    && cp target/release/agent-runner /usr/local/bin/ \
+    && { command -v sccache >/dev/null && sccache --show-stats || true; }
 
 # ── Stage 2: install Graphify into a self-contained venv ────────────────────────────────────────
 # Built with compilers present (some tree-sitter grammars may ship sdists) but the toolchain is
