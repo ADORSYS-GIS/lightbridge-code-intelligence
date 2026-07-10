@@ -2391,13 +2391,20 @@ pub async fn list_push_configs_for_task(
         .await
 }
 
-/// Delete a push config by id. Returns whether a row was removed (`false` = already gone). The handler
-/// confirms the config belongs to the proven-owned task before calling.
-pub async fn delete_push_config(pool: &PgPool, config_id: Uuid) -> Result<bool, sqlx::Error> {
-    let result = sqlx::query("DELETE FROM a2a_push_configs WHERE config_id = $1")
-        .bind(config_id)
-        .execute(pool)
-        .await?;
+/// Delete a push config, scoped to its owning task in one query. Returns whether a row was removed
+/// (`false` = wrong task / unknown id / already gone), so the handler maps a miss to `TaskNotFound`
+/// without a prior existence SELECT — the caller-scoping is `config_id = $1 AND a2a_task_id = $2`.
+pub async fn delete_push_config(
+    pool: &PgPool,
+    config_id: Uuid,
+    a2a_task_id: Uuid,
+) -> Result<bool, sqlx::Error> {
+    let result =
+        sqlx::query("DELETE FROM a2a_push_configs WHERE config_id = $1 AND a2a_task_id = $2")
+            .bind(config_id)
+            .bind(a2a_task_id)
+            .execute(pool)
+            .await?;
     Ok(result.rows_affected() > 0)
 }
 

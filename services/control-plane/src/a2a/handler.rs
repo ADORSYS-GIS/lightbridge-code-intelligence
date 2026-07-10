@@ -858,7 +858,7 @@ impl RequestHandler for A2aHandler {
             .map_err(db_error)?
             .filter(|row| row.a2a_task_id == task_id)
             .ok_or_else(|| A2AError::task_not_found(&req.id))?;
-        Ok(push_config_view(&row))
+        Ok(push_config_view(row))
     }
 
     async fn list_push_configs(
@@ -883,7 +883,7 @@ impl RequestHandler for A2aHandler {
         let configs = db::list_push_configs_for_task(&self.pool, task_id)
             .await
             .map_err(db_error)?
-            .iter()
+            .into_iter()
             .map(push_config_view)
             .collect();
         // No pagination in this slice: all of a task's configs fit in one page (per-task config caps
@@ -914,16 +914,15 @@ impl RequestHandler for A2aHandler {
             .ok_or_else(|| A2AError::task_not_found(&req.task_id))?;
 
         let config_id = Uuid::parse_str(&req.id).map_err(|_| A2AError::task_not_found(&req.id))?;
-        // Confirm the config belongs to the proven-owned task before deleting, so a caller cannot
-        // delete a config on a task it does not own by guessing the config id.
-        let row = db::get_push_config(&self.pool, config_id)
-            .await
-            .map_err(db_error)?
-            .filter(|row| row.a2a_task_id == task_id)
-            .ok_or_else(|| A2AError::task_not_found(&req.id))?;
-        db::delete_push_config(&self.pool, row.config_id)
+        // Delete scoped to the proven-owned task in a single query: a config on another task (or a
+        // guessed id) matches zero rows → TaskNotFound. No pre-SELECT is needed — this is the last
+        // operation, so there is no later INSERT that could FK-violate on a missing row.
+        let deleted = db::delete_push_config(&self.pool, config_id, task_id)
             .await
             .map_err(db_error)?;
+        if !deleted {
+            return Err(A2AError::task_not_found(&req.id));
+        }
         tracing::info!(
             caller = %caller.id, a2a_task_id = %task_id, config_id = %config_id,
             "a2a push config deleted"
@@ -1017,15 +1016,14 @@ fn submitted_metadata(caller: &CallerCtx, underlying: &Uuid) -> Map<String, Valu
 /// §1). Echoes the caller's own token back — it is the caller's secret and the read is caller-scoped —
 /// so a `create`→`get` round-trip is faithful. `authentication` is not persisted separately in this
 /// slice (only the caller `token`; see the migration), so it comes back `None`.
-fn push_config_view(row: &db::PushConfigRow) -> TaskPushNotificationConfig {
+fn push_config_view(row: db::PushConfigRow) -> TaskPushNotificationConfig {
     TaskPushNotificationConfig {
-        url: row.url.clone(),
+        url: row.url,
         id: Some(row.config_id.to_string()),
         task_id: row.a2a_task_id.to_string(),
         token: row
             .token_enc
-            .as_ref()
-            .and_then(|bytes| String::from_utf8(bytes.clone()).ok()),
+            .and_then(|bytes| String::from_utf8(bytes).ok()),
         authentication: None,
         tenant: None,
     }
