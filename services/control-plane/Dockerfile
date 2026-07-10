@@ -39,7 +39,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=secret,id=sccache_s3_secret_access_key \
     if [ -n "$SCCACHE_BUCKET" ] && [ -s /run/secrets/sccache_s3_access_key_id ]; then \
       export RUSTC_WRAPPER=sccache CARGO_INCREMENTAL=0 SCCACHE_S3_USE_SSL=true \
-             SCCACHE_ENDPOINT="$SCCACHE_ENDPOINT" \
+             SCCACHE_ENDPOINT="$SCCACHE_ENDPOINT" SCCACHE_REGION=us-east-1 \
              AWS_ACCESS_KEY_ID="$(cat /run/secrets/sccache_s3_access_key_id)" \
              AWS_SECRET_ACCESS_KEY="$(cat /run/secrets/sccache_s3_secret_access_key)"; \
     fi; \

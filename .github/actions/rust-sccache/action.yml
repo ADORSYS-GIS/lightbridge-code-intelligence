@@ -50,6 +50,9 @@ runs:
           echo "SCCACHE_BUCKET=${{ inputs.bucket }}"
           echo "SCCACHE_ENDPOINT=${{ inputs.endpoint }}"
           echo "SCCACHE_S3_USE_SSL=true"
+          # opendal's S3 backend has no region auto-detection against a custom endpoint and errors
+          # "region is missing" without this. MinIO accepts (and defaults to) us-east-1.
+          echo "SCCACHE_REGION=us-east-1"
           echo "AWS_ACCESS_KEY_ID=$SCCACHE_ACCESS_KEY_ID"
           echo "AWS_SECRET_ACCESS_KEY=$SCCACHE_SECRET_ACCESS_KEY"
         } >> "$GITHUB_ENV"
