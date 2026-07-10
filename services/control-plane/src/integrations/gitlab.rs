@@ -80,6 +80,43 @@ impl GitlabClient {
         format!("{}{}", self.api_url, path)
     }
 
+    /// Build the base API path for a noteable's parent (MR or issue).
+    /// `noteable_type` is the task's `target_type` (`"pull_request"` → MR, anything else → issue).
+    /// Defaults to MR when `noteable_type` is `None` (legacy rows).
+    fn noteable_base(project: &str, iid: i64, noteable_type: Option<&str>) -> String {
+        let is_mr = noteable_type.map(|t| t == "pull_request").unwrap_or(true);
+        if is_mr {
+            format!("/projects/{}/merge_requests/{}", project, iid)
+        } else {
+            format!("/projects/{}/issues/{}", project, iid)
+        }
+    }
+
+    /// Build the award-emoji endpoint for a note on an MR or issue.
+    fn note_award_emoji_path(
+        project: &str,
+        iid: i64,
+        note_id: i64,
+        noteable_type: Option<&str>,
+    ) -> String {
+        format!(
+            "{}/notes/{}/award_emoji",
+            Self::noteable_base(project, iid, noteable_type),
+            note_id
+        )
+    }
+
+    /// Normalize GitLab award-emoji names to the GitHub vocabulary used by the
+    /// feedback-memory consumer (`rejected_findings_for_repo` filters `reaction = '-1'`).
+    /// GitLab returns `"thumbsup"`/`"thumbsdown"`; GitHub returns `"+1"`/`"-1"`.
+    fn normalize_emoji_name(name: &str) -> String {
+        match name {
+            "thumbsup" => "+1".to_string(),
+            "thumbsdown" => "-1".to_string(),
+            other => other.to_string(),
+        }
+    }
+
     /// Standard headers for every GitLab API call.
     fn api_headers(&self) -> reqwest::header::HeaderMap {
         let mut h = reqwest::header::HeaderMap::new();
@@ -312,16 +349,10 @@ impl CodePlatform for GitlabClient {
             "body": body
         });
 
-        let is_mr = noteable_type.map(|t| t == "pull_request").unwrap_or(true);
-
-        let endpoint = if is_mr {
-            format!(
-                "/projects/{}/merge_requests/{}/notes",
-                project, issue_number
-            )
-        } else {
-            format!("/projects/{}/issues/{}/notes", project, issue_number)
-        };
+        let endpoint = format!(
+            "{}/notes",
+            Self::noteable_base(&project, issue_number, noteable_type)
+        );
         let url = self.url(&endpoint);
         let resp = self
             .http
@@ -348,16 +379,10 @@ impl CodePlatform for GitlabClient {
         let project = Self::project_encoded(repo);
         match target {
             ReactionTarget::Issue { number } => {
-                let is_mr = noteable_type.map(|t| t == "pull_request").unwrap_or(true);
-
-                let endpoint = if is_mr {
-                    format!(
-                        "/projects/{}/merge_requests/{}/award_emoji",
-                        project, number
-                    )
-                } else {
-                    format!("/projects/{}/issues/{}/award_emoji", project, number)
-                };
+                let endpoint = format!(
+                    "{}/award_emoji",
+                    Self::noteable_base(&project, number, noteable_type)
+                );
                 let url = self.url(&endpoint);
                 let _ = self
                     .http
@@ -379,18 +404,8 @@ impl CodePlatform for GitlabClient {
                          (missing from outbox payload — legacy row?)"
                     )
                 })?;
-                let is_mr = noteable_type.map(|t| t == "pull_request").unwrap_or(true);
-                let endpoint = if is_mr {
-                    format!(
-                        "/projects/{}/merge_requests/{}/notes/{}/award_emoji",
-                        project, iid, comment_id
-                    )
-                } else {
-                    format!(
-                        "/projects/{}/issues/{}/notes/{}/award_emoji",
-                        project, iid, comment_id
-                    )
-                };
+                let endpoint =
+                    Self::note_award_emoji_path(&project, iid, comment_id, noteable_type);
                 let url = self.url(&endpoint);
                 let _ = self
                     .http
@@ -500,29 +515,30 @@ impl CodePlatform for GitlabClient {
                  (missing from PollableComment — legacy row?)"
             )
         })?;
-        let is_mr = noteable_type.map(|t| t == "pull_request").unwrap_or(true);
-        let endpoint = if is_mr {
-            format!(
-                "/projects/{}/merge_requests/{}/notes/{}/award_emoji?per_page=100",
-                project, iid, comment_id
-            )
-        } else {
-            format!(
-                "/projects/{}/issues/{}/notes/{}/award_emoji?per_page=100",
-                project, iid, comment_id
-            )
-        };
+        let endpoint = format!(
+            "{}?per_page=100",
+            Self::note_award_emoji_path(&project, iid, comment_id, noteable_type)
+        );
         let url = self.url(&endpoint);
-        let award_resp = self
+        let resp = self
             .http
             .get(&url)
             .headers(self.api_headers())
             .send()
-            .await?
-            .error_for_status()?;
-        let award_v: serde_json::Value = award_resp.json().await?;
+            .await?;
 
-        // Parse award emoji
+        // A 404 means the note was deleted (or never existed). Treat it as "no reactions"
+        // so that `reconcile_comment_feedback` still runs and prunes stale feedback rows
+        // (e.g. a 👎 the user has since removed). Without this, a deleted note would
+        // error every poll cycle and the stale rejection would suppress the finding forever.
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(vec![]);
+        }
+        let resp = resp.error_for_status()?;
+        let award_v: serde_json::Value = resp.json().await?;
+
+        // Parse award emoji — normalize GitLab names to the GitHub vocabulary so
+        // downstream filters (`reaction = '-1'`) fire correctly (ADR-0044).
         let reactions: Vec<Reaction> = award_v
             .as_array()
             .into_iter()
@@ -531,7 +547,7 @@ impl CodePlatform for GitlabClient {
                 let name = item.get("name")?.as_str()?;
                 let user = item.get("user")?.get("username")?.as_str()?;
                 Some(Reaction {
-                    content: name.to_string(),
+                    content: Self::normalize_emoji_name(name),
                     user_login: user.to_string(),
                 })
             })

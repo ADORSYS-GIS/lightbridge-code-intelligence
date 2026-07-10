@@ -171,6 +171,31 @@ flowchart TD
   content.
 - Bad, because the runner is platform-agnostic today and that's a property worth keeping.
 
+## Known Limitations
+
+### GitLab Clone URL URL Encoding
+**Status:** Low-risk limitation, documented in `services/control-plane/src/integrations/gitlab.rs`
+
+- `clone_url()` builds `https://oauth2:{token}@{host}/{repo}.git` without URL-encoding the token or
+  repo path. GitLab PATs are alphanumeric + hyphens, and project paths are typically alphanumeric +
+  hyphens + underscores, so malformed URLs are extremely unlikely.
+- **Impact:** None in practice; malformed URLs would cause `git clone` to fail, which would be caught
+  and retried by the agent-runner.
+- **Mitigation:** URL-encoding would break the OAuth2 format (`:` in token would be misinterpreted as
+  scheme separator). A proper fix would require git credential helpers or `.netrc`, out of scope for
+  the current implementation.
+
+### Agent Runner @-Passthrough Edge Case
+**Status:** Rare edge case, documented in `services/agent-runner/src/bootstrap/client.rs`
+
+- `authenticated_clone_url()` uses `rest.contains('@')` to detect a pre-authenticated URL. This is
+  correct for GitLab's `oauth2:TOKEN@host` format, but if a GitLab subgroup path contains `@` (e.g.
+  `group@team/repo.git`), the function would wrongly pass it through without splicing the token.
+- **Impact:** Extremely rare; neither GitHub nor GitLab allow `@` in usernames, org names, or
+  subgroup paths.
+- **Mitigation:** The guard is sufficient for all currently supported platforms; the edge case is
+  documented for future review if a platform with different naming rules is added.
+
 ## More Information
 
 - Implementation plan: [`docs/gitlab-implementation-plan.md`](../gitlab-implementation-plan.md)
