@@ -636,6 +636,7 @@ dependencies = [
  "rand 0.8.6",
  "reqwest 0.12.28",
  "restate-sdk",
+ "ring",
  "rmcp",
  "rsa",
  "rustls",

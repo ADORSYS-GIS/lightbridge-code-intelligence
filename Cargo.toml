@@ -112,6 +112,11 @@ url = "2"
 # Parse + containment-test the configurable extra SSRF deny-list CIDRs (ADR-0079 §2). The fixed
 # blocked ranges stay hand-rolled and auditable; ipnet only backs the operator-supplied extra list.
 ipnet = "2"
+# AEAD (ChaCha20-Poly1305) for encrypting the A2A webhook auth token at rest (ADR-0079 §3). `ring` is
+# already this workspace's single pinned rustls crypto provider (installed process-wide in
+# control-plane's `main`), so `ring::aead` reuses an audited, already-compiled primitive — it adds no
+# new crypto crate and no second provider. Version-matched to the transitive `ring` sqlx already pulls.
+ring = "0.17"
 
 # --- Dev / test only ---
 tempfile = "3"

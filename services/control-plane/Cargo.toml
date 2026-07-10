@@ -27,6 +27,10 @@ rustls.workspace = true
 # A2A push-notification webhook egress (ADR-0079): URL parsing + SSRF extra-CIDR deny-list.
 url.workspace = true
 ipnet.workspace = true
+# AEAD (ChaCha20-Poly1305) encryption-at-rest for the webhook auth token (ADR-0079 §3); base64 decodes
+# the 32-byte key from `A2A_PUSH_TOKEN_KEY`. `ring` is already the pinned rustls crypto provider.
+ring.workspace = true
+base64.workspace = true
 hmac.workspace = true
 sha2.workspace = true
 hex.workspace = true
@@ -51,4 +55,3 @@ a2a-server-lf.workspace = true
 # Test-only: generate an RSA keypair at runtime so no private key is committed (see src/jwt.rs).
 rsa.workspace = true
 rand.workspace = true
-base64.workspace = true

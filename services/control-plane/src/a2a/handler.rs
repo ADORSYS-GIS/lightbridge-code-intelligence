@@ -85,10 +85,18 @@ pub struct A2aHandler {
     listener_pool: PgPool,
     store: PgTaskStore,
     quota: QuotaConfig,
+    /// The AEAD key for webhook-token encryption-at-rest (ADR-0079 §3), loaded from
+    /// `A2A_PUSH_TOKEN_KEY` at role startup. `None` when unconfigured: a `create` carrying a token
+    /// then **fails closed** (never storing plaintext), while a tokenless config still works.
+    push_key: Option<super::push_crypto::Key>,
 }
 
 impl A2aHandler {
-    pub fn new(pool: PgPool, quota: QuotaConfig) -> Self {
+    pub fn new(
+        pool: PgPool,
+        quota: QuotaConfig,
+        push_key: Option<super::push_crypto::Key>,
+    ) -> Self {
         let store = PgTaskStore::new(pool.clone());
         // Derived from the request pool's own connect options (so it targets the same database,
         // including in tests) but with its own small cap and a short acquire timeout, so a saturated
@@ -103,6 +111,7 @@ impl A2aHandler {
             listener_pool,
             store,
             quota,
+            push_key,
         }
     }
 
@@ -801,11 +810,23 @@ impl RequestHandler for A2aHandler {
         )
         .map_err(|error| A2AError::invalid_params(error.to_string()))?;
 
-        // TODO(ADR-0079 §3): encrypt the token at rest. No app-level secret-encryption helper exists in
-        // this repo yet, so the caller-supplied token is stored RAW in `token_enc` for this slice — it
-        // is never logged and is only ever sent over the policy-guaranteed HTTPS. Tracked as a PR
-        // follow-up; do NOT roll a custom crypto scheme here.
-        let token_enc = req.token.as_ref().map(|t| t.as_bytes().to_vec());
+        // Encrypt the caller's auth token at rest (ADR-0079 §3): ChaCha20-Poly1305 AEAD, a fresh
+        // per-config nonce prepended to the ciphertext (see `push_crypto`). **Fail closed:** if a
+        // caller supplies a token but no encryption key is configured, reject rather than store it in
+        // plaintext — nothing is written (this runs before the DB insert). A config with *no* token
+        // needs no key and stores `NULL`, unchanged. The token bytes never touch a log line.
+        let token_enc = match req.token.as_deref() {
+            Some(token) => match self.push_key.as_ref() {
+                Some(key) => Some(crate::a2a::push_crypto::encrypt(token.as_bytes(), key)),
+                None => {
+                    return Err(A2AError::invalid_params(
+                        "push token encryption is not configured; this server cannot accept a \
+                         webhook auth token",
+                    ));
+                }
+            },
+            None => None,
+        };
         // Multiple configs per task are allowed (spec) — mint a fresh server-side id every time.
         let config_id = Uuid::now_v7();
         db::insert_push_config(
@@ -858,7 +879,7 @@ impl RequestHandler for A2aHandler {
             .map_err(db_error)?
             .filter(|row| row.a2a_task_id == task_id)
             .ok_or_else(|| A2AError::task_not_found(&req.id))?;
-        Ok(push_config_view(row))
+        Ok(push_config_view(row, self.push_key.as_ref()))
     }
 
     async fn list_push_configs(
@@ -884,7 +905,7 @@ impl RequestHandler for A2aHandler {
             .await
             .map_err(db_error)?
             .into_iter()
-            .map(push_config_view)
+            .map(|row| push_config_view(row, self.push_key.as_ref()))
             .collect();
         // No pagination in this slice: all of a task's configs fit in one page (per-task config caps
         // are the abuse bound — ADR-0079 P7). A `next_page_token` is a later refinement.
@@ -1014,16 +1035,40 @@ fn submitted_metadata(caller: &CallerCtx, underlying: &Uuid) -> Map<String, Valu
 
 /// Project a stored push-config row into the A2A [`TaskPushNotificationConfig`] wire type (ADR-0079
 /// §1). Echoes the caller's own token back — it is the caller's secret and the read is caller-scoped —
-/// so a `create`→`get` round-trip is faithful. `authentication` is not persisted separately in this
-/// slice (only the caller `token`; see the migration), so it comes back `None`.
-fn push_config_view(row: db::PushConfigRow) -> TaskPushNotificationConfig {
+/// so a `create`→`get` round-trip is faithful. The token is stored **encrypted at rest** (§3), so it
+/// is decrypted here with the role's `push_key`. A decrypt failure — a wrong/rotated key, or a token
+/// stored while a key was configured but now absent — echoes `token: None` and logs at `warn`; it is
+/// never a 500 (the rest of the config is still useful) and the token bytes/key are never logged.
+/// `authentication` is not persisted separately in this slice (only the caller `token`; see the
+/// migration), so it comes back `None`.
+fn push_config_view(
+    row: db::PushConfigRow,
+    push_key: Option<&super::push_crypto::Key>,
+) -> TaskPushNotificationConfig {
+    let token = row.token_enc.as_deref().and_then(|bytes| match push_key {
+        Some(key) => {
+            let decoded = crate::a2a::push_crypto::decrypt(bytes, key);
+            if decoded.is_none() {
+                tracing::warn!(
+                    config_id = %row.config_id,
+                    "a2a: stored webhook token failed to decrypt (wrong/rotated key?); echoing token=None"
+                );
+            }
+            decoded
+        }
+        None => {
+            tracing::warn!(
+                config_id = %row.config_id,
+                "a2a: stored webhook token present but no encryption key is configured; echoing token=None"
+            );
+            None
+        }
+    });
     TaskPushNotificationConfig {
         url: row.url,
         id: Some(row.config_id.to_string()),
         task_id: row.a2a_task_id.to_string(),
-        token: row
-            .token_enc
-            .and_then(|bytes| String::from_utf8(bytes).ok()),
+        token,
         authentication: None,
         tenant: None,
     }
@@ -1050,6 +1095,15 @@ mod tests {
     use a2a::{Message, Part, Role};
     use serde_json::json;
 
+    /// A fixed 32-byte webhook-token encryption key for tests, so a `create` (encrypt) and a later
+    /// assertion (decrypt) share the same key deterministically.
+    const TEST_KEY_BYTES: [u8; 32] = [7u8; 32];
+
+    fn test_key() -> super::super::push_crypto::Key {
+        super::super::push_crypto::Key::from_bytes(&TEST_KEY_BYTES).unwrap()
+    }
+
+    /// The default test handler: a configured encryption key, so tokened push configs work.
     fn handler(pool: PgPool, max: i64) -> A2aHandler {
         A2aHandler::new(
             pool,
@@ -1057,6 +1111,20 @@ mod tests {
                 max,
                 window_secs: 3600,
             },
+            Some(test_key()),
+        )
+    }
+
+    /// A handler with NO encryption key — exercises the fail-closed path (a tokened `create` is
+    /// rejected and stores nothing).
+    fn handler_no_key(pool: PgPool, max: i64) -> A2aHandler {
+        A2aHandler::new(
+            pool,
+            QuotaConfig {
+                max,
+                window_secs: 3600,
+            },
+            None,
         )
     }
 
@@ -2214,7 +2282,7 @@ mod tests {
         assert_eq!(created.url, OK_WEBHOOK);
         assert_eq!(created.task_id, a2a_id);
 
-        // The stored row exists with the expected defaults + caller ownership + token bytes.
+        // The stored row exists with the expected defaults + caller ownership + ENCRYPTED token.
         let row = db::get_push_config(&pool, Uuid::parse_str(&config_id).unwrap())
             .await
             .unwrap()
@@ -2225,7 +2293,87 @@ mod tests {
         assert_eq!(row.delivered_seq, 0);
         assert_eq!(row.attempts, 0);
         assert_eq!(row.created_by, "svc-a");
-        assert_eq!(row.token_enc.as_deref(), Some(b"s3cr3t".as_ref()));
+        // Encryption-at-rest (ADR-0079 §3): the stored bytes are ciphertext, NOT the plaintext token,
+        // yet decrypt with the role key recovers it exactly.
+        let stored = row.token_enc.as_deref().expect("token stored");
+        assert_ne!(
+            stored,
+            b"s3cr3t".as_ref(),
+            "token must be stored encrypted, not plaintext"
+        );
+        assert!(
+            !stored.windows(6).any(|w| w == b"s3cr3t"),
+            "the plaintext token must not appear anywhere in the stored bytes"
+        );
+        assert!(
+            stored.len() > "s3cr3t".len() + 12 + 16 - 1,
+            "ciphertext carries the 12-byte nonce + 16-byte tag"
+        );
+        assert_eq!(
+            super::super::push_crypto::decrypt(stored, &test_key()).as_deref(),
+            Some("s3cr3t"),
+            "decrypt with the role key recovers the original token"
+        );
+    }
+
+    /// A `create`→`get` round-trip on a tokened config faithfully recovers the token: it is encrypted
+    /// on write and decrypted on read with the same role key, so the caller sees its own secret back.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn create_then_get_round_trips_the_token(pool: PgPool) {
+        seed_approved_repo(&pool, "acme", "api", 111).await;
+        let h = handler(pool.clone(), 10);
+        let caller = params("svc-a", &["a2a:review"]);
+        let (a2a_id, _) = submit(&h, &caller, 7).await;
+
+        let token = "bearer-abc-123!@#";
+        let cfg_id = h
+            .create_push_config(&caller, push_config(&a2a_id, OK_WEBHOOK, Some(token)))
+            .await
+            .unwrap()
+            .id
+            .unwrap();
+
+        let got = h
+            .get_push_config(&caller, get_cfg_req(&a2a_id, &cfg_id))
+            .await
+            .unwrap();
+        assert_eq!(
+            got.token.as_deref(),
+            Some(token),
+            "get decrypts and echoes the original token"
+        );
+    }
+
+    /// Fail-closed (ADR-0079 §3): with NO encryption key configured, a `create` that carries a token
+    /// is rejected (`invalid_params`) and stores nothing — a token is never persisted in plaintext. A
+    /// tokenless `create` still succeeds with no key.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn create_with_token_but_no_key_fails_closed_and_stores_nothing(pool: PgPool) {
+        seed_approved_repo(&pool, "acme", "api", 111).await;
+        let h = handler_no_key(pool.clone(), 10);
+        let caller = params("svc-a", &["a2a:review"]);
+        let (a2a_id, _) = submit(&h, &caller, 7).await;
+
+        // A tokened create with no key → rejected, nothing stored.
+        let err = h
+            .create_push_config(&caller, push_config(&a2a_id, OK_WEBHOOK, Some("s3cr3t")))
+            .await
+            .expect_err("a tokened create must fail closed when no key is configured");
+        assert_eq!(err.code, a2a::error_code::INVALID_PARAMS);
+        assert_eq!(
+            config_count(&pool, &a2a_id).await,
+            0,
+            "a fail-closed create must not store a row (least of all a plaintext token)"
+        );
+
+        // A tokenless create still works fine with no key (encryption only matters for a secret).
+        let created = h
+            .create_push_config(&caller, push_config(&a2a_id, OK_WEBHOOK, None))
+            .await
+            .expect("a tokenless config needs no key");
+        assert!(created.id.is_some());
+        assert_eq!(created.token, None);
+        assert_eq!(config_count(&pool, &a2a_id).await, 1);
     }
 
     /// The security-relevant path: a non-HTTPS / metadata / private URL is rejected as `invalid_params`
