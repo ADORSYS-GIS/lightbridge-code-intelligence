@@ -203,7 +203,8 @@ values, no `kind` discriminators, `supportedInterfaces[]` on the card, REST medi
   registered webhook URLs must be HTTPS, resolve to public addresses (reject RFC 1918,
   localhost, link-local — the role runs *inside* the cluster, so an unvalidated URL is a probe
   into `converse` and beyond), and are re-validated at delivery time (DNS rebinding). Config
-  CRUD per spec (`CreateTaskPushNotificationConfig` etc., multiple configs per task).
+  CRUD per spec (`CreateTaskPushNotificationConfig` etc., multiple configs per task). Designed in
+  [ADR-0079](../adr/0079-a2a-push-notifications-webhook-egress.md).
 - **Phase 4 — `input-required` + `ListTasks`.** Requires RFC-0005 Phase B: the task workflow
   parks on an awakeable carrying a question artifact; the continuation is a `SendMessage` with
   the same `taskId`+`contextId` (spec §3.4), which resolves the awakeable. This unlocks
