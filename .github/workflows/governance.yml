@@ -19,6 +19,13 @@ on:
 
 jobs:
   governance:
+    # Skip release-please's automated release PRs: they are mechanical version-bump +
+    # CHANGELOG PRs with no human intent to declare, so they can't (and shouldn't) carry an
+    # AI Usage Declaration / source-of-truth / verification body. release-please opens them
+    # from `release-please--branches--<target>`. If governance-check is a *required* status
+    # check in branch protection, a skipped job reports no status — admin-merge the release
+    # PR (sole-maintainer flow) or mark this check non-required.
+    if: ${{ !startsWith(github.head_ref, 'release-please--') }}
     # ADORSYS-GIS/ai-governance @ v1.0.0
     uses: ADORSYS-GIS/ai-governance/.github/workflows/governance-check.yml@959d8565041ddef86d3a10001b64393a6d4a60a2
     # Runs on GitHub-hosted ubuntu-latest by default. To run on your own runners,
