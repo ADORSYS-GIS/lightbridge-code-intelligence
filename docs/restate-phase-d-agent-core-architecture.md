@@ -9,7 +9,7 @@
 
 ---
 
-## 0. Toolchain target (R1 step 0)
+## 0. Toolchain target (R1a)
 
 The agent crates are born on **edition 2024** with the workspace on **`resolver = "3"`**.
 As of this writing, `main`'s workspace manifest still says `edition = "2021"` / `resolver = "2"` —
@@ -412,8 +412,9 @@ fixes; seven R1 library skeletons (`lci-agent-types`, `lci-agent-step`, `lci-age
 `agent-worker`**; the `lightbridge-config` → `lci-config` package rename; a workspace `bon` pin;
 the stable-only `rustfmt.toml`; `StepName`/`step_names!` and their format/list stability tests; and
 the dependency-hygiene `xtask` check with its own tests and CI wiring. Because `lci-agent-types`
-contains real `StepName` behavior, its ≥ 85% coverage gate starts in R1a; the other skeletons enter
-the gate when their first non-skeleton code lands.
+contains real `StepName` behavior, the coverage configuration's explicit active-crate allowlist
+contains only `lci-agent-types` in R1a. Each other skeleton is added to that allowlist when its
+first non-skeleton code lands.
 
 R1a does **not** port clients, tools, the loop, policies, model code, prompts, or host behavior.
 Those remain **R1b** `agent-clients` extraction (mechanical move, importers updated); **R1c**

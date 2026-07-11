@@ -282,9 +282,10 @@ Randomized testing is adopted — in the shape that survives CI:
   gates get gamed — a flat workspace cliff invites assertion-free test theater):
   - **New crates (the `lci-*` family): hard floor ≥ 85% line coverage from birth**, where "birth"
     means the first non-skeleton production code. A manifest plus placeholder `lib.rs` is not a
-    coverage target. `lci-agent-types` gains `StepName` behavior in R1a and is gated there; each
-    other R1a skeleton becomes gated in the slice that first populates it. The floor is per-crate
-    so a big host binary cannot dilute it.
+    coverage target. The coverage configuration keeps an explicit active-crate allowlist:
+    `lci-agent-types` is its only R1a entry because it gains `StepName` behavior; each other R1a
+    skeleton is added in the slice that first populates it. The floor is per-crate so a big host
+    binary cannot dilute it.
   - **Legacy crates: a ratchet, not a cliff** — coverage may never *decrease*; the recorded floor
     rises automatically as the P/R slices port tested code out. An immediate 85% on `db.rs` or
     `handler.rs` mid-drawdown would fail instantly and manufacture junk tests.

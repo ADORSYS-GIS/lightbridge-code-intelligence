@@ -145,14 +145,22 @@ is: **the durable runtime is a swap, not a rewrite.**
 > companion pattern as ADR-0076's implementation plan). This section records the decision-level
 > shape; **the companion doc is normative for the code.**
 
+Accepting this ADR independently adopts **only** the ADR-0083 decisions required by R1a:
+the `lci-config` rename, the workspace `bon` pin, the stable-only `rustfmt.toml`, the
+`StepName`/`step_names!` macro and stability tests, and the ≥ 85% coverage gate for
+`lci-agent-types`. [ADR-0083](0083-platform-crate-architecture-and-cratestack-data-layer.md)
+otherwise remains **Proposed**; none of its other tooling, crate, role, or data-layer decisions is
+accepted through this cross-reference.
+
 A new **family of workspace library crates** — `agent-types` → `agent-step` / `agent-tools` /
 `agent-clients` → `agent-loop` → `review-agent`, plus a dev-only `agent-testkit` ("agent-core" is
 the family's working name, not one crate; the DAG and each crate's allowed/forbidden deps are in
 the companion) — owns the agent programming model, **born on edition 2024, with the workspace bump
-to edition 2024 / resolver v3 as R1 step 0**. Shared crates depend on serde/tokio/anyhow only —
-**no `kube`, no `sqlx`, no `restate-sdk`** (runtime impls live with their host binaries, so the SDK
-pin never leaks into shared crates; enforced by an `xtask` dependency-hygiene check, not
-convention). The seams, trait-by-trait:
+to edition 2024 / resolver v3 in R1a**. Each shared crate uses only the direct dependencies allowed
+by the companion table; the universal rule is that the agent family never consumes the host-only
+heavy dependencies **`kube`, `sqlx`, or `restate-sdk`**. Runtime implementations live with their
+host binaries, so the SDK pin never leaks into shared crates; an `xtask` dependency-hygiene check
+enforces this rule. The seams, trait-by-trait:
 
 - **`StepRuntime` — the durability seam (the load-bearing one).** Every effect the loop performs
   goes through `step(name, f) -> T`, plus `sleep(name, d)` and an awakeable/promise hook for the
@@ -276,8 +284,9 @@ acceptable — and where it is not:
 - **Untrusted *content* on a multi-task pod** (checkout scratch dirs): per-task scratch under a
   dedicated `emptyDir`, wiped in `finalize` and by a lazy-clean guard in `ensure_checkout`; a
   startup and periodic sweep prunes inactive scratch left by cancellation, timeout, or abrupt
-  termination without touching active workflows. Read-only-root elsewhere; the existing
-  non-root/no-caps posture carries over.
+  termination without touching active workflows. The sweep also ignores recently created
+  directories for a configured safety window, preventing a new workflow from racing its active
+  registration. Read-only-root elsewhere; the existing non-root/no-caps posture carries over.
 - **The runner token becomes standing** instead of per-Job. Flagged as the honest security delta
   (it aligns with the standing-token surface [#243](https://github.com/vymalo/lightbridge-code-intelligence/issues/243)
   already tracks); mitigation is the same task-scoping the internal API already enforces per
