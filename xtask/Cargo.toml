@@ -10,3 +10,6 @@ description = "Workspace automation (cargo-xtask pattern), invoked from the just
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

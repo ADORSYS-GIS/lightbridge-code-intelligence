@@ -47,7 +47,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-      - uses: taiki-e/install-action@cargo-llvm-cov
+      # v2.83.1, pinned to immutable reviewed code; checksums stay enabled explicitly.
+      - uses: taiki-e/install-action@2ca9b94c269419b7b0c711c09d0b21c4e1d51145
+        with:
+          tool: cargo-llvm-cov@0.8.7
+          checksum: true
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: "."
@@ -61,7 +65,9 @@ jobs:
           access-key-id: ${{ secrets.SCCACHE_S3_ACCESS_KEY_ID }}
           secret-access-key: ${{ secrets.SCCACHE_S3_SECRET_ACCESS_KEY }}
       - name: dependency hygiene
-        run: cargo xtask dependency-hygiene
+        run: cargo run --locked --package xtask -- dependency-hygiene
+      - name: xtask tests
+        run: cargo test --locked -p xtask
       - name: cargo fmt --all --check
         run: cargo fmt --all -- --check
       - name: cargo clippy --workspace -D warnings

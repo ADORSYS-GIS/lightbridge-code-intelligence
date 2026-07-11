@@ -643,16 +643,30 @@ impl ReviewConfig {
     /// from env. The system prompt comes from the `system_prompt_file` template (env-subst'd) when
     /// set. A `review` block whose model is empty disables review, same as an unset `LLM_MODEL`.
     pub fn resolve(file: Option<&FileConfig>) -> anyhow::Result<Option<Self>> {
+        Self::resolve_with_env(file, &|name| std::env::var(name).ok())
+    }
+
+    fn resolve_with_env(
+        file: Option<&FileConfig>,
+        env: &impl Fn(&str) -> Option<String>,
+    ) -> anyhow::Result<Option<Self>> {
         let Some(r) = file.and_then(|f| f.review.as_ref()) else {
             return Self::from_env();
         };
-        Self::from_review_file(r)
+        Self::from_review_file_with_env(r, env)
     }
 
     /// Resolve ONE review block — the flat `review.*`, or a per-tier `review.fast`/`review.deep` block,
     /// each a *complete* config (ADR-0062) — into a [`ReviewConfig`]. `Ok(None)` when the model is empty
     /// (review disabled). Any nested `fast`/`deep` on `r` is ignored (tiers don't nest).
     fn from_review_file(r: &ReviewFile) -> anyhow::Result<Option<Self>> {
+        Self::from_review_file_with_env(r, &|name| std::env::var(name).ok())
+    }
+
+    fn from_review_file_with_env(
+        r: &ReviewFile,
+        env: &impl Fn(&str) -> Option<String>,
+    ) -> anyhow::Result<Option<Self>> {
         if r.model.trim().is_empty() {
             return Ok(None); // review explicitly disabled
         }
@@ -707,7 +721,10 @@ impl ReviewConfig {
             base_url: require_field("review", "base_url", &r.base_url)?,
             api_key: require_field("review", "api_key", &r.api_key)?,
             model: require_field("review", "model", &r.model)?,
-            system_prompt: require_system_prompt(r.system_prompt_file.as_deref())?,
+            system_prompt: require_system_prompt_with_env(
+                r.system_prompt_file.as_deref(),
+                env("REVIEW_SYSTEM_PROMPT"),
+            )?,
             max_diff_chars: r.max_diff_chars.unwrap_or(DEFAULT_MAX_DIFF_CHARS),
             // File config wins when set, else env (an operator can still tune via env with a
             // ConfigMap mounted), else the generous default.
@@ -1126,7 +1143,16 @@ mod tests {
     #[test]
     fn review_config_requires_a_system_prompt() {
         // ADR-0037: no built-in default. With no prompt source set, resolving review fails closed.
-        let err = require_system_prompt_with_env(None, None)
+        let file = FileConfig {
+            review: Some(ReviewFile {
+                base_url: "https://gw/v1".to_string(),
+                api_key: "key".to_string(),
+                model: "model".to_string(),
+                ..ReviewFile::default()
+            }),
+            ..FileConfig::default()
+        };
+        let err = ReviewConfig::resolve_with_env(Some(&file), &|_| None)
             .expect_err("must fail closed without a prompt");
         assert!(
             format!("{err:#}").contains("system prompt"),

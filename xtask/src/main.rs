@@ -98,22 +98,27 @@ const SINGLE_MANIFEST_DEPENDENCIES: &[DependencyOwner] = &[
 /// Enforce architecture-owned heavyweight dependencies from resolved Cargo metadata.
 fn dependency_hygiene() -> anyhow::Result<()> {
     let workspace_root = workspace_root();
+    let metadata = load_cargo_metadata(&workspace_root)?;
+    validate_dependency_hygiene(&metadata, &workspace_root)
+}
+
+fn load_cargo_metadata(workspace_root: &Path) -> anyhow::Result<CargoMetadata> {
     let output = Command::new("cargo")
-        .args(["metadata", "--format-version", "1", "--no-deps"])
-        .current_dir(&workspace_root)
+        .args(["metadata", "--format-version", "1", "--no-deps", "--locked"])
+        .current_dir(workspace_root)
         .output()
         .context("failed to run `cargo metadata` for dependency hygiene")?;
 
     if !output.status.success() {
         anyhow::bail!(
-            "`cargo metadata --format-version 1 --no-deps` failed: {}",
+            "`cargo metadata --format-version 1 --no-deps --locked` failed: {}",
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
 
     let metadata: CargoMetadata =
         serde_json::from_slice(&output.stdout).context("failed to decode cargo metadata")?;
-    validate_dependency_hygiene(&metadata, &workspace_root)
+    Ok(metadata)
 }
 
 fn validate_dependency_hygiene(metadata: &CargoMetadata, root: &Path) -> anyhow::Result<()> {
@@ -231,6 +236,131 @@ fn on_path(bin: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct ScratchWorkspace {
+        root: tempfile::TempDir,
+    }
+
+    impl ScratchWorkspace {
+        fn new(agent_loop_dependencies: &str) -> Self {
+            let root = tempfile::tempdir().unwrap();
+            write(
+                root.path(),
+                "Cargo.toml",
+                r#"
+[workspace]
+resolver = "3"
+members = [
+    "services/control-plane",
+    "services/agent-loop",
+    "services/review-agent",
+]
+exclude = [
+    "deps/restate-sdk",
+    "deps/kube",
+    "deps/sqlx",
+    "deps/lci-agent-testkit",
+]
+
+[workspace.dependencies]
+database = { package = "sqlx", path = "deps/sqlx" }
+test-support = { package = "lci-agent-testkit", path = "deps/lci-agent-testkit" }
+"#,
+            );
+
+            write_package(root.path(), "deps/restate-sdk", "restate-sdk", "");
+            write_package(root.path(), "deps/kube", "kube", "");
+            write_package(root.path(), "deps/sqlx", "sqlx", "");
+            write_package(
+                root.path(),
+                "deps/lci-agent-testkit",
+                "lci-agent-testkit",
+                "",
+            );
+
+            write_package(
+                root.path(),
+                "services/control-plane",
+                "control-plane",
+                r#"
+[dependencies]
+durable-host = { package = "restate-sdk", path = "../../deps/restate-sdk" }
+
+[target.'cfg(unix)'.dev-dependencies]
+database.workspace = true
+
+[target.'cfg(unix)'.build-dependencies]
+cluster-client = { package = "kube", path = "../../deps/kube" }
+"#,
+            );
+            write_package(
+                root.path(),
+                "services/agent-loop",
+                "lci-agent-loop",
+                agent_loop_dependencies,
+            );
+            write_package(
+                root.path(),
+                "services/review-agent",
+                "lci-review-agent",
+                r#"
+[target.'cfg(unix)'.dev-dependencies]
+test-support.workspace = true
+"#,
+            );
+
+            let output = Command::new("cargo")
+                .args(["generate-lockfile", "--manifest-path"])
+                .arg(root.path().join("Cargo.toml"))
+                .env("CARGO_NET_OFFLINE", "true")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "fixture lockfile generation failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+
+            Self { root }
+        }
+
+        fn metadata(&self) -> CargoMetadata {
+            load_cargo_metadata(&self.root_path()).unwrap()
+        }
+
+        fn validate(&self) -> anyhow::Result<()> {
+            let metadata = self.metadata();
+            validate_dependency_hygiene(&metadata, &self.root_path())
+        }
+
+        fn root_path(&self) -> PathBuf {
+            self.root.path().canonicalize().unwrap()
+        }
+    }
+
+    fn write(root: &Path, relative: &str, contents: &str) {
+        let path = root.join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, contents.trim_start()).unwrap();
+    }
+
+    fn write_package(root: &Path, relative: &str, name: &str, dependencies: &str) {
+        write(
+            root,
+            &format!("{relative}/Cargo.toml"),
+            &format!(
+                r#"
+[package]
+name = "{name}"
+version = "0.0.0"
+edition = "2024"
+publish = false
+{dependencies}
+"#
+            ),
+        );
+        write(root, &format!("{relative}/src/lib.rs"), "");
+    }
 
     fn dependency(name: &str) -> CargoDependency {
         CargoDependency {
@@ -352,5 +482,114 @@ mod tests {
 
         let error = validate_dependency_hygiene(&metadata, Path::new("/workspace")).unwrap_err();
         assert!(error.to_string().contains("build dependency"));
+    }
+
+    #[test]
+    fn scratch_workspace_resolves_alias_workspace_target_and_dependency_kinds() {
+        let scratch = ScratchWorkspace::new("");
+        let metadata = scratch.metadata();
+        scratch.validate().unwrap();
+
+        let control_plane = metadata
+            .packages
+            .iter()
+            .find(|package| {
+                package
+                    .manifest_path
+                    .ends_with("services/control-plane/Cargo.toml")
+            })
+            .unwrap();
+        assert!(
+            control_plane.dependencies.iter().any(|dependency| {
+                dependency.name == "restate-sdk" && dependency.kind.is_none()
+            })
+        );
+        assert!(control_plane.dependencies.iter().any(|dependency| {
+            dependency.name == "sqlx" && dependency.kind.as_deref() == Some("dev")
+        }));
+        assert!(control_plane.dependencies.iter().any(|dependency| {
+            dependency.name == "kube" && dependency.kind.as_deref() == Some("build")
+        }));
+
+        let review_agent = metadata
+            .packages
+            .iter()
+            .find(|package| {
+                package
+                    .manifest_path
+                    .ends_with("services/review-agent/Cargo.toml")
+            })
+            .unwrap();
+        assert!(review_agent.dependencies.iter().any(|dependency| {
+            dependency.name == "lci-agent-testkit" && dependency.kind.as_deref() == Some("dev")
+        }));
+    }
+
+    #[test]
+    fn scratch_workspace_rejects_heavyweight_dependencies_in_every_manifest_form() {
+        let cases = [
+            (
+                "normal package alias",
+                r#"
+[dependencies]
+database-client = { package = "sqlx", path = "../../deps/sqlx" }
+"#,
+            ),
+            (
+                "workspace-inherited dev dependency",
+                r#"
+[dev-dependencies]
+database.workspace = true
+"#,
+            ),
+            (
+                "build dependency",
+                r#"
+[build-dependencies]
+cluster-client = { package = "kube", path = "../../deps/kube" }
+"#,
+            ),
+            (
+                "inactive target dependency",
+                r#"
+[target.'cfg(windows)'.dependencies]
+durable-host = { package = "restate-sdk", path = "../../deps/restate-sdk" }
+"#,
+            ),
+        ];
+
+        for (case, dependencies) in cases {
+            let error = ScratchWorkspace::new(dependencies).validate().unwrap_err();
+            assert!(
+                error.to_string().contains("services/agent-loop/Cargo.toml"),
+                "{case} escaped the check: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn scratch_workspace_enforces_agent_testkit_as_dev_only() {
+        for (case, dependencies) in [
+            (
+                "normal",
+                r#"
+[dependencies]
+test-support.workspace = true
+"#,
+            ),
+            (
+                "build",
+                r#"
+[build-dependencies]
+test-support.workspace = true
+"#,
+            ),
+        ] {
+            let error = ScratchWorkspace::new(dependencies).validate().unwrap_err();
+            assert!(
+                error.to_string().contains("must be a dev-dependency"),
+                "{case} testkit dependency escaped the check: {error}"
+            );
+        }
     }
 }
