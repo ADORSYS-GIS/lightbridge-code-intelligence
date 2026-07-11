@@ -18,7 +18,7 @@ pub trait Tool: Send + Sync {
     fn spec(&self) -> &ToolSpec;
     fn kind(&self) -> ToolKind;
     fn replay(&self) -> ReplaySafety;
-    fn call<'a>(&'a self, cx: &'a ToolCx<'a>, args: &'a str) -> BoxFuture<'a, ToolOutcome>;
+    fn call<'a>(&'a self, cx: &'a ToolCx<'a>, call: &'a ToolCallReq) -> BoxFuture<'a, ToolOutcome>;
 }
 
 /// Classification used by budgets and per-turn offered-set policies.
@@ -84,8 +84,19 @@ impl std::error::Error for WorkspaceError {}
 pub struct ToolCx<'a> {
     pub task_id: Uuid,
     pub workspace: &'a dyn Workspace,
-    /// Present when the runtime can deduplicate a `NeedsDedupKey` call.
-    pub dedup_key: Option<&'a str>,
+}
+
+/// A refusal is typed so each assembly renders its own exact model-facing steer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DispatchRefusal {
+    NotOffered { tool_name: String },
+    MissingCallId { tool_name: String },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DispatchResult {
+    Completed(ToolOutcome),
+    Refused(DispatchRefusal),
 }
 
 /// A monotonic restriction of the tools offered on one turn.
@@ -226,17 +237,23 @@ impl TurnView<'_> {
         &self.specs
     }
 
-    pub async fn dispatch(&self, cx: &ToolCx<'_>, call: &ToolCallReq) -> ToolOutcome {
+    pub async fn dispatch(&self, cx: &ToolCx<'_>, call: &ToolCallReq) -> DispatchResult {
         match self
             .offered
             .iter()
             .find(|tool| tool.spec().name() == call.function.name)
         {
-            Some(tool) => tool.call(cx, &call.function.arguments).await,
-            None => ToolOutcome::Continue(format!(
-                "`{}` is not available on this turn — use one of the tools that was offered.",
-                call.function.name
-            )),
+            Some(tool)
+                if tool.replay() == ReplaySafety::NeedsDedupKey && call.id.trim().is_empty() =>
+            {
+                DispatchResult::Refused(DispatchRefusal::MissingCallId {
+                    tool_name: call.function.name.clone(),
+                })
+            }
+            Some(tool) => DispatchResult::Completed(tool.call(cx, call).await),
+            None => DispatchResult::Refused(DispatchRefusal::NotOffered {
+                tool_name: call.function.name.clone(),
+            }),
         }
     }
 }
@@ -275,8 +292,14 @@ mod tests {
             self.replay
         }
 
-        fn call<'a>(&'a self, _cx: &'a ToolCx<'a>, args: &'a str) -> BoxFuture<'a, ToolOutcome> {
-            Box::pin(async move { ToolOutcome::Continue(format!("ran {args}")) })
+        fn call<'a>(
+            &'a self,
+            _cx: &'a ToolCx<'a>,
+            call: &'a ToolCallReq,
+        ) -> BoxFuture<'a, ToolOutcome> {
+            Box::pin(
+                async move { ToolOutcome::Continue(format!("ran {}", call.function.arguments)) },
+            )
         }
     }
 
@@ -334,16 +357,17 @@ mod tests {
         let cx = ToolCx {
             task_id: Uuid::nil(),
             workspace: &Root,
-            dedup_key: None,
         };
         assert_eq!(
             view.dispatch(&cx, &call("finish")).await,
-            ToolOutcome::Continue("ran {}".into())
+            DispatchResult::Completed(ToolOutcome::Continue("ran {}".into()))
         );
-        assert!(matches!(
+        assert_eq!(
             view.dispatch(&cx, &call("read")).await,
-            ToolOutcome::Continue(message) if message.contains("not available")
-        ));
+            DispatchResult::Refused(DispatchRefusal::NotOffered {
+                tool_name: "read".into()
+            })
+        );
         assert_eq!(cx.workspace.root().await.unwrap(), Path::new("/tmp"));
     }
 
@@ -394,6 +418,39 @@ mod tests {
             WorkspaceError::new("missing")
                 .to_string()
                 .contains("missing")
+        );
+    }
+
+    #[tokio::test]
+    async fn needs_dedup_uses_the_actual_call_id_and_rejects_missing_ids() {
+        let mut registry = ToolRegistry::new();
+        registry
+            .register(
+                Arc::new(FixedTool::new(
+                    "comment",
+                    ToolKind::Write,
+                    ReplaySafety::NeedsDedupKey,
+                )),
+                RuntimeCaps::default(),
+            )
+            .unwrap();
+        let view = registry.view(&TurnFilter::all());
+        let cx = ToolCx {
+            task_id: Uuid::nil(),
+            workspace: &Root,
+        };
+        let mut missing = call("comment");
+        missing.id.clear();
+        assert_eq!(
+            view.dispatch(&cx, &missing).await,
+            DispatchResult::Refused(DispatchRefusal::MissingCallId {
+                tool_name: "comment".into()
+            })
+        );
+        let actual = call("comment");
+        assert_eq!(
+            view.dispatch(&cx, &actual).await,
+            DispatchResult::Completed(ToolOutcome::Continue("ran {}".into()))
         );
     }
 }

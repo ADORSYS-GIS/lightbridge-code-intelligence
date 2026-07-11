@@ -40,6 +40,7 @@ tree-sitter-typescript.workspace = true
 tree-sitter-python.workspace = true
 
 [dev-dependencies]
+lci-agent-testkit = { path = "../agent-testkit" }
 # HTTP mocking for the control-plane client contract tests (no live control plane).
 wiremock.workspace = true
 tempfile.workspace = true

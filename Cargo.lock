@@ -86,6 +86,7 @@ dependencies = [
  "base64",
  "futures",
  "lci-agent-clients",
+ "lci-agent-testkit",
  "lci-agent-types",
  "lci-config",
  "lci-review-agent",
@@ -2405,6 +2406,8 @@ dependencies = [
  "lci-agent-types",
  "serde",
  "serde_json",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]
