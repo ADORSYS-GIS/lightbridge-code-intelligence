@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::ratelimit::{self, RateLimitSnapshot};
+use lci_agent_clients::ratelimit::{self, RateLimitSnapshot};
 
 /// A single message in the Chat Completions `messages` array.
 ///
@@ -655,8 +655,8 @@ impl ChatClient {
         }
 
         // Capture the gateway's advertised budget before the body consumes the response (Copy, so the
-        // borrow on `headers()` ends here). Advisory only — see [`crate::ratelimit`]. Captured once
-        // here so both the streaming and non-streaming paths carry it.
+        // borrow on `headers()` ends here). Advisory only — see `lci_agent_clients::ratelimit`.
+        // Captured once here so both the streaming and non-streaming paths carry it.
         let rate_limit = RateLimitSnapshot::from_headers(response.headers());
 
         // Streaming path (spike): collect the SSE chunks ourselves under a per-chunk idle timeout.

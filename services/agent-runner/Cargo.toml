@@ -13,6 +13,7 @@ path = "src/main.rs"
 # Versions + features are centralized in the workspace root Cargo.toml.
 [dependencies]
 anyhow.workspace = true
+lci-agent-clients = { path = "../agent-clients" }
 lci-config = { path = "../config" }
 mimalloc.workspace = true
 serde.workspace = true

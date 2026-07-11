@@ -19,8 +19,8 @@ use anyhow::Context;
 use serde::Deserialize;
 use uuid::Uuid;
 
-use crate::bootstrap::client::ControlPlaneClient;
 use crate::bootstrap::config::SastConfig;
+use lci_agent_clients::ControlPlaneClient;
 
 /// One opengrep finding, normalized from a SARIF result into the shape the review buffer needs.
 #[derive(Debug, Clone, PartialEq)]

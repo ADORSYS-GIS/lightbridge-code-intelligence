@@ -30,7 +30,7 @@ Two independent indexers run in the same task:
 
 - **Semantic** — our own tree-sitter chunker embeds each chunk and submits batches to the control
   plane, which upserts `code_chunks` rows (pgvector). Code: `services/agent-runner/src/indexer/mod.rs`,
-  `services/agent-runner/src/indexer/chunker.rs`, `services/agent-runner/src/indexer/embeddings.rs`.
+  `services/agent-runner/src/indexer/chunker.rs`, `services/agent-clients/src/embeddings.rs`.
 - **Structural** — Graphify (a bundled multi-grammar AST→graph extractor) emits `graph.json`; the
   runner keeps only the **code** nodes/edges and submits them; the control plane writes Neo4j. Code:
   `services/agent-runner/src/indexer/graph.rs`, `services/control-plane/src/integrations/neo4j.rs`.

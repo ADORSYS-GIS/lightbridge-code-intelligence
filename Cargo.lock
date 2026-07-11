@@ -85,6 +85,7 @@ dependencies = [
  "anyhow",
  "base64",
  "futures",
+ "lci-agent-clients",
  "lci-config",
  "mimalloc",
  "regex",
@@ -2364,8 +2365,14 @@ dependencies = [
 name = "lci-agent-clients"
 version = "0.1.0"
 dependencies = [
- "lci-agent-types",
+ "anyhow",
  "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "uuid",
+ "wiremock",
 ]
 
 [[package]]

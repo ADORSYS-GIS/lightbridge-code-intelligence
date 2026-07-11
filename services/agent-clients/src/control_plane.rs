@@ -736,4 +736,31 @@ mod tests {
             "https://oauth2:glpat-deadbeef@gitlab.com/group/repo.git"
         );
     }
+
+    #[test]
+    fn attribution_headers_are_complete_sanitized_and_bounded() {
+        let mut ctx = context("https://github.com/octo/repo.git", "test-tok");
+        ctx.owner = "octo\norg".into();
+        ctx.name = format!("répo{}", "x".repeat(250));
+        ctx.command = "review\u{7}now".into();
+
+        let headers = ctx.attribution_headers();
+        let find = |name: &str| {
+            headers
+                .iter()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| value.as_str())
+                .expect("attribution header")
+        };
+
+        assert_eq!(headers.len(), 6);
+        assert_eq!(find("x-code-intelligence-owner"), "octo org");
+        assert_eq!(find("x-code-intelligence-repo-id"), "1");
+        assert_eq!(find("x-code-intelligence-task-id"), Uuid::nil().to_string());
+        assert_eq!(find("x-code-intelligence-target"), "pull_request#7");
+        assert_eq!(find("x-code-intelligence-command"), "review now");
+        let repo = find("x-code-intelligence-repo");
+        assert_eq!(repo.chars().count(), 200);
+        assert!(repo.is_ascii());
+    }
 }

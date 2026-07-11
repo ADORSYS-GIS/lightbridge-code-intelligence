@@ -344,7 +344,7 @@ pub async fn posted_findings_for_head(
 // ── ADR-0034 agent run transcript ──────────────────────────────────────────────────────────────
 
 /// One transcript entry submitted by the runner (the ingest shape; mirrors
-/// `agent-runner::bootstrap::client::TranscriptEntry`).
+/// `lci-agent-clients::TranscriptEntry`).
 #[derive(Debug, Deserialize)]
 pub struct TranscriptInput {
     pub role: String,
