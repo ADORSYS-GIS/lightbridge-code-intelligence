@@ -387,6 +387,19 @@ alternative — the goal (resume, not restart) survives even if the engine-nativ
 - **Run the loop in the existing `restate-worker`.** One fewer Deployment, but it would co-locate
   the untrusted-content agent surface with the forge App key that `PlatformEgress` holds — undoing
   the ADR-0002 credential separation that survived every phase so far. Rejected outright.
+- **Delegate the agent core to an external agent CLI (OpenCode driven over ACP)** *(owner-raised,
+  2026-07-11)*. ACP gives the client per-tool-call **visibility and gating** (tool-call events +
+  `request_permission`), but not per-step **ownership**: the LLM calls and conversation state live
+  inside the external process, there is no replay verb to fast-forward it through completed steps
+  from *our* journal, and its own session persistence is pod-local disk with no exactly-once
+  semantics. The granularity Phase D journaling requires ("resume at the tool it left") structurally
+  does not exist across ACP — and driving one prompt per turn degenerates the CLI into a worse
+  chat-completions proxy while re-inheriting loop ownership anyway. It would also re-run the
+  ADR-0026 reversal (runner-*enforced* quality gates would become prompt-level asks in someone
+  else's loop — the ADR-0069 honor-system lesson) and re-open the ADR-0075 provider-fidelity risk
+  class. **Rejected for the core.** The legitimate need it pointed at — reading project agent
+  conventions (`.skills/*`, `SKILL.md`, `.claude/skills/`, `.cursor/rules`) — is a native loader
+  slice on the ADR-0036/0030/0031 lineage, not a runtime decision.
 
 ## More Information
 
