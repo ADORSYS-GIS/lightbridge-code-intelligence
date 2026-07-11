@@ -313,7 +313,7 @@ pub(crate) mod test_support {
 
         static KEYS: std::sync::OnceLock<(String, String)> = std::sync::OnceLock::new();
         KEYS.get_or_init(|| {
-            let private = rsa::RsaPrivateKey::new(&mut rand::rngs::OsRng, 2048).expect("gen rsa");
+            let private = rsa::RsaPrivateKey::new(&mut rand_08::rngs::OsRng, 2048).expect("gen rsa");
             let pem = private
                 .to_pkcs8_pem(rsa::pkcs8::LineEnding::LF)
                 .expect("pkcs8 pem")
@@ -382,7 +382,7 @@ mod tests {
 
         static KEYS: std::sync::OnceLock<(String, String)> = std::sync::OnceLock::new();
         KEYS.get_or_init(|| {
-            let private = rsa::RsaPrivateKey::new(&mut rand::rngs::OsRng, 2048).expect("gen rsa");
+            let private = rsa::RsaPrivateKey::new(&mut rand_08::rngs::OsRng, 2048).expect("gen rsa");
             let pem = private
                 .to_pkcs8_pem(rsa::pkcs8::LineEnding::LF)
                 .expect("pkcs8 pem")

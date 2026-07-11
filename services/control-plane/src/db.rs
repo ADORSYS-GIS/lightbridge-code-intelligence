@@ -92,9 +92,9 @@ pub async fn reconcile_embedding_dimension(
         .await?;
     // `dimension` is an i64 from typed config (not user free-text), so formatting it into the DDL is
     // safe; the vector type width can't be a bind parameter.
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "ALTER TABLE code_chunks ALTER COLUMN embedding TYPE vector({dimension})"
-    ))
+    )))
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
@@ -1159,20 +1159,14 @@ pub struct TaskRow {
     pub repo_name: Option<String>,
     pub repo_default_branch: Option<String>,
     /// The Kubernetes Job name (set once dispatched), so the console can stream the run's logs. `None`
-    /// before dispatch or after the Job is reaped/TTL'd. Already selected by `TASK_SELECT` (`t.*`).
+    /// before dispatch or after the Job is reaped/TTL'd.
     pub job_name: Option<String>,
     /// The runner's free-text status `detail` (#137), persisted on the last status report that carried
     /// one. `None` for a genuine clean success / runs that predate migration 0016; `Some` records why
     /// a run did not post a review (e.g. a failure reason, or a "posted nothing" no-op), so the console
-    /// can tell a silent no-op apart from a real clean review. Selected by `TASK_SELECT` (`t.*`).
+    /// can tell a silent no-op apart from a real clean review.
     pub error_detail: Option<String>,
 }
-
-/// `SELECT` projection shared by the list and detail queries: every `tasks` column plus the joined
-/// repository identity, aliased to the `repo_*` fields of [`TaskRow`].
-const TASK_SELECT: &str = "SELECT t.*, r.owner AS repo_owner, r.name AS repo_name, \
-     r.default_branch AS repo_default_branch \
-     FROM tasks t LEFT JOIN repositories r ON r.id = t.repository_id";
 
 /// Fields needed to create a task from a webhook event.
 pub struct NewTask {
@@ -1283,14 +1277,14 @@ async fn notify_or_log_initial_status(pool: &PgPool, id: Uuid, repository_id: i6
 /// is mid-index (ADR-0055).
 pub async fn create_task(pool: &PgPool, task: &NewTask) -> Result<Option<Uuid>, sqlx::Error> {
     let id = Uuid::new_v4();
-    let inserted: Option<(Uuid, String)> = sqlx::query_as(&format!(
+    let inserted: Option<(Uuid, String)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "INSERT INTO tasks (id, repository_id, installation_id, webhook_delivery_id, target_type, \
          target_id, command_text, base_sha, head_sha, run_epoch, tier, trigger_comment_id, status) \
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, {INITIAL_TASK_STATUS_SQL}) \
          ON CONFLICT (repository_id, target_type, target_id, command_text, head_sha, run_epoch) \
          DO NOTHING \
          RETURNING id, status"
-    ))
+    )))
     .bind(id)
     .bind(task.repository_id)
     .bind(task.installation_id)
@@ -1333,7 +1327,7 @@ pub async fn create_explicit_task(pool: &PgPool, task: &NewTask) -> Result<Uuid,
     loop {
         attempt += 1;
         let id = Uuid::new_v4();
-        let result = sqlx::query_as::<_, (Uuid, String)>(&format!(
+        let result = sqlx::query_as::<_, (Uuid, String)>(sqlx::AssertSqlSafe(format!(
             "INSERT INTO tasks (id, repository_id, installation_id, webhook_delivery_id, target_type, \
              target_id, command_text, base_sha, head_sha, tier, trigger_comment_id, run_epoch, status) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, \
@@ -1342,7 +1336,7 @@ pub async fn create_explicit_task(pool: &PgPool, task: &NewTask) -> Result<Uuid,
                   AND command_text = $7 AND head_sha IS NOT DISTINCT FROM $9), \
                {INITIAL_TASK_STATUS_SQL}) \
              RETURNING id, status"
-        ))
+        )))
         .bind(id)
         .bind(task.repository_id)
         .bind(task.installation_id)
@@ -1699,20 +1693,28 @@ pub async fn renew_lease(pool: &PgPool, id: Uuid, lease: Duration) -> Result<boo
 
 /// Most recent tasks first (the dashboard run list).
 pub async fn list_tasks(pool: &PgPool, limit: i64) -> Result<Vec<TaskRow>, sqlx::Error> {
-    let sql = format!("{TASK_SELECT} ORDER BY t.created_at DESC LIMIT $1");
-    sqlx::query_as::<_, TaskRow>(&sql)
-        .bind(limit)
-        .fetch_all(pool)
-        .await
+    sqlx::query_as::<_, TaskRow>(
+        "SELECT t.*, r.owner AS repo_owner, r.name AS repo_name, \
+         r.default_branch AS repo_default_branch \
+         FROM tasks t LEFT JOIN repositories r ON r.id = t.repository_id \
+         ORDER BY t.id DESC LIMIT $1",
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await
 }
 
 /// A single task by id.
 pub async fn get_task(pool: &PgPool, id: Uuid) -> Result<Option<TaskRow>, sqlx::Error> {
-    let sql = format!("{TASK_SELECT} WHERE t.id = $1");
-    sqlx::query_as::<_, TaskRow>(&sql)
-        .bind(id)
-        .fetch_optional(pool)
-        .await
+    sqlx::query_as::<_, TaskRow>(
+        "SELECT t.*, r.owner AS repo_owner, r.name AS repo_name, \
+         r.default_branch AS repo_default_branch \
+         FROM tasks t LEFT JOIN repositories r ON r.id = t.repository_id \
+         WHERE t.id = $1",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await
 }
 
 /// A connected repository for the dashboard's Repositories view (ADR-0016), with a small activity
@@ -2337,11 +2339,6 @@ pub struct PushConfigRow {
     pub created_by: String,
 }
 
-/// Column list shared by the push-config point/list reads, matching [`PushConfigRow`]'s fields.
-const PUSH_CONFIG_SELECT: &str =
-    "SELECT config_id, a2a_task_id, url, token_enc, delivered_seq, attempts, state, created_by \
-     FROM a2a_push_configs";
-
 /// Insert a new push-notification config for a task (ADR-0079 §1). The caller MUST already have proven
 /// ownership of `a2a_task_id` (the handler does, via `load_owned`, before calling). `delivered_seq`
 /// (0), `attempts` (0), `next_attempt_at` (`now()`), and `state` (`active`) take their table defaults.
@@ -2373,11 +2370,14 @@ pub async fn get_push_config(
     pool: &PgPool,
     config_id: Uuid,
 ) -> Result<Option<PushConfigRow>, sqlx::Error> {
-    let sql = format!("{PUSH_CONFIG_SELECT} WHERE config_id = $1");
-    sqlx::query_as::<_, PushConfigRow>(&sql)
-        .bind(config_id)
-        .fetch_optional(pool)
-        .await
+    sqlx::query_as::<_, PushConfigRow>(
+        "SELECT config_id, a2a_task_id, url, token_enc, delivered_seq, attempts, state, created_by \
+         FROM a2a_push_configs \
+         WHERE config_id = $1",
+    )
+    .bind(config_id)
+    .fetch_optional(pool)
+    .await
 }
 
 /// List every push config registered on a task, oldest first. Caller-scoping is the handler's job
@@ -2386,13 +2386,14 @@ pub async fn list_push_configs_for_task(
     pool: &PgPool,
     a2a_task_id: Uuid,
 ) -> Result<Vec<PushConfigRow>, sqlx::Error> {
-    let sql = format!(
-        "{PUSH_CONFIG_SELECT} WHERE a2a_task_id = $1 ORDER BY created_at ASC, config_id ASC"
-    );
-    sqlx::query_as::<_, PushConfigRow>(&sql)
-        .bind(a2a_task_id)
-        .fetch_all(pool)
-        .await
+    sqlx::query_as::<_, PushConfigRow>(
+        "SELECT config_id, a2a_task_id, url, token_enc, delivered_seq, attempts, state, created_by \
+         FROM a2a_push_configs \
+         WHERE a2a_task_id = $1 ORDER BY created_at ASC, config_id ASC",
+    )
+    .bind(a2a_task_id)
+    .fetch_all(pool)
+    .await
 }
 
 /// Delete a push config, scoped to its owning task in one query. Returns whether a row was removed

@@ -55,4 +55,4 @@ a2a-server-lf.workspace = true
 [dev-dependencies]
 # Test-only: generate an RSA keypair at runtime so no private key is committed (see src/jwt.rs).
 rsa.workspace = true
-rand.workspace = true
+rand_08.workspace = true
