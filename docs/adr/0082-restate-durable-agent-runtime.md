@@ -1,6 +1,6 @@
 # ADR-0082: Restate Phase D — the durable agent runtime (the review loop resumes at the step it left)
 
-- **Status:** Proposed (design-only — nothing in this ADR is implemented; gated, see §Gates)
+- **Status:** Accepted (design-only; R1 owner-authorized; R2 remains gated, see §Gates)
 - **Date:** 2026-07-11
 - **Deciders:** @stephane-segning
 
@@ -99,6 +99,8 @@ bootstrap in [`main.rs`](../../services/agent-runner/src/main.rs); each numbered
    `head_sha` into a per-task scratch dir. **Not** a plain journaled step: its *product* (the working
    tree) is local ephemeral state a replay on a fresh pod does not recreate, so every FS-touching
    step guards on `ensure_checkout(head_sha)` (clone-if-missing) rather than trusting the journal.
+   The reconstruction itself runs **outside `ctx.run`** (otherwise replay skips it) and on
+   `spawn_blocking` or equivalent background I/O so it cannot block Restate's cooperative executor.
 3. **Per-turn loop** (`for turn in 0..max_turns`, the deterministic glue re-runs on replay):
    - **`llm_turn:{turn}`** (`ctx.run`) — the [`chat.rs`](../../services/agent-runner/src/review/native/chat.rs)
      completion call, streaming + per-chunk idle timeout intact *inside* the step; the journaled
@@ -215,8 +217,9 @@ A 150-turn deep review produces ~300+ journal entries. Entries stay **bounded an
 - Journaled verbatim: assistant messages, per-call tool outputs *up to a per-entry cap* (tool
   outputs are already truncated for the conversation; the cap aligns with that truncation).
 - Over-cap payloads (the 300 KB-class diff from step 1, oversized tool outputs) are **offloaded to
-  Postgres via the existing internal API**, keyed `(task_id, step_name)`; the journal holds the key +
-  a content hash so replay can verify it rehydrates the same bytes. This extends the
+  Postgres via the existing internal API**, keyed by the full `workflow_id` (including
+  `run_epoch`) plus `step_name`, never bare `task_id`; the journal holds the key + a content hash
+  so replay can verify it rehydrates the same bytes. This extends the
   `DeliverOutcome` smallness discipline ([ADR-0074](0074-restate-egress-pilot.md)) from "an enum"
   to "a bounded blob or a verified pointer."
 - The entry-size ceiling, total-journal ceiling, and **replay time** for a synthetic 300-entry
@@ -227,10 +230,11 @@ A 150-turn deep review produces ~300+ journal entries. Entries stay **bounded an
 A journaled step is **skipped** on replay — so any step whose *product* lives on the pod's
 filesystem or in process memory (the checkout, the `ChatClient`, the in-memory rate-limiter bucket)
 must either be rebuilt unconditionally (clients — cheap, deterministic from the journaled config
-snapshot) or guarded lazily (`ensure_checkout`). The review is **read-only over the checkout at a
-pinned SHA**, so a lazy re-clone yields byte-identical content and `read_file` steps stay
-deterministic. This rule gets its own review checklist line; it is the Phase-D analogue of
-ADR-0076's "no `Context` in `ctx.run`."
+snapshot) or guarded lazily (`ensure_checkout`). Checkout reconstruction must execute outside
+`ctx.run` and off the workflow executor. The review is **read-only over the checkout at a pinned
+SHA**, so a lazy re-clone yields byte-identical content and `read_file` steps stay deterministic.
+This rule gets its own review checklist line; it is the Phase-D analogue of ADR-0076's "no
+`Context` in `ctx.run`."
 
 ### Idempotency of side-effectful steps (the at-least-once seam)
 
@@ -270,8 +274,10 @@ acceptable — and where it is not:
   Phase-B task workflow runs it as its own step before invoking `ReviewAgent`, and the digest
   arrives as a journaled bootstrap input. The long-lived worker never runs opengrep.
 - **Untrusted *content* on a multi-task pod** (checkout scratch dirs): per-task scratch under a
-  dedicated `emptyDir`, wiped in `finalize` and by a lazy-clean guard in `ensure_checkout`;
-  read-only-root elsewhere; the existing non-root/no-caps posture carries over.
+  dedicated `emptyDir`, wiped in `finalize` and by a lazy-clean guard in `ensure_checkout`; a
+  startup and periodic sweep prunes inactive scratch left by cancellation, timeout, or abrupt
+  termination without touching active workflows. Read-only-root elsewhere; the existing
+  non-root/no-caps posture carries over.
 - **The runner token becomes standing** instead of per-Job. Flagged as the honest security delta
   (it aligns with the standing-token surface [#243](https://github.com/vymalo/lightbridge-code-intelligence/issues/243)
   already tracks); mitigation is the same task-scoping the internal API already enforces per
@@ -314,11 +320,15 @@ Phase D proper (R2, the Restate runtime) does not start until:
   per-entry and total journal sizes within server limits with the offload rule applied,
   **replay-to-resume time in single-digit seconds**, measured under `kill -9` at turns 10/75/149 —
   and the `StepRuntime` seam demonstrated to compile and replay against the pinned SDK's `ctx.run`
-  closure lifetimes (boxed/erased step form allowed).
-- **G2 — local-state resume spike:** kill mid-run on one pod, resume lands on another replica;
-  `ensure_checkout` lazily restores the tree; a post-resume `read_file` returns byte-identical
-  content; the completed prefix is not re-executed (assert zero duplicate gateway calls via the
-  eaig ledger, [#281](https://github.com/vymalo/lightbridge-code-intelligence/issues/281)).
+  closure lifetimes (boxed/erased step form allowed). Two epochs of one task must offload the same
+  step name without collision, proving the key includes the full workflow identity/`run_epoch`.
+- **G2 — local-state resume + scratch-lifecycle spike:** kill mid-run on one pod, resume lands on
+  another replica; `ensure_checkout` reconstructs outside `ctx.run` without blocking the workflow
+  executor; a post-resume `read_file` returns byte-identical content; the completed prefix is not
+  re-executed (assert zero duplicate gateway calls via the eaig ledger,
+  [#281](https://github.com/vymalo/lightbridge-code-intelligence/issues/281)). Cancellation,
+  timeout, and abrupt-death cases must also demonstrate that startup/periodic cleanup reclaims
+  inactive scratch while preserving directories owned by active workflows.
 - **G3 — revision-drain rehearsal:** deploy a new `agent-worker` revision while a synthetic 2 h run
   is in flight; the old revision drains it to completion; the new revision takes new work.
 - **G4 — the `add_comment` dedup key** exists on the internal API (the one hard prerequisite in the

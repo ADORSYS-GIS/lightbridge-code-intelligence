@@ -127,10 +127,10 @@ ADR-0082's agent family this is the whole workspace (arrows = depends-on, downwa
 | `control-plane` (host) | `main.rs` role mux, `http/` (webhook, internal, admin, api), `review.rs` orchestration, `jwt.rs`, `config.rs`, metrics | `axum`, **`restate-sdk`** (serves the egress handler; ADR-0082's `agent-worker` is the other SDK host) |
 
 Rules carried over from ADR-0082 verbatim: crates are **born on edition 2024** (workspace bump is
-R1 step 0 there); the `xtask` dependency-hygiene check extends to the table above (`cratestack-pg`,
-`sqlx`, `kube`, `restate-sdk` each in exactly one manifest); domain crates never depend on each
-other sideways except through the arrows drawn (e.g. `queue` calls `egress` for the 👀 reaction, it
-does not reach into `platform` directly).
+R1a there); the `xtask` dependency-hygiene check governs allowed direct consumers (root workspace
+declarations do not count) and moves an allowlist entry in the same slice that moves its owner;
+domain crates never depend on each other sideways except through the arrows drawn (e.g. `queue`
+calls `egress` for the 👀 reaction, it does not reach into `platform` directly).
 
 `queue/reconciler.rs` splits along the seam it already has: the **drain** halves live in `egress`
 (they are the delivery path), the **feedback poll** in `platform` (it reads forge reactions).
@@ -280,8 +280,11 @@ Randomized testing is adopted — in the shape that survives CI:
     `StepName` format stability, push-cursor monotonicity.
 - **Coverage: `cargo-llvm-cov` in CI, gated with the ADR-0069 lesson applied** (honor-system
   gates get gamed — a flat workspace cliff invites assertion-free test theater):
-  - **New crates (the `lci-*` family): hard floor ≥ 85% line coverage from birth.** Born-with-tests
-    crates meet it cheaply, and the floor is per-crate so a big host binary can't dilute it.
+  - **New crates (the `lci-*` family): hard floor ≥ 85% line coverage from birth**, where "birth"
+    means the first non-skeleton production code. A manifest plus placeholder `lib.rs` is not a
+    coverage target. `lci-agent-types` gains `StepName` behavior in R1a and is gated there; each
+    other R1a skeleton becomes gated in the slice that first populates it. The floor is per-crate
+    so a big host binary cannot dilute it.
   - **Legacy crates: a ratchet, not a cliff** — coverage may never *decrease*; the recorded floor
     rises automatically as the P/R slices port tested code out. An immediate 85% on `db.rs` or
     `handler.rs` mid-drawdown would fail instantly and manufacture junk tests.
