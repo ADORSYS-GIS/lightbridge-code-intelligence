@@ -219,12 +219,15 @@ so it isn't re-litigated per PR). Everything adopted goes through `[workspace.de
 | `rustfmt.toml` | **Adopt (committed)** | Stable-channel options only: `edition` (2024 after R1a), `newline_style = "Unix"`, `use_field_init_shorthand`, `use_try_shorthand`. Nightly-only options (`imports_granularity`, `group_imports`, `wrap_comments`) deliberately excluded until fmt runs on nightly in CI — noted so nobody adds them and breaks stable contributors. |
 | `schemars` | **Adopt (agent crates)** | Derives the JSON schema for tool argument structs — `ToolSpec` schemas stop being hand-written strings; pairs with the `Tool` derive macro (§5). |
 | `insta` | **Adopt (dev-dep)** | Snapshot testing for the golden-transcript harness (`agent-testkit`) and the config compat tests — reviewable `.snap` diffs instead of hand-maintained fixtures. |
+| `proptest` | **Adopt (dev-dep)** | Property-based/randomized testing done right: generated inputs **with shrinking and persisted failure seeds**, so a random failure is reproducible in CI instead of flaky (raw `rand` in tests is declined for exactly that reason; `rand` latest is pinned as a workspace dep only where runtime code needs an RNG). See §6 for targets. |
+| `cargo-llvm-cov` | **Adopt (CI)** | Line/branch coverage in CI with the gate designed in §6 — hard floor for new crates, ratchet for legacy; generated code excluded. |
 | `ignore` | **Adopt (runner/worker)** | Gitignore-aware repo walking (ripgrep's walker) for changed-file discovery and future repo iteration — the mature answer to the niche walkers below. |
 | `mimalloc` | **Already in** | Workspace dep + `#[global_allocator]` in the service binaries (ADR-0080 musl rationale); the `agent-worker` bin adopts the same. |
 | `tokio` | **Already in** | Workspace dep. New crates inherit; no second runtime. |
 | `rayon` | **Targeted only** | For provably CPU-bound parallel work — realistically the indexer (tree-sitter parse/chunk). Bridged via `spawn_blocking`; **forbidden inside async handlers** (a rayon pool inside tokio workers is a latency footgun). Not a workspace default. |
 | `crossbeam` | **Declined (for now)** | No current need tokio channels + `std::sync` don't cover; `std` scoped threads are stable. Revisit only with a measured contention case. |
 | `fff` (`fff-search`) | **Targeted, future tool** | Verified healthy (9.6k★, v0.9.6 2026-06). An in-memory frecency/fuzzy/grep index built for AI agents in long-running processes — the natural engine for a future `find_files`/`grep_repo` **review tool** in the Phase-D `agent-worker` (a long-lived process amortizes the index; the one-shot Job cannot). Used as an in-process crate, not via its MCP server (knowledge-tools stay remote-HTTP-only, ADR-0066). A capability decision → its own slice, not a baseline dep. |
+| `monty` / `monty-pool` (pydantic) | **Targeted, future tool — experiment-gated** | Verified: a minimal, secure Python interpreter in Rust for AI-generated code (7.9k★, 0.0.18 2026-05, explicitly "experimental / not ready for prime time"). Default-closed fs/net/env with **external-function callbacks** + memory/stack/time limits — the callback surface maps 1:1 onto our mediated tools (ADR-0037), making it the natural engine for a future `run_python` **sandboxed-compute review tool**: the model verifies claims computationally (regex behavior, boundary arithmetic) and does Anthropic-style *programmatic tool calling* — one snippet orchestrating N mediated calls instead of N turns, a direct lever on deep-tier turn budgets (ADR-0070). Does **not** breach the never-execute-repo-code posture (ADR-0029/0082): it runs *model-authored* snippets in an interpreter we resource-cap, and in Phase D the execution is one journaled step. 0.0.x maturity = below even cratestack's bar → dogfood-flagged experiment first, own ADR when picked up; not a baseline dep. |
 | `dir-structure` | **Declined** | Neat idea (typed directory layouts), but 1 star and zero published releases — the infrastructure maturity bar isn't met (the same bar ADR-0005 applied to cratestack 0.4.x, and that one had strategic commitment behind it). `ignore` + plain `std::fs` cover the actual need. |
 | `fp-core.rs` | **Declined** | FP type-classes (Functor/Monad/HKT emulation) fight the borrow checker, wreck inference and compile errors, and create a dialect every contributor must learn; the crate is effectively unmaintained. `Option`/`Result`/`Iterator` + `?` already deliver the railway style; `itertools` as a dev-convenience covers most of the rest. Functional *discipline* yes — FP *framework* no. |
 
@@ -256,6 +259,37 @@ Identified candidates, mapped to the ladder:
 Anti-goals, stated once: no DSLs; no macro-generated *public* API a reader can't follow in
 rustdoc; `bon` over any hand-rolled builder macro; a macro that saves fewer lines than its own
 definition + tests costs is deleted in review.
+
+### 6. Test discipline: properties + a coverage gate that can't be gamed cheaply
+
+Randomized testing is adopted — in the shape that survives CI:
+
+- **`proptest`, not raw RNG.** Random inputs come with shrinking (a failure minimizes itself) and
+  **persisted regression seeds** (a failure replays deterministically forever after). A bare
+  `rand`-driven test that fails once and never again is worse than no test; that shape is
+  declined.
+- **What gets property-tested** — macro output and the naturally law-shaped code:
+  - **Macro-generated code is tested at runtime, not just at expansion**: `delegate_repo!` impls
+    hold parity with the raw-SQLx twin for *arbitrary* rows (this is the P-series parity suite,
+    upgraded from fixtures to properties); `bon`-built and `#[derive(ReviewTool)]`-parsed values
+    round-trip for arbitrary field combinations. `trybuild` + expansion snapshots (§5) cover the
+    compile-time half; properties cover the generated behavior.
+  - The law-shaped invariants the designs already state: the SSRF validator (arbitrary
+    IPs/hostnames never resolve into a blocked range — `a2a/ssrf.rs` is the highest-value target
+    in the codebase), `TurnPolicy`'s monotonic `Narrow` merge, `ToolRegistry` view filtering,
+    `StepName` format stability, push-cursor monotonicity.
+- **Coverage: `cargo-llvm-cov` in CI, gated with the ADR-0069 lesson applied** (honor-system
+  gates get gamed — a flat workspace cliff invites assertion-free test theater):
+  - **New crates (the `lci-*` family): hard floor ≥ 85% line coverage from birth.** Born-with-tests
+    crates meet it cheaply, and the floor is per-crate so a big host binary can't dilute it.
+  - **Legacy crates: a ratchet, not a cliff** — coverage may never *decrease*; the recorded floor
+    rises automatically as the P/R slices port tested code out. An immediate 85% on `db.rs` or
+    `handler.rs` mid-drawdown would fail instantly and manufacture junk tests.
+  - **Generated code is excluded** (the `cratestack_schema` module, macro expansions) via
+    ignore patterns — measuring generated lines inflates the number without information.
+  - Stated plainly in the gate's doc: coverage counts *execution*, not *assertions* — the
+    antidotes are review plus the property tests above (which earn their coverage honestly);
+    `cargo-mutants` spot-checks are the escalation if theater appears.
 
 ## Sequencing (P-series; interleaves with ADR-0082's R-series, independent of Restate gates)
 
