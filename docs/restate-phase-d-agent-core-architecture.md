@@ -454,6 +454,37 @@ It drives **today's loop** and **the extracted loop** through the same scripts a
 comparison seam to assert their canonical observations are byte-identical. These goldens are the R18
 mitigation and stay as regression tests after R1e deletes the old loop.
 
+### 7.1 R1d/R1e boundary, as implemented
+
+Extracting the loop showed the clean "R1d dual-drives all six goldens byte-identically" framing above
+is not mechanically achievable in R1d alone: `agent-loop` must not depend on `agent-clients` (§1 DAG),
+so the review-flavored policies and the real `ChatClient` that reproduce `fast_tier_refusal` /
+`coverage_bounce` — and the `chat_requests` / `control_plane_writes` streams — cannot live in the
+generic engine. The split landed as:
+
+- **R1d** builds the generic engine (`AgentLoop`), the three *generic* policies
+  (`WindDown` / `ReadBudgets` / `TurnBudget`; the `ContextWindowTrim` arithmetic lives in the engine
+  preamble because the trimmed-count and the message mutation are the engine's, not a policy's), the
+  `StepRuntime` / `ModelClient` / `TranscriptSink` seams, and `agent-testkit`'s `ScriptedModel` /
+  `CapturingSink` / `FailingRuntime`. Its merge bar is a **decision-trace parity** check: driven
+  through the same scripts, the extracted engine reproduces a golden's *generic projection* — the
+  generic policy-event sequence (`wind_down` / `context_trim` / `read_file_budget` /
+  `retrieval_budget` / `halfway`), the call sequence, and the outcome. `wind_down_entry` and
+  `exhausted_backstop` are pinned to their fixtures this way.
+- **R1e** adds the review assembly — `review-agent::model::ChatClient` (a real `ModelClient`), the
+  review-flavored policies (`FastTierGuard` / `CoverageGate` / `ScratchpadLoopGuard`), the prompt
+  builder, `flows::run_review` — and only then can the **full six-fixture, byte-identical** parity run
+  (chat_requests + control_plane_writes + the review events `finding_finish_nudge` / `coverage_bounce`
+  / `coverage_disclosure` / `fast_refusal` / `exhausted`). R1e also cuts `agent-runner` over and
+  deletes the old modules.
+
+One reconciliation is queued for R1e: the extracted `TurnView::dispatch` refuses a call to a
+non-offered tool in **every** tier (§3.3), whereas the pre-extraction deep tier dispatched any tool by
+name (only the fast tier refused). The `context_trim_trigger` fixture exercises exactly this — a
+non-offered `read_file` dispatched during a turn-0 wind-down — so R1e must either preserve the deep
+tier's non-enforcement or regenerate that fixture under the uniform rule. That is a deliberate call to
+make with the review policies in hand, not silently inside the engine.
+
 ## 8. Open questions (tracked, not blocking acceptance)
 
 1. **`awaitable` shape** — resolved-from-outside promises need an id the internal API can route;

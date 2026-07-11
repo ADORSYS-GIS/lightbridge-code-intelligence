@@ -202,6 +202,17 @@ impl ToolRegistry {
         Ok(())
     }
 
+    /// The registered kind of a tool by name, across the full surface (not just one turn's offered
+    /// set). The loop tallies per-category read budgets over *every* call the model made — including
+    /// calls to tools narrowed out this turn — so it needs the registry-wide answer, not the view's.
+    #[must_use]
+    pub fn kind_of(&self, name: &str) -> Option<ToolKind> {
+        self.tools
+            .iter()
+            .find(|tool| tool.spec().name() == name)
+            .map(|tool| tool.kind())
+    }
+
     #[must_use]
     pub fn view(&self, filter: &TurnFilter) -> TurnView<'_> {
         let offered: Vec<&dyn Tool> = self
@@ -235,6 +246,17 @@ impl TurnView<'_> {
     #[must_use]
     pub fn specs(&self) -> &[ToolSpec] {
         &self.specs
+    }
+
+    /// The kind of an *offered* tool by name (`None` if it was not offered this turn). Lets the loop
+    /// decide which of the model's calls join the concurrent read-only batch without re-consulting
+    /// the registry, and mirrors the guard `dispatch` applies (a non-offered call is refused).
+    #[must_use]
+    pub fn kind_of(&self, name: &str) -> Option<ToolKind> {
+        self.offered
+            .iter()
+            .find(|tool| tool.spec().name() == name)
+            .map(|tool| tool.kind())
     }
 
     pub async fn dispatch(&self, cx: &ToolCx<'_>, call: &ToolCallReq) -> DispatchResult {

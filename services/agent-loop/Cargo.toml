@@ -11,6 +11,13 @@ publish = false
 path = "src/lib.rs"
 
 [dependencies]
+futures.workspace = true
 lci-agent-step = { path = "../agent-step" }
 lci-agent-tools = { path = "../agent-tools" }
 lci-agent-types = { path = "../agent-types" }
+serde_json.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+uuid.workspace = true
