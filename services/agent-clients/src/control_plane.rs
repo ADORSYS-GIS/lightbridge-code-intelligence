@@ -213,7 +213,7 @@ pub struct DiscoveredTool {
 }
 
 /// Result of a knowledge-tool call (ADR-0066). Plain text, already size-capped control-plane-side —
-/// untrusted content, framed as such before it reaches the model (see `review::native::tools`).
+/// untrusted content, framed as such before it reaches the model (see `lci_review_agent::tools::mcp`).
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct KnowledgeToolResult {
     pub text: String,
