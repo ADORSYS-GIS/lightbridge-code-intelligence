@@ -29,7 +29,7 @@ use super::chat::{ChatClient, ChatMessage, ChatParams, RetryPolicy, ToolDef};
 use super::tools::{
     ABORT, ADD_COMMENT, ADD_REVIEW_COMMENT, EMPTY_RETRIEVAL_RESULT, FINISH, GRAPH_FIND_SYMBOL,
     GRAPH_GET_CALLERS, READ_FILE, RETRACT_FINDING, ToolOutcome, Tools, VECTOR_SEMANTIC_SEARCH,
-    tool_defs,
+    fast_refusal, tool_defs,
 };
 use crate::bootstrap::config::{McpToolPattern, ReviewConfig, ReviewToolSelector};
 use crate::clone::PrDiff;
@@ -47,6 +47,29 @@ pub enum ReviewOutcome {
     Finished,
     Exhausted,
     Aborted(String),
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum LegacyEvent {
+    Tool {
+        turn: usize,
+        call: super::chat::ToolCall,
+        outcome: ToolOutcome,
+    },
+    Policy {
+        turn: usize,
+        name: &'static str,
+        detail: serde_json::Value,
+    },
+}
+
+#[cfg(test)]
+fn observe(observer: &mut Option<&mut dyn FnMut(LegacyEvent)>, event: LegacyEvent) {
+    if let Some(observer) = observer.as_deref_mut() {
+        observer(event);
+    }
 }
 
 /// The machine **tool-protocol** appended after the operator's system prompt (ADR-0037). This is the
@@ -259,6 +282,42 @@ pub async fn run_native_agent(
     command: &str,
     diff: Option<&PrDiff>,
     repo_instructions: Option<&str>,
+    prior_reviews: Option<&str>,
+    repo_memory: Option<&str>,
+    sast_digest: Option<&str>,
+    attribution: &[(String, String)],
+    client: &ControlPlaneClient,
+    embedder: &EmbeddingsClient,
+    task_id: Uuid,
+    checkout_root: &Path,
+    transcript: &mut Vec<TranscriptEntry>,
+) -> anyhow::Result<ReviewOutcome> {
+    run_native_agent_inner(
+        review,
+        command,
+        diff,
+        repo_instructions,
+        prior_reviews,
+        repo_memory,
+        sast_digest,
+        attribution,
+        client,
+        embedder,
+        task_id,
+        checkout_root,
+        transcript,
+        #[cfg(test)]
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_native_agent_inner(
+    review: &ReviewConfig,
+    command: &str,
+    diff: Option<&PrDiff>,
+    repo_instructions: Option<&str>,
     // The agent's own prior review of this target (A, #137), pre-formatted by the control plane. `Some`
     // only on a re-review with an earlier review; injected so the run reconciles with its past output
     // instead of contradicting itself across runs.
@@ -279,6 +338,7 @@ pub async fn run_native_agent(
     // Accumulates the run transcript (ADR-0034) as the loop progresses. The caller owns it and submits
     // it afterwards (even on error), so a failed run's reasoning is still captured.
     transcript: &mut Vec<TranscriptEntry>,
+    #[cfg(test)] mut observer: Option<&mut dyn FnMut(LegacyEvent)>,
 ) -> anyhow::Result<ReviewOutcome> {
     // Streaming (ADR-0039 / #206): opt-in via `review.stream` (config; else the legacy `LLM_STREAM`
     // env, resolved in bootstrap). Collects the SSE response under a per-chunk idle timeout instead of
@@ -315,12 +375,6 @@ pub async fn run_native_agent(
         "review agent starting"
     );
 
-    let tools = Tools {
-        client,
-        embedder,
-        task_id,
-        checkout_root,
-    };
     // Without a diff (an issue target, or `git diff` was unavailable) an inline finding has no line to
     // anchor to — finalize would only bucket it. Don't offer `add_review_comment` then, so the model
     // replies via `add_comment` instead of hallucinating inline comments that go nowhere.
@@ -364,8 +418,9 @@ pub async fn run_native_agent(
         None => true,                 // allowlist unset → full surface
         Some(sel) => !sel.is_empty(), // set → only if it names ≥1 mcp selector
     };
+    let mut dispatch_discovered = Vec::new();
     if discover {
-        match tools.client.list_knowledge_tools(task_id).await {
+        match client.list_knowledge_tools(task_id).await {
             Ok(discovered) => {
                 let matched: Vec<_> = discovered
                     .into_iter()
@@ -376,11 +431,12 @@ pub async fn run_native_agent(
                     .collect();
                 if !matched.is_empty() {
                     tracing::info!(task_id = %task_id, count = matched.len(), "offering discovered external-knowledge tools");
-                    defs.extend(
-                        matched
-                            .into_iter()
-                            .map(|t| ToolDef::function(t.name, t.description, t.input_schema)),
-                    );
+                    let specs: Vec<_> = matched
+                        .into_iter()
+                        .map(|t| ToolDef::function(t.name, t.description, t.input_schema))
+                        .collect();
+                    dispatch_discovered.extend(specs.iter().cloned());
+                    defs.extend(specs);
                 }
             }
             Err(error) => {
@@ -388,6 +444,14 @@ pub async fn run_native_agent(
             }
         }
     }
+    let tools = Tools::new(
+        client,
+        embedder,
+        task_id,
+        checkout_root,
+        dispatch_discovered,
+    )
+    .context("assembling review tool registry")?;
     // Reduced tool set for the wind-down tail (#137): write/finish/abort only, retrieval/read_file
     // dropped so the model can no longer keep investigating once the budget is nearly spent. Derived
     // from the (possibly allowlist-restricted) `defs`, NOT the global surface, so a per-tier
@@ -571,6 +635,15 @@ pub async fn run_native_agent(
             if est > target {
                 let trimmed = trim_tool_history(&mut messages, &defs, target);
                 if trimmed > 0 {
+                    #[cfg(test)]
+                    observe(
+                        &mut observer,
+                        LegacyEvent::Policy {
+                            turn,
+                            name: "context_trim",
+                            detail: serde_json::json!({"trimmed": trimmed}),
+                        },
+                    );
                     est = estimate_tokens(&messages, &defs);
                     tracing::warn!(
                         task_id = %task_id, turn, trimmed, est_tokens = est, window,
@@ -660,6 +733,15 @@ pub async fn run_native_agent(
             } else {
                 format!("Turn budget almost spent (turn {turn}/{max_turns})")
             };
+            #[cfg(test)]
+            observe(
+                &mut observer,
+                LegacyEvent::Policy {
+                    turn,
+                    name: "wind_down",
+                    detail: serde_json::json!({"reason": why}),
+                },
+            );
             messages.push(ChatMessage::user(format!(
                 "⏳ {why}. Stop investigating — record any remaining findings now with \
                  add_review_comment/add_comment, then call `finish` with your overall verdict. (The \
@@ -669,6 +751,15 @@ pub async fn run_native_agent(
             // One-time notice when a single read budget is exhausted (the tool is already dropped above).
             if files_spent && !files_budget_announced {
                 files_budget_announced = true;
+                #[cfg(test)]
+                observe(
+                    &mut observer,
+                    LegacyEvent::Policy {
+                        turn,
+                        name: "read_file_budget",
+                        detail: serde_json::json!({"files_read": files_read}),
+                    },
+                );
                 messages.push(ChatMessage::user(format!(
                     "📄 You've read {files_read} files (the read_file budget). Stop opening files — work \
                      from what you have, record findings, and head toward `finish`."
@@ -676,6 +767,15 @@ pub async fn run_native_agent(
             }
             if searches_spent && !searches_budget_announced {
                 searches_budget_announced = true;
+                #[cfg(test)]
+                observe(
+                    &mut observer,
+                    LegacyEvent::Policy {
+                        turn,
+                        name: "retrieval_budget",
+                        detail: serde_json::json!({"searches": searches}),
+                    },
+                );
                 messages.push(ChatMessage::user(format!(
                     "🔎 You've run {searches} searches (the retrieval budget). Stop searching — record \
                      findings from what you've found and head toward `finish`."
@@ -687,6 +787,15 @@ pub async fn run_native_agent(
                 // `winddown <= halfway`: once we've announced wind-down ("finalize now"), we must NOT then
                 // push the softer "you're past halfway" message — that would be a conflicting instruction.
                 halfway_nudged = true;
+                #[cfg(test)]
+                observe(
+                    &mut observer,
+                    LegacyEvent::Policy {
+                        turn,
+                        name: "halfway",
+                        detail: serde_json::json!({}),
+                    },
+                );
                 messages.push(ChatMessage::user(
                     "You're past halfway on your turn budget — start converging: record what you've \
                      found and head toward `finish`.",
@@ -928,16 +1037,31 @@ pub async fn run_native_agent(
                 // which the shared prompt still mentions). Refuse with a steer instead of dispatching —
                 // the fast pass reviews the diff (+ SAST digest) directly and finishes.
                 tracing::info!(task_id = %task_id, turn, tool, "fast tier: refusing non-offered tool call");
-                ToolOutcome::Continue(format!(
-                    "`{tool}` is not available in this fast review pass — review the diff directly, \
-                     record any findings with add_review_comment, then call finish."
-                ))
+                #[cfg(test)]
+                observe(
+                    &mut observer,
+                    LegacyEvent::Policy {
+                        turn,
+                        name: "fast_refusal",
+                        detail: serde_json::json!({"tool": tool}),
+                    },
+                );
+                ToolOutcome::Continue(fast_refusal(tool))
             } else {
                 match batched.remove(&i) {
                     Some(o) => o,
                     None => tools.dispatch(call).await,
                 }
             };
+            #[cfg(test)]
+            observe(
+                &mut observer,
+                LegacyEvent::Tool {
+                    turn,
+                    call: call.clone(),
+                    outcome: outcome.clone(),
+                },
+            );
             match outcome {
                 ToolOutcome::Finish => {
                     should_finish = true;
@@ -1014,6 +1138,15 @@ pub async fn run_native_agent(
         if same_loc_repeats >= 2 {
             same_loc_repeats = 0;
             suppress_record = true;
+            #[cfg(test)]
+            observe(
+                &mut observer,
+                LegacyEvent::Policy {
+                    turn,
+                    name: "scratchpad_guard",
+                    detail: serde_json::json!({}),
+                },
+            );
             tracing::warn!(
                 task_id = %task_id,
                 turn,
@@ -1053,6 +1186,15 @@ pub async fn run_native_agent(
                     let stalled =
                         coverage_bounces > 0 && engaged_files.len() == engaged_at_last_bounce;
                     coverage_bounces += 1;
+                    #[cfg(test)]
+                    observe(
+                        &mut observer,
+                        LegacyEvent::Policy {
+                            turn,
+                            name: "coverage_bounce",
+                            detail: serde_json::json!({"bounce": coverage_bounces, "uncovered": uncovered, "stalled": stalled}),
+                        },
+                    );
                     engaged_at_last_bounce = engaged_files.len();
                     tracing::info!(
                         task_id = %task_id,
@@ -1076,6 +1218,15 @@ pub async fn run_native_agent(
             // deterministic and the lone LLM turn is a light pass; deep `@mention` runs the refute pass.
             if !review.fast && !refute_bounced && p0p1_recorded > 0 {
                 refute_bounced = true;
+                #[cfg(test)]
+                observe(
+                    &mut observer,
+                    LegacyEvent::Policy {
+                        turn,
+                        name: "refute",
+                        detail: serde_json::json!({"p0p1": p0p1_recorded}),
+                    },
+                );
                 tracing::info!(
                     task_id = %task_id,
                     turn,
@@ -1099,7 +1250,7 @@ pub async fn run_native_agent(
             // engagement is not a meaningful coverage signal there. Best-effort: a failed re-post
             // keeps the model's own summary rather than failing a finished run.
             if !review.fast {
-                amend_summary_with_coverage(
+                let _disclosed = amend_summary_with_coverage(
                     client,
                     task_id,
                     finish_summary.as_deref(),
@@ -1107,6 +1258,17 @@ pub async fn run_native_agent(
                     &engaged_files,
                 )
                 .await;
+                #[cfg(test)]
+                if _disclosed {
+                    observe(
+                        &mut observer,
+                        LegacyEvent::Policy {
+                            turn,
+                            name: "coverage_disclosure",
+                            detail: serde_json::json!({}),
+                        },
+                    );
+                }
             }
             return Ok(ReviewOutcome::Finished);
         }
@@ -1117,6 +1279,15 @@ pub async fn run_native_agent(
         // "investigation" wording — fast has no investigation tools (gemini review on #235).
         if findings_recorded > 0 && !nudged_to_finish {
             nudged_to_finish = true;
+            #[cfg(test)]
+            observe(
+                &mut observer,
+                LegacyEvent::Policy {
+                    turn,
+                    name: "finding_finish_nudge",
+                    detail: serde_json::json!({"findings": findings_recorded}),
+                },
+            );
             let nudge = if review.fast {
                 "You've recorded a finding. Record any others on changed lines with add_review_comment, \
                  then call `finish` with your overall verdict to post the review."
@@ -1146,10 +1317,19 @@ pub async fn run_native_agent(
             "review agent hit its turn budget without calling finish — finalizing buffered findings"
         );
     }
+    #[cfg(test)]
+    observe(
+        &mut observer,
+        LegacyEvent::Policy {
+            turn: max_turns,
+            name: "exhausted",
+            detail: serde_json::json!({"context_overflow": overflow_finalize, "findings": findings_recorded}),
+        },
+    );
     // A bounced `finish` already posted its summary before the gate rejected it — if the budget then
     // ran out, that summary is what finalize posts, so it gets the same coverage disclosure.
     if !review.fast && finish_summary.is_some() {
-        amend_summary_with_coverage(
+        let _disclosed = amend_summary_with_coverage(
             client,
             task_id,
             finish_summary.as_deref(),
@@ -1157,6 +1337,17 @@ pub async fn run_native_agent(
             &engaged_files,
         )
         .await;
+        #[cfg(test)]
+        if _disclosed {
+            observe(
+                &mut observer,
+                LegacyEvent::Policy {
+                    turn: max_turns,
+                    name: "coverage_disclosure",
+                    detail: serde_json::json!({}),
+                },
+            );
+        }
     }
     Ok(ReviewOutcome::Exhausted)
 }
@@ -1505,14 +1696,14 @@ async fn amend_summary_with_coverage(
     summary: Option<&str>,
     changed_files: &HashSet<String>,
     engaged_files: &HashSet<String>,
-) {
-    let Some(summary) = summary else { return };
+) -> bool {
+    let Some(summary) = summary else { return false };
     let mut uncovered: Vec<&str> = changed_files
         .difference(engaged_files)
         .map(String::as_str)
         .collect();
     if uncovered.is_empty() {
-        return;
+        return false;
     }
     uncovered.sort_unstable();
     let engaged = changed_files.len() - uncovered.len();
@@ -1529,6 +1720,7 @@ async fn amend_summary_with_coverage(
     if let Err(error) = client.set_review_summary(task_id, &amended).await {
         tracing::warn!(task_id = %task_id, %error, "coverage disclosure: amending the summary failed");
     }
+    true
 }
 
 /// A turn-level chat failure after retries, carrying whether the
@@ -3876,5 +4068,255 @@ mod tests {
             inline >= 1,
             "the finding recorded before wandering was buffered, not discarded at exhaustion"
         );
+    }
+
+    fn golden_reply(
+        id: &str,
+        name: &str,
+        arguments: &str,
+        extra: Option<serde_json::Value>,
+    ) -> serde_json::Value {
+        let mut call =
+            json!({"id":id,"type":"function","function":{"name":name,"arguments":arguments}});
+        if let Some(extra) = extra {
+            call["extra_content"] = extra;
+        }
+        json!({"choices":[{"finish_reason":"tool_calls","message":{"role":"assistant","tool_calls":[call]}}]})
+    }
+
+    async fn mount_golden_control_plane(server: &MockServer) {
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/internal/tasks/{}/knowledge/tools",
+                Uuid::nil()
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .mount(server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(format!(
+                "/internal/tasks/{}/review/telemetry",
+                Uuid::nil()
+            )))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(server)
+            .await;
+        for endpoint in ["inline", "reply", "summary", "retract"] {
+            Mock::given(method("POST"))
+                .and(path(format!(
+                    "/internal/tasks/{}/review/{endpoint}",
+                    Uuid::nil()
+                )))
+                .respond_with(ResponseTemplate::new(204))
+                .mount(server)
+                .await;
+        }
+    }
+
+    async fn capture_actual_legacy_trace(
+        scenario: lci_agent_testkit::GoldenScenario,
+    ) -> lci_agent_testkit::LegacyTrace {
+        use lci_agent_testkit::{LegacyTrace, ObservedCall, ObservedWrite};
+
+        let chat = MockServer::start().await;
+        let cp = MockServer::start().await;
+        mount_golden_control_plane(&cp).await;
+        let checkout = tempfile::tempdir().unwrap();
+        tokio::fs::write(checkout.path().join("a.rs"), "one\ntwo\nthree\n")
+            .await
+            .unwrap();
+        tokio::fs::write(checkout.path().join("big.txt"), "x".repeat(32 * 1024))
+            .await
+            .unwrap();
+
+        let diff_a = PrDiff {
+            diff: "@@ -1,1 +1,2 @@\n one\n+two\n".into(),
+            files: vec!["a.rs".into()],
+        };
+        let (responses, diff): (Vec<_>, Option<&PrDiff>) = match scenario {
+            lci_agent_testkit::GoldenScenario::PlainConvergeFinish => (
+                vec![
+                    golden_reply(
+                        "plain-record",
+                        ADD_REVIEW_COMMENT,
+                        r#"{"file":"a.rs","line":2,"title":"Issue","priority":"P2","category":"quality","body":"body","evidence":"line 2"}"#,
+                        Some(json!({"provider":{"signature":"opaque"}})),
+                    ),
+                    golden_reply("plain-finish", FINISH, r#"{"summary":"one finding"}"#, None),
+                ],
+                Some(&diff_a),
+            ),
+            lci_agent_testkit::GoldenScenario::WindDownEntry => (
+                vec![
+                    golden_reply(
+                        "wind-progress",
+                        super::super::tools::REPORT_PROGRESS,
+                        r#"{"note":"working"}"#,
+                        None,
+                    ),
+                    golden_reply("wind-finish", FINISH, r#"{"summary":"done"}"#, None),
+                ],
+                None,
+            ),
+            lci_agent_testkit::GoldenScenario::ContextTrimTrigger => (
+                vec![
+                    golden_reply("trim-read", READ_FILE, r#"{"path":"big.txt"}"#, None),
+                    golden_reply(
+                        "trim-progress",
+                        super::super::tools::REPORT_PROGRESS,
+                        r#"{"note":"working"}"#,
+                        None,
+                    ),
+                    golden_reply("trim-finish", FINISH, r#"{"summary":"done"}"#, None),
+                ],
+                Some(&diff_a),
+            ),
+            lci_agent_testkit::GoldenScenario::FastTierRefusal => (
+                vec![golden_reply(
+                    "fast-illegal",
+                    READ_FILE,
+                    r#"{"path":"a.rs"}"#,
+                    None,
+                )],
+                Some(&diff_a),
+            ),
+            lci_agent_testkit::GoldenScenario::CoverageBounce => (
+                vec![
+                    golden_reply("coverage-finish-1", FINISH, r#"{"summary":"early"}"#, None),
+                    golden_reply("coverage-read", READ_FILE, r#"{"path":"a.rs"}"#, None),
+                    golden_reply("coverage-finish-2", FINISH, r#"{"summary":"done"}"#, None),
+                ],
+                Some(&diff_a),
+            ),
+            lci_agent_testkit::GoldenScenario::ExhaustedBackstop => {
+                (vec![text_reply("still thinking")], None)
+            }
+        };
+        mount_chat(&chat, responses).await;
+        let mut config = review_config(format!("{}/v1", chat.uri()));
+        match scenario {
+            lci_agent_testkit::GoldenScenario::PlainConvergeFinish => config.max_turns = 5,
+            lci_agent_testkit::GoldenScenario::WindDownEntry
+            | lci_agent_testkit::GoldenScenario::ExhaustedBackstop => config.max_turns = 2,
+            lci_agent_testkit::GoldenScenario::ContextTrimTrigger => {
+                config.max_turns = 5;
+                config.context_window = Some(2_000);
+            }
+            lci_agent_testkit::GoldenScenario::FastTierRefusal => {
+                config.fast = true;
+                config.max_turns = 1;
+            }
+            lci_agent_testkit::GoldenScenario::CoverageBounce => {
+                config.max_turns = 5;
+                config.max_coverage_bounces = 1;
+            }
+        }
+        let client = ControlPlaneClient::new(cp.uri(), "tok");
+        let embedder = EmbeddingsClient::new("http://unused", "key", "model");
+        let mut transcript = Vec::new();
+        let mut calls = Vec::new();
+        let mut policy_events = Vec::new();
+        let mut observer = |event: LegacyEvent| match event {
+            LegacyEvent::Tool {
+                turn,
+                call,
+                outcome,
+            } => calls.push(ObservedCall {
+                turn,
+                call,
+                outcome,
+            }),
+            event @ LegacyEvent::Policy { .. } => {
+                policy_events.push(serde_json::to_value(event).unwrap())
+            }
+        };
+        let outcome = run_native_agent_inner(
+            &config,
+            "review",
+            diff,
+            None,
+            None,
+            None,
+            None,
+            &[],
+            &client,
+            &embedder,
+            Uuid::nil(),
+            checkout.path(),
+            &mut transcript,
+            Some(&mut observer),
+        )
+        .await
+        .unwrap();
+
+        let chat_requests = chat
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|request| serde_json::from_slice(&request.body).unwrap())
+            .collect();
+        let control_plane_writes = cp
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter_map(|request| {
+                let endpoint = request.url.path().to_string();
+                (request.method.as_str() == "POST"
+                    && endpoint.contains("/review/")
+                    && !endpoint.ends_with("/telemetry"))
+                .then(|| ObservedWrite {
+                    endpoint,
+                    body: serde_json::from_slice(&request.body).unwrap_or(serde_json::Value::Null),
+                })
+            })
+            .collect();
+        let outcome = match outcome {
+            ReviewOutcome::Finished => json!({"status":"finished"}),
+            ReviewOutcome::Exhausted => json!({"status":"exhausted"}),
+            ReviewOutcome::Aborted(reason) => json!({"status":"aborted","reason":reason}),
+        };
+        LegacyTrace {
+            scenario,
+            chat_requests,
+            calls,
+            policy_events,
+            control_plane_writes,
+            outcome,
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_run_native_agent_matches_all_six_frozen_traces() {
+        for scenario in lci_agent_testkit::GoldenScenario::ALL {
+            let actual = capture_actual_legacy_trace(scenario).await;
+            if scenario == lci_agent_testkit::GoldenScenario::FastTierRefusal {
+                assert_eq!(
+                    actual.calls[0].outcome,
+                    ToolOutcome::Continue(fast_refusal(READ_FILE))
+                );
+            }
+            if scenario == lci_agent_testkit::GoldenScenario::PlainConvergeFinish {
+                assert_eq!(
+                    actual.chat_requests[1]["messages"][2]["tool_calls"][0]["extra_content"]["provider"]
+                        ["signature"],
+                    "opaque"
+                );
+                assert_eq!(
+                    actual.chat_requests[1]["messages"][3]["tool_call_id"],
+                    "plain-record"
+                );
+            }
+            if std::env::var_os("LCI_PRINT_GOLDENS").is_some() {
+                println!(
+                    "GOLDEN:{scenario:?}\n{}\nEND_GOLDEN",
+                    String::from_utf8(lci_agent_testkit::GoldenHarness::canonical_bytes(&actual))
+                        .unwrap()
+                );
+            } else {
+                lci_agent_testkit::GoldenHarness::assert_fixture(scenario, &actual);
+            }
+        }
     }
 }

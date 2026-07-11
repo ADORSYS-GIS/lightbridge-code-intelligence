@@ -187,7 +187,7 @@ pub trait Tool: Send + Sync {
     fn spec(&self) -> &ToolSpec;          // name, description, JSON schema — today's ToolDef
     fn kind(&self) -> ToolKind;
     fn replay(&self) -> ReplaySafety;
-    fn call<'a>(&'a self, cx: &'a ToolCx<'a>, args: &'a str) -> BoxFuture<'a, ToolOutcome>;
+    fn call<'a>(&'a self, cx: &'a ToolCx<'a>, call: &'a ToolCallReq) -> BoxFuture<'a, ToolOutcome>;
 }
 
 pub enum ToolKind {
@@ -217,7 +217,8 @@ pub struct ToolRegistry { tools: Vec<Arc<dyn Tool>> }
 
 impl ToolRegistry {
     /// Registration asserts the runtime can honor the tool's replay contract:
-    /// a NeedsDedupKey tool on a host without per-call dedup is a *startup* error, not a runtime double-post.
+    /// a NeedsDedupKey tool on a replaying host without per-call dedup is a *startup* error, not a
+    /// runtime double-post. Passthrough never replays completed effects, so it needs no key.
     pub fn register(&mut self, t: Arc<dyn Tool>, caps: RuntimeCaps) -> Result<(), RegistryError>;
     /// The turn's offered set: allowlist ∩ kind-filters ∩ budget-drops, in policy order.
     pub fn view(&self, filter: &TurnFilter) -> TurnView<'_>;
@@ -228,9 +229,13 @@ impl TurnView<'_> {
     pub fn specs(&self) -> &[ToolSpec];
     /// Dispatch one call; a call to a non-offered tool returns the refusal steer
     /// (today's fast-tier refusal synthesis) instead of executing.
-    pub async fn dispatch(&self, cx: &ToolCx<'_>, call: &ToolCallReq) -> ToolOutcome;
+    pub async fn dispatch(&self, cx: &ToolCx<'_>, call: &ToolCallReq) -> DispatchResult;
 }
 ```
+
+`DispatchResult` is `Completed(ToolOutcome)` or a typed `Refused(NotOffered | MissingCallId)`.
+The generic crate does not invent model-facing prose; `review-agent` renders the exact review steer.
+`NeedsDedupKey` consumes the actual non-empty `ToolCallReq.id` — no synthesized fallback id exists.
 
 ### 3.4 `Workspace` — dyn, the `ensure_checkout` guard as a type
 
@@ -238,23 +243,27 @@ impl TurnView<'_> {
 // agent-tools
 pub trait Workspace: Send + Sync {
     /// The checkout root, materializing it if this pod has never had it (or lost it).
-    async fn root(&self) -> Result<&Path, StepError>;
+    fn root(&self) -> BoxFuture<'_, Result<&Path, WorkspaceError>>;
 }
 // impls: EagerWorkspace (agent-runner: cloned at bootstrap, today's behavior)
 //        LazyWorkspace  (agent-worker: clone-if-missing at the journaled head_sha — ADR-0082 §local state)
 ```
 
 Small and dyn (`Arc<dyn Workspace>` inside `ToolCx`): two impls coexist and tools must not know
-which they got. `ToolCx` carries what today's `Tools` struct carries, re-typed:
+which they got. Native `async fn` in a trait is not dyn-compatible, so this deliberately uses the
+same boxed-future boundary as `Tool`. `WorkspaceError` stays local to `agent-tools` in R1c; mapping
+it into the loop's `StepError` belongs to R1d.
 
 ```rust
 pub struct ToolCx<'a> {
     pub task_id: Uuid,
-    pub cp: &'a ControlPlaneClient,      // agent-clients
-    pub embedder: &'a EmbeddingsClient,  // agent-clients
     pub workspace: &'a dyn Workspace,
 }
 ```
+
+`ToolCx` cannot carry `ControlPlaneClient` or `EmbeddingsClient`: `agent-tools` and `agent-clients`
+are parallel crates in the accepted DAG. Concrete `review-agent` tools own shared client handles;
+the generic context carries only cross-agent data.
 
 ### 3.5 `ModelClient` — static (one impl per assembly), AFIT
 
@@ -369,8 +378,10 @@ step's journaled value is the ordered vector of `(call_id, outcome)` so replay r
 
 ```rust
 // agent-runner (Job host) — R1, behavior-identical to today
-let cx      = ToolCx { task_id, cp: &cp_client, embedder: &embedder, workspace: &EagerWorkspace::cloned(&checkout) };
-let tools   = review_agent::tools::registry(RuntimeCaps::passthrough())?;   // full built-in set + MCP discovery
+let cx      = ToolCx { task_id, workspace: &EagerWorkspace::cloned(&checkout) };
+let tools   = review_agent::tools::tool_registry(
+    cp_client, embedder, discovered_tools, RuntimeCaps::default()
+)?;                                                                        // full built-in set + MCP discovery
 let polys   = review_agent::policies::for_tier(&cfg);                       // table in §3.6
 let mut loop_ = AgentLoop::new(Passthrough, ChatClient::from(&cfg), tools, polys, JobSink::new());
 let outcome = review_agent::flows::run_review(&Passthrough, &mut loop_, &cx, inputs).await?;
@@ -381,7 +392,7 @@ let outcome = review_agent::flows::run_review(&Passthrough, &mut loop_, &cx, inp
 impl ReviewAgent for ReviewAgentImpl {
     async fn run(&self, ctx: WorkflowContext<'_>, task: TaskRef) -> Result<(), HandlerError> {
         let rt   = RestateRuntime::new(&ctx);                       // the ONLY line that knows Restate
-        let cx   = ToolCx { workspace: &LazyWorkspace::at(journaled.head_sha), ..same };
+        let cx   = ToolCx { task_id, workspace: &LazyWorkspace::at(journaled.head_sha) };
         let mut loop_ = AgentLoop::new(rt, ChatClient::from(&journaled.config), same_tools, same_policies, IncrementalSink::new());
         review_agent::flows::run_review(&rt, &mut loop_, &cx, journaled.inputs).await?
     }
@@ -431,13 +442,17 @@ above are introduced only in the first consuming slice or a separate follow-on P
 
 ## 7. Golden-transcript harness (the R1 merge bar, mechanically)
 
-`agent-testkit` provides `ScriptedModel` (a `ModelClient` returning a recorded sequence of
-assistant turns) and `StaticTool`s with canned outputs. A golden test drives **today's loop** and
-**the extracted loop** with the same script and asserts the *full transcript* — message sequence,
-offered-tool sets per turn, policy events, final outcome — is byte-identical. Fixtures cover: a
-plain converge-and-finish run, a wind-down entry, a context-trim trigger, a fast-tier refusal, a
-coverage bounce, and the exhausted backstop. These goldens are the R18 mitigation and stay as
-regression tests after R1e deletes the old loop.
+R1c provides `StaticTool`, a deterministic legacy-loop observer, and six scrubbed baseline fixtures:
+a plain converge-and-finish run, a wind-down entry, a context-trim trigger, a fast-tier refusal, a
+coverage bounce, and the exhausted backstop. Each observation includes messages, ordered offered
+specs, calls/results, derived policy events, mediated control-plane writes, and the final outcome.
+The current loop hard-constructs its HTTP/model/tool dependencies, so pretending to dual-run an
+extracted loop before that loop exists would be a false merge bar.
+
+R1d adds `ScriptedModel`, the `StepRuntime`/`TranscriptSink` fakes, and the extracted loop/policies.
+It drives **today's loop** and **the extracted loop** through the same scripts and uses the R1c
+comparison seam to assert their canonical observations are byte-identical. These goldens are the R18
+mitigation and stay as regression tests after R1e deletes the old loop.
 
 ## 8. Open questions (tracked, not blocking acceptance)
 

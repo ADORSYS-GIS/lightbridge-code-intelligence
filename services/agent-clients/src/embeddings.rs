@@ -32,6 +32,7 @@ struct EmbedData {
     index: usize,
 }
 
+#[derive(Clone)]
 pub struct EmbeddingsClient {
     url: String,
     api_key: String,

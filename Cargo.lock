@@ -86,7 +86,10 @@ dependencies = [
  "base64",
  "futures",
  "lci-agent-clients",
+ "lci-agent-testkit",
+ "lci-agent-types",
  "lci-config",
+ "lci-review-agent",
  "mimalloc",
  "regex",
  "reqwest",
@@ -2401,6 +2404,10 @@ dependencies = [
  "lci-agent-step",
  "lci-agent-tools",
  "lci-agent-types",
+ "serde",
+ "serde_json",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]
@@ -2408,7 +2415,9 @@ name = "lci-agent-tools"
 version = "0.1.0"
 dependencies = [
  "lci-agent-types",
+ "serde_json",
  "tokio",
+ "uuid",
 ]
 
 [[package]]
@@ -2435,12 +2444,20 @@ dependencies = [
 name = "lci-review-agent"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "lci-agent-clients",
  "lci-agent-loop",
  "lci-agent-step",
  "lci-agent-testkit",
  "lci-agent-tools",
  "lci-agent-types",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "uuid",
+ "wiremock",
 ]
 
 [[package]]

@@ -13,3 +13,7 @@ path = "src/lib.rs"
 [dependencies]
 lci-agent-types = { path = "../agent-types" }
 tokio.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

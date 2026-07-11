@@ -14,6 +14,8 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 lci-agent-clients = { path = "../agent-clients" }
+lci-agent-types = { path = "../agent-types" }
+lci-review-agent = { path = "../review-agent" }
 lci-config = { path = "../config" }
 mimalloc.workspace = true
 serde.workspace = true
@@ -38,6 +40,7 @@ tree-sitter-typescript.workspace = true
 tree-sitter-python.workspace = true
 
 [dev-dependencies]
+lci-agent-testkit = { path = "../agent-testkit" }
 # HTTP mocking for the control-plane client contract tests (no live control plane).
 wiremock.workspace = true
 tempfile.workspace = true

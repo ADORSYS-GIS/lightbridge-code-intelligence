@@ -255,6 +255,7 @@ struct StatusUpdate<'a> {
 }
 
 /// Talks to one control plane with one task's bearer.
+#[derive(Clone)]
 pub struct ControlPlaneClient {
     base_url: String,
     token: String,
