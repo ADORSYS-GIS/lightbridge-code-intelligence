@@ -218,4 +218,33 @@ mod tests {
                 .starts_with("error:")
         );
     }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_file_rejects_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let repository = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let secret = "external-secret-must-not-be-disclosed";
+        let secret_path = outside.path().join("secret.txt");
+        tokio::fs::write(&secret_path, secret).await.unwrap();
+        symlink(&secret_path, repository.path().join("escape.txt")).unwrap();
+
+        let result = read(repository.path(), "escape.txt", None, None).await;
+        assert_eq!(
+            result,
+            "error: \"escape.txt\" resolves outside the repository (symlink escape rejected)."
+        );
+        assert!(!result.contains(secret));
+
+        tokio::fs::write(repository.path().join("source.txt"), "safe in-repo content")
+            .await
+            .unwrap();
+        symlink("source.txt", repository.path().join("alias.txt")).unwrap();
+        assert_eq!(
+            read(repository.path(), "alias.txt", None, None).await,
+            "safe in-repo content"
+        );
+    }
 }
