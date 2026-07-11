@@ -21,8 +21,7 @@ use tokio::io::AsyncReadExt;
 use uuid::Uuid;
 
 use super::chat::{ToolCall, ToolDef};
-use crate::bootstrap::client::ControlPlaneClient;
-use crate::indexer::embeddings::EmbeddingsClient;
+use lci_agent_clients::{ControlPlaneClient, EmbeddingsClient};
 
 // The retrieval tools keep the `lightbridge_`-prefixed names the MCP servers used, so a reviewer
 // prompt that references them by name stays accurate for the native agent too.

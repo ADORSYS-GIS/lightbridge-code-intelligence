@@ -6,7 +6,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Output;
 
-use crate::bootstrap::client::TaskContext;
+use lci_agent_clients::TaskContext;
 
 /// Clone the task's repo at the relevant commit into `{workdir}/repo` and return that path.
 ///

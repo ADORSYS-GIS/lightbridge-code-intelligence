@@ -31,10 +31,9 @@ use super::tools::{
     GRAPH_GET_CALLERS, READ_FILE, RETRACT_FINDING, ToolOutcome, Tools, VECTOR_SEMANTIC_SEARCH,
     tool_defs,
 };
-use crate::bootstrap::client::{ControlPlaneClient, TranscriptEntry};
 use crate::bootstrap::config::{McpToolPattern, ReviewConfig, ReviewToolSelector};
 use crate::clone::PrDiff;
-use crate::indexer::embeddings::EmbeddingsClient;
+use lci_agent_clients::{ControlPlaneClient, EmbeddingsClient, TranscriptEntry};
 
 /// How the agent loop ended (#137). Distinct from `Err`, which is reserved for a transport/chat
 /// failure where the gateway was unreachable and nothing useful happened. The caller maps these to a
@@ -769,7 +768,8 @@ pub async fn run_native_agent(
 
         // One concise line per turn (ADR-0034/0039): index, tools called, tokens, wall-clock latency,
         // and the gateway's remaining rate-limit budget when it advertises one (advisory telemetry,
-        // crate::ratelimit). Full content lives in the transcript; this keeps pod logs legible.
+        // lci_agent_clients::ratelimit). Full content lives in the transcript; this keeps pod logs
+        // legible.
         let tool_names: Vec<&str> = calls.iter().map(|c| c.function.name.as_str()).collect();
         tracing::info!(
             task_id = %task_id,

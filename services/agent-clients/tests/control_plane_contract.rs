@@ -2,7 +2,7 @@
 //! (wiremock) — no live service. They pin the wire shape the control plane's `internal.rs` must
 //! keep: bearer auth, the task-context JSON, and the status callback.
 
-use agent_runner::bootstrap::client::ControlPlaneClient;
+use lci_agent_clients::ControlPlaneClient;
 use uuid::Uuid;
 use wiremock::matchers::{bearer_token, body_json, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -89,7 +89,7 @@ async fn report_status_posts_the_status_with_bearer() {
 
 #[tokio::test]
 async fn submit_chunks_posts_batch_with_bearer() {
-    use agent_runner::bootstrap::client::{ChunkBatch, ChunkPayload};
+    use lci_agent_clients::{ChunkBatch, ChunkPayload};
 
     let server = MockServer::start().await;
     let task_id = Uuid::nil();
@@ -102,8 +102,7 @@ async fn submit_chunks_posts_batch_with_bearer() {
         .mount(&server)
         .await;
 
-    let client =
-        agent_runner::bootstrap::client::ControlPlaneClient::new(server.uri(), "runner-secret");
+    let client = ControlPlaneClient::new(server.uri(), "runner-secret");
     client
         .submit_chunks(
             task_id,
@@ -157,7 +156,7 @@ async fn submit_review_telemetry_posts_tools_and_config_with_bearer() {
 
 #[tokio::test]
 async fn submit_graph_posts_nodes_and_edges_with_bearer() {
-    use agent_runner::bootstrap::client::{GraphBatch, GraphEdgePayload, GraphNodePayload};
+    use lci_agent_clients::{GraphBatch, GraphEdgePayload, GraphNodePayload};
 
     let server = MockServer::start().await;
     let task_id = Uuid::nil();
@@ -170,8 +169,7 @@ async fn submit_graph_posts_nodes_and_edges_with_bearer() {
         .mount(&server)
         .await;
 
-    let client =
-        agent_runner::bootstrap::client::ControlPlaneClient::new(server.uri(), "runner-secret");
+    let client = ControlPlaneClient::new(server.uri(), "runner-secret");
     client
         .submit_graph(
             task_id,
@@ -212,8 +210,7 @@ async fn search_posts_embedding_and_parses_hits() {
         .mount(&server)
         .await;
 
-    let client =
-        agent_runner::bootstrap::client::ControlPlaneClient::new(server.uri(), "runner-secret");
+    let client = ControlPlaneClient::new(server.uri(), "runner-secret");
     let hits = client
         .search(task_id, &[0.1, 0.2, 0.3], 5)
         .await
@@ -237,14 +234,212 @@ async fn graph_get_callers_posts_op_and_parses_symbols() {
         .mount(&server)
         .await;
 
-    let client =
-        agent_runner::bootstrap::client::ControlPlaneClient::new(server.uri(), "runner-secret");
+    let client = ControlPlaneClient::new(server.uri(), "runner-secret");
     let callers = client
         .graph_get_callers(task_id, "src_math_add", 10)
         .await
         .expect("callers");
     assert_eq!(callers.len(), 1);
     assert_eq!(callers[0].node_id, "src_math_calc_bump");
+}
+
+#[tokio::test]
+async fn review_and_knowledge_endpoints_preserve_their_wire_contracts() {
+    use lci_agent_clients::TranscriptEntry;
+
+    let server = MockServer::start().await;
+    let task_id = Uuid::nil();
+    let authenticated_post = |suffix: &str, body: serde_json::Value| {
+        Mock::given(method("POST"))
+            .and(path(format!("/internal/tasks/{task_id}{suffix}")))
+            .and(bearer_token("runner-secret"))
+            .and(body_json(body))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+    };
+
+    authenticated_post(
+        "/review/inline",
+        serde_json::json!({
+            "file": "src/lib.rs",
+            "line": 12,
+            "start_line": 10,
+            "title": "Bounds check",
+            "priority": "P1",
+            "category": "correctness",
+            "suggestion": "check the lower bound",
+            "body": "The range is incomplete."
+        }),
+    )
+    .mount(&server)
+    .await;
+    authenticated_post(
+        "/review/inline/retract",
+        serde_json::json!({ "file": "src/lib.rs", "line": 12 }),
+    )
+    .mount(&server)
+    .await;
+    Mock::given(method("POST"))
+        .and(path(format!(
+            "/internal/tasks/{task_id}/review/inline/clear"
+        )))
+        .and(bearer_token("runner-secret"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    authenticated_post(
+        "/review/comment",
+        serde_json::json!({ "body": "A plain reply" }),
+    )
+    .mount(&server)
+    .await;
+    authenticated_post(
+        "/review/summary",
+        serde_json::json!({ "body": "One issue found" }),
+    )
+    .mount(&server)
+    .await;
+    authenticated_post(
+        "/review/finalize",
+        serde_json::json!({ "outcome": "finished" }),
+    )
+    .mount(&server)
+    .await;
+    authenticated_post(
+        "/transcript",
+        serde_json::json!({
+            "entries": [{
+                "role": "assistant",
+                "content": "checking",
+                "tool_calls": [{"id": "call-1"}],
+                "prompt_tokens": 10,
+                "completion_tokens": 4,
+                "reasoning_tokens": 2,
+                "model": "review-model"
+            }]
+        }),
+    )
+    .mount(&server)
+    .await;
+    Mock::given(method("POST"))
+        .and(path(format!("/internal/tasks/{task_id}/graph/query")))
+        .and(bearer_token("runner-secret"))
+        .and(body_json(serde_json::json!({
+            "op": "find_symbol",
+            "term": "parse",
+            "limit": 3
+        })))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!([{
+                "node_id": "src_parser_parse",
+                "label": "parse()",
+                "source_file": "src/parser.rs",
+                "start_line": 8
+            }])),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/internal/tasks/{task_id}/knowledge/tools")))
+        .and(bearer_token("runner-secret"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!([{
+                "name": "mcp__docs__lookup",
+                "description": "look up docs",
+                "input_schema": {"type": "object"}
+            }])),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(format!("/internal/tasks/{task_id}/knowledge/call")))
+        .and(bearer_token("runner-secret"))
+        .and(body_json(serde_json::json!({
+            "tool": "mcp__docs__lookup",
+            "arguments": {"query": "retry policy"}
+        })))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({ "text": "documentation" })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = ControlPlaneClient::new(server.uri(), "runner-secret");
+    client
+        .add_review_comment(
+            task_id,
+            "src/lib.rs",
+            12,
+            Some(10),
+            Some("Bounds check"),
+            Some("P1"),
+            Some("correctness"),
+            Some("check the lower bound"),
+            "The range is incomplete.",
+        )
+        .await
+        .expect("inline finding");
+    client
+        .retract_finding(task_id, "src/lib.rs", 12)
+        .await
+        .expect("retract finding");
+    client
+        .clear_findings(task_id)
+        .await
+        .expect("clear findings");
+    client
+        .add_review_reply(task_id, "A plain reply")
+        .await
+        .expect("reply");
+    client
+        .set_review_summary(task_id, "One issue found")
+        .await
+        .expect("summary");
+    client
+        .finalize_review(task_id, "finished")
+        .await
+        .expect("finalize");
+    client
+        .submit_transcript(
+            task_id,
+            &[TranscriptEntry {
+                role: "assistant".to_string(),
+                content: Some("checking".to_string()),
+                tool_calls: Some(serde_json::json!([{"id": "call-1"}])),
+                tool_name: None,
+                prompt_tokens: Some(10),
+                completion_tokens: Some(4),
+                reasoning_tokens: Some(2),
+                model: Some("review-model".to_string()),
+            }],
+        )
+        .await
+        .expect("transcript");
+
+    let symbols = client
+        .graph_find_symbol(task_id, "parse", 3)
+        .await
+        .expect("find symbol");
+    assert_eq!(symbols[0].source_file, "src/parser.rs");
+    let tools = client
+        .list_knowledge_tools(task_id)
+        .await
+        .expect("list tools");
+    assert_eq!(tools[0].name, "mcp__docs__lookup");
+    let result = client
+        .call_knowledge_tool(
+            task_id,
+            "mcp__docs__lookup",
+            serde_json::json!({"query": "retry policy"}),
+        )
+        .await
+        .expect("call tool");
+    assert_eq!(result, "documentation");
 }
 
 #[tokio::test]

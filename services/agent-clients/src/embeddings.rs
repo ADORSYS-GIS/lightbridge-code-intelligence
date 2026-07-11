@@ -261,7 +261,7 @@ fn backoff(attempt: u32) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wiremock::matchers::{bearer_token, method, path};
+    use wiremock::matchers::{bearer_token, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[tokio::test]
@@ -270,6 +270,7 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/v1/embeddings"))
             .and(bearer_token("key"))
+            .and(header("x-code-intelligence-task-id", "task-7"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "object": "list",
                 "data": [
@@ -281,7 +282,15 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = EmbeddingsClient::new(&server.uri(), "key", "test-model");
+        let client = EmbeddingsClient::new(&server.uri(), "key", "test-model")
+            .with_timeout(Duration::from_secs(2))
+            .with_attribution(&[
+                (
+                    "x-code-intelligence-task-id".to_string(),
+                    "task-7".to_string(),
+                ),
+                ("invalid header".to_string(), "ignored".to_string()),
+            ]);
         let vecs = client.embed(&["hello", "world"]).await.expect("embed");
         assert_eq!(vecs.len(), 2);
         // Index 0 should come first (sorted by `index` field).
@@ -344,5 +353,58 @@ mod tests {
 
         let reqs = server.received_requests().await.unwrap();
         assert_eq!(reqs.len(), 1, "400 must not be retried");
+    }
+
+    #[tokio::test]
+    async fn embed_retries_on_500_with_computed_backoff() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/embeddings"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("gateway unavailable"))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/embeddings"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{"index": 0, "embedding": [0.5_f32]}]
+            })))
+            .mount(&server)
+            .await;
+
+        let vectors = EmbeddingsClient::new(&server.uri(), "key", "model")
+            .embed(&["recover"])
+            .await
+            .expect("recovers after 500");
+        assert_eq!(vectors, vec![vec![0.5]]);
+    }
+
+    #[tokio::test]
+    async fn embed_rejects_malformed_and_wrong_sized_successes() {
+        let malformed = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/embeddings"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("not-json"))
+            .mount(&malformed)
+            .await;
+        let error = EmbeddingsClient::new(&malformed.uri(), "key", "model")
+            .embed(&["one"])
+            .await
+            .expect_err("malformed 2xx must fail");
+        assert!(format!("{error:#}").contains("parsing embeddings response"));
+
+        let wrong_size = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/embeddings"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": []
+            })))
+            .mount(&wrong_size)
+            .await;
+        let error = EmbeddingsClient::new(&wrong_size.uri(), "key", "model")
+            .embed(&["one"])
+            .await
+            .expect_err("wrong vector count must fail");
+        assert!(format!("{error:#}").contains("returned 0 vectors for 1 inputs"));
     }
 }

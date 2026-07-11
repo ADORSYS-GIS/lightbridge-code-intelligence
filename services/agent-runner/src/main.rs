@@ -11,13 +11,12 @@
 //! write tools the control plane flushes) → report. Indexing is required; the structural graph and the
 //! review are best-effort and non-fatal.
 
-use agent_runner::bootstrap::client::ControlPlaneClient;
 use agent_runner::bootstrap::config::{
     EmbeddingsConfig, ReviewConfig, ReviewConfigs, RunnerConfig, SastConfig,
 };
 use agent_runner::clone;
-use agent_runner::indexer::embeddings::EmbeddingsClient;
 use agent_runner::{indexer, review, sast};
+use lci_agent_clients::{ControlPlaneClient, EmbeddingsClient};
 
 // Global allocator — static-musl images (ADR-0080). The runner is allocation-heavy (clone walk,
 // tree-sitter parse, embedding batches); mimalloc avoids musl malloc's multithreaded regression.
