@@ -176,3 +176,122 @@ where
 
     Ok(outcome)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::sync::Arc;
+
+    use lci_agent_clients::{ControlPlaneClient, EmbeddingsClient};
+    use lci_agent_loop::{ChatMessage, RequestOptions};
+    use lci_agent_step::Passthrough;
+    use lci_agent_testkit::{CapturingSink, ScriptedModel};
+    use lci_agent_tools::RuntimeCaps;
+    use lci_agent_types::{AssistantTurn, FunctionCallReq, ToolCallReq};
+    use uuid::Uuid;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use crate::tools::{FINISH, tool_registry};
+
+    fn finish_turn() -> AssistantTurn {
+        AssistantTurn {
+            content: None,
+            tool_calls: vec![ToolCallReq {
+                id: "fin".into(),
+                kind: "function".into(),
+                function: FunctionCallReq {
+                    name: FINISH.into(),
+                    arguments: r#"{"summary":"done"}"#.into(),
+                },
+                extra_content: None,
+            }],
+        }
+    }
+
+    /// Drive `run_review` to a clean `finish` over the deterministic testkit. The finish tool records
+    /// its summary control-plane-side, so a wiremock accepts that one write; a fast / no-diff run raises
+    /// no coverage disclosure, so no other write is needed.
+    async fn drive_to_finish(fast: bool, diff_present: bool) -> LoopOutcome {
+        let cp = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(format!(
+                "/internal/tasks/{}/review/summary",
+                Uuid::nil()
+            )))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&cp)
+            .await;
+        let checkout = tempfile::tempdir().unwrap();
+        let client = ControlPlaneClient::new(cp.uri(), "tok");
+        let embedder = EmbeddingsClient::new("http://unused", "key", "model");
+        let registry = tool_registry(
+            Arc::new(client.clone()),
+            Arc::new(embedder),
+            [],
+            RuntimeCaps::default(),
+        )
+        .unwrap();
+        let workspace = eager_workspace(checkout.path().to_path_buf());
+        let cx = ToolCx {
+            task_id: Uuid::nil(),
+            workspace: &workspace,
+        };
+        let conversation = Conversation::new(
+            vec![
+                ChatMessage::system("be a reviewer"),
+                ChatMessage::user("review"),
+            ],
+            RequestOptions {
+                model: "m".to_string(),
+                ..RequestOptions::default()
+            },
+        );
+        let params = ReviewRunParams {
+            max_turns: 40,
+            max_batch_size: 8,
+            max_batches: 6,
+            max_files_read: 30,
+            max_searches: 15,
+            max_coverage_bounces: 3,
+            circuit_breaker_threshold: 3,
+            context_window: None,
+            fast,
+            diff_present,
+            diff_files: if diff_present {
+                vec!["a.rs".to_string()]
+            } else {
+                Vec::new()
+            },
+        };
+        run_review(
+            Passthrough,
+            ScriptedModel::new([finish_turn()]),
+            Box::new(CapturingSink::default()),
+            &cx,
+            registry,
+            conversation,
+            params,
+            &client,
+        )
+        .await
+        .unwrap()
+    }
+
+    // A deep no-diff run: the winddown filter takes its diff-absent branch (dropping the inline
+    // `retract_finding`) and the 40-turn budget is never capped; a first-turn finish converges cleanly
+    // with no coverage disclosure (empty change set).
+    #[tokio::test]
+    async fn deep_no_diff_run_converges_on_finish() {
+        assert_eq!(drive_to_finish(false, false).await, LoopOutcome::Finished);
+    }
+
+    // A fast run with a diff: the winddown filter takes its diff-present branch, the FAST turn cap +
+    // `FastTierGuard` are in force, and coverage bounces are disabled — so a first-turn finish still
+    // converges (and raises no disclosure, so no control-plane write).
+    #[tokio::test]
+    async fn fast_run_with_diff_converges_on_finish() {
+        assert_eq!(drive_to_finish(true, true).await, LoopOutcome::Finished);
+    }
+}
