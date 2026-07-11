@@ -68,6 +68,11 @@ Chosen option: **Option A — one `ReviewAgent` workflow per deep-tier task**, h
 `agent-worker` role, **gated on Phase B shipping and soaking first** (§Gates). Fast-tier reviews and
 index tasks keep the ADR-0004 Job unchanged.
 
+The decision is deliberately **designed around a code revamp** (§The code revamp): the loop is
+extracted into a runtime-agnostic `agent-core` crate behind trait seams (`StepRuntime`, `Tool`,
+`TurnPolicy`, `ModelClient`, `Workspace`), so the durable runtime is a *swap*, not a rewrite — and
+the extraction itself (R1) is a pure refactor that ships first, un-gated, on the existing Job path.
+
 ### Where it sits in the strangler sequence
 
 **A (egress, live) → B (task lifecycle, designed) → D (this: the agent loop) — with C (delete
@@ -118,6 +123,77 @@ bootstrap in [`main.rs`](../../services/agent-runner/src/main.rs); each numbered
    [`main.rs`](../../services/agent-runner/src/main.rs) tail does. The transcript can additionally be
    flushed incrementally (it is already accumulated per turn), so even a *journal-lost* disaster
    degrades to today's behavior, never worse.
+
+### The code revamp: one loop, trait seams, two runtimes
+
+The step map above cannot be hand-carved into today's code. `run_native_agent` is a ~3,900-line
+monolith ([`agent.rs`](../../services/agent-runner/src/review/native/agent.rs)) where the loop, the
+budget/wind-down/coverage policies, and the prompt assembly are interleaved, and
+[`tools.rs`](../../services/agent-runner/src/review/native/tools.rs) dispatches via a `match` over
+string constants with classification spread across helper predicates (`is_read_only_tool`,
+`is_retrieval_tool`) and inline branches. Sprinkling `ctx.run` into that directly would **fork the
+loop** — a Job flavor and a Restate flavor drifting apart, with the fast tier and the Option-B
+fallback each multiplying the fork. Phase D is therefore designed around a code revamp whose test
+is: **the durable runtime is a swap, not a rewrite.**
+
+A new workspace library crate, **`services/agent-core`**, owns the agent programming model. It
+depends on serde/tokio/anyhow only — **no `kube`, no `sqlx`, no `restate-sdk`** (runtime impls live
+with their hosts, so the SDK pin never leaks into the shared crate). Its seams, trait-by-trait:
+
+- **`StepRuntime` — the durability seam (the load-bearing one).** Every effect the loop performs
+  goes through `step(name, f) -> T`, plus `sleep(name, d)` and an awakeable/promise hook for the
+  future `input-required` slice. Three implementations, one per execution substrate:
+  `Passthrough` (the Job path — awaits the future, ignores the name; in `agent-core`),
+  `RestateRuntime` (wraps `ctx.run`/`ctx.sleep`/awakeables; lives in the `agent-worker` binary with
+  the pinned SDK), and — only if the gates fail — `CheckpointRuntime` (Option B, persisting via the
+  internal API). **The Option-B fallback collapses from "a second system" to "a third impl of the
+  same trait."** Step *names* (`llm_turn:{n}`, `tools:{n}`, …) are constants in `agent-core` with a
+  stability test, turning the R14 journal-contract rule from a review convention into code.
+- **`Tool` — spec + classification + replay contract, then a registry.** Each tool implements
+  `spec()` (today's `ToolDef` JSON schema), `kind()` (`ReadOnly{Retrieval|File|Knowledge}` /
+  `Write` / `Terminal` / `Progress` — replacing the string-predicate helpers), `replay()`
+  (`ReadOnly` / `Idempotent` / `NeedsDedupKey` — the §idempotency table becomes machine-checkable:
+  a runtime without dedup support can *refuse to register* a `NeedsDedupKey` tool instead of
+  silently double-posting), and `call(cx, args)`. A `ToolRegistry` owns the set, and everything
+  that is an inline branch today becomes a per-turn registry *view*: the tier allowlist (builtin +
+  `mcp__` selectors, ADR-0062/0066), the diff-absent gate, wind-down narrowing, per-category budget
+  drops, and the fast-tier refusal. MCP-discovered tools are just another `Tool` impl over the
+  control-plane proxy.
+- **`ToolCx` / `Workspace` — the checkout becomes a trait.** Today's `Tools` struct fields
+  (`client`, `embedder`, `task_id`, `checkout_root`) become the tool context, with the filesystem
+  behind `Workspace::root()`. The Job impl clones eagerly at bootstrap (today's behavior); the
+  worker impl **is** the `ensure_checkout` lazy guard from §Local ephemeral state — the replay trap
+  gets a type, not a convention.
+- **`ModelClient` — the LLM seam.** `complete(req) -> AssistantTurn`; `chat.rs`'s native client is
+  the sole impl (streaming, per-chunk idle timeout, transport retries stay inside — ADR-0075 stands,
+  no Rig). The loop stops knowing about SSE or retry policy.
+- **`TurnPolicy` — the loop's inline logic, named and composable.** `before_turn(&mut self, state)
+  -> actions` (narrow tools / inject a nudge / force-finish / refuse a call) and `after_turn`
+  observation. Today's interleaved blocks become one policy each: `TurnBudget`, `WindDown`,
+  `ReadBudgets` (ADR-0042), `ContextWindowTrim` (ADR-0045), `CoverageGate` (ADR-0069),
+  `FastTierGuard` (ADR-0062), `ScratchpadLoopGuard`. Each becomes independently unit-testable —
+  today they are testable only by driving the whole loop.
+- **`AgentLoop<R: StepRuntime>` — the engine.** Owns the conversation, drives the turn loop,
+  journals through `R`, records through a `TranscriptSink` (ADR-0034/0060). Deliberately **not
+  review-specific**: the review agent is `AgentLoop` + the review tool set + review policies + the
+  review prompt builder, so a future agent surface (e.g. RFC-0006's `ask`) composes the same crate
+  instead of copying the loop.
+- **Flows are functions, not a trait.** `bootstrap`, `finalize`, and the Phase-B handler steps
+  compose as plain async fns over `&R` — dynamic dispatch earns a trait only where a registry needs
+  it (tools, policies, runtimes). Naming a `Flow` abstraction today would be speculative generality;
+  this ADR explicitly declines it until a second real flow exists.
+
+**Sequencing — the revamp ships first, un-gated.** The extraction (call it **R1**) is a pure,
+behavior-identical refactor of the Job path: `agent-core` extracted, tools ported onto `Tool` +
+registry, the loop onto `AgentLoop<Passthrough>`, `agent-runner` reduced to a thin host. It needs
+no Restate, predates the gates, and is independently valuable — it retires the monolith, makes the
+policies unit-testable, and gives the eval harness a seam. Behavior-identity is enforced by golden
+transcripts (same fixtures in → same transcript out) plus the existing unit/sqlx tests moving over.
+Phase D proper (**R2**) then binds `AgentLoop<RestateRuntime>` in the `agent-worker` binary — and
+the gates G0–G4 test *the runtime implementation*, not the loop. One friction is named now: the
+generic `step(name, f)` signature must be reconciled with the pinned SDK's `ctx.run` closure
+lifetimes — possibly via a boxed/erased step form; **G1 additionally validates that the
+`StepRuntime` seam compiles and replays against the pinned SDK** before R2 begins.
 
 ### The journal-size and offload rule
 
@@ -214,14 +290,18 @@ and the per-turn step names (`llm_turn:{turn}`) are part of the journal contract
 
 ## Gates (all must pass before implementation)
 
-Phase D does not start until:
+The **R1 extraction is not gated** — it is a pure refactor of the Job path (§The code revamp) and
+can begin immediately; its own merge bar is behavior-identity (golden transcripts + existing tests).
+Phase D proper (R2, the Restate runtime) does not start until:
 
 - **G0 — Phase B live and soaked** per ADR-0076's own gate: the task workflow owns new tasks in
   prod, the legacy backlog is drained, and its R2 (`ctx.select` crash/replay verification on the
   pinned SDK) passed — Phase D reuses that verdict.
-- **G1 — journal-scale spike:** a synthetic 150-turn/300-entry workflow on the prod server:
-  per-entry and total journal sizes within server limits with the offload rule applied, and
-  **replay-to-resume time in single-digit seconds**, measured under `kill -9` at turns 10/75/149.
+- **G1 — journal-scale + seam spike:** a synthetic 150-turn/300-entry workflow on the prod server:
+  per-entry and total journal sizes within server limits with the offload rule applied,
+  **replay-to-resume time in single-digit seconds**, measured under `kill -9` at turns 10/75/149 —
+  and the `StepRuntime` seam demonstrated to compile and replay against the pinned SDK's `ctx.run`
+  closure lifetimes (boxed/erased step form allowed).
 - **G2 — local-state resume spike:** kill mid-run on one pod, resume lands on another replica;
   `ensure_checkout` lazily restores the tree; a post-resume `read_file` returns byte-identical
   content; the completed prefix is not re-executed (assert zero duplicate gateway calls via the
@@ -252,9 +332,18 @@ alternative — the goal (resume, not restart) survives even if the engine-nativ
   step map must stay boring even when the loop's *logic* iterates.
 - **Bad:** the LLM step's at-least-once window means a crash can re-pay one turn's tokens; accepted
   and bounded, but nonzero.
-- **Neutral:** the `agent-runner` crate splits: the loop + tools move behind the workflow; the Job
-  path remains for fast/index (and as the Option-B fallback), so the binary surface grows before
-  Phase C-style cleanup can shrink it.
+- **Good (from the revamp, even if Phase D never lands):** the ~3,900-line loop monolith becomes a
+  small engine + named, unit-testable policies + a typed tool registry; the replay-safety of every
+  tool is declared metadata instead of tribal knowledge; the eval harness gains a seam; and any
+  future agent surface (RFC-0006 `ask`) composes `agent-core` instead of copying the loop.
+- **Bad (from the revamp):** R1 churns the hottest file in the repo (`agent.rs` iterates with every
+  review-quality lesson) and trades inline readability for trait indirection. Mitigated by
+  move-don't-change discipline under golden transcripts, and by the "flows are functions, not a
+  trait" line against over-abstraction — but the migration window will be noisy for concurrent
+  loop work.
+- **Neutral:** the `agent-runner` crate splits: the loop + tools move to `agent-core` behind the
+  workflow; the Job path remains for fast/index (and as the Option-B fallback), so the binary
+  surface grows before Phase C-style cleanup can shrink it.
 
 ### Risk register (extends RFC-0005's; IDs continue)
 
@@ -266,6 +355,8 @@ alternative — the goal (resume, not restart) survives even if the engine-nativ
 | R15 | Shared worker as blast radius: one task's pathology (a poisoned diff, a pathological repo) degrades co-resident runs | Medium | Medium | No repo-code execution on the worker; SAST stays in a sandboxed Job; per-task scratch quotas; crashes are cheap by construction (replay) |
 | R16 | Standing runner token on a long-lived pod widens #243's surface | Medium | Medium | Task-scoped internal-API authz (ADR-0017) unchanged; fold into #243's token-hardening work; no forge/Restate-admin creds on the role |
 | R17 | LLM-step replay double-pays a turn (crash in the ack window) | Low | Low ($ bounded to one turn) | Accepted; eaig billing ledger (#281) makes occurrences visible |
+| R18 | R1 extraction silently changes loop behavior (a policy fires a turn earlier, a tool-narrowing branch inverts) — review quality regresses without a crash to notice | Medium | Medium | Move-don't-change discipline; golden-transcript equivalence on fixtures as the R1 merge bar; existing unit/sqlx tests move with the code; the dogfood repos catch drift in days |
+| R19 | The `StepRuntime` generic seam fights the pinned SDK's `ctx.run` lifetimes and erodes into SDK types leaking through `agent-core` | Medium | Medium | G1 validates the seam against the pin before R2; a boxed/erased step signature is the sanctioned escape hatch; `restate-sdk` stays a host-binary dep, never an `agent-core` dep — enforced in review |
 
 ## Alternatives considered
 
