@@ -116,13 +116,12 @@ pub async fn run(
             // --- live-tail poll for an open detail page (status + transcript) ---
             _ = detail_poll.tick() => {
                 // `should_poll` includes the in-flight guard, so a slow backend can't stack polls.
-                if let Some(d) = app.detail.as_mut() {
-                    if d.should_poll() {
+                if let Some(d) = app.detail.as_mut()
+                    && d.should_poll() {
                         let id = d.task_id;
                         d.tail_in_flight = true;
                         spawn_detail_tail(id, &api, &tx);
                     }
-                }
             }
 
             // --- lightweight UI tick (toast expiry + spinner + token countdown redraw) ---
@@ -158,10 +157,10 @@ pub async fn run(
             // The detail renderer measured the transcript geometry into `DetailState`'s cells during
             // the draw; reconcile the scroll offset (autoscroll pin / clamp) now. If it moved, a
             // follow-up redraw shows the corrected position without waiting for the next event.
-            if let Some(d) = app.detail.as_mut() {
-                if d.sync_after_render() {
-                    guard.terminal.draw(|f| ui::draw(f, &app))?;
-                }
+            if let Some(d) = app.detail.as_mut()
+                && d.sync_after_render()
+            {
+                guard.terminal.draw(|f| ui::draw(f, &app))?;
             }
         }
     }

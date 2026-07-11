@@ -3,24 +3,40 @@
 # the agent runner is the per-task Kubernetes Job that clones/indexes/reviews a repo;
 # `xtask` is the build/CI automation entrypoint invoked from the justfile.
 [workspace]
-resolver = "2"
-members = ["services/config", "services/control-plane", "services/agent-runner", "clients/lci", "xtask"]
+resolver = "3"
+members = [
+    "services/config",
+    "services/control-plane",
+    "services/agent-runner",
+    "services/agent-types",
+    "services/agent-step",
+    "services/agent-tools",
+    "services/agent-clients",
+    "services/agent-loop",
+    "services/agent-testkit",
+    "services/review-agent",
+    "clients/lci",
+    "xtask",
+]
 # `services/a2a-probe` is a THROWAWAY evaluation crate (RFC-0006 / #298), deliberately kept out of
 # the members list so it never builds in CI/release — build it explicitly with `-p a2a-probe`.
 # Remove the directory once the resulting ADR lands. Listed as an exclude to document intent.
 exclude = ["services/a2a-probe"]
 
 [workspace.package]
-edition = "2021"
+edition = "2024"
 license = "MIT"
 repository = "https://github.com/vymalo/lightbridge-code-intelligence"
 
 # Single source of truth for every third-party version. Member crates declare deps as
 # `<crate>.workspace = true` (features are set here, not per-member) so a version bump happens
-# in exactly one place. Internal path deps (e.g. lightbridge-config) stay in the member manifests.
+# in exactly one place. Internal path deps (e.g. lci-config) stay in the member manifests.
 [workspace.dependencies]
 # --- Shared across the Rust services ---
 anyhow = "1.0.103"
+# Workspace-standard compile-time builders (ADR-0083). New wide constructors use `bon` rather than
+# hand-written builder types.
+bon = "3.9.3"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 tokio = { version = "1.52.3", features = ["full"] }

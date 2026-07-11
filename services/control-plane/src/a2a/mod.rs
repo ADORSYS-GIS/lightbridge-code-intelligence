@@ -31,14 +31,14 @@ mod store;
 
 use std::sync::Arc;
 
+use axum::Router;
 use axum::extract::{DefaultBodyLimit, Request, State};
-use axum::http::{header, HeaderValue, StatusCode};
+use axum::http::{HeaderValue, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use axum::Router;
 
-use crate::jwt::{AuthError, JwtValidator};
 use crate::AppState;
+use crate::jwt::{AuthError, JwtValidator};
 
 pub use handler::{A2aHandler, HandlerLimits, QuotaConfig};
 
@@ -68,12 +68,12 @@ struct A2aAuthState {
 /// `A2A_QUOTA_WINDOW_SECS`. Defaults: 20 per hour. A non-positive max is clamped to 1 so the role
 /// can never be configured into an unbounded state.
 fn quota_from_env() -> QuotaConfig {
-    let env_i64 = |name: &str, default: i64| {
-        std::env::var(name)
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(default)
-    };
+    quota_from(|name| std::env::var(name).ok())
+}
+
+fn quota_from(env: impl Fn(&str) -> Option<String>) -> QuotaConfig {
+    let env_i64 =
+        |name: &str, default: i64| env(name).and_then(|v| v.parse().ok()).unwrap_or(default);
     let max = env_i64("A2A_QUOTA_MAX", 20).max(1);
     let window_secs = env_i64("A2A_QUOTA_WINDOW_SECS", 3600).max(1);
     QuotaConfig { max, window_secs }
@@ -106,15 +106,22 @@ pub(crate) fn push_token_key_from_env() -> Option<push_crypto::Key> {
 /// The externally reachable base URL advertised in the card's `supportedInterfaces` (`A2A_BASE_URL`).
 /// The real Ingress host is an ai-helm concern; this is a config value, not a binding decision.
 fn base_url_from_env() -> String {
-    std::env::var("A2A_BASE_URL")
-        .ok()
+    base_url_from(std::env::var("A2A_BASE_URL").ok())
+}
+
+fn base_url_from(value: Option<String>) -> String {
+    value
         .filter(|v| !v.trim().is_empty())
         .unwrap_or_else(|| "http://localhost:8080".to_string())
 }
 
 fn bind_addr() -> String {
-    match std::env::var("A2A_BIND") {
-        Ok(v) if !v.trim().is_empty() => v,
+    bind_addr_from(std::env::var("A2A_BIND").ok())
+}
+
+fn bind_addr_from(value: Option<String>) -> String {
+    match value {
+        Some(v) if !v.trim().is_empty() => v,
         _ => DEFAULT_BIND.to_string(),
     }
 }
@@ -233,28 +240,27 @@ mod tests {
 
     #[test]
     fn quota_defaults_and_clamps() {
-        std::env::remove_var("A2A_QUOTA_MAX");
-        std::env::remove_var("A2A_QUOTA_WINDOW_SECS");
-        let q = quota_from_env();
+        let quota = |max: Option<&str>, window: Option<&str>| {
+            quota_from(|name| match name {
+                "A2A_QUOTA_MAX" => max.map(str::to_string),
+                "A2A_QUOTA_WINDOW_SECS" => window.map(str::to_string),
+                _ => None,
+            })
+        };
+
+        let q = quota(None, None);
         assert_eq!(q.max, 20);
         assert_eq!(q.window_secs, 3600);
 
-        std::env::set_var("A2A_QUOTA_MAX", "0");
-        std::env::set_var("A2A_QUOTA_WINDOW_SECS", "-5");
-        let q = quota_from_env();
+        let q = quota(Some("0"), Some("-5"));
         assert_eq!(
             q.max, 1,
             "a non-positive max is clamped to 1 (never unbounded)"
         );
         assert_eq!(q.window_secs, 1);
 
-        std::env::set_var("A2A_QUOTA_MAX", "7");
-        std::env::set_var("A2A_QUOTA_WINDOW_SECS", "60");
-        let q = quota_from_env();
+        let q = quota(Some("7"), Some("60"));
         assert_eq!((q.max, q.window_secs), (7, 60));
-
-        std::env::remove_var("A2A_QUOTA_MAX");
-        std::env::remove_var("A2A_QUOTA_WINDOW_SECS");
     }
 
     /// End-to-end over a real socket: the agent card is public, and the protected bindings are gated
@@ -425,15 +431,12 @@ mod tests {
 
     #[test]
     fn bind_and_base_url_fallbacks() {
-        std::env::remove_var("A2A_BIND");
-        assert_eq!(bind_addr(), DEFAULT_BIND);
-        std::env::set_var("A2A_BIND", "   ");
-        assert_eq!(bind_addr(), DEFAULT_BIND);
-        std::env::set_var("A2A_BIND", "127.0.0.1:18080");
-        assert_eq!(bind_addr(), "127.0.0.1:18080");
-        std::env::remove_var("A2A_BIND");
-
-        std::env::remove_var("A2A_BASE_URL");
-        assert!(base_url_from_env().starts_with("http"));
+        assert_eq!(bind_addr_from(None), DEFAULT_BIND);
+        assert_eq!(bind_addr_from(Some("   ".to_string())), DEFAULT_BIND);
+        assert_eq!(
+            bind_addr_from(Some("127.0.0.1:18080".to_string())),
+            "127.0.0.1:18080"
+        );
+        assert!(base_url_from(None).starts_with("http"));
     }
 }

@@ -83,7 +83,7 @@ pub const DEFAULT_SAST_TIMEOUT_SECS: u64 = 300;
 
 /// The agent runner's file config (ADR-0021/0018). Every field is optional: a partial file overrides
 /// only what it sets, and an absent file means "use env + defaults everywhere". String values support
-/// `{env:VAR:-default}` (resolved by `lightbridge-config`), so secrets stay in env while models,
+/// `{env:VAR:-default}` (resolved by `lci-config`), so secrets stay in env while models,
 /// URLs, and template paths live declaratively in the ConfigMap.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -100,7 +100,7 @@ pub struct FileConfig {
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SastFile {
-    #[serde(default, deserialize_with = "lightbridge_config::de::opt_bool")]
+    #[serde(default, deserialize_with = "lci_config::de::opt_bool")]
     pub enabled: Option<bool>,
     /// opengrep binary name/path; defaults to `opengrep` on PATH.
     pub bin: Option<String>,
@@ -108,9 +108,9 @@ pub struct SastFile {
     pub rules: Option<String>,
     /// Minimum SARIF level to surface (`error`|`warning`|`note`).
     pub min_severity: Option<String>,
-    #[serde(default, deserialize_with = "lightbridge_config::de::opt_usize")]
+    #[serde(default, deserialize_with = "lci_config::de::opt_usize")]
     pub max_findings: Option<usize>,
-    #[serde(default, deserialize_with = "lightbridge_config::de::opt_u64")]
+    #[serde(default, deserialize_with = "lci_config::de::opt_u64")]
     pub timeout_secs: Option<u64>,
 }
 
@@ -130,7 +130,7 @@ pub struct EmbeddingsFile {
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct EmbeddingsTuningFile {
-    #[serde(default, deserialize_with = "lightbridge_config::de::opt_u64")]
+    #[serde(default, deserialize_with = "lci_config::de::opt_u64")]
     pub request_timeout_secs: Option<u64>,
 }
 
@@ -142,15 +142,15 @@ pub struct ReviewFile {
     pub model: String,
     /// Path to the reviewer's system-prompt template (a mounted file); its contents are env-subst'd.
     pub system_prompt_file: Option<String>,
-    #[serde(default, deserialize_with = "lightbridge_config::de::opt_usize")]
+    #[serde(default, deserialize_with = "lci_config::de::opt_usize")]
     pub max_diff_chars: Option<usize>,
     /// Generation params for the review model. All optional — unset means the model/provider default.
     /// Numeric-string tolerant so `{env:…}`-substituted values (always strings) still deserialize.
-    #[serde(default, deserialize_with = "lightbridge_config::de::opt_f64")]
+    #[serde(default, deserialize_with = "lci_config::de::opt_f64")]
     pub temperature: Option<f64>,
-    #[serde(default, deserialize_with = "lightbridge_config::de::opt_f64")]
+    #[serde(default, deserialize_with = "lci_config::de::opt_f64")]
     pub top_p: Option<f64>,
-    #[serde(default, deserialize_with = "lightbridge_config::de::opt_i64")]
+    #[serde(default, deserialize_with = "lci_config::de::opt_i64")]
     pub max_tokens: Option<i64>,
     /// Provider-specific passthrough generation params, merged verbatim into the chat request body —
     /// for knobs the typed fields don't cover, notably a **reasoning budget** (e.g. `thinking`,
@@ -160,34 +160,34 @@ pub struct ReviewFile {
     pub extra: Option<serde_json::Value>,
     /// Resilience knobs (ADR-0039). All optional — unset falls back to the safe defaults above so a
     /// deploy works without an ai-helm values change. Numeric-string tolerant for `{env:…}` values.
-    #[serde(default, deserialize_with = "lightbridge_config::de::opt_u64")]
+    #[serde(default, deserialize_with = "lci_config::de::opt_u64")]
     pub request_timeout_secs: Option<u64>,
-    #[serde(default, deserialize_with = "lightbridge_config::de::opt_u64")]
+    #[serde(default, deserialize_with = "lci_config::de::opt_u64")]
     pub max_retries: Option<u64>,
-    #[serde(default, deserialize_with = "lightbridge_config::de::opt_u64")]
+    #[serde(default, deserialize_with = "lci_config::de::opt_u64")]
     pub circuit_breaker_threshold: Option<u64>,
     /// Ceiling on model turns before the run is cut off (operator-tunable). Unset = [`DEFAULT_MAX_TURNS`].
     /// Numeric-string tolerant for `{env:…}`-substituted values.
-    #[serde(default, deserialize_with = "lightbridge_config::de::opt_usize")]
+    #[serde(default, deserialize_with = "lci_config::de::opt_usize")]
     pub max_turns: Option<usize>,
     /// Max read-only tool calls run concurrently per turn (ADR-0042). Unset = [`DEFAULT_MAX_BATCH_SIZE`].
-    #[serde(default, deserialize_with = "lightbridge_config::de::opt_usize")]
+    #[serde(default, deserialize_with = "lci_config::de::opt_usize")]
     pub max_batch_size: Option<usize>,
     /// Cumulative read budgets (ADR-0042). Unset = the `DEFAULT_MAX_*` constants.
-    #[serde(default, deserialize_with = "lightbridge_config::de::opt_usize")]
+    #[serde(default, deserialize_with = "lci_config::de::opt_usize")]
     pub max_files_read: Option<usize>,
-    #[serde(default, deserialize_with = "lightbridge_config::de::opt_usize")]
+    #[serde(default, deserialize_with = "lci_config::de::opt_usize")]
     pub max_searches: Option<usize>,
-    #[serde(default, deserialize_with = "lightbridge_config::de::opt_usize")]
+    #[serde(default, deserialize_with = "lci_config::de::opt_usize")]
     pub max_batches: Option<usize>,
     /// Coverage-gate bounce cap (ADR-0069). Unset = [`DEFAULT_MAX_COVERAGE_BOUNCES`]; `0` disables the
     /// bounce (the coverage disclosure still applies), `1` = legacy bounce-once.
-    #[serde(default, deserialize_with = "lightbridge_config::de::opt_usize")]
+    #[serde(default, deserialize_with = "lci_config::de::opt_usize")]
     pub max_coverage_bounces: Option<usize>,
     /// Model context window in tokens (ADR-0045). When set, the agent budgets its conversation against
     /// it — winding down before overflow and trimming old tool output — instead of failing a 400 when
     /// the history grows too large. Unset = no budgeting (unchanged behaviour).
-    #[serde(default, deserialize_with = "lightbridge_config::de::opt_usize")]
+    #[serde(default, deserialize_with = "lci_config::de::opt_usize")]
     pub context_window: Option<usize>,
     /// Stream the chat response (SSE) and reassemble it client-side instead of awaiting the whole
     /// completion (ADR-0039 / #206). `Some(true)` enables it; unset falls back to the `LLM_STREAM` env
@@ -195,7 +195,7 @@ pub struct ReviewFile {
     /// timeout rather than one whole-request timeout — useful for a heavy-reasoning model (e.g. GLM).
     /// Bool-tolerant like the numeric knobs above, so a `{env:…}`-substituted string (e.g.
     /// `"{env:LLM_STREAM:-true}"`) still deserializes instead of failing the config.
-    #[serde(default, deserialize_with = "lightbridge_config::de::opt_bool")]
+    #[serde(default, deserialize_with = "lci_config::de::opt_bool")]
     pub stream: Option<bool>,
     /// Two-tier review (ADR-0062): a fully-independent config for the FAST tier (automatic
     /// `pull_request opened`). When present it is a COMPLETE review block (its own model, gateway, prompt,
@@ -368,7 +368,7 @@ pub fn load_file_config() -> anyhow::Result<Option<FileConfig>> {
     if !path.exists() {
         return Ok(None);
     }
-    lightbridge_config::load::<FileConfig>(path).map(Some)
+    lci_config::load::<FileConfig>(path).map(Some)
 }
 
 /// Everything the runner needs to start: which task it is, and how to reach the control plane.
@@ -643,16 +643,30 @@ impl ReviewConfig {
     /// from env. The system prompt comes from the `system_prompt_file` template (env-subst'd) when
     /// set. A `review` block whose model is empty disables review, same as an unset `LLM_MODEL`.
     pub fn resolve(file: Option<&FileConfig>) -> anyhow::Result<Option<Self>> {
+        Self::resolve_with_env(file, &|name| std::env::var(name).ok())
+    }
+
+    fn resolve_with_env(
+        file: Option<&FileConfig>,
+        env: &impl Fn(&str) -> Option<String>,
+    ) -> anyhow::Result<Option<Self>> {
         let Some(r) = file.and_then(|f| f.review.as_ref()) else {
             return Self::from_env();
         };
-        Self::from_review_file(r)
+        Self::from_review_file_with_env(r, env)
     }
 
     /// Resolve ONE review block — the flat `review.*`, or a per-tier `review.fast`/`review.deep` block,
     /// each a *complete* config (ADR-0062) — into a [`ReviewConfig`]. `Ok(None)` when the model is empty
     /// (review disabled). Any nested `fast`/`deep` on `r` is ignored (tiers don't nest).
     fn from_review_file(r: &ReviewFile) -> anyhow::Result<Option<Self>> {
+        Self::from_review_file_with_env(r, &|name| std::env::var(name).ok())
+    }
+
+    fn from_review_file_with_env(
+        r: &ReviewFile,
+        env: &impl Fn(&str) -> Option<String>,
+    ) -> anyhow::Result<Option<Self>> {
         if r.model.trim().is_empty() {
             return Ok(None); // review explicitly disabled
         }
@@ -707,7 +721,10 @@ impl ReviewConfig {
             base_url: require_field("review", "base_url", &r.base_url)?,
             api_key: require_field("review", "api_key", &r.api_key)?,
             model: require_field("review", "model", &r.model)?,
-            system_prompt: require_system_prompt(r.system_prompt_file.as_deref())?,
+            system_prompt: require_system_prompt_with_env(
+                r.system_prompt_file.as_deref(),
+                env("REVIEW_SYSTEM_PROMPT"),
+            )?,
             max_diff_chars: r.max_diff_chars.unwrap_or(DEFAULT_MAX_DIFF_CHARS),
             // File config wins when set, else env (an operator can still tune via env with a
             // ConfigMap mounted), else the generous default.
@@ -910,7 +927,7 @@ fn secret_shaped_key(key: &str) -> bool {
 }
 
 /// Recursively redact every secret-shaped key at ANY depth (objects nested in arrays included).
-/// Depth matters: `lightbridge_config::substitute_value` expands `{env:VAR}` at every level of the
+/// Depth matters: `lci_config::substitute_value` expands `{env:VAR}` at every level of the
 /// file config, so `review.extra: {"azure": {"api_key": "{env:LLM_API_KEY}"}}` puts the REAL secret
 /// in a nested object a top-level-only pass would clone verbatim.
 fn redact_value(v: &serde_json::Value) -> serde_json::Value {
@@ -999,15 +1016,25 @@ impl ReviewConfigs {
 /// instead of silently running a weak fallback. The prompt is owned in ai-helm
 /// (`config.reviewSystemPrompt`) and mounted into the Job.
 fn require_system_prompt(system_prompt_file: Option<&str>) -> anyhow::Result<String> {
+    require_system_prompt_with_env(
+        system_prompt_file,
+        std::env::var("REVIEW_SYSTEM_PROMPT").ok(),
+    )
+}
+
+fn require_system_prompt_with_env(
+    system_prompt_file: Option<&str>,
+    env_prompt: Option<String>,
+) -> anyhow::Result<String> {
     let from_file = match system_prompt_file {
         Some(path) if !path.trim().is_empty() => Some(
-            lightbridge_config::load_template(Path::new(path))
+            lci_config::load_template(Path::new(path))
                 .with_context(|| format!("loading review.system_prompt_file {path}"))?,
         ),
         _ => None,
     };
     let prompt = from_file
-        .or_else(|| std::env::var("REVIEW_SYSTEM_PROMPT").ok())
+        .or(env_prompt)
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
     prompt.context(
@@ -1116,39 +1143,17 @@ mod tests {
     #[test]
     fn review_config_requires_a_system_prompt() {
         // ADR-0037: no built-in default. With no prompt source set, resolving review fails closed.
-        // (Guard against env bleed from a parallel test by asserting the error mentions the prompt.)
-        std::env::remove_var("REVIEW_SYSTEM_PROMPT");
         let file = FileConfig {
-            embeddings: None,
-            sast: None,
             review: Some(ReviewFile {
                 base_url: "https://gw/v1".to_string(),
-                api_key: "k".to_string(),
-                model: "m".to_string(),
-                system_prompt_file: None,
-                max_diff_chars: None,
-                temperature: None,
-                top_p: None,
-                max_tokens: None,
-                extra: None,
-                request_timeout_secs: None,
-                max_retries: None,
-                circuit_breaker_threshold: None,
-                max_turns: None,
-                max_batch_size: None,
-                max_files_read: None,
-                max_searches: None,
-                max_batches: None,
-                max_coverage_bounces: None,
-                context_window: None,
-                stream: None,
-                fast: None,
-                deep: None,
-                tools: None,
+                api_key: "key".to_string(),
+                model: "model".to_string(),
+                ..ReviewFile::default()
             }),
+            ..FileConfig::default()
         };
-        let err =
-            ReviewConfig::resolve(Some(&file)).expect_err("must fail closed without a prompt");
+        let err = ReviewConfig::resolve_with_env(Some(&file), &|_| None)
+            .expect_err("must fail closed without a prompt");
         assert!(
             format!("{err:#}").contains("system prompt"),
             "error names the missing prompt: {err:#}"

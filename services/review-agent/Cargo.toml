@@ -1,0 +1,21 @@
+[package]
+name = "lci-review-agent"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Review-specific assembly for the Lightbridge agent loop."
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+lci-agent-clients = { path = "../agent-clients" }
+lci-agent-loop = { path = "../agent-loop" }
+lci-agent-step = { path = "../agent-step" }
+lci-agent-tools = { path = "../agent-tools" }
+lci-agent-types = { path = "../agent-types" }
+
+[dev-dependencies]
+lci-agent-testkit = { path = "../agent-testkit" }

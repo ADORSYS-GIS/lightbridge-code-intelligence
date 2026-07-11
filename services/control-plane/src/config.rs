@@ -115,7 +115,7 @@ where
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct EmbeddingsSection {
-    #[serde(default, deserialize_with = "lightbridge_config::de::opt_i64")]
+    #[serde(default, deserialize_with = "lci_config::de::opt_i64")]
     pub dimension: Option<i64>,
     pub allow_reindex_on_dim_change: bool,
 }
@@ -172,7 +172,7 @@ pub struct AgentSection {
     /// mount at `/etc/lightbridge` so the runner reads its file config. `None` → not mounted.
     pub config_configmap: Option<String>,
     /// The Job's `activeDeadlineSeconds` runtime cap.
-    #[serde(default, deserialize_with = "lightbridge_config::de::opt_i64")]
+    #[serde(default, deserialize_with = "lci_config::de::opt_i64")]
     pub job_deadline_seconds: Option<i64>,
     /// Legacy passthrough: inline reviewer prompt injected as `REVIEW_SYSTEM_PROMPT`. Prefer mounting
     /// the template via `config_configmap` instead.
@@ -194,30 +194,30 @@ pub struct AgentSection {
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct DispatcherSection {
-    #[serde(default, deserialize_with = "lightbridge_config::de::opt_u64")]
+    #[serde(default, deserialize_with = "lci_config::de::opt_u64")]
     pub claim_lease_seconds: Option<u64>,
-    #[serde(default, deserialize_with = "lightbridge_config::de::opt_u64")]
+    #[serde(default, deserialize_with = "lci_config::de::opt_u64")]
     pub poll_fallback_seconds: Option<u64>,
-    #[serde(default, deserialize_with = "lightbridge_config::de::opt_u64")]
+    #[serde(default, deserialize_with = "lci_config::de::opt_u64")]
     pub launch_backoff_seconds: Option<u64>,
-    #[serde(default, deserialize_with = "lightbridge_config::de::opt_u64")]
+    #[serde(default, deserialize_with = "lci_config::de::opt_u64")]
     pub reap_interval_seconds: Option<u64>,
     /// How often the index sweeper prunes stale `(repo, commit)` snapshots (ADR-0052). The outbox
     /// sweeper (ADR-0059) shares this same GC tick.
-    #[serde(default, deserialize_with = "lightbridge_config::de::opt_u64")]
+    #[serde(default, deserialize_with = "lci_config::de::opt_u64")]
     pub prune_interval_seconds: Option<u64>,
     /// How often the durable data-purge backstop re-checks for `disabled` repos with leftover index
     /// data (Epic #75). A rare recovery net (the prompt path is the spawned purge on disable/deny), so
     /// it runs on its own slow tick rather than the ~30s reaper cadence. Default 600.
-    #[serde(default, deserialize_with = "lightbridge_config::de::opt_u64")]
+    #[serde(default, deserialize_with = "lci_config::de::opt_u64")]
     pub purge_reconcile_interval_seconds: Option<u64>,
     /// Days a delivered (`posted`) `outbox` row is kept before the outbox sweeper prunes it
     /// (ADR-0059). Default 7.
-    #[serde(default, deserialize_with = "lightbridge_config::de::opt_i64")]
+    #[serde(default, deserialize_with = "lci_config::de::opt_i64")]
     pub outbox_posted_retention_days: Option<i64>,
     /// Days a dead-lettered (`failed`) `outbox` row is kept — longer, for inspection — before
     /// pruning (ADR-0059). Default 30.
-    #[serde(default, deserialize_with = "lightbridge_config::de::opt_i64")]
+    #[serde(default, deserialize_with = "lci_config::de::opt_i64")]
     pub outbox_failed_retention_days: Option<i64>,
 }
 
@@ -230,7 +230,7 @@ pub fn load_file_config() -> anyhow::Result<Option<FileConfig>> {
     if !path.exists() {
         return Ok(None);
     }
-    lightbridge_config::load::<FileConfig>(path).map(Some)
+    lci_config::load::<FileConfig>(path).map(Some)
 }
 
 #[cfg(test)]

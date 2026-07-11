@@ -51,12 +51,12 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+use axum::Router;
 use axum::extract::{DefaultBodyLimit, MatchedPath, Request, State};
-use axum::http::{header, StatusCode};
+use axum::http::{StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use axum::Router;
 use metrics_exporter_prometheus::PrometheusHandle;
 use sqlx::PgPool;
 use tracing_subscriber::EnvFilter;
@@ -265,11 +265,12 @@ impl AppState {
 
 /// A boolean env flag that is true for `1`/`true`/`yes` (case-insensitive), false otherwise.
 fn env_flag(name: &str) -> bool {
+    env_flag_value(std::env::var(name).ok().as_deref())
+}
+
+fn env_flag_value(value: Option<&str>) -> bool {
     matches!(
-        std::env::var(name)
-            .unwrap_or_default()
-            .to_ascii_lowercase()
-            .as_str(),
+        value.unwrap_or_default().to_ascii_lowercase().as_str(),
         "1" | "true" | "yes"
     )
 }
@@ -470,7 +471,7 @@ async fn readiness(State(state): State<AppState>) -> impl IntoResponse {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 "OIDC_ISSUER not configured",
-            )
+            );
         }
         Some(validator) => {
             if validator.warm().await.is_err() {
@@ -492,13 +493,13 @@ async fn readiness(State(state): State<AppState>) -> impl IntoResponse {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 "database connection failed",
-            )
+            );
         }
         DbReadiness::NotConfigured => {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 "database not configured (set DATABASE_URL; ALLOW_NO_DB=1 for dev only)",
-            )
+            );
         }
     }
     (StatusCode::OK, "ok")
@@ -828,14 +829,11 @@ mod tests {
     #[test]
     fn env_flag_parses_truthy_values_only() {
         for truthy in ["1", "true", "TRUE", "Yes"] {
-            std::env::set_var("CP_TEST_FLAG", truthy);
-            assert!(env_flag("CP_TEST_FLAG"), "{truthy} should be truthy");
+            assert!(env_flag_value(Some(truthy)), "{truthy} should be truthy");
         }
         for falsy in ["0", "false", "no", "", "off"] {
-            std::env::set_var("CP_TEST_FLAG", falsy);
-            assert!(!env_flag("CP_TEST_FLAG"), "{falsy} should be falsy");
+            assert!(!env_flag_value(Some(falsy)), "{falsy} should be falsy");
         }
-        std::env::remove_var("CP_TEST_FLAG");
-        assert!(!env_flag("CP_TEST_FLAG"));
+        assert!(!env_flag_value(None));
     }
 }

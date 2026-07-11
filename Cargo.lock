@@ -85,7 +85,7 @@ dependencies = [
  "anyhow",
  "base64",
  "futures",
- "lightbridge-config",
+ "lci-config",
  "mimalloc",
  "regex",
  "reqwest",
@@ -677,7 +677,7 @@ dependencies = [
  "jsonwebtoken",
  "k8s-openapi",
  "kube",
- "lightbridge-config",
+ "lci-config",
  "metrics",
  "metrics-exporter-prometheus",
  "mimalloc",
@@ -2361,6 +2361,82 @@ dependencies = [
 ]
 
 [[package]]
+name = "lci-agent-clients"
+version = "0.1.0"
+dependencies = [
+ "lci-agent-types",
+ "reqwest",
+]
+
+[[package]]
+name = "lci-agent-loop"
+version = "0.1.0"
+dependencies = [
+ "lci-agent-step",
+ "lci-agent-tools",
+ "lci-agent-types",
+]
+
+[[package]]
+name = "lci-agent-step"
+version = "0.1.0"
+dependencies = [
+ "lci-agent-types",
+ "tokio",
+]
+
+[[package]]
+name = "lci-agent-testkit"
+version = "0.1.0"
+dependencies = [
+ "lci-agent-clients",
+ "lci-agent-loop",
+ "lci-agent-step",
+ "lci-agent-tools",
+ "lci-agent-types",
+]
+
+[[package]]
+name = "lci-agent-tools"
+version = "0.1.0"
+dependencies = [
+ "lci-agent-types",
+ "tokio",
+]
+
+[[package]]
+name = "lci-agent-types"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
+name = "lci-config"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tracing",
+]
+
+[[package]]
+name = "lci-review-agent"
+version = "0.1.0"
+dependencies = [
+ "lci-agent-clients",
+ "lci-agent-loop",
+ "lci-agent-step",
+ "lci-agent-testkit",
+ "lci-agent-tools",
+ "lci-agent-types",
+]
+
+[[package]]
 name = "left-right"
 version = "0.11.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2409,17 +2485,6 @@ checksum = "2e99fb7a497b1e3339bc746195567ed8d3e24945ecd636e3619d20b9de9e9149"
 dependencies = [
  "pkg-config",
  "vcpkg",
-]
-
-[[package]]
-name = "lightbridge-config"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "serde",
- "serde_json",
- "tempfile",
- "tracing",
 ]
 
 [[package]]
@@ -5965,6 +6030,9 @@ name = "xtask"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]

@@ -132,7 +132,7 @@ async fn main() -> std::process::ExitCode {
 /// (containers) / macOS (dev); the non-Unix arm falls back to Ctrl-C so the code still compiles.
 #[cfg(unix)]
 async fn terminated() {
-    use tokio::signal::unix::{signal, SignalKind};
+    use tokio::signal::unix::{SignalKind, signal};
     match signal(SignalKind::terminate()) {
         Ok(mut sigterm) => {
             sigterm.recv().await;
@@ -309,10 +309,10 @@ async fn run(
             .await;
             // Submit the transcript regardless of outcome (ADR-0034) — a failed run's reasoning is the
             // most useful to inspect. Best-effort: never let it change the task result.
-            if !transcript.is_empty() {
-                if let Err(error) = client.submit_transcript(config.task_id, &transcript).await {
-                    tracing::warn!(%error, "submitting transcript failed (non-fatal)");
-                }
+            if !transcript.is_empty()
+                && let Err(error) = client.submit_transcript(config.task_id, &transcript).await
+            {
+                tracing::warn!(%error, "submitting transcript failed (non-fatal)");
             }
             // Net invariant (#137): every review run leaves a VISIBLE artifact unless the gateway was
             // unreachable. We finalize on Finished AND Exhausted AND Aborted — finalize flushes the

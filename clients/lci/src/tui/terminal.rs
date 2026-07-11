@@ -7,11 +7,11 @@
 use anyhow::{Context, Result};
 use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
 use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use crossterm::{cursor::Show, execute};
-use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
+use ratatui::backend::CrosstermBackend;
 use std::io::{self, Stdout};
 
 /// Restore the terminal to a sane state: **disable mouse capture**, leave the alternate screen,
@@ -72,8 +72,8 @@ impl Drop for TerminalGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// A stand-in restore target we can assert ran. Mirrors the guard structure: a `Drop` that calls a
     /// pure restore fn, so we test the *contract* (restore runs exactly once on drop) without touching

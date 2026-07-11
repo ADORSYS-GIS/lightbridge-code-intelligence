@@ -1,4 +1,6 @@
-# Workspace-wide Rust lint gate: `cargo fmt --check` + `cargo clippy -D warnings`.
+# Workspace-wide Rust architecture/lint gate: dependency hygiene, `cargo fmt --check`, and
+# `cargo clippy -D warnings`. The first populated `lci-*` crate also starts the per-crate coverage
+# floor required by ADR-0083.
 #
 # Why this exists: the other CI (build-images, control-plane-tests) compiles and tests but never
 # checked formatting or lints, so `cargo fmt` drift and clippy warnings landed on `main` unnoticed
@@ -12,17 +14,21 @@ on:
   push:
     branches: [main]
     paths:
+      - "clients/**"
       - "services/**"
       - "xtask/**"
       - "Cargo.toml"
       - "Cargo.lock"
+      - "rustfmt.toml"
       - ".github/workflows/rust-lint.yml"
   pull_request:
     paths:
+      - "clients/**"
       - "services/**"
       - "xtask/**"
       - "Cargo.toml"
       - "Cargo.lock"
+      - "rustfmt.toml"
       - ".github/workflows/rust-lint.yml"
 
 permissions:
@@ -41,6 +47,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      # v2.83.1, pinned to immutable reviewed code; checksums stay enabled explicitly.
+      - uses: taiki-e/install-action@2ca9b94c269419b7b0c711c09d0b21c4e1d51145
+        with:
+          tool: cargo-llvm-cov@0.8.7
+          checksum: true
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: "."
@@ -53,10 +64,16 @@ jobs:
           endpoint: ${{ vars.SCCACHE_ENDPOINT }}
           access-key-id: ${{ secrets.SCCACHE_S3_ACCESS_KEY_ID }}
           secret-access-key: ${{ secrets.SCCACHE_S3_SECRET_ACCESS_KEY }}
+      - name: dependency hygiene
+        run: cargo run --locked --package xtask -- dependency-hygiene
+      - name: xtask tests
+        run: cargo test --locked -p xtask
       - name: cargo fmt --all --check
         run: cargo fmt --all -- --check
       - name: cargo clippy --workspace -D warnings
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: lci-agent-types line coverage
+        run: cargo llvm-cov -p lci-agent-types --locked --fail-under-lines 85
       - name: sccache stats
         if: always()
         run: sccache --show-stats || true

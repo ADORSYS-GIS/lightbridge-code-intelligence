@@ -397,7 +397,12 @@ impl Tools<'_> {
                     // Fold the cited evidence into the rendered body (Phase 2, ADR-0043) so the proof is
                     // visible to the human and stored with the finding — no schema change needed. Skipped
                     // when absent (a pre-evidence prompt), so findings still record (rollout safety).
-                    let body = match a.evidence.as_deref().map(str::trim).filter(|e| !e.is_empty()) {
+                    let body = match a
+                        .evidence
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|e| !e.is_empty())
+                    {
                         Some(ev) => format!("{}\n\n**Evidence:** {ev}", a.body.trim_end()),
                         None => a.body.clone(),
                     };
@@ -436,7 +441,11 @@ impl Tools<'_> {
                 )),
             },
             RETRACT_FINDING => match parse::<RetractFindingArgs>(args) {
-                Ok(a) => match self.client.retract_finding(self.task_id, &a.file, a.line).await {
+                Ok(a) => match self
+                    .client
+                    .retract_finding(self.task_id, &a.file, a.line)
+                    .await
+                {
                     Ok(()) => ToolOutcome::Continue(format!(
                         "retracted finding at {}:{}{}",
                         a.file,
@@ -519,13 +528,13 @@ impl Tools<'_> {
         let canonical_root = match tokio::fs::canonicalize(self.checkout_root).await {
             Ok(p) => p,
             Err(_) => {
-                return format!("error: could not open {rel:?} (file not found or unreadable).")
+                return format!("error: could not open {rel:?} (file not found or unreadable).");
             }
         };
         let canonical = match tokio::fs::canonicalize(&resolved).await {
             Ok(p) => p,
             Err(_) => {
-                return format!("error: could not open {rel:?} (file not found or unreadable).")
+                return format!("error: could not open {rel:?} (file not found or unreadable).");
             }
         };
         if !canonical.starts_with(&canonical_root) {

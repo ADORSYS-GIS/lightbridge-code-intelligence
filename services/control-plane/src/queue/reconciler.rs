@@ -19,8 +19,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use sqlx::postgres::PgListener;
 use sqlx::PgPool;
+use sqlx::postgres::PgListener;
 
 use crate::config::ReviewSection;
 use crate::integrations::platform::{CodePlatform, Platform, ReactionTarget, RepoRef};
@@ -281,13 +281,12 @@ pub(crate) async fn deliver(
             // (e.g. one that transiently 502'd and is backing off) means a real review is coming, so
             // don't race a misleading apology ahead of it (#219 review). A dead-lettered (`failed`)
             // review is excluded, so a review that truly can't be delivered still yields a notice.
-            if let Some(task) = row.task_id {
-                if crate::db::has_responded_or_pending_content(pool, task)
+            if let Some(task) = row.task_id
+                && crate::db::has_responded_or_pending_content(pool, task)
                     .await
                     .unwrap_or(false)
-                {
-                    return Ok(None);
-                }
+            {
+                return Ok(None);
             }
             let issue = payload_i64(&row.payload, "issue")?;
             let body = payload_str(&row.payload, "body")?;
@@ -388,20 +387,20 @@ async fn deliver_review(
     if let Some(l) = &review.label_reviewed {
         labels.push(l.clone());
     }
-    if p.label_findings {
-        if let Some(l) = &review.label_findings {
-            labels.push(l.clone());
-        }
+    if p.label_findings
+        && let Some(l) = &review.label_findings
+    {
+        labels.push(l.clone());
     }
-    if p.label_error {
-        if let Some(l) = &review.label_error {
-            labels.push(l.clone());
-        }
+    if p.label_error
+        && let Some(l) = &review.label_error
+    {
+        labels.push(l.clone());
     }
-    if !labels.is_empty() {
-        if let Err(error) = platform.add_labels(repo, p.pr, &labels).await {
-            tracing::warn!(%error, pr = p.pr, "applying outcome labels failed (non-fatal)");
-        }
+    if !labels.is_empty()
+        && let Err(error) = platform.add_labels(repo, p.pr, &labels).await
+    {
+        tracing::warn!(%error, pr = p.pr, "applying outcome labels failed (non-fatal)");
     }
     // ADR-0068: the verdict reaction (👎 findings / 👍 clean) is a separate `reaction` intent
     // enqueued at finalize — a `review` intent is only ever produced when there ARE findings, so the
@@ -485,7 +484,7 @@ async fn poll_once(
                     .into_iter()
                     .map(|r| (r.user_login, r.content))
                     .collect();
-                if let Err(error) = crate::db::reconcile_comment_feedback(
+                match crate::db::reconcile_comment_feedback(
                     pool,
                     c.task_id,
                     c.platform_comment_id,
@@ -494,9 +493,12 @@ async fn poll_once(
                 )
                 .await
                 {
-                    tracing::warn!(%error, comment = c.platform_comment_id, "reconciling feedback failed");
-                } else {
-                    checked += 1;
+                    Ok(_) => {
+                        checked += 1;
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, comment = c.platform_comment_id, "reconciling feedback failed");
+                    }
                 }
             }
             Err(error) => {

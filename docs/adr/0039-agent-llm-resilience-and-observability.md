@@ -118,7 +118,7 @@ optional — unset uses the safe default, so an existing deploy keeps working:
 
 - Transport + loop: `services/agent-runner/src/review/native/{chat,agent}.rs`; config knobs:
   `services/agent-runner/src/bootstrap/config.rs` (numeric-string-tolerant deserializers in the shared
-  `lightbridge-config` crate).
+  `lci-config` crate).
 - Builds on [ADR-0026](0026-native-review-agent.md) (native loop),
   [ADR-0037](0037-agent-acts-via-mediated-tools.md) (mediated tools; prompt/model as operator config),
   [ADR-0038](0038-per-repo-review-model.md) (per-repo model), and

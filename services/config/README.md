@@ -1,4 +1,4 @@
-# lightbridge-config
+# lci-config
 
 The shared **configuration loader** for the Rust services. Both the
 [control plane](../control-plane/README.md) and the [agent runner](../agent-runner/README.md) read a
@@ -25,5 +25,5 @@ The loader, the substitution grammar, and the design rationale live in
 
 ## Tests
 
-`cargo nextest run -p lightbridge-config` — substitution edge cases are covered with **tempfile**
+`cargo nextest run -p lci-config` — substitution edge cases are covered with **tempfile**
 (no external state needed).

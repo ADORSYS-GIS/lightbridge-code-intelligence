@@ -8,13 +8,13 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use axum::extract::FromRequestParts;
-use axum::http::request::Parts;
-use axum::http::StatusCode;
-use axum::response::IntoResponse;
 use axum::Json;
+use axum::extract::FromRequestParts;
+use axum::http::StatusCode;
+use axum::http::request::Parts;
+use axum::response::IntoResponse;
 use jsonwebtoken::jwk::JwkSet;
-use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
+use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
@@ -298,7 +298,7 @@ pub fn from_env() -> Option<Arc<JwtValidator>> {
 #[cfg(test)]
 pub(crate) mod test_support {
     use super::*;
-    use jsonwebtoken::{encode, EncodingKey, Header};
+    use jsonwebtoken::{EncodingKey, Header, encode};
     use serde_json::json;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -367,7 +367,7 @@ mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use jsonwebtoken::{encode, EncodingKey, Header};
+    use jsonwebtoken::{EncodingKey, Header, encode};
     use serde_json::json;
 
     const ISSUER: &str = "https://idp.test/realms/lightbridge";
@@ -455,15 +455,19 @@ mod tests {
 
         // Nested dotted path.
         let nested = claims_with(json!({ "code_intelligence": { "permissions": ["task:logs"] } }));
-        assert!(nested
-            .permissions("code_intelligence.permissions")
-            .contains("task:logs"));
+        assert!(
+            nested
+                .permissions("code_intelligence.permissions")
+                .contains("task:logs")
+        );
 
         // Missing / wrong-typed claim → empty set (fail-closed).
         assert!(claims_with(json!({})).permissions("permissions").is_empty());
-        assert!(claims_with(json!({ "permissions": "not-an-array" }))
-            .permissions("permissions")
-            .is_empty());
+        assert!(
+            claims_with(json!({ "permissions": "not-an-array" }))
+                .permissions("permissions")
+                .is_empty()
+        );
     }
 
     #[tokio::test]

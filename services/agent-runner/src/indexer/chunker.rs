@@ -33,12 +33,11 @@ pub fn chunk_file(file_path: &str, source: &str, language: &str) -> Vec<Chunk> {
         return Vec::new();
     }
 
-    if super::language::has_grammar(language) {
-        if let Some(chunks) = try_treesitter(file_path, source, language) {
-            if !chunks.is_empty() {
-                return chunks;
-            }
-        }
+    if super::language::has_grammar(language)
+        && let Some(chunks) = try_treesitter(file_path, source, language)
+        && !chunks.is_empty()
+    {
+        return chunks;
     }
     // Fallback: text files and languages without a grammar get windowed chunking.
     window_chunks(file_path, source, language)
