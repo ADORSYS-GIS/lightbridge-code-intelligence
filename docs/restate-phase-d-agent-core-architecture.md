@@ -74,7 +74,7 @@ every `[dependencies]` reference updated in the same commit). Directories stay f
 | `agent-types` | Pure data: `ChatMessage`, `AssistantTurn`, `ToolCallReq`, `ToolSpec`, `ToolOutcome`, `LoopOutcome`, `StepName`, `TranscriptEntry`, error enums | serde, uuid | tokio, reqwest, anything async |
 | `agent-step` | The durability seam: `StepRuntime`, `StepError`, `Passthrough`, step-name stability testing | agent-types, tokio | restate-sdk, sqlx, kube |
 | `agent-tools` | `Tool` (dyn), `ToolKind`, `ReplaySafety`, `ToolRegistry` + per-turn views, `ToolCx`, `Workspace` | agent-types, tokio | reqwest (impls live elsewhere) |
-| `agent-clients` | `ControlPlaneClient`, `EmbeddingsClient` + their DTOs (moved verbatim from `agent-runner/src/bootstrap/client.rs`) | agent-types, reqwest | kube, sqlx |
+| `agent-clients` | `ControlPlaneClient`, `EmbeddingsClient`, their HTTP DTOs, and the shared gateway rate-limit/`Retry-After` parser (mechanically moved from the runner's `bootstrap/client.rs`, `indexer/embeddings.rs`, and `ratelimit.rs`) | agent-types, reqwest | kube, sqlx |
 | `agent-loop` | `AgentLoop<R, M>`, `TurnPolicy` + the *generic* policies, `ModelClient`, `TranscriptSink`, `TurnState`/`TurnOutcome` | agent-types, agent-step, agent-tools | reqwest, restate-sdk |
 | `agent-testkit` | `ScriptedModel`, `StaticTool`, `CapturingSink`, `FailingRuntime`, the golden-transcript harness | all agent crates | (dev-dependency only — never a `[dependencies]` entry) |
 | `review-agent` | The **review** assembly: prompt builder, the concrete tool impls over `agent-clients`, review-specific policies, the bootstrap/finalize flows, `ChatClient: ModelClient` | all of the above | kube, restate-sdk, sqlx |
@@ -82,8 +82,11 @@ every `[dependencies]` reference updated in the same commit). Directories stay f
 | `agent-worker` (new, R2) | Restate host bin: `RestateRuntime` impl, the `ReviewAgent` workflow handler, h2c serve (mirrors `restate_worker.rs`) | review-agent + restate-sdk | kube, sqlx |
 
 Why this many and not fewer: `agent-clients` exists because **two** consumers need it (`review-agent`
-and `agent-runner`'s indexer, which calls `submit_chunks`/`submit_graph` today); `agent-testkit`
-exists so golden-transcript fixtures aren't copy-pasted into three crates' `tests/`; the
+and `agent-runner`'s indexer, which calls `submit_chunks`/`submit_graph` today). The gateway
+rate-limit parser also belongs there because both `EmbeddingsClient` and `ChatClient` consume it;
+keeping one shared parser avoids duplication and an upward dependency from a client crate into an
+assembly or host crate. `agent-testkit` exists so golden-transcript fixtures aren't copy-pasted into
+three crates' `tests/`; the
 `types`/`step`/`tools`/`loop` split follows the dependency arrows above — each lower crate is
 usable without the ones above it (a future non-LLM durable flow can use `agent-step` alone).
 Why not more: a `Flow` crate/trait is **declined** (ADR-0082 §revamp — flows are plain `async fn`s
@@ -108,8 +111,8 @@ pub enum StepError {
 ```
 
 Mapping duties: `agent-clients` classifies HTTP results (5xx/429/timeouts → `Transient`, 4xx →
-`Terminal`); the `ChatClient` keeps its in-step transport retries and rate-limit handling
-([`ratelimit.rs`](../services/agent-runner/src/ratelimit.rs)) but surfaces what escapes them as
+`Terminal`); the `ChatClient` keeps its in-step transport retries and rate-limit handling using the
+shared [`ratelimit.rs`](../services/agent-clients/src/ratelimit.rs), but surfaces what escapes them as
 `StepError`; `Passthrough` retries nothing (the Job's behavior today); `RestateRuntime` maps
 `Transient` → retryable `HandlerError` (engine backoff policy per step) and `Terminal` →
 `TerminalError` — the same split `restate_worker.rs`'s `deliver_step` already implements for egress.
@@ -262,9 +265,10 @@ pub trait ModelClient: Send + Sync {
 }
 ```
 
-`review-agent::model::ChatClient` (today's `chat.rs` + `ratelimit.rs`, moved) is the sole impl:
-streaming, per-chunk idle timeout, transport retries, provider `extra` passthrough, reasoning
-capture — all *inside* `complete`, invisible to the loop. ADR-0075 stands: native transport, no Rig.
+`review-agent::model::ChatClient` (today's `chat.rs`, moved) is the sole impl. It consumes the shared
+`lci-agent-clients::ratelimit` parser while retaining streaming, per-chunk idle timeout, transport
+retries, provider `extra` passthrough, and reasoning capture — all *inside* `complete`, invisible to
+the loop. ADR-0075 stands: native transport, no Rig.
 
 ### 3.6 `TurnPolicy` — dyn, sync methods, ordered composition
 
@@ -398,9 +402,11 @@ impl ReviewAgent for ReviewAgentImpl {
 | `agent.rs` `PromptBudgets`, `build_messages`, `cap_prompt_block` | 1191-1397 | `review-agent::prompt` |
 | `agent.rs` `is_read_only_tool` / `is_retrieval_tool` / `arg_field` | 1398-1433 | deleted — `ToolKind` metadata + typed args |
 | `agent.rs` coverage fns (`coverage_*`, `amend_summary_with_coverage`) | 1434-1536 | `review-agent::policy::CoverageGate` |
-| `review/native/chat.rs` + `ratelimit.rs` | whole | `review-agent::model::ChatClient` (impl `ModelClient`) |
+| `review/native/chat.rs` | whole | `review-agent::model::ChatClient` (impl `ModelClient`; consumes the shared `agent-clients::ratelimit` parser) |
+| `ratelimit.rs` | whole | `agent-clients::ratelimit` (shared by `EmbeddingsClient` and `ChatClient`; no duplicate parser or upward dependency) |
 | `review/native/tools.rs` — trait-shaped surface | consts, `dispatch` 342-… | trait/registry → `agent-tools`; each tool one module under `review-agent::tools::{vector, graph, read_file, record, reply, finish, mcp}` |
-| `bootstrap/client.rs` (`ControlPlaneClient`, `EmbeddingsClient`) | whole | `agent-clients` (verbatim move; indexer keeps using it) |
+| `bootstrap/client.rs` (`ControlPlaneClient`, HTTP DTOs) | whole | `agent-clients` (verbatim move; indexer keeps using the control-plane client) |
+| `indexer/embeddings.rs` (`EmbeddingsClient`) | whole | `agent-clients` (verbatim move; indexer keeps using it) |
 | `bootstrap/config.rs`, `clone.rs`, `indexer/`, `sast/`, `main.rs` host glue | whole | stay in `agent-runner` (the Job host) |
 | `control-plane/src/restate_worker.rs` | pattern only | `agent-worker` mirrors its h2c serve + Health service shape (R2) |
 
