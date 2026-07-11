@@ -136,19 +136,32 @@ loop** — a Job flavor and a Restate flavor drifting apart, with the fast tier 
 fallback each multiplying the fork. Phase D is therefore designed around a code revamp whose test
 is: **the durable runtime is a swap, not a rewrite.**
 
-A new workspace library crate, **`services/agent-core`**, owns the agent programming model. It
-depends on serde/tokio/anyhow only — **no `kube`, no `sqlx`, no `restate-sdk`** (runtime impls live
-with their hosts, so the SDK pin never leaks into the shared crate). Its seams, trait-by-trait:
+> The fine-grained architecture — the crate DAG, concrete trait signatures with their dyn/static
+> dispatch decisions, the `StepError` taxonomy, host wiring, the file-by-file migration map, the
+> golden-transcript harness, and the R1 PR slicing — lives in the companion
+> [Phase D `agent-core` architecture](../restate-phase-d-agent-core-architecture.md) (the same
+> companion pattern as ADR-0076's implementation plan). This section records the decision-level
+> shape; **the companion doc is normative for the code.**
+
+A new **family of workspace library crates** — `agent-types` → `agent-step` / `agent-tools` /
+`agent-clients` → `agent-loop` → `review-agent`, plus a dev-only `agent-testkit` ("agent-core" is
+the family's working name, not one crate; the DAG and each crate's allowed/forbidden deps are in
+the companion) — owns the agent programming model, **born on edition 2024, with the workspace bump
+to edition 2024 / resolver v3 as R1 step 0**. Shared crates depend on serde/tokio/anyhow only —
+**no `kube`, no `sqlx`, no `restate-sdk`** (runtime impls live with their host binaries, so the SDK
+pin never leaks into shared crates; enforced by an `xtask` dependency-hygiene check, not
+convention). The seams, trait-by-trait:
 
 - **`StepRuntime` — the durability seam (the load-bearing one).** Every effect the loop performs
   goes through `step(name, f) -> T`, plus `sleep(name, d)` and an awakeable/promise hook for the
   future `input-required` slice. Three implementations, one per execution substrate:
-  `Passthrough` (the Job path — awaits the future, ignores the name; in `agent-core`),
+  `Passthrough` (the Job path — awaits the future, ignores the name; lives in `agent-step`),
   `RestateRuntime` (wraps `ctx.run`/`ctx.sleep`/awakeables; lives in the `agent-worker` binary with
   the pinned SDK), and — only if the gates fail — `CheckpointRuntime` (Option B, persisting via the
   internal API). **The Option-B fallback collapses from "a second system" to "a third impl of the
-  same trait."** Step *names* (`llm_turn:{n}`, `tools:{n}`, …) are constants in `agent-core` with a
-  stability test, turning the R14 journal-contract rule from a review convention into code.
+  same trait."** Step *names* (`llm_turn:{n}`, `tools:{n}`, `tool:{n}:{call_id}`, …) are constants
+  in `agent-types` with a stability test, turning the R14 journal-contract rule from a review
+  convention into code.
 - **`Tool` — spec + classification + replay contract, then a registry.** Each tool implements
   `spec()` (today's `ToolDef` JSON schema), `kind()` (`ReadOnly{Retrieval|File|Knowledge}` /
   `Write` / `Terminal` / `Progress` — replacing the string-predicate helpers), `replay()`
@@ -377,6 +390,9 @@ alternative — the goal (resume, not restart) survives even if the engine-nativ
 
 ## More Information
 
+- [Phase D `agent-core` architecture](../restate-phase-d-agent-core-architecture.md) — the
+  **normative companion** for the code revamp: crate DAG, trait signatures + dispatch decisions,
+  error taxonomy, host wiring, migration map, golden harness, R1 PR slicing.
 - [RFC-0005](../rfc/0005-durable-orchestration-on-restate.md) — the strangler proposal this extends
   with **Phase D**; determinism rules and the base risk register live there.
 - [ADR-0074](0074-restate-egress-pilot.md) (Phase A, live) / [ADR-0076](0076-restate-task-lifecycle-workflow.md)
