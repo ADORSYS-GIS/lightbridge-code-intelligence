@@ -15,10 +15,59 @@ use lci_agent_clients::{
     ChunkBatch, ChunkPayload, ControlPlaneClient, EmbeddingsClient, TaskContext,
 };
 
-/// How many chunks we embed and submit in one round-trip. Balances request size vs latency.
-/// Most embedding APIs accept up to 2048 items; 32 is a safe default that keeps batches small
-/// enough to stay well under typical token-per-minute rate limits.
-const EMBED_BATCH_SIZE: usize = 32;
+/// Operator-tunable indexer knobs (ADR-0010 / epic #5). Read from the environment once per run and
+/// clamped to ≥1 so a misconfiguration can't wedge the pipeline. These were hardcoded, which made a
+/// downstream limit (e.g. an AI-gateway capping the batched-embedding *response* size) impossible to
+/// work around without a rebuild — the reason this struct exists.
+#[derive(Clone, Copy, Debug)]
+pub struct IndexTuning {
+    /// Chunks embedded + submitted per round-trip. Larger = fewer requests (kinder to per-minute
+    /// rate limits) but a bigger embeddings response body, which some gateways cap.
+    /// `INDEX_EMBED_BATCH_SIZE` (default 32).
+    pub embed_batch_size: usize,
+    /// Max lines a structured (tree-sitter) chunk may span before it is split into windows.
+    /// `INDEX_MAX_CHUNK_LINES` (default 150).
+    pub max_chunk_lines: usize,
+    /// Windowed-fallback window size, in lines. `INDEX_WINDOW_SIZE` (default 100).
+    pub window_size: usize,
+    /// Windowed-fallback step, in lines (overlap = `window_size - window_step`). `INDEX_WINDOW_STEP`
+    /// (default 50).
+    pub window_step: usize,
+}
+
+impl Default for IndexTuning {
+    fn default() -> Self {
+        Self {
+            embed_batch_size: 32,
+            max_chunk_lines: 150,
+            window_size: 100,
+            window_step: 50,
+        }
+    }
+}
+
+impl IndexTuning {
+    /// Read the knobs from the environment, falling back to [`Default`] and clamping each to ≥1.
+    #[must_use]
+    pub fn from_env() -> Self {
+        let defaults = Self::default();
+        Self {
+            embed_batch_size: env_usize("INDEX_EMBED_BATCH_SIZE", defaults.embed_batch_size),
+            max_chunk_lines: env_usize("INDEX_MAX_CHUNK_LINES", defaults.max_chunk_lines),
+            window_size: env_usize("INDEX_WINDOW_SIZE", defaults.window_size),
+            window_step: env_usize("INDEX_WINDOW_STEP", defaults.window_step),
+        }
+    }
+}
+
+/// Parse a `usize` env var, clamping to ≥1; falls back to `default` when unset or unparseable.
+fn env_usize(key: &str, default: usize) -> usize {
+    std::env::var(key)
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .map(|n| n.max(1))
+        .unwrap_or(default)
+}
 
 /// Index the checkout directory and submit all chunks to the control plane.
 /// Returns the total number of chunks submitted.
@@ -34,7 +83,8 @@ pub async fn index_checkout(
         .unwrap_or(&context.default_branch)
         .to_string();
 
-    let chunks = collect_chunks(checkout)
+    let tuning = IndexTuning::from_env();
+    let chunks = collect_chunks(checkout, tuning)
         .await
         .context("collecting chunks")?;
     if chunks.is_empty() {
@@ -43,13 +93,14 @@ pub async fn index_checkout(
     }
     tracing::info!(
         chunk_count = chunks.len(),
-        "chunking complete; embedding in batches of {EMBED_BATCH_SIZE}"
+        embed_batch_size = tuning.embed_batch_size,
+        "chunking complete; embedding in batches"
     );
 
     let mut submitted = 0usize;
     let total = chunks.len();
 
-    for (batch_idx, batch_chunks) in chunks.chunks(EMBED_BATCH_SIZE).enumerate() {
+    for (batch_idx, batch_chunks) in chunks.chunks(tuning.embed_batch_size).enumerate() {
         let texts: Vec<&str> = batch_chunks.iter().map(|c| c.content.as_str()).collect();
         let embeddings = embedder
             .embed(&texts)
@@ -90,7 +141,7 @@ pub async fn index_checkout(
 }
 
 /// Walk the checkout directory and produce chunks for every indexable file.
-async fn collect_chunks(root: &Path) -> anyhow::Result<Vec<chunker::Chunk>> {
+async fn collect_chunks(root: &Path, tuning: IndexTuning) -> anyhow::Result<Vec<chunker::Chunk>> {
     // Run the file walk + tree-sitter parsing on a blocking thread so we don't stall the async
     // runtime (tree-sitter is synchronous CPU work).
     let root = root.to_path_buf();
@@ -161,7 +212,7 @@ async fn collect_chunks(root: &Path) -> anyhow::Result<Vec<chunker::Chunk>> {
                     Err(_) => continue, // binary or unreadable
                 };
 
-                let file_chunks = chunker::chunk_file(&rel_path, &source, lang);
+                let file_chunks = chunker::chunk_file(&rel_path, &source, lang, tuning);
                 all_chunks.extend(file_chunks);
             }
         }
@@ -170,4 +221,33 @@ async fn collect_chunks(root: &Path) -> anyhow::Result<Vec<chunker::Chunk>> {
     })
     .await
     .context("chunk collection task panicked")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{IndexTuning, env_usize};
+
+    #[test]
+    fn defaults_match_the_historical_hardcoded_values() {
+        let tuning = IndexTuning::default();
+        assert_eq!(tuning.embed_batch_size, 32);
+        assert_eq!(tuning.max_chunk_lines, 150);
+        assert_eq!(tuning.window_size, 100);
+        assert_eq!(tuning.window_step, 50);
+    }
+
+    #[test]
+    fn env_usize_parses_clamps_to_one_and_falls_back() {
+        // A test-unique key so this never races another test's environment.
+        let key = "LCI_TEST_INDEX_ENV_USIZE";
+        unsafe { std::env::remove_var(key) };
+        assert_eq!(env_usize(key, 7), 7, "unset → default");
+        unsafe { std::env::set_var(key, "12") };
+        assert_eq!(env_usize(key, 7), 12, "parses a value");
+        unsafe { std::env::set_var(key, "0") };
+        assert_eq!(env_usize(key, 7), 1, "zero clamps to 1");
+        unsafe { std::env::set_var(key, "not-a-number") };
+        assert_eq!(env_usize(key, 7), 7, "unparseable → default");
+        unsafe { std::env::remove_var(key) };
+    }
 }

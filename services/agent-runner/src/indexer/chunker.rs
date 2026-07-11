@@ -4,12 +4,9 @@
 
 use tree_sitter::{Language, Node, Parser};
 
-/// Maximum lines a single structured chunk may span before we split it into windowed sub-chunks.
-const MAX_CHUNK_LINES: usize = 150;
-/// Windowed fallback: window size and step (overlap = WINDOW_SIZE - WINDOW_STEP lines).
-const WINDOW_SIZE: usize = 100;
-const WINDOW_STEP: usize = 50;
 /// Skip files larger than this (avoids embedding enormous generated files).
+/// The chunk-line ceiling and the windowed-fallback sizes are operator-tunable — see
+/// [`super::IndexTuning`].
 const MAX_FILE_BYTES: usize = 5 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
@@ -24,7 +21,12 @@ pub struct Chunk {
 }
 
 /// Walk `root` recursively and collect all chunks for `file_path`.
-pub fn chunk_file(file_path: &str, source: &str, language: &str) -> Vec<Chunk> {
+pub fn chunk_file(
+    file_path: &str,
+    source: &str,
+    language: &str,
+    tuning: super::IndexTuning,
+) -> Vec<Chunk> {
     if source.len() > MAX_FILE_BYTES {
         return Vec::new();
     }
@@ -34,13 +36,13 @@ pub fn chunk_file(file_path: &str, source: &str, language: &str) -> Vec<Chunk> {
     }
 
     if super::language::has_grammar(language)
-        && let Some(chunks) = try_treesitter(file_path, source, language)
+        && let Some(chunks) = try_treesitter(file_path, source, language, tuning)
         && !chunks.is_empty()
     {
         return chunks;
     }
     // Fallback: text files and languages without a grammar get windowed chunking.
-    window_chunks(file_path, source, language)
+    window_chunks(file_path, source, language, tuning)
 }
 
 fn ts_language(lang: &str) -> Option<Language> {
@@ -55,7 +57,12 @@ fn ts_language(lang: &str) -> Option<Language> {
     }
 }
 
-fn try_treesitter(file_path: &str, source: &str, language: &str) -> Option<Vec<Chunk>> {
+fn try_treesitter(
+    file_path: &str,
+    source: &str,
+    language: &str,
+    tuning: super::IndexTuning,
+) -> Option<Vec<Chunk>> {
     let ts_lang = ts_language(language)?;
     let mut parser = Parser::new();
     parser.set_language(&ts_lang).ok()?;
@@ -67,7 +74,15 @@ fn try_treesitter(file_path: &str, source: &str, language: &str) -> Option<Vec<C
 
     let bytes = source.as_bytes();
     let mut chunks = Vec::new();
-    collect_items(&root, bytes, file_path, source, language, &mut chunks);
+    collect_items(
+        &root,
+        bytes,
+        file_path,
+        source,
+        language,
+        tuning,
+        &mut chunks,
+    );
 
     if chunks.is_empty() {
         None
@@ -84,6 +99,7 @@ fn collect_items(
     file_path: &str,
     source: &str,
     language: &str,
+    tuning: super::IndexTuning,
     out: &mut Vec<Chunk>,
 ) {
     let mut cursor = node.walk();
@@ -95,7 +111,7 @@ fn collect_items(
 
             let content = &source[child.byte_range()];
 
-            if span <= MAX_CHUNK_LINES {
+            if span <= tuning.max_chunk_lines {
                 out.push(Chunk {
                     file_path: file_path.to_string(),
                     language: language.to_string(),
@@ -106,11 +122,11 @@ fn collect_items(
                     content: content.to_string(),
                 });
                 // Also recurse so methods inside a small impl / class are independently indexed.
-                collect_items(&child, bytes, file_path, source, language, out);
+                collect_items(&child, bytes, file_path, source, language, tuning, out);
             } else {
                 // Large node: try to extract interesting children (e.g. methods inside a big impl).
                 let before = out.len();
-                collect_items(&child, bytes, file_path, source, language, out);
+                collect_items(&child, bytes, file_path, source, language, tuning, out);
                 if out.len() == before {
                     // No interesting sub-nodes (e.g. a 200-line function with no nested fns).
                     // Emit it as a single chunk rather than silently dropping it; the embedding
@@ -128,7 +144,7 @@ fn collect_items(
             }
         } else {
             // Not an interesting node itself — still descend to find nested interesting nodes.
-            collect_items(&child, bytes, file_path, source, language, out);
+            collect_items(&child, bytes, file_path, source, language, tuning, out);
         }
     }
 }
@@ -171,7 +187,12 @@ fn interesting_node(node: &Node<'_>, bytes: &[u8]) -> Option<(&'static str, Opti
 }
 
 /// Fixed-size line windows with overlap — the fallback for text / unsupported languages.
-fn window_chunks(file_path: &str, source: &str, language: &str) -> Vec<Chunk> {
+fn window_chunks(
+    file_path: &str,
+    source: &str,
+    language: &str,
+    tuning: super::IndexTuning,
+) -> Vec<Chunk> {
     let lines: Vec<&str> = source.lines().collect();
     if lines.is_empty() {
         return Vec::new();
@@ -179,7 +200,7 @@ fn window_chunks(file_path: &str, source: &str, language: &str) -> Vec<Chunk> {
     let mut chunks = Vec::new();
     let mut start = 0usize;
     while start < lines.len() {
-        let end = (start + WINDOW_SIZE).min(lines.len());
+        let end = (start + tuning.window_size).min(lines.len());
         let content = lines[start..end].join("\n");
         chunks.push(Chunk {
             file_path: file_path.to_string(),
@@ -193,13 +214,14 @@ fn window_chunks(file_path: &str, source: &str, language: &str) -> Vec<Chunk> {
         if end == lines.len() {
             break;
         }
-        start += WINDOW_STEP;
+        start += tuning.window_step;
     }
     chunks
 }
 
 #[cfg(test)]
 mod tests {
+    use super::super::IndexTuning;
     use super::*;
 
     #[test]
@@ -208,7 +230,7 @@ mod tests {
 
 fn sub(a: i32, b: i32) -> i32 { a - b }
 "#;
-        let chunks = chunk_file("src/math.rs", src, "rust");
+        let chunks = chunk_file("src/math.rs", src, "rust", IndexTuning::default());
         assert!(!chunks.is_empty(), "should produce at least one chunk");
         let add = chunks
             .iter()
@@ -220,7 +242,7 @@ fn sub(a: i32, b: i32) -> i32 { a - b }
     #[test]
     fn binary_content_is_skipped() {
         let src = "hello\x00world";
-        let chunks = chunk_file("image.png", src, "text");
+        let chunks = chunk_file("image.png", src, "text", IndexTuning::default());
         assert!(chunks.is_empty());
     }
 
@@ -228,7 +250,7 @@ fn sub(a: i32, b: i32) -> i32 { a - b }
     fn text_file_falls_back_to_windows() {
         let lines: Vec<String> = (0..200).map(|i| format!("line {i}")).collect();
         let src = lines.join("\n");
-        let chunks = chunk_file("README.md", &src, "text");
+        let chunks = chunk_file("README.md", &src, "text", IndexTuning::default());
         assert!(!chunks.is_empty());
         assert!(chunks.iter().all(|c| c.chunk_type == "window"));
     }
@@ -236,7 +258,7 @@ fn sub(a: i32, b: i32) -> i32 { a - b }
     #[test]
     fn window_chunk_covers_full_file_when_short() {
         let src = "one\ntwo\nthree\n";
-        let chunks = window_chunks("f.txt", src, "text");
+        let chunks = window_chunks("f.txt", src, "text", IndexTuning::default());
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].start_line, 0);
     }
