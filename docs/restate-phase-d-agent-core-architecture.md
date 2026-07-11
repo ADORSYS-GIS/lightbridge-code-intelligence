@@ -2,20 +2,21 @@
 
 > **Status: design-only.** This is the fine-grained code architecture for
 > [ADR-0082](adr/0082-restate-durable-agent-runtime.md)'s revamp — crate layout, trait signatures,
-> dispatch decisions, error taxonomy, wiring, and the migration map. **R1 (the extraction) may be
-> built once ADR-0082 is accepted; R2 (the Restate runtime) stays behind ADR-0082's gates G0–G4.**
+> dispatch decisions, error taxonomy, wiring, and the migration map. **R1 (the extraction) is
+> owner-authorized; R2 (the Restate runtime) stays behind ADR-0082's gates G0–G4.**
 > Companion pattern: same relationship as the
 > [Phase B implementation plan](restate-phase-b-implementation-plan.md) to ADR-0076.
 
 ---
 
-## 0. Toolchain target (R1 step 0)
+## 0. Toolchain target (R1a)
 
 The agent crates are born on **edition 2024** with the workspace on **`resolver = "3"`**.
 As of this writing, `main`'s workspace manifest still says `edition = "2021"` / `resolver = "2"` —
-the bump is **R1 step 0** (one PR: flip `workspace.package.edition = "2024"`,
-`workspace.resolver = "3"`, `cargo fix --edition` across members, clippy clean). Nothing below
-depends on 2021 semantics; three 2024-era capabilities are load-bearing:
+the bump is part of **R1a**: flip `workspace.package.edition = "2024"`, set
+`workspace.resolver = "3"`, and apply only the compiler-required edition fixes across existing
+members. No behavioral refactor belongs in the edition diff. Three 2024-era capabilities are
+load-bearing:
 
 - **Native `async fn` in traits (AFIT/RPITIT)** — `StepRuntime` and `ModelClient` are async traits
   with *no* `async-trait` macro and no boxing, because they are statically dispatched (see §3 for
@@ -25,9 +26,13 @@ depends on 2021 semantics; three 2024-era capabilities are load-bearing:
 - **Resolver v3** — per-target feature resolution keeps host-only heavyweights (`restate-sdk`,
   `kube`) from unifying features into the shared crates.
 
-Dependency-hygiene rule, enforced mechanically (an `xtask` check, same spirit as the existing
-CI lint): **`restate-sdk` may appear in exactly one manifest (`agent-worker`); `kube` in exactly
-one (`control-plane`); `sqlx` in exactly one (`control-plane`). No agent crate links any of them.**
+The R1a dependency-hygiene rule is an **allowed-direct-consumer check**, enforced by `xtask` tests
+and CI. Root `[workspace.dependencies]` declarations do not count as consumers. The current
+allowlist is `restate-sdk` → `control-plane`, `kube` → `control-plane`, and `sqlx` →
+`control-plane`; R2 may additionally allow `restate-sdk` → `agent-worker` when that host is
+created. Every crate in the agent family is forbidden from directly consuming these dependencies.
+Other packages may consume `lci-agent-testkit` only through `[dev-dependencies]`. Later platform
+slices that move an owned dependency must update the allowlist and its tests in the same PR.
 
 ## 1. Crate DAG
 
@@ -399,12 +404,24 @@ impl ReviewAgent for ReviewAgentImpl {
 | `bootstrap/config.rs`, `clone.rs`, `indexer/`, `sast/`, `main.rs` host glue | whole | stay in `agent-runner` (the Job host) |
 | `control-plane/src/restate_worker.rs` | pattern only | `agent-worker` mirrors its h2c serve + Health service shape (R2) |
 
-R1 lands as five PRs, each green and behavior-identical (goldens run from R1c on):
-**R1a** edition-2024/resolver-3 bump + empty crate skeletons with the dependency-hygiene xtask
-check; **R1b** `agent-clients` extraction (mechanical move, importers updated); **R1c**
+R1 lands as five PRs, each green and behavior-identical (goldens run from R1c on).
+
+**R1a has an exact, mechanical boundary:** edition 2024/resolver 3 plus edition-only compiler
+fixes; seven R1 library skeletons (`lci-agent-types`, `lci-agent-step`, `lci-agent-tools`,
+`lci-agent-clients`, `lci-agent-loop`, `lci-agent-testkit`, `lci-review-agent`) — **no
+`agent-worker`**; the `lightbridge-config` → `lci-config` package rename; a workspace `bon` pin;
+the stable-only `rustfmt.toml`; `StepName`/`step_names!` and their format/list stability tests; and
+the dependency-hygiene `xtask` check with its own tests and CI wiring. Because `lci-agent-types`
+contains real `StepName` behavior, the coverage configuration's explicit active-crate allowlist
+contains only `lci-agent-types` in R1a. Each other skeleton is added to that allowlist when its
+first non-skeleton code lands.
+
+R1a does **not** port clients, tools, the loop, policies, model code, prompts, or host behavior.
+Those remain **R1b** `agent-clients` extraction (mechanical move, importers updated); **R1c**
 `agent-tools` + the tool port + `agent-testkit` with the golden-transcript harness; **R1d**
 `agent-loop` + policy extraction under goldens; **R1e** `review-agent` assembly, `agent-runner`
-reduced to host glue, old modules deleted.
+reduced to host glue, old modules deleted. Baseline tools from ADR-0083 other than the R1a items
+above are introduced only in the first consuming slice or a separate follow-on PR.
 
 ## 7. Golden-transcript harness (the R1 merge bar, mechanically)
 
