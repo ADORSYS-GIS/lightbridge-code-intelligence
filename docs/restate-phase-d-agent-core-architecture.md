@@ -71,8 +71,8 @@ every `[dependencies]` reference updated in the same commit). Directories stay f
 
 | Crate (`lci-…`) | Responsibility | May depend on | Must never depend on |
 |---|---|---|---|
-| `agent-types` | Pure data: `ChatMessage`, `AssistantTurn`, `ToolCallReq`, `ToolSpec`, `ToolOutcome`, `LoopOutcome`, `StepName`, `TranscriptEntry`, error enums | serde, uuid | tokio, reqwest, anything async |
-| `agent-step` | The durability seam: `StepRuntime`, `StepError`, `Passthrough`, step-name stability testing | agent-types, tokio | restate-sdk, sqlx, kube |
+| `agent-types` | Pure data: `ChatMessage`, `AssistantTurn`, `ToolCallReq`, `ToolSpec`, `ToolOutcome`, `LoopOutcome`, `StepName`, `TranscriptEntry`, error enums including `StepError` | anyhow (error source only), serde, uuid | tokio, reqwest, anything async |
+| `agent-step` | The durability seam: `StepRuntime`, the `StepError` re-export, `Passthrough`, step-name stability testing | agent-types, serde, tokio | restate-sdk, sqlx, kube |
 | `agent-tools` | `Tool` (dyn), `ToolKind`, `ReplaySafety`, `ToolRegistry` + per-turn views, `ToolCx`, `Workspace` | agent-types, tokio | reqwest (impls live elsewhere) |
 | `agent-clients` | `ControlPlaneClient`, `EmbeddingsClient`, their HTTP DTOs, and the shared gateway rate-limit/`Retry-After` parser (mechanically moved from the runner's `bootstrap/client.rs`, `indexer/embeddings.rs`, and `ratelimit.rs`) | agent-types, reqwest | kube, sqlx |
 | `agent-loop` | `AgentLoop<R, M>`, `TurnPolicy` + the *generic* policies, `ModelClient`, `TranscriptSink`, `TurnState`/`TurnOutcome` | agent-types, agent-step, agent-tools | reqwest, restate-sdk |
@@ -89,6 +89,12 @@ assembly or host crate. `agent-testkit` exists so golden-transcript fixtures are
 three crates' `tests/`; the
 `types`/`step`/`tools`/`loop` split follows the dependency arrows above — each lower crate is
 usable without the ones above it (a future non-LLM durable flow can use `agent-step` alone).
+
+**R1d handoff note.** To keep the accepted R1d/R1e boundary, R1d does not relocate the native
+`chat.rs` model/message implementation or the control-plane transport `TranscriptEntry`. The generic
+loop introduces its wire-compatible `ChatMessage`/`ChatRequest` and a distinct `TranscriptEvent` sink
+contract; R1e performs the final native-model adapter/consolidation when it moves `chat.rs` and prompt
+assembly. Generic transcript events must not be confused with the persisted control-plane DTO.
 Why not more: a `Flow` crate/trait is **declined** (ADR-0082 §revamp — flows are plain `async fn`s
 over `&R` until a second real flow exists), and splitting policies into their own crate would
 separate them from the `TurnState` they observe for no consumer's benefit.
@@ -109,6 +115,12 @@ pub enum StepError {
     Terminal { reason: String },
 }
 ```
+
+**R1d ownership erratum.** `StepError` is defined once in `agent-types` and re-exported by
+`agent-step`. The earlier crate-table wording that assigned the definition to `agent-step` was
+inconsistent with the taxonomy above and would force `agent-clients` to depend upward on the runtime
+crate merely to classify HTTP failures. `anyhow` is used only as the opaque source carried by the data
+enum; `agent-types` remains free of async/runtime behavior.
 
 Mapping duties: `agent-clients` classifies HTTP results (5xx/429/timeouts → `Transient`, 4xx →
 `Terminal`); the `ChatClient` keeps its in-step transport retries and rate-limit handling using the
@@ -296,6 +308,12 @@ pub enum PolicyAction {
     ForceFinish { reason: &'static str },   // the Exhausted backstop
 }
 ```
+
+R1d retains these two methods and adds default-empty terminal/exhaustion action hooks plus a
+default-empty `after_turn_actions` extension. The extension is required for the already-existing
+coverage and refute gates: both must reject a dispatched `finish`, inject a nudge, and continue, which
+the original `after_turn(...)->()` sketch cannot express. The hooks stay synchronous and deterministic;
+the review assembly performs the coverage summary upsert after the generic loop returns.
 
 Merge semantics are fixed and simple: actions apply in policy-registration order; `Narrow` only
 intersects (a later policy cannot re-widen); `Inject`s concatenate; any `ForceFinish` ends the loop

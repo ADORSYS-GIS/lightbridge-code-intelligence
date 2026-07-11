@@ -74,14 +74,18 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: lci-agent-types line coverage
         run: cargo llvm-cov -p lci-agent-types --locked --fail-under-lines 85
+      - name: lci-agent-step line coverage
+        run: cargo llvm-cov -p lci-agent-step --locked --fail-under-lines 85
+      - name: lci-agent-loop line coverage
+        run: cargo llvm-cov -p lci-agent-loop -p agent-runner --lib --locked --exclude-from-report agent-runner --fail-under-lines 85
       - name: lci-agent-clients line coverage
         run: cargo llvm-cov -p lci-agent-clients --locked --fail-under-lines 85
       - name: lci-agent-tools line coverage
         run: cargo llvm-cov -p lci-agent-tools --locked --fail-under-lines 85
       - name: lci-review-agent line coverage
-        run: cargo llvm-cov -p lci-review-agent --locked --fail-under-lines 85
+        run: cargo llvm-cov -p lci-review-agent -p agent-runner --lib --locked --exclude-from-report agent-runner --fail-under-lines 85
       - name: lci-agent-testkit line coverage
-        run: cargo llvm-cov -p lci-agent-testkit --locked --fail-under-lines 85
+        run: cargo llvm-cov -p lci-agent-testkit -p agent-runner --lib --locked --exclude-from-report agent-runner --fail-under-lines 85
       - name: sccache stats
         if: always()
         run: sccache --show-stats || true

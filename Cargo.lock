@@ -86,7 +86,10 @@ dependencies = [
  "base64",
  "futures",
  "lci-agent-clients",
+ "lci-agent-loop",
+ "lci-agent-step",
  "lci-agent-testkit",
+ "lci-agent-tools",
  "lci-agent-types",
  "lci-config",
  "lci-review-agent",
@@ -2382,9 +2385,12 @@ dependencies = [
 name = "lci-agent-loop"
 version = "0.1.0"
 dependencies = [
+ "futures",
  "lci-agent-step",
  "lci-agent-tools",
  "lci-agent-types",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -2392,6 +2398,7 @@ name = "lci-agent-step"
 version = "0.1.0"
 dependencies = [
  "lci-agent-types",
+ "serde",
  "tokio",
 ]
 
@@ -2424,6 +2431,7 @@ dependencies = [
 name = "lci-agent-types"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "serde",
  "serde_json",
  "uuid",

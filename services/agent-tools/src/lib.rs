@@ -223,6 +223,24 @@ impl ToolRegistry {
     pub fn is_empty(&self) -> bool {
         self.tools.is_empty()
     }
+
+    /// Classification lookup used by the generic loop to partition read batches from ordered
+    /// effect calls. The tool implementation remains hidden behind the registry.
+    #[must_use]
+    pub fn kind(&self, name: &str) -> Option<ToolKind> {
+        self.tools
+            .iter()
+            .find(|tool| tool.spec().name() == name)
+            .map(|tool| tool.kind())
+    }
+
+    #[must_use]
+    pub fn replay(&self, name: &str) -> Option<ReplaySafety> {
+        self.tools
+            .iter()
+            .find(|tool| tool.spec().name() == name)
+            .map(|tool| tool.replay())
+    }
 }
 
 /// One turn's offered specs and guarded dispatcher.
