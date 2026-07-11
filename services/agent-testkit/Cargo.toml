@@ -18,7 +18,5 @@ lci-agent-tools = { path = "../agent-tools" }
 lci-agent-types = { path = "../agent-types" }
 serde.workspace = true
 serde_json.workspace = true
-uuid.workspace = true
-
-[dev-dependencies]
 tokio.workspace = true
+uuid.workspace = true

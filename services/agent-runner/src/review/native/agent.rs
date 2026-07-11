@@ -4070,18 +4070,29 @@ mod tests {
         );
     }
 
-    fn golden_reply(
-        id: &str,
-        name: &str,
-        arguments: &str,
-        extra: Option<serde_json::Value>,
-    ) -> serde_json::Value {
-        let mut call =
-            json!({"id":id,"type":"function","function":{"name":name,"arguments":arguments}});
-        if let Some(extra) = extra {
-            call["extra_content"] = extra;
-        }
-        json!({"choices":[{"finish_reason":"tool_calls","message":{"role":"assistant","tool_calls":[call]}}]})
+    fn golden_script_responses(
+        scenario: lci_agent_testkit::GoldenScenario,
+    ) -> Vec<serde_json::Value> {
+        scenario
+            .script()
+            .turns
+            .into_iter()
+            .map(|turn| {
+                let finish_reason = if turn.tool_calls.is_empty() {
+                    "stop"
+                } else {
+                    "tool_calls"
+                };
+                let mut message = json!({"role": "assistant"});
+                if let Some(content) = turn.content {
+                    message["content"] = json!(content);
+                }
+                if !turn.tool_calls.is_empty() {
+                    message["tool_calls"] = json!(turn.tool_calls);
+                }
+                json!({"choices":[{"finish_reason":finish_reason,"message":message}]})
+            })
+            .collect()
     }
 
     async fn mount_golden_control_plane(server: &MockServer) {
@@ -4133,84 +4144,14 @@ mod tests {
             diff: "@@ -1,1 +1,2 @@\n one\n+two\n".into(),
             files: vec!["a.rs".into()],
         };
-        let (responses, diff): (Vec<_>, Option<&PrDiff>) = match scenario {
-            lci_agent_testkit::GoldenScenario::PlainConvergeFinish => (
-                vec![
-                    golden_reply(
-                        "plain-record",
-                        ADD_REVIEW_COMMENT,
-                        r#"{"file":"a.rs","line":2,"title":"Issue","priority":"P2","category":"quality","body":"body","evidence":"line 2"}"#,
-                        Some(json!({"provider":{"signature":"opaque"}})),
-                    ),
-                    golden_reply("plain-finish", FINISH, r#"{"summary":"one finding"}"#, None),
-                ],
-                Some(&diff_a),
-            ),
-            lci_agent_testkit::GoldenScenario::WindDownEntry => (
-                vec![
-                    golden_reply(
-                        "wind-progress",
-                        super::super::tools::REPORT_PROGRESS,
-                        r#"{"note":"working"}"#,
-                        None,
-                    ),
-                    golden_reply("wind-finish", FINISH, r#"{"summary":"done"}"#, None),
-                ],
-                None,
-            ),
-            lci_agent_testkit::GoldenScenario::ContextTrimTrigger => (
-                vec![
-                    golden_reply("trim-read", READ_FILE, r#"{"path":"big.txt"}"#, None),
-                    golden_reply(
-                        "trim-progress",
-                        super::super::tools::REPORT_PROGRESS,
-                        r#"{"note":"working"}"#,
-                        None,
-                    ),
-                    golden_reply("trim-finish", FINISH, r#"{"summary":"done"}"#, None),
-                ],
-                Some(&diff_a),
-            ),
-            lci_agent_testkit::GoldenScenario::FastTierRefusal => (
-                vec![golden_reply(
-                    "fast-illegal",
-                    READ_FILE,
-                    r#"{"path":"a.rs"}"#,
-                    None,
-                )],
-                Some(&diff_a),
-            ),
-            lci_agent_testkit::GoldenScenario::CoverageBounce => (
-                vec![
-                    golden_reply("coverage-finish-1", FINISH, r#"{"summary":"early"}"#, None),
-                    golden_reply("coverage-read", READ_FILE, r#"{"path":"a.rs"}"#, None),
-                    golden_reply("coverage-finish-2", FINISH, r#"{"summary":"done"}"#, None),
-                ],
-                Some(&diff_a),
-            ),
-            lci_agent_testkit::GoldenScenario::ExhaustedBackstop => {
-                (vec![text_reply("still thinking")], None)
-            }
-        };
-        mount_chat(&chat, responses).await;
+        let settings = scenario.settings();
+        let diff = settings.diff_present.then_some(&diff_a);
+        mount_chat(&chat, golden_script_responses(scenario)).await;
         let mut config = review_config(format!("{}/v1", chat.uri()));
-        match scenario {
-            lci_agent_testkit::GoldenScenario::PlainConvergeFinish => config.max_turns = 5,
-            lci_agent_testkit::GoldenScenario::WindDownEntry
-            | lci_agent_testkit::GoldenScenario::ExhaustedBackstop => config.max_turns = 2,
-            lci_agent_testkit::GoldenScenario::ContextTrimTrigger => {
-                config.max_turns = 5;
-                config.context_window = Some(2_000);
-            }
-            lci_agent_testkit::GoldenScenario::FastTierRefusal => {
-                config.fast = true;
-                config.max_turns = 1;
-            }
-            lci_agent_testkit::GoldenScenario::CoverageBounce => {
-                config.max_turns = 5;
-                config.max_coverage_bounces = 1;
-            }
-        }
+        config.max_turns = settings.max_turns;
+        config.context_window = settings.context_window;
+        config.fast = settings.fast;
+        config.max_coverage_bounces = settings.max_coverage_bounces;
         let client = ControlPlaneClient::new(cp.uri(), "tok");
         let embedder = EmbeddingsClient::new("http://unused", "key", "model");
         let mut transcript = Vec::new();
@@ -4287,10 +4228,217 @@ mod tests {
         }
     }
 
+    struct GoldenWorkspace(std::path::PathBuf);
+
+    impl lci_agent_tools::Workspace for GoldenWorkspace {
+        fn root(
+            &self,
+        ) -> lci_agent_tools::BoxFuture<'_, Result<&Path, lci_agent_tools::WorkspaceError>>
+        {
+            Box::pin(async { Ok(self.0.as_path()) })
+        }
+    }
+
+    async fn capture_actual_extracted_trace(
+        scenario: lci_agent_testkit::GoldenScenario,
+    ) -> (lci_agent_testkit::LegacyTrace, Vec<String>) {
+        use std::sync::Arc;
+
+        use lci_agent_loop::policy::{ContextWindowTrim, ReadBudgets, TurnBudget, WindDown};
+        use lci_agent_loop::{
+            AgentLoop, ChatMessage as LoopMessage, Conversation, LoopLimits, LoopOutcome,
+            RequestOptions, TranscriptEvent, TurnPolicy,
+        };
+        use lci_agent_testkit::{
+            CapturingSink, FailingRuntime, LegacyTrace, ObservedCall, ObservedWrite, ScriptedModel,
+        };
+        use lci_agent_tools::{RuntimeCaps, ToolCx, TurnFilter};
+        use lci_review_agent::policies::{
+            CoverageGate, FastTierGuard, FindingFinishNudge, RefuteGate, ScratchpadLoopGuard,
+            render_fast_refusal,
+        };
+
+        let cp = MockServer::start().await;
+        mount_golden_control_plane(&cp).await;
+        let checkout = tempfile::tempdir().unwrap();
+        tokio::fs::write(checkout.path().join("a.rs"), "one\ntwo\nthree\n")
+            .await
+            .unwrap();
+        tokio::fs::write(checkout.path().join("big.txt"), "x".repeat(32 * 1024))
+            .await
+            .unwrap();
+        let diff_a = PrDiff {
+            diff: "@@ -1,1 +1,2 @@\n one\n+two\n".into(),
+            files: vec!["a.rs".into()],
+        };
+        let settings = scenario.settings();
+        let diff = settings.diff_present.then_some(&diff_a);
+        let mut config = review_config("http://unused/v1".into());
+        config.max_turns = settings.max_turns;
+        config.context_window = settings.context_window;
+        config.fast = settings.fast;
+        config.max_coverage_bounces = settings.max_coverage_bounces;
+
+        let native_messages = build_messages(&config, "review", diff, None, None, None, None);
+        let messages: Vec<LoopMessage> = serde_json::from_value(
+            serde_json::to_value(native_messages).expect("legacy seed messages serialize"),
+        )
+        .expect("loop messages preserve the legacy wire shape");
+        let initial_names = lci_review_agent::tools::tool_defs()
+            .into_iter()
+            .filter(|spec| settings.diff_present || spec.name() != ADD_REVIEW_COMMENT)
+            .map(|spec| spec.function.name)
+            .collect::<Vec<_>>();
+        let conversation = Conversation::new(
+            messages,
+            RequestOptions {
+                model: config.model.clone(),
+                temperature: config.temperature,
+                top_p: config.top_p,
+                max_tokens: config.max_tokens,
+                stream: config.stream.then_some(true),
+                extra: config.extra.clone(),
+            },
+        )
+        .with_filter(TurnFilter::only_names(initial_names));
+
+        let client = ControlPlaneClient::new(cp.uri(), "tok");
+        let embedder = EmbeddingsClient::new("http://unused", "key", "model");
+        let registry = lci_review_agent::tools::tool_registry(
+            Arc::new(client.clone()),
+            Arc::new(embedder),
+            [],
+            RuntimeCaps::default(),
+        )
+        .unwrap();
+        let workspace = GoldenWorkspace(checkout.path().to_path_buf());
+        let cx = ToolCx {
+            task_id: Uuid::nil(),
+            workspace: &workspace,
+        };
+        let (coverage, coverage_state) = CoverageGate::new(
+            diff.map(|value| value.files.clone()).unwrap_or_default(),
+            config.max_coverage_bounces,
+            settings.max_turns,
+            settings.fast,
+        );
+        let winddown_filter = if settings.diff_present {
+            TurnFilter::all()
+        } else {
+            TurnFilter::only_names(
+                lci_review_agent::tools::tool_defs()
+                    .into_iter()
+                    .map(|spec| spec.function.name)
+                    .filter(|name| name != RETRACT_FINDING),
+            )
+        };
+        let policies: Vec<Box<dyn TurnPolicy>> = vec![
+            Box::new(ContextWindowTrim::new(config.context_window)),
+            Box::new(
+                WindDown::new(settings.max_turns, config.max_batches)
+                    .disabled(settings.fast)
+                    .with_filter(winddown_filter),
+            ),
+            Box::new(
+                ReadBudgets::new(config.max_files_read, config.max_searches)
+                    .disabled(settings.fast),
+            ),
+            Box::new(TurnBudget::new(settings.max_turns).disabled(settings.fast)),
+            Box::new(FastTierGuard::new(settings.fast)),
+            Box::new(ScratchpadLoopGuard::new()),
+            Box::new(coverage),
+            Box::new(RefuteGate::new(settings.fast)),
+            Box::new(FindingFinishNudge::new(settings.fast)),
+        ];
+        let model = ScriptedModel::new(scenario.script().turns);
+        let model_handle = model.clone();
+        let sink = CapturingSink::default();
+        let sink_handle = sink.clone();
+        let runtime = FailingRuntime::default();
+        let runtime_handle = runtime.clone();
+        let mut agent = AgentLoop::new(
+            runtime,
+            model,
+            registry,
+            policies,
+            Box::new(sink),
+            LoopLimits {
+                max_turns: settings.max_turns,
+                max_batch_size: config.max_batch_size,
+                circuit_breaker_threshold: config.resilience.circuit_breaker_threshold,
+                no_tool_nudge: "Use the tools to investigate and record findings with `add_review_comment` (or a reply with `add_comment`), then call `finish` with your verdict (or `abort`). Do not reply in prose.".into(),
+            },
+        )
+        .with_refusal_renderer(render_fast_refusal);
+        let outcome = agent.run(conversation, &cx).await.unwrap();
+        if let Some(amended) = coverage_state.amended_summary() {
+            client
+                .set_review_summary(Uuid::nil(), &amended)
+                .await
+                .unwrap();
+        }
+
+        let mut calls = Vec::new();
+        let mut policy_events = Vec::new();
+        for event in sink_handle.entries() {
+            match event {
+                TranscriptEvent::Tool {
+                    turn,
+                    call,
+                    outcome,
+                } => calls.push(ObservedCall {
+                    turn,
+                    call,
+                    outcome,
+                }),
+                TranscriptEvent::Policy { turn, name, detail } => policy_events.push(json!({
+                    "type": "policy",
+                    "turn": turn,
+                    "name": name,
+                    "detail": detail,
+                })),
+                TranscriptEvent::Assistant { .. } => {}
+            }
+        }
+        let control_plane_writes = cp
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter_map(|request| {
+                let endpoint = request.url.path().to_string();
+                (request.method.as_str() == "POST"
+                    && endpoint.contains("/review/")
+                    && !endpoint.ends_with("/telemetry"))
+                .then(|| ObservedWrite {
+                    endpoint,
+                    body: serde_json::from_slice(&request.body).unwrap_or(serde_json::Value::Null),
+                })
+            })
+            .collect();
+        let outcome = match outcome {
+            LoopOutcome::Finished => json!({"status":"finished"}),
+            LoopOutcome::Exhausted => json!({"status":"exhausted"}),
+            LoopOutcome::Aborted { reason } => json!({"status":"aborted","reason":reason}),
+        };
+        (
+            LegacyTrace {
+                scenario,
+                chat_requests: model_handle.requests(),
+                calls,
+                policy_events,
+                control_plane_writes,
+                outcome,
+            },
+            runtime_handle.steps(),
+        )
+    }
+
     #[tokio::test]
-    async fn legacy_run_native_agent_matches_all_six_frozen_traces() {
+    async fn legacy_and_extracted_loops_match_all_six_frozen_traces() {
         for scenario in lci_agent_testkit::GoldenScenario::ALL {
             let actual = capture_actual_legacy_trace(scenario).await;
+            let (extracted, steps) = capture_actual_extracted_trace(scenario).await;
             if scenario == lci_agent_testkit::GoldenScenario::FastTierRefusal {
                 assert_eq!(
                     actual.calls[0].outcome,
@@ -4316,7 +4464,72 @@ mod tests {
                 );
             } else {
                 lci_agent_testkit::GoldenHarness::assert_fixture(scenario, &actual);
+                if extracted.chat_requests != actual.chat_requests {
+                    let signature = |requests: &[serde_json::Value]| {
+                        requests
+                            .iter()
+                            .map(|request| json!({
+                                "message_lengths": request["messages"].as_array().unwrap().iter().map(|message| message["content"].as_str().map(str::len)).collect::<Vec<_>>(),
+                                "roles": request["messages"].as_array().unwrap().iter().map(|message| message["role"].as_str()).collect::<Vec<_>>(),
+                                "tools": request["tools"].as_array().unwrap().iter().map(|tool| tool["function"]["name"].as_str()).collect::<Vec<_>>(),
+                            }))
+                            .collect::<Vec<_>>()
+                    };
+                    panic!(
+                        "{scenario:?}: requests\nextracted={}\nlegacy={}",
+                        serde_json::to_string_pretty(&signature(&extracted.chat_requests)).unwrap(),
+                        serde_json::to_string_pretty(&signature(&actual.chat_requests)).unwrap()
+                    );
+                }
+                assert_eq!(extracted.calls, actual.calls, "{scenario:?}: calls");
+                assert_eq!(
+                    extracted.policy_events, actual.policy_events,
+                    "{scenario:?}: policy events"
+                );
+                assert_eq!(
+                    extracted.control_plane_writes, actual.control_plane_writes,
+                    "{scenario:?}: CP writes"
+                );
+                assert_eq!(extracted.outcome, actual.outcome, "{scenario:?}: outcome");
+                lci_agent_testkit::GoldenHarness::assert_parity(&actual, &extracted);
             }
+            let expected_steps: &[&str] = match scenario {
+                lci_agent_testkit::GoldenScenario::PlainConvergeFinish => &[
+                    "llm_turn:0",
+                    "tool:0:plain-record",
+                    "llm_turn:1",
+                    "tool:1:plain-finish",
+                ],
+                lci_agent_testkit::GoldenScenario::WindDownEntry => &[
+                    "llm_turn:0",
+                    "tool:0:wind-progress",
+                    "llm_turn:1",
+                    "tool:1:wind-finish",
+                ],
+                lci_agent_testkit::GoldenScenario::ContextTrimTrigger => &[
+                    "llm_turn:0",
+                    "tools:0",
+                    "llm_turn:1",
+                    "tool:1:trim-progress",
+                    "llm_turn:2",
+                    "tool:2:trim-finish",
+                    "llm_turn:3",
+                    "tool:3:trim-finish",
+                ],
+                lci_agent_testkit::GoldenScenario::FastTierRefusal => &["llm_turn:0"],
+                lci_agent_testkit::GoldenScenario::CoverageBounce => &[
+                    "llm_turn:0",
+                    "tool:0:coverage-finish-1",
+                    "llm_turn:1",
+                    "tools:1",
+                    "llm_turn:2",
+                    "tool:2:coverage-finish-2",
+                ],
+                lci_agent_testkit::GoldenScenario::ExhaustedBackstop => {
+                    &["llm_turn:0", "llm_turn:1"]
+                }
+            };
+            assert_eq!(steps, expected_steps, "{scenario:?}: journal step sequence");
         }
     }
 }

@@ -1,9 +1,17 @@
 //! Deterministic support for the R1 legacy-vs-extracted agent comparison.
 
-use std::sync::Mutex;
+use std::collections::{BTreeSet, VecDeque};
+use std::future::{Future, pending};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
+use lci_agent_loop::{ChatRequest, ModelClient, TranscriptEvent, TranscriptSink};
+use lci_agent_step::{AwaitableId, StepRuntime};
 use lci_agent_tools::{BoxFuture, ReplaySafety, Tool, ToolCx, ToolKind};
-use lci_agent_types::{ToolCallReq, ToolOutcome, ToolSpec};
+use lci_agent_types::{
+    AssistantTurn, FunctionCallReq, StepError, StepName, ToolCallReq, ToolOutcome, ToolSpec,
+};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -35,6 +43,139 @@ impl GoldenScenario {
             Self::CoverageBounce => include_str!("../goldens/coverage_bounce.json"),
             Self::ExhaustedBackstop => include_str!("../goldens/exhausted_backstop.json"),
         }
+    }
+
+    /// One source of truth for the model replies used by both the legacy and extracted loops.
+    #[must_use]
+    pub fn script(self) -> GoldenScript {
+        let call = |id: &str, name: &str, arguments: &str, extra_content| AssistantTurn {
+            content: None,
+            tool_calls: vec![ToolCallReq {
+                id: id.into(),
+                kind: "function".into(),
+                function: FunctionCallReq {
+                    name: name.into(),
+                    arguments: arguments.into(),
+                },
+                extra_content,
+            }],
+        };
+        let turns = match self {
+            Self::PlainConvergeFinish => vec![
+                call(
+                    "plain-record",
+                    "add_review_comment",
+                    r#"{"file":"a.rs","line":2,"title":"Issue","priority":"P2","category":"quality","body":"body","evidence":"line 2"}"#,
+                    Some(serde_json::json!({"provider":{"signature":"opaque"}})),
+                ),
+                call(
+                    "plain-finish",
+                    "finish",
+                    r#"{"summary":"one finding"}"#,
+                    None,
+                ),
+            ],
+            Self::WindDownEntry => vec![
+                call(
+                    "wind-progress",
+                    "report_progress",
+                    r#"{"note":"working"}"#,
+                    None,
+                ),
+                call("wind-finish", "finish", r#"{"summary":"done"}"#, None),
+            ],
+            Self::ContextTrimTrigger => vec![
+                call("trim-read", "read_file", r#"{"path":"big.txt"}"#, None),
+                call(
+                    "trim-progress",
+                    "report_progress",
+                    r#"{"note":"working"}"#,
+                    None,
+                ),
+                call("trim-finish", "finish", r#"{"summary":"done"}"#, None),
+            ],
+            Self::FastTierRefusal => vec![call(
+                "fast-illegal",
+                "read_file",
+                r#"{"path":"a.rs"}"#,
+                None,
+            )],
+            Self::CoverageBounce => vec![
+                call(
+                    "coverage-finish-1",
+                    "finish",
+                    r#"{"summary":"early"}"#,
+                    None,
+                ),
+                call("coverage-read", "read_file", r#"{"path":"a.rs"}"#, None),
+                call("coverage-finish-2", "finish", r#"{"summary":"done"}"#, None),
+            ],
+            Self::ExhaustedBackstop => vec![AssistantTurn {
+                content: Some("still thinking".into()),
+                tool_calls: Vec::new(),
+            }],
+        };
+        GoldenScript { turns }
+    }
+
+    #[must_use]
+    pub fn settings(self) -> GoldenSettings {
+        match self {
+            Self::PlainConvergeFinish => GoldenSettings::new(5).with_diff(),
+            Self::WindDownEntry => GoldenSettings::new(2),
+            Self::ContextTrimTrigger => GoldenSettings::new(5)
+                .with_diff()
+                .with_context_window(2_000),
+            Self::FastTierRefusal => GoldenSettings::new(1).with_diff().fast(),
+            Self::CoverageBounce => GoldenSettings::new(5).with_diff().with_coverage_bounces(1),
+            Self::ExhaustedBackstop => GoldenSettings::new(2),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct GoldenScript {
+    pub turns: Vec<AssistantTurn>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GoldenSettings {
+    pub max_turns: usize,
+    pub diff_present: bool,
+    pub context_window: Option<usize>,
+    pub fast: bool,
+    pub max_coverage_bounces: usize,
+}
+
+impl GoldenSettings {
+    fn new(max_turns: usize) -> Self {
+        Self {
+            max_turns,
+            diff_present: false,
+            context_window: None,
+            fast: false,
+            max_coverage_bounces: 3,
+        }
+    }
+
+    fn with_diff(mut self) -> Self {
+        self.diff_present = true;
+        self
+    }
+
+    fn with_context_window(mut self, context_window: usize) -> Self {
+        self.context_window = Some(context_window);
+        self
+    }
+
+    fn fast(mut self) -> Self {
+        self.fast = true;
+        self
+    }
+
+    fn with_coverage_bounces(mut self, bounces: usize) -> Self {
+        self.max_coverage_bounces = bounces;
+        self
     }
 }
 
@@ -98,6 +239,188 @@ pub struct StaticTool {
     outcome: ToolOutcome,
     calls: Mutex<Vec<ToolCallReq>>,
 }
+
+enum ScriptedResponse {
+    Turn(AssistantTurn),
+    Terminal(String),
+    Transient(String),
+}
+
+/// Deterministic native-AFIT model fake that captures every complete request before replying.
+#[derive(Clone, Default)]
+pub struct ScriptedModel {
+    responses: Arc<Mutex<VecDeque<ScriptedResponse>>>,
+    requests: Arc<Mutex<Vec<serde_json::Value>>>,
+    last_turn: Arc<Mutex<Option<AssistantTurn>>>,
+    repeat_last: bool,
+}
+
+impl ScriptedModel {
+    #[must_use]
+    pub fn new(turns: impl IntoIterator<Item = AssistantTurn>) -> Self {
+        Self {
+            responses: Arc::new(Mutex::new(
+                turns.into_iter().map(ScriptedResponse::Turn).collect(),
+            )),
+            requests: Arc::default(),
+            last_turn: Arc::default(),
+            repeat_last: true,
+        }
+    }
+
+    #[must_use]
+    pub fn terminal(reason: impl Into<String>) -> Self {
+        let model = Self::default();
+        model
+            .responses
+            .lock()
+            .expect("scripted model mutex")
+            .push_back(ScriptedResponse::Terminal(reason.into()));
+        model
+    }
+
+    #[must_use]
+    pub fn transient(reason: impl Into<String>) -> Self {
+        let model = Self::default();
+        model
+            .responses
+            .lock()
+            .expect("scripted model mutex")
+            .push_back(ScriptedResponse::Transient(reason.into()));
+        model
+    }
+
+    #[must_use]
+    pub fn requests(&self) -> Vec<serde_json::Value> {
+        self.requests
+            .lock()
+            .expect("scripted requests mutex")
+            .clone()
+    }
+}
+
+impl ModelClient for ScriptedModel {
+    async fn complete(&self, request: ChatRequest<'_>) -> Result<AssistantTurn, StepError> {
+        self.requests
+            .lock()
+            .expect("scripted requests mutex")
+            .push(serde_json::to_value(request).expect("chat request serializes"));
+        match self
+            .responses
+            .lock()
+            .expect("scripted model mutex")
+            .pop_front()
+        {
+            Some(ScriptedResponse::Turn(turn)) => {
+                *self.last_turn.lock().expect("scripted last-turn mutex") = Some(turn.clone());
+                Ok(turn)
+            }
+            Some(ScriptedResponse::Terminal(reason)) => Err(StepError::terminal(reason)),
+            Some(ScriptedResponse::Transient(reason)) => {
+                Err(StepError::transient(std::io::Error::other(reason), None))
+            }
+            None if self.repeat_last => self
+                .last_turn
+                .lock()
+                .expect("scripted last-turn mutex")
+                .clone()
+                .ok_or_else(|| StepError::terminal("scripted model exhausted")),
+            None => Err(StepError::terminal("scripted model exhausted")),
+        }
+    }
+}
+
+/// Cloneable handle to transcript entries after the loop consumes its boxed sink.
+#[derive(Clone, Default)]
+pub struct CapturingSink(Arc<Mutex<Vec<TranscriptEvent>>>);
+
+impl CapturingSink {
+    #[must_use]
+    pub fn entries(&self) -> Vec<TranscriptEvent> {
+        self.0.lock().expect("capturing sink mutex").clone()
+    }
+}
+
+impl TranscriptSink for CapturingSink {
+    fn record(&mut self, entry: TranscriptEvent) {
+        self.0.lock().expect("capturing sink mutex").push(entry);
+    }
+}
+
+/// Runtime fake that captures stable names and can fail selected steps before executing them.
+#[derive(Clone, Default)]
+pub struct FailingRuntime {
+    fail: Arc<Mutex<BTreeSet<String>>>,
+    steps: Arc<Mutex<Vec<String>>>,
+}
+
+impl FailingRuntime {
+    #[must_use]
+    pub fn on(names: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        Self {
+            fail: Arc::new(Mutex::new(names.into_iter().map(Into::into).collect())),
+            steps: Arc::default(),
+        }
+    }
+
+    #[must_use]
+    pub fn steps(&self) -> Vec<String> {
+        self.steps.lock().expect("runtime steps mutex").clone()
+    }
+
+    fn record(&self, name: &StepName) -> Result<(), StepError> {
+        self.steps
+            .lock()
+            .expect("runtime steps mutex")
+            .push(name.as_str().into());
+        if self
+            .fail
+            .lock()
+            .expect("runtime failure mutex")
+            .contains(name.as_str())
+        {
+            Err(StepError::terminal(format!(
+                "injected failure at {}",
+                name.as_str()
+            )))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl StepRuntime for FailingRuntime {
+    async fn step<T, F>(&self, name: StepName, f: F) -> Result<T, StepError>
+    where
+        T: Serialize + DeserializeOwned + Send + 'static,
+        F: AsyncFnOnce() -> Result<T, StepError> + Send,
+    {
+        self.record(&name)?;
+        f().await
+    }
+
+    async fn sleep(&self, name: StepName, _after: Duration) -> Result<(), StepError> {
+        self.record(&name)
+    }
+
+    async fn awaitable<T>(
+        &self,
+        name: StepName,
+    ) -> Result<
+        (
+            AwaitableId,
+            impl Future<Output = Result<T, StepError>> + Send,
+        ),
+        StepError,
+    >
+    where
+        T: Serialize + DeserializeOwned + Send + 'static,
+    {
+        self.record(&name)?;
+        let (id, _) = lci_agent_step::Passthrough.awaitable::<T>(name).await?;
+        Ok((id, pending()))
+    }
+}
 impl StaticTool {
     #[must_use]
     pub fn new(spec: ToolSpec, kind: ToolKind, replay: ReplaySafety, outcome: ToolOutcome) -> Self {
@@ -139,7 +462,6 @@ impl Tool for StaticTool {
 mod tests {
     use super::*;
     use lci_agent_tools::{Workspace, WorkspaceError};
-    use lci_agent_types::FunctionCallReq;
     use std::path::Path;
     struct Root;
     impl Workspace for Root {
@@ -235,5 +557,57 @@ mod tests {
             ))
             .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn scripted_model_captures_requests_and_preserves_provider_fields() {
+        let scripted = GoldenScenario::PlainConvergeFinish.script();
+        let model = ScriptedModel::new(scripted.turns);
+        let request = lci_agent_loop::ChatRequest {
+            model: "m",
+            messages: &[],
+            tools: &[],
+            tool_choice: None,
+            temperature: None,
+            top_p: None,
+            max_tokens: None,
+            stream: None,
+            stream_options: None,
+            extra: &serde_json::Map::new(),
+        };
+        let turn = model.complete(request).await.unwrap();
+        assert_eq!(
+            turn.tool_calls[0].extra_content.as_ref().unwrap()["provider"]["signature"],
+            "opaque"
+        );
+        assert_eq!(
+            model.requests(),
+            vec![serde_json::json!({"model":"m","messages":[]})]
+        );
+    }
+
+    #[tokio::test]
+    async fn failing_runtime_records_before_failing() {
+        let runtime = FailingRuntime::on(["llm_turn:0"]);
+        let error = runtime
+            .step(lci_agent_types::step_names::llm_turn(0), async || {
+                Ok::<_, StepError>(1_u8)
+            })
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("injected failure"));
+        assert_eq!(runtime.steps(), vec!["llm_turn:0"]);
+    }
+
+    #[test]
+    fn capturing_sink_is_observable_after_boxing() {
+        let sink = CapturingSink::default();
+        let mut boxed: Box<dyn TranscriptSink> = Box::new(sink.clone());
+        boxed.record(TranscriptEvent::Policy {
+            turn: 3,
+            name: "x",
+            detail: serde_json::json!({}),
+        });
+        assert_eq!(sink.entries().len(), 1);
     }
 }
