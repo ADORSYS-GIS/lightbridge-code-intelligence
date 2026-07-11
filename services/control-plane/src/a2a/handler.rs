@@ -22,21 +22,21 @@ use a2a::{
     ListTasksRequest, ListTasksResponse, SendMessageRequest, SendMessageResponse, StreamResponse,
     SubscribeToTaskRequest, Task, TaskPushNotificationConfig, TaskState,
 };
+use a2a_server::TaskStore;
 use a2a_server::handler::RequestHandler;
 use a2a_server::middleware::ServiceParams;
-use a2a_server::TaskStore;
 use async_trait::async_trait;
 use futures::stream::BoxStream;
-use serde_json::{json, Map, Value};
-use sqlx::postgres::{PgListener, PgPoolOptions};
+use serde_json::{Map, Value, json};
 use sqlx::PgPool;
+use sqlx::postgres::{PgListener, PgPoolOptions};
 use uuid::Uuid;
 
 use super::mapping::{
-    build_task_view, parse_review_request, review_artifacts, task_state_from_status, ParseError,
-    ReviewContext, ReviewInput,
+    ParseError, ReviewContext, ReviewInput, build_task_view, parse_review_request,
+    review_artifacts, task_state_from_status,
 };
-use super::store::{PgTaskStore, LB_CALLER, LB_SKILL, LB_UNDERLYING};
+use super::store::{LB_CALLER, LB_SKILL, LB_UNDERLYING, PgTaskStore};
 use super::{HDR_CALLER, HDR_PERMS};
 use crate::db;
 
@@ -1378,11 +1378,12 @@ mod tests {
         let task = task_of(resp);
         assert_eq!(task.status.state, TaskState::Submitted);
         // The client view never leaks the caller id.
-        assert!(task
-            .metadata
-            .as_ref()
-            .map(|m| !m.contains_key(LB_CALLER))
-            .unwrap_or(true));
+        assert!(
+            task.metadata
+                .as_ref()
+                .map(|m| !m.contains_key(LB_CALLER))
+                .unwrap_or(true)
+        );
 
         // A real deep-tier task row exists behind it.
         let underlying = underlying_of(&task).expect("underlying task id");
@@ -1977,8 +1978,8 @@ mod tests {
         );
 
         // Phase-1 unsupported surface: ListTasks + push config.
-        assert!(h
-            .list_tasks(
+        assert!(
+            h.list_tasks(
                 &caller,
                 ListTasksRequest {
                     context_id: None,
@@ -1992,7 +1993,8 @@ mod tests {
                 }
             )
             .await
-            .is_err());
+            .is_err()
+        );
     }
 
     /// Regression (Gemini HIGH): when the underlying `tasks` row is deleted, the FK's `ON DELETE SET
@@ -2084,8 +2086,8 @@ mod tests {
     // ---------------------------------------------------------------------------
 
     use a2a::StreamResponse;
-    use futures::stream::BoxStream;
     use futures::StreamExt;
+    use futures::stream::BoxStream;
     use std::time::Duration;
 
     /// A bounded-timeout stream collector: drains a `BoxStream` to completion, but if any single item

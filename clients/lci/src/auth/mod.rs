@@ -7,10 +7,10 @@
 mod pkce;
 mod store;
 
-pub use store::{clear, StoredToken};
+pub use store::{StoredToken, clear};
 
 use crate::config::Config;
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::net::SocketAddr;

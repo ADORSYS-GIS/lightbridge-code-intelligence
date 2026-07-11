@@ -21,7 +21,7 @@
 //! never logged anywhere in this module.
 
 use base64::Engine;
-use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, CHACHA20_POLY1305, NONCE_LEN};
+use ring::aead::{Aad, CHACHA20_POLY1305, LessSafeKey, NONCE_LEN, Nonce, UnboundKey};
 use ring::rand::{SecureRandom, SystemRandom};
 
 /// A 32-byte ChaCha20-Poly1305 key. A newtype so key material can't be confused with arbitrary bytes

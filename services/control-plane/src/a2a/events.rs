@@ -31,7 +31,7 @@ use serde_json::Value;
 use sqlx::{PgConnection, PgPool};
 use uuid::Uuid;
 
-use super::mapping::{review_artifacts, task_state_from_status, ReviewContext};
+use super::mapping::{ReviewContext, review_artifacts, task_state_from_status};
 
 /// Postgres `LISTEN`/`NOTIFY` channel prefix for a per-A2A-task stream. The SSE tail loop listens on
 /// `{prefix}{a2a_task_id}`; producers `NOTIFY` it as a *wake hint* only (the `seq`-cursor SELECT is

@@ -104,21 +104,22 @@ impl Default for NotifierConfig {
 impl NotifierConfig {
     /// Resolve from env, each unset/invalid field falling back to its default.
     pub fn from_env() -> Self {
+        Self::from_env_with(|name| std::env::var(name).ok())
+    }
+
+    fn from_env_with(env: impl Fn(&str) -> Option<String>) -> Self {
         let secs = |name: &str, default: Duration| {
-            std::env::var(name)
-                .ok()
+            env(name)
                 .and_then(|v| v.parse::<u64>().ok())
                 .filter(|&s| s > 0)
                 .map(Duration::from_secs)
                 .unwrap_or(default)
         };
-        let max_attempts = std::env::var("NOTIFIER_MAX_ATTEMPTS")
-            .ok()
+        let max_attempts = env("NOTIFIER_MAX_ATTEMPTS")
             .and_then(|v| v.parse::<i32>().ok())
             .filter(|&m| m > 0)
             .unwrap_or(DEFAULT_MAX_ATTEMPTS);
-        let max_events_per_claim = std::env::var("NOTIFIER_MAX_EVENTS_PER_CLAIM")
-            .ok()
+        let max_events_per_claim = env("NOTIFIER_MAX_EVENTS_PER_CLAIM")
             .and_then(|v| v.parse::<usize>().ok())
             .filter(|&m| m > 0)
             .unwrap_or(DEFAULT_MAX_EVENTS_PER_CLAIM);
@@ -199,10 +200,10 @@ fn build_pinned_client(validated: &ValidatedWebhook) -> reqwest::Result<reqwest:
         .timeout(TOTAL_TIMEOUT);
     // Pin the connect to the validated IP for a domain host (DNS-rebinding defence). `host_str` is the
     // domain for a domain URL; for a literal IP there is nothing to override (the pin is the literal).
-    if let (Some(host), Some(&ip)) = (validated.url.host_str(), validated.pinned_ips.first()) {
-        if matches!(validated.url.host(), Some(url::Host::Domain(_))) {
-            builder = builder.resolve(host, SocketAddr::new(ip, HTTPS_PORT));
-        }
+    if let (Some(host), Some(&ip)) = (validated.url.host_str(), validated.pinned_ips.first())
+        && matches!(validated.url.host(), Some(url::Host::Domain(_)))
+    {
+        builder = builder.resolve(host, SocketAddr::new(ip, HTTPS_PORT));
     }
     builder.build()
 }
@@ -475,7 +476,7 @@ async fn record_failure(
 /// delivery cycles — mirrors the dispatcher's signal handling.
 #[cfg(unix)]
 async fn shutdown_signal() {
-    use tokio::signal::unix::{signal, SignalKind};
+    use tokio::signal::unix::{SignalKind, signal};
     let mut sigterm = match signal(SignalKind::terminate()) {
         Ok(s) => s,
         Err(error) => {
@@ -514,30 +515,29 @@ mod tests {
 
     #[test]
     fn config_from_env_defaults_and_overrides() {
-        std::env::remove_var("NOTIFIER_POLL_SECS");
-        std::env::remove_var("NOTIFIER_LEASE_SECS");
-        std::env::remove_var("NOTIFIER_MAX_ATTEMPTS");
-        std::env::remove_var("NOTIFIER_MAX_EVENTS_PER_CLAIM");
-        let cfg = NotifierConfig::from_env();
+        let config =
+            |poll: Option<&str>, lease: Option<&str>, attempts: Option<&str>, cap: Option<&str>| {
+                NotifierConfig::from_env_with(|name| match name {
+                    "NOTIFIER_POLL_SECS" => poll.map(str::to_string),
+                    "NOTIFIER_LEASE_SECS" => lease.map(str::to_string),
+                    "NOTIFIER_MAX_ATTEMPTS" => attempts.map(str::to_string),
+                    "NOTIFIER_MAX_EVENTS_PER_CLAIM" => cap.map(str::to_string),
+                    _ => None,
+                })
+            };
+
+        let cfg = config(None, None, None, None);
         assert_eq!(cfg.poll_interval, DEFAULT_POLL_INTERVAL);
         assert_eq!(cfg.lease, DEFAULT_LEASE);
         assert_eq!(cfg.max_attempts, DEFAULT_MAX_ATTEMPTS);
         assert_eq!(cfg.max_events_per_claim, DEFAULT_MAX_EVENTS_PER_CLAIM);
 
-        std::env::set_var("NOTIFIER_POLL_SECS", "7");
-        std::env::set_var("NOTIFIER_MAX_ATTEMPTS", "3");
-        std::env::set_var("NOTIFIER_MAX_EVENTS_PER_CLAIM", "5");
         // A zero is invalid and falls back to the default (never a busy-loop / zero-attempt state).
-        std::env::set_var("NOTIFIER_LEASE_SECS", "0");
-        let cfg = NotifierConfig::from_env();
+        let cfg = config(Some("7"), Some("0"), Some("3"), Some("5"));
         assert_eq!(cfg.poll_interval, Duration::from_secs(7));
         assert_eq!(cfg.lease, DEFAULT_LEASE);
         assert_eq!(cfg.max_attempts, 3);
         assert_eq!(cfg.max_events_per_claim, 5);
-        std::env::remove_var("NOTIFIER_POLL_SECS");
-        std::env::remove_var("NOTIFIER_LEASE_SECS");
-        std::env::remove_var("NOTIFIER_MAX_ATTEMPTS");
-        std::env::remove_var("NOTIFIER_MAX_EVENTS_PER_CLAIM");
     }
 
     /// The hardened client builds for both a domain (pinned via `resolve`) and a literal-IP webhook.
@@ -700,16 +700,18 @@ mod tests {
         let cfg = test_cfg();
 
         // One claim delivers the whole catch-up (events 1..3) while holding the lease.
-        assert!(deliver_next_due(
-            &pool,
-            &sender,
-            None,
-            &SsrfPolicy::default(),
-            "owner-a",
-            &cfg
-        )
-        .await
-        .unwrap());
+        assert!(
+            deliver_next_due(
+                &pool,
+                &sender,
+                None,
+                &SsrfPolicy::default(),
+                "owner-a",
+                &cfg
+            )
+            .await
+            .unwrap()
+        );
 
         assert_eq!(
             sender.event_ids(),
@@ -724,16 +726,18 @@ mod tests {
         assert_eq!((delivered, attempts, state.as_str()), (3, 0, "active"));
 
         // Nothing left due.
-        assert!(!deliver_next_due(
-            &pool,
-            &sender,
-            None,
-            &SsrfPolicy::default(),
-            "owner-a",
-            &cfg
-        )
-        .await
-        .unwrap());
+        assert!(
+            !deliver_next_due(
+                &pool,
+                &sender,
+                None,
+                &SsrfPolicy::default(),
+                "owner-a",
+                &cfg
+            )
+            .await
+            .unwrap()
+        );
     }
 
     /// Regression: `advance_push_delivered` is strictly monotonic. A stale worker whose lease

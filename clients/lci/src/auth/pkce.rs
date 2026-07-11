@@ -4,8 +4,8 @@
 //! `base64url(sha256(verifier))` and the exchange is a plain reqwest POST, so the dependency isn't
 //! worth its weight.
 
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use rand::RngExt as _;
 use sha2::{Digest, Sha256};
 
@@ -72,10 +72,11 @@ mod tests {
     fn generated_verifier_is_in_range_and_url_safe() {
         let pkce = Pkce::generate();
         assert!((43..=128).contains(&pkce.verifier.len()));
-        assert!(pkce
-            .verifier
-            .bytes()
-            .all(|b| VERIFIER_ALPHABET.contains(&b)));
+        assert!(
+            pkce.verifier
+                .bytes()
+                .all(|b| VERIFIER_ALPHABET.contains(&b))
+        );
         // The challenge round-trips through the derivation.
         assert_eq!(challenge_for(&pkce.verifier), pkce.challenge);
     }

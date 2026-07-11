@@ -109,7 +109,7 @@ pub fn load_template(path: &Path) -> anyhow::Result<String> {
 /// yields strings, so a numeric config field written as `"{env:DEADLINE:-3600}"` arrives as the
 /// string `"3600"`; these let it deserialize anyway (while a literal JSON number still works). Empty
 /// / null → `None`. Annotate numeric `Option` fields with
-/// `#[serde(default, deserialize_with = "lightbridge_config::de::opt_u64")]`.
+/// `#[serde(default, deserialize_with = "lci_config::de::opt_u64")]`.
 pub mod de {
     use serde::de::Error;
     use serde::{Deserialize, Deserializer};
@@ -209,7 +209,7 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
-    fn env_of(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+    fn env_of(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> + use<> {
         let map: HashMap<String, String> = pairs
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))

@@ -11,17 +11,17 @@
 //! clone_url (the runner splices `x-access-token:<token>@`). GitLab embeds the token in the
 //! clone_url itself (`oauth2:<token>@host`) and sends an empty token field.
 
-use axum::extract::{FromRequestParts, Path, State};
-use axum::http::request::Parts;
-use axum::http::StatusCode;
-use axum::response::{IntoResponse, Response};
 use axum::Json;
+use axum::extract::{FromRequestParts, Path, State};
+use axum::http::StatusCode;
+use axum::http::request::Parts;
+use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 use uuid::Uuid;
 
-use crate::integrations::platform::{CodePlatform, Platform, RepoRef};
 use crate::AppState;
+use crate::integrations::platform::{CodePlatform, Platform, RepoRef};
 
 /// Authenticates a runner request by comparing its `Authorization: Bearer` token against the
 /// configured `AGENT_RUNNER_TOKEN`, in constant time. A unit extractor: presence of the value is
@@ -1505,8 +1505,8 @@ pub async fn finalize_review(
             // reacts 👎 with its truthful note), or 👍 for a clean finish that still posts because prior
             // findings exist on this target (retraction visibility, ADR-0065 composition). Best-effort:
             // the review itself is queued, the reaction is cosmetic.
-            if let Some(content) = policy.verdict {
-                if let Err(error) = crate::outbox::enqueue_verdict_reaction(
+            if let Some(content) = policy.verdict
+                && let Err(error) = crate::outbox::enqueue_verdict_reaction(
                     pool,
                     &t,
                     context.target_id,
@@ -1515,14 +1515,13 @@ pub async fn finalize_review(
                     &context.target_type,
                 )
                 .await
-                {
-                    tracing::warn!(%error, task_id = %id, content, "enqueueing verdict reaction failed (non-fatal)");
-                }
+            {
+                tracing::warn!(%error, task_id = %id, content, "enqueueing verdict reaction failed (non-fatal)");
             }
             // An aborted run posted an apology, not a verdict → 😕 (same dedup key as the failure-path
             // 😕, so a run that also reports `failed` isn't double-reacted).
-            if policy.react_confused {
-                if let Err(error) = crate::outbox::enqueue_reaction(
+            if policy.react_confused
+                && let Err(error) = crate::outbox::enqueue_reaction(
                     pool,
                     &t,
                     context.target_id,
@@ -1531,9 +1530,8 @@ pub async fn finalize_review(
                     &context.target_type,
                 )
                 .await
-                {
-                    tracing::warn!(%error, task_id = %id, "enqueueing aborted 😕 failed (non-fatal)");
-                }
+            {
+                tracing::warn!(%error, task_id = %id, "enqueueing aborted 😕 failed (non-fatal)");
             }
         }
     }
@@ -1584,10 +1582,10 @@ pub async fn set_status(
         Ok(true) => {
             // ADR-0037 idempotency: a runner (re)starting its task clears any buffer left by a prior
             // attempt, so a retry accumulates from empty rather than appending to a partial review.
-            if update.status == "running" {
-                if let Err(error) = crate::db::clear_pending_review(pool, id).await {
-                    tracing::warn!(%error, task_id = %id, "clearing pending buffer on (re)start failed (non-fatal)");
-                }
+            if update.status == "running"
+                && let Err(error) = crate::db::clear_pending_review(pool, id).await
+            {
+                tracing::warn!(%error, task_id = %id, "clearing pending buffer on (re)start failed (non-fatal)");
             }
             // A terminal failure gets 😕 + a fallback "review failed, retry" comment on the PR when the
             // review never finalized (ADR-0056), so the author isn't left in silence. Success is

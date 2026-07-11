@@ -564,12 +564,12 @@ impl App {
     }
     /// Expire the toast if its TTL has elapsed. Returns true if it changed (needs redraw).
     pub fn tick_toast(&mut self, now: Instant) -> bool {
-        if let Some(t) = &self.toast {
-            if now.duration_since(t.shown_at) >= TOAST_TTL {
-                self.toast = None;
-                self.mark_dirty();
-                return true;
-            }
+        if let Some(t) = &self.toast
+            && now.duration_since(t.shown_at) >= TOAST_TTL
+        {
+            self.toast = None;
+            self.mark_dirty();
+            return true;
         }
         false
     }

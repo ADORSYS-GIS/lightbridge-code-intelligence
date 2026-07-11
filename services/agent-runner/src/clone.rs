@@ -34,18 +34,16 @@ pub async fn checkout(ctx: &TaskContext, workdir: &str) -> anyhow::Result<PathBu
 
     // Best-effort: bring in the base commit too (for PR diffing / overlay indexing in a later
     // slice). A failure here is non-fatal — the head checkout is what this slice needs.
-    if let Some(base_sha) = &ctx.base_sha {
-        if Some(base_sha) != ctx.head_sha.as_ref() {
-            if let Err(error) = git(
-                &dir,
-                &["fetch", "--depth", "1", "origin", base_sha],
-                &ctx.token,
-            )
-            .await
-            {
-                tracing::warn!(%error, base_sha, "could not fetch base sha (non-fatal)");
-            }
-        }
+    if let Some(base_sha) = &ctx.base_sha
+        && Some(base_sha) != ctx.head_sha.as_ref()
+        && let Err(error) = git(
+            &dir,
+            &["fetch", "--depth", "1", "origin", base_sha],
+            &ctx.token,
+        )
+        .await
+    {
+        tracing::warn!(%error, base_sha, "could not fetch base sha (non-fatal)");
     }
 
     Ok(dir)

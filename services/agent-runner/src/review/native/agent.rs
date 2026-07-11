@@ -27,9 +27,9 @@ use uuid::Uuid;
 
 use super::chat::{ChatClient, ChatMessage, ChatParams, RetryPolicy, ToolDef};
 use super::tools::{
-    tool_defs, ToolOutcome, Tools, ABORT, ADD_COMMENT, ADD_REVIEW_COMMENT, EMPTY_RETRIEVAL_RESULT,
-    FINISH, GRAPH_FIND_SYMBOL, GRAPH_GET_CALLERS, READ_FILE, RETRACT_FINDING,
-    VECTOR_SEMANTIC_SEARCH,
+    ABORT, ADD_COMMENT, ADD_REVIEW_COMMENT, EMPTY_RETRIEVAL_RESULT, FINISH, GRAPH_FIND_SYMBOL,
+    GRAPH_GET_CALLERS, READ_FILE, RETRACT_FINDING, ToolOutcome, Tools, VECTOR_SEMANTIC_SEARCH,
+    tool_defs,
 };
 use crate::bootstrap::client::{ControlPlaneClient, TranscriptEntry};
 use crate::bootstrap::config::{McpToolPattern, ReviewConfig, ReviewToolSelector};
@@ -1581,8 +1581,8 @@ fn truncate_on_boundary(s: &str, max: usize) -> &str {
 mod tests {
     use super::*;
     use serde_json::json;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 

@@ -1252,8 +1252,7 @@ mod tests {
     #[tokio::test]
     async fn stream_parses_rate_limit_headers() {
         let server = MockServer::start().await;
-        let sse =
-            "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\n\
+        let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\n\
                    data: [DONE]\n\n";
         Mock::given(method("POST"))
             .and(path("/v1/chat/completions"))

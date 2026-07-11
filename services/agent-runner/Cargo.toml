@@ -13,7 +13,7 @@ path = "src/main.rs"
 # Versions + features are centralized in the workspace root Cargo.toml.
 [dependencies]
 anyhow.workspace = true
-lightbridge-config = { path = "../config" }
+lci-config = { path = "../config" }
 mimalloc.workspace = true
 serde.workspace = true
 serde_json.workspace = true

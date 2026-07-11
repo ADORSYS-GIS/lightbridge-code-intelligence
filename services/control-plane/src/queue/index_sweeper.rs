@@ -57,10 +57,10 @@ async fn sweep_repo(
         return Ok(());
     }
     let mut keep = db::in_use_commits(pool, repository_id).await?;
-    if let Some(latest) = db::latest_indexed_commit(pool, repository_id).await? {
-        if !keep.contains(&latest) {
-            keep.push(latest);
-        }
+    if let Some(latest) = db::latest_indexed_commit(pool, repository_id).await?
+        && !keep.contains(&latest)
+    {
+        keep.push(latest);
     }
     if keep.is_empty() {
         return Ok(());

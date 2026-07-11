@@ -15,8 +15,8 @@ use axum::response::{IntoResponse, Response};
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 
-use crate::integrations::platform::{CodePlatform, Platform, RepoRef};
 use crate::AppState;
+use crate::integrations::platform::{CodePlatform, Platform, RepoRef};
 
 type HmacSha256 = Hmac<Sha256>;
 

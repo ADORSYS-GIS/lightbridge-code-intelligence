@@ -10,8 +10,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use sqlx::postgres::PgListener;
 use sqlx::PgPool;
+use sqlx::postgres::PgListener;
 
 use crate::config::ReviewSection;
 use crate::db;
@@ -77,6 +77,13 @@ impl DispatcherConfig {
     /// Resolve from the file config's `dispatcher` section; each unset (or zero) field uses its
     /// default.
     pub fn from_file(section: Option<&crate::config::DispatcherSection>) -> Self {
+        Self::from_file_with_env(section, |name| std::env::var(name).ok())
+    }
+
+    fn from_file_with_env(
+        section: Option<&crate::config::DispatcherSection>,
+        env: impl Fn(&str) -> Option<String>,
+    ) -> Self {
         let secs = |value: Option<u64>, default: u64| {
             Duration::from_secs(value.filter(|&s| s > 0).unwrap_or(default))
         };
@@ -86,8 +93,7 @@ impl DispatcherConfig {
         // A2A task retention is env-configured (like the notifier's knobs), not file-config: an
         // unset/blank/non-positive value falls back to the default (the sweep never runs with a 0 TTL).
         let env_days = |name: &str, default: i64| {
-            std::env::var(name)
-                .ok()
+            env(name)
                 .and_then(|v| v.parse::<i64>().ok())
                 .filter(|&d| d > 0)
                 .unwrap_or(default)
@@ -252,7 +258,7 @@ pub async fn run<L: TaskLauncher>(
 /// run on Linux/macOS; the non-Unix arm falls back to Ctrl-C so the code still compiles.
 #[cfg(unix)]
 async fn shutdown_signal() {
-    use tokio::signal::unix::{signal, SignalKind};
+    use tokio::signal::unix::{SignalKind, signal};
     let mut sigterm = match signal(SignalKind::terminate()) {
         Ok(s) => s,
         // Can't install the handler — never resolve (the orchestrator's SIGKILL still stops us).
@@ -426,30 +432,31 @@ mod tests {
         );
     }
 
-    // The A2A task-retention knobs come from env (like the notifier's), defaulting when unset/blank and
-    // a non-positive value falling back to the default rather than a 0-day sweep-everything window.
-    // Serialized to avoid env cross-talk with other tests reading the same vars.
+    // The A2A task-retention knobs come from env (like the notifier's), defaulting when unset/blank
+    // and a non-positive value falling back to the default rather than a 0-day sweep-everything
+    // window. Inject values so the parallel test runner never mutates the process environment.
     #[test]
     fn a2a_task_retention_from_env_defaults_and_overrides() {
-        std::env::remove_var("A2A_TASK_TTL_DAYS");
-        std::env::remove_var("A2A_TASK_SWEEP_BATCH");
-        let cfg = DispatcherConfig::default();
+        let config = |ttl: Option<&str>, batch: Option<&str>| {
+            DispatcherConfig::from_file_with_env(None, |name| match name {
+                "A2A_TASK_TTL_DAYS" => ttl.map(str::to_string),
+                "A2A_TASK_SWEEP_BATCH" => batch.map(str::to_string),
+                _ => None,
+            })
+        };
+
+        let cfg = config(None, None);
         assert_eq!(cfg.a2a_task_ttl_days, DEFAULT_A2A_TASK_TTL_DAYS);
         assert_eq!(cfg.a2a_task_sweep_batch, DEFAULT_A2A_TASK_SWEEP_BATCH);
 
-        std::env::set_var("A2A_TASK_TTL_DAYS", "7");
-        std::env::set_var("A2A_TASK_SWEEP_BATCH", "100");
-        let cfg = DispatcherConfig::default();
+        let cfg = config(Some("7"), Some("100"));
         assert_eq!(cfg.a2a_task_ttl_days, 7);
         assert_eq!(cfg.a2a_task_sweep_batch, 100);
 
         // A non-positive TTL falls back to the default (never a 0-day delete-everything sweep).
-        std::env::set_var("A2A_TASK_TTL_DAYS", "0");
         assert_eq!(
-            DispatcherConfig::default().a2a_task_ttl_days,
+            config(Some("0"), Some("100")).a2a_task_ttl_days,
             DEFAULT_A2A_TASK_TTL_DAYS
         );
-        std::env::remove_var("A2A_TASK_TTL_DAYS");
-        std::env::remove_var("A2A_TASK_SWEEP_BATCH");
     }
 }

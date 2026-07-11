@@ -9,7 +9,7 @@ use k8s_openapi::api::batch::v1::Job;
 use k8s_openapi::api::core::v1::ServiceAccount;
 use kube::api::{DeleteParams, PostParams};
 use kube::{Api, Client};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::db::ClaimedTask;
 

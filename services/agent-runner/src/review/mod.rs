@@ -9,4 +9,4 @@
 pub mod instructions;
 pub mod native;
 
-pub use native::agent::{run_native_agent, ReviewOutcome};
+pub use native::agent::{ReviewOutcome, run_native_agent};

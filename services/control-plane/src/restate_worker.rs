@@ -41,10 +41,10 @@ use restate_sdk::prelude::{
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 
+use crate::AppState;
 use crate::config::ReviewSection;
 use crate::db::OutboxRow;
 use crate::integrations::platform::{CodePlatform, Platform, RepoRef};
-use crate::AppState;
 
 /// Default bind address for the Restate SDK endpoint. The Restate server connects here to discover
 /// and invoke services; 9080 is the SDK's conventional port.
@@ -270,8 +270,12 @@ async fn dead_letter_step(pool: &PgPool, outbox_id: i64, error: &str) -> Handler
 /// [`DEFAULT_BIND`]. Bound as a raw string so hostnames resolve via `ToSocketAddrs`, consistent with
 /// the `serve` role's `BIND_ADDR` handling.
 fn bind_addr() -> String {
-    match std::env::var("RESTATE_WORKER_BIND") {
-        Ok(v) if !v.trim().is_empty() => v,
+    bind_addr_from(std::env::var("RESTATE_WORKER_BIND").ok())
+}
+
+fn bind_addr_from(value: Option<String>) -> String {
+    match value {
+        Some(v) if !v.trim().is_empty() => v,
         _ => DEFAULT_BIND.to_string(),
     }
 }
@@ -330,7 +334,7 @@ pub async fn run(state: AppState) -> anyhow::Result<()> {
 /// the `restate-worker` role shuts down on the same signals as the other headless roles.
 #[cfg(unix)]
 async fn shutdown_signal() {
-    use tokio::signal::unix::{signal, SignalKind};
+    use tokio::signal::unix::{SignalKind, signal};
     let mut sigterm = match signal(SignalKind::terminate()) {
         Ok(s) => s,
         Err(error) => {
@@ -372,28 +376,25 @@ mod tests {
         assert_eq!(ping_response("   "), "pong");
     }
 
-    // One test drives every `RESTATE_WORKER_BIND` state: the var is a process-global, so splitting
-    // these across tests would race under cargo's parallel runner.
     #[test]
     fn bind_addr_resolves_default_blank_and_override() {
-        std::env::remove_var("RESTATE_WORKER_BIND");
         assert_eq!(
-            bind_addr(),
+            bind_addr_from(None),
             DEFAULT_BIND,
             "unset should fall back to default"
         );
 
-        std::env::set_var("RESTATE_WORKER_BIND", "   ");
         assert_eq!(
-            bind_addr(),
+            bind_addr_from(Some("   ".to_string())),
             DEFAULT_BIND,
             "blank should fall back to default"
         );
 
-        std::env::set_var("RESTATE_WORKER_BIND", "127.0.0.1:19080");
-        assert_eq!(bind_addr(), "127.0.0.1:19080", "a set value wins");
-
-        std::env::remove_var("RESTATE_WORKER_BIND");
+        assert_eq!(
+            bind_addr_from(Some("127.0.0.1:19080".to_string())),
+            "127.0.0.1:19080",
+            "a set value wins"
+        );
     }
 
     // The default and override addresses must be valid `SocketAddr`s — otherwise `run` bails before
@@ -509,10 +510,12 @@ mod tests {
 
         // mark-posted settles the row out of the pending set (records the platform id).
         mark_posted_step(&pool, id, Some(777)).await.unwrap();
-        assert!(crate::db::load_pending_outbox_row(&pool, id)
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            crate::db::load_pending_outbox_row(&pool, id)
+                .await
+                .unwrap()
+                .is_none()
+        );
 
         // dead-letter parks a fresh pending row `failed`.
         crate::db::enqueue_outbox_post(
@@ -533,9 +536,11 @@ mod tests {
             .unwrap()
             .unwrap();
         dead_letter_step(&pool, dead, "deleted PR").await.unwrap();
-        assert!(crate::db::load_pending_outbox_row(&pool, dead)
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            crate::db::load_pending_outbox_row(&pool, dead)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 }

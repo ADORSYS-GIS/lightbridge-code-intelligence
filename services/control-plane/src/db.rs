@@ -8,8 +8,8 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
+use sqlx::postgres::PgPoolOptions;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -2850,9 +2850,11 @@ mod tests {
             .await
             .unwrap()
             .expect("task");
-        assert!(!has_responded_or_pending_content(&pool, task2)
-            .await
-            .unwrap());
+        assert!(
+            !has_responded_or_pending_content(&pool, task2)
+                .await
+                .unwrap()
+        );
         upsert_review(
             &pool,
             task2,
@@ -2867,9 +2869,11 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(has_responded_or_pending_content(&pool, task2)
-            .await
-            .unwrap());
+        assert!(
+            has_responded_or_pending_content(&pool, task2)
+                .await
+                .unwrap()
+        );
     }
 
     /// ADR-0059: an enqueued intent is claimable in order, idempotent on `dedup_key`, and the
@@ -3002,10 +3006,12 @@ mod tests {
             "a posted row is not pending → the handler skips it"
         );
         // … and neither does an absent id.
-        assert!(load_pending_outbox_row(&pool, 10_000_000)
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            load_pending_outbox_row(&pool, 10_000_000)
+                .await
+                .unwrap()
+                .is_none()
+        );
 
         // Dead-letter: park a *pending* row `failed` unconditionally (the engine's retry ceiling already
         // fired), recording the error and dropping it from the claim set — mirroring the drain's terminal
@@ -3176,18 +3182,22 @@ mod tests {
         let findings = serde_json::json!([]);
 
         // Nothing yet → the clean branch may proceed.
-        assert!(!has_review_intent_or_posted_review(&pool, task)
-            .await
-            .unwrap());
+        assert!(
+            !has_review_intent_or_posted_review(&pool, task)
+                .await
+                .unwrap()
+        );
 
         // A silent-clean persisted row (no platform_review_id) does NOT trip the guard — re-running the
         // clean path is harmless (insert-if-absent no-ops, verdict key no-ops).
         insert_review_if_absent(&pool, task, "clean", "body", 0, 0, 0, &findings)
             .await
             .unwrap();
-        assert!(!has_review_intent_or_posted_review(&pool, task)
-            .await
-            .unwrap());
+        assert!(
+            !has_review_intent_or_posted_review(&pool, task)
+                .await
+                .unwrap()
+        );
 
         // The reconciler upserts the POSTED copy (platform_review_id set) → guard trips…
         upsert_review(
@@ -3204,9 +3214,11 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(has_review_intent_or_posted_review(&pool, task)
-            .await
-            .unwrap());
+        assert!(
+            has_review_intent_or_posted_review(&pool, task)
+                .await
+                .unwrap()
+        );
 
         // …and a late clean-path insert is a no-op: the posted row keeps its platform_review_id.
         insert_review_if_absent(&pool, task, "clean", "body", 0, 0, 0, &findings)
@@ -3238,9 +3250,11 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(has_review_intent_or_posted_review(&pool, task2)
-            .await
-            .unwrap());
+        assert!(
+            has_review_intent_or_posted_review(&pool, task2)
+                .await
+                .unwrap()
+        );
     }
 
     /// #219 review: the failure-notice gate must treat a still-in-flight review intent as "responding",
@@ -3471,9 +3485,11 @@ mod tests {
         assert_eq!(embedding_dim(&pool).await, 4096);
 
         // A change without the flag fails loud (no destruction).
-        assert!(reconcile_embedding_dimension(&pool, 1536, false)
-            .await
-            .is_err());
+        assert!(
+            reconcile_embedding_dimension(&pool, 1536, false)
+                .await
+                .is_err()
+        );
         assert_eq!(
             embedding_dim(&pool).await,
             4096,
@@ -3630,10 +3646,12 @@ mod tests {
         let pending = list_repositories(&pool, Some("pending")).await.unwrap();
         assert_eq!(pending.len(), 2);
         assert!(pending.iter().all(|r| r.status == "pending" && !r.active));
-        assert!(list_repositories(&pool, Some("approved"))
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            list_repositories(&pool, Some("approved"))
+                .await
+                .unwrap()
+                .is_empty()
+        );
 
         // Approve → approved + active + records the approver; the gate opens.
         let row = set_repository_status_by_id(&pool, id, "approved", Some("alice"))
@@ -3667,11 +3685,13 @@ mod tests {
                 .unwrap(),
             "re-registering a disabled repo re-pends it"
         );
-        assert!(list_repositories(&pool, Some("pending"))
-            .await
-            .unwrap()
-            .iter()
-            .any(|r| r.platform_repo_id == 5555));
+        assert!(
+            list_repositories(&pool, Some("pending"))
+                .await
+                .unwrap()
+                .iter()
+                .any(|r| r.platform_repo_id == 5555)
+        );
         // Re-registering an APPROVED repo is a no-op (must not revert it).
         set_repository_status_by_id(&pool, id, "approved", Some("alice"))
             .await
@@ -4241,9 +4261,10 @@ mod tests {
         .unwrap();
         let fb = get_feedback(&pool, task_id).await.unwrap();
         assert_eq!(fb.len(), 2);
-        assert!(fb
-            .iter()
-            .any(|r| r.reactor == "alice" && r.reaction == "+1"));
+        assert!(
+            fb.iter()
+                .any(|r| r.reactor == "alice" && r.reaction == "+1")
+        );
         assert_eq!(
             fb[0].file.as_deref(),
             Some("a.rs"),
@@ -4266,9 +4287,10 @@ mod tests {
         let fb = get_feedback(&pool, task_id).await.unwrap();
         assert_eq!(fb.len(), 2);
         assert!(!fb.iter().any(|r| r.reactor == "alice"), "un-react removed");
-        assert!(fb
-            .iter()
-            .any(|r| r.reactor == "carol" && r.reaction == "heart"));
+        assert!(
+            fb.iter()
+                .any(|r| r.reactor == "carol" && r.reaction == "heart")
+        );
 
         // Empty cycle (all reactions gone) clears the comment's feedback.
         reconcile_comment_feedback(&pool, task_id, 555, "inline", &[])
@@ -4637,9 +4659,11 @@ mod tests {
         let repo_id = seed(&pool).await;
         let task = claim_after_create(&pool, repo_id, "head1").await;
 
-        assert!(set_task_status(&pool, task, "succeeded", None)
-            .await
-            .unwrap());
+        assert!(
+            set_task_status(&pool, task, "succeeded", None)
+                .await
+                .unwrap()
+        );
 
         let row: (String, Option<OffsetDateTime>, Option<String>) =
             sqlx::query_as("SELECT status, completed_at, lease_owner FROM tasks WHERE id = $1")
@@ -4667,14 +4691,16 @@ mod tests {
         let task = claim_after_create(&pool, repo_id, "head1").await;
 
         // A report carrying a detail records it.
-        assert!(set_task_status(
-            &pool,
-            task,
-            "succeeded",
-            Some("Review produced no comments to post.")
-        )
-        .await
-        .unwrap());
+        assert!(
+            set_task_status(
+                &pool,
+                task,
+                "succeeded",
+                Some("Review produced no comments to post.")
+            )
+            .await
+            .unwrap()
+        );
         let detail: Option<String> =
             sqlx::query_scalar("SELECT error_detail FROM tasks WHERE id = $1")
                 .bind(task)
@@ -4687,9 +4713,11 @@ mod tests {
         );
 
         // A later report without a detail must not erase the recorded reason.
-        assert!(set_task_status(&pool, task, "succeeded", None)
-            .await
-            .unwrap());
+        assert!(
+            set_task_status(&pool, task, "succeeded", None)
+                .await
+                .unwrap()
+        );
         let preserved: Option<String> =
             sqlx::query_scalar("SELECT error_detail FROM tasks WHERE id = $1")
                 .bind(task)

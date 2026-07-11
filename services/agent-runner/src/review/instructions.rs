@@ -50,10 +50,10 @@ pub async fn read_agent_instructions(checkout: &Path) -> Option<String> {
         while let Ok(Some(entry)) = entries.next_entry().await {
             // `file_type().await` is the async metadata query; `path().is_file()` would block the
             // executor thread.
-            if let Ok(ft) = entry.file_type().await {
-                if ft.is_file() {
-                    rule_files.push(entry.path());
-                }
+            if let Ok(ft) = entry.file_type().await
+                && ft.is_file()
+            {
+                rule_files.push(entry.path());
             }
         }
         rule_files.sort();

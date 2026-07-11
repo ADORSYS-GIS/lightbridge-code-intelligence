@@ -34,7 +34,7 @@
 //! `#[ignore]`d, post-merge step); see the run command in that file.
 
 use rig_core::providers::openai::completion::{CompletionResponse, Message};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// A per-field verdict: did rig's OpenAI provider preserve the field through a parse round-trip?
 #[derive(Debug, Clone, PartialEq)]
