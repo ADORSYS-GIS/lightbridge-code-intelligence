@@ -92,9 +92,9 @@ pub async fn reconcile_embedding_dimension(
         .await?;
     // `dimension` is an i64 from typed config (not user free-text), so formatting it into the DDL is
     // safe; the vector type width can't be a bind parameter.
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "ALTER TABLE code_chunks ALTER COLUMN embedding TYPE vector({dimension})"
-    ))
+    )))
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
@@ -1283,14 +1283,14 @@ async fn notify_or_log_initial_status(pool: &PgPool, id: Uuid, repository_id: i6
 /// is mid-index (ADR-0055).
 pub async fn create_task(pool: &PgPool, task: &NewTask) -> Result<Option<Uuid>, sqlx::Error> {
     let id = Uuid::new_v4();
-    let inserted: Option<(Uuid, String)> = sqlx::query_as(&format!(
+    let inserted: Option<(Uuid, String)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "INSERT INTO tasks (id, repository_id, installation_id, webhook_delivery_id, target_type, \
          target_id, command_text, base_sha, head_sha, run_epoch, tier, trigger_comment_id, status) \
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, {INITIAL_TASK_STATUS_SQL}) \
          ON CONFLICT (repository_id, target_type, target_id, command_text, head_sha, run_epoch) \
          DO NOTHING \
          RETURNING id, status"
-    ))
+    )))
     .bind(id)
     .bind(task.repository_id)
     .bind(task.installation_id)
@@ -1333,7 +1333,7 @@ pub async fn create_explicit_task(pool: &PgPool, task: &NewTask) -> Result<Uuid,
     loop {
         attempt += 1;
         let id = Uuid::new_v4();
-        let result = sqlx::query_as::<_, (Uuid, String)>(&format!(
+        let result = sqlx::query_as::<_, (Uuid, String)>(sqlx::AssertSqlSafe(format!(
             "INSERT INTO tasks (id, repository_id, installation_id, webhook_delivery_id, target_type, \
              target_id, command_text, base_sha, head_sha, tier, trigger_comment_id, run_epoch, status) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, \
@@ -1342,7 +1342,7 @@ pub async fn create_explicit_task(pool: &PgPool, task: &NewTask) -> Result<Uuid,
                   AND command_text = $7 AND head_sha IS NOT DISTINCT FROM $9), \
                {INITIAL_TASK_STATUS_SQL}) \
              RETURNING id, status"
-        ))
+        )))
         .bind(id)
         .bind(task.repository_id)
         .bind(task.installation_id)
@@ -1700,7 +1700,7 @@ pub async fn renew_lease(pool: &PgPool, id: Uuid, lease: Duration) -> Result<boo
 /// Most recent tasks first (the dashboard run list).
 pub async fn list_tasks(pool: &PgPool, limit: i64) -> Result<Vec<TaskRow>, sqlx::Error> {
     let sql = format!("{TASK_SELECT} ORDER BY t.created_at DESC LIMIT $1");
-    sqlx::query_as::<_, TaskRow>(&sql)
+    sqlx::query_as::<_, TaskRow>(sqlx::AssertSqlSafe(sql))
         .bind(limit)
         .fetch_all(pool)
         .await
@@ -1709,7 +1709,7 @@ pub async fn list_tasks(pool: &PgPool, limit: i64) -> Result<Vec<TaskRow>, sqlx:
 /// A single task by id.
 pub async fn get_task(pool: &PgPool, id: Uuid) -> Result<Option<TaskRow>, sqlx::Error> {
     let sql = format!("{TASK_SELECT} WHERE t.id = $1");
-    sqlx::query_as::<_, TaskRow>(&sql)
+    sqlx::query_as::<_, TaskRow>(sqlx::AssertSqlSafe(sql))
         .bind(id)
         .fetch_optional(pool)
         .await
@@ -2374,7 +2374,7 @@ pub async fn get_push_config(
     config_id: Uuid,
 ) -> Result<Option<PushConfigRow>, sqlx::Error> {
     let sql = format!("{PUSH_CONFIG_SELECT} WHERE config_id = $1");
-    sqlx::query_as::<_, PushConfigRow>(&sql)
+    sqlx::query_as::<_, PushConfigRow>(sqlx::AssertSqlSafe(sql))
         .bind(config_id)
         .fetch_optional(pool)
         .await
@@ -2389,7 +2389,7 @@ pub async fn list_push_configs_for_task(
     let sql = format!(
         "{PUSH_CONFIG_SELECT} WHERE a2a_task_id = $1 ORDER BY created_at ASC, config_id ASC"
     );
-    sqlx::query_as::<_, PushConfigRow>(&sql)
+    sqlx::query_as::<_, PushConfigRow>(sqlx::AssertSqlSafe(sql))
         .bind(a2a_task_id)
         .fetch_all(pool)
         .await

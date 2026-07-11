@@ -6,7 +6,7 @@
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
-use rand::Rng;
+use rand::RngExt as _;
 use sha2::{Digest, Sha256};
 
 /// The unreserved character set RFC 7636 allows in a code verifier.
@@ -47,10 +47,10 @@ pub fn random_state() -> String {
 
 /// Draw `len` characters uniformly from `alphabet`.
 fn random_string(len: usize, alphabet: &[u8]) -> String {
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     (0..len)
         .map(|_| {
-            let idx = rng.gen_range(0..alphabet.len());
+            let idx = rng.random_range(0..alphabet.len());
             alphabet[idx] as char
         })
         .collect()
