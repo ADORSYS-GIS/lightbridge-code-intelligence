@@ -1,6 +1,6 @@
 //! File-boundary–aware packing of a PR's unified diff into the review prompt (ADR-0062).
 //!
-//! The review prompt has a byte budget (`review.max_diff_chars`). The naive approach — take the whole
+//! The review prompt has a byte budget (`max_diff_chars`). The naive approach — take the whole
 //! `git diff` string and cut it at the byte cap — slices mid-file and mid-hunk with no idea where a
 //! file's changes start or end. A real failure (PR #274): a 132 KB diff was cut at byte 60 000, exactly
 //! 278 bytes *before* a function definition whose call site the model *could* see, so the fast pass
@@ -17,11 +17,9 @@
 //!    no review signal per byte, so they're set aside and listed rather than rendered — freeing the whole
 //!    budget for source. (If a PR changes *only* such files we still render them, so the diff isn't blank.)
 //!
-//! The caller ([`super::agent::build_messages`]) turns [`RenderedDiff::omitted_for_budget`] and
+//! The caller ([`super::build_messages`]) turns [`RenderedDiff::omitted_for_budget`] and
 //! [`RenderedDiff::low_signal`] into an explicit "these files were NOT shown" block in the prompt, so the
 //! model can state honest coverage and never raises a defect about code it was never given.
-
-use crate::clone::PrDiff;
 
 /// One file's slice of a unified diff: its repo-relative path and the raw `diff --git …` block (header +
 /// hunks) exactly as git emitted it — both borrowed from the original diff (no per-file allocation).
@@ -170,7 +168,7 @@ fn truncate_on_boundary(s: &str, max: usize) -> &str {
     &s[..end]
 }
 
-/// Pack `pr`'s unified diff into `max` bytes on **file boundaries**: whole per-file sections, source
+/// Pack a PR's unified `diff` into `max` bytes on **file boundaries**: whole per-file sections, source
 /// files first and lock/generated noise deprioritised, each shown completely or listed as not-shown.
 ///
 /// Ordering: source sections (in diff order) come first so the budget is spent on reviewable code;
@@ -178,8 +176,8 @@ fn truncate_on_boundary(s: &str, max: usize) -> &str {
 /// then they're the diff (packed within budget) so the prompt isn't empty. A single section larger than
 /// the whole budget is boundary-truncated (only when it would otherwise be the first thing shown) so one
 /// huge file can't blank the diff; it's still flagged as omitted so the model knows it's partial.
-pub fn render_diff_for_prompt(pr: &PrDiff, max: usize) -> RenderedDiff<'_> {
-    let sections = split_sections(&pr.diff);
+pub fn render_diff_for_prompt(diff: &str, max: usize) -> RenderedDiff<'_> {
+    let sections = split_sections(diff);
 
     let (source, low_signal): (Vec<&FileSection>, Vec<&FileSection>) =
         sections.iter().partition(|s| !s.low_signal);
@@ -227,13 +225,6 @@ pub fn render_diff_for_prompt(pr: &PrDiff, max: usize) -> RenderedDiff<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn pr(diff: &str, files: &[&str]) -> PrDiff {
-        PrDiff {
-            diff: diff.to_string(),
-            files: files.iter().map(|f| f.to_string()).collect(),
-        }
-    }
 
     /// A minimal but realistic `git diff` section for `path` padded to roughly `body_lines` `+` lines,
     /// so a test can dial a section's byte size.
@@ -329,8 +320,7 @@ mod tests {
         let diff = format!("{a}{b}{c}");
         // Budget for two whole sections but not the third.
         let max = a.len() + b.len() + 1;
-        let input = pr(&diff, &["src/a.rs", "src/b.rs", "src/c.rs"]);
-        let out = render_diff_for_prompt(&input, max);
+        let out = render_diff_for_prompt(&diff, max);
         // Whole files only — never a partial hunk.
         assert!(out.text.contains("src/a.rs") && out.text.contains("src/b.rs"));
         assert!(!out.text.contains("+line 0 in src/c.rs"));
@@ -347,8 +337,7 @@ mod tests {
         let diff = format!("{lock}{src}");
         // Budget fits the source but NOT the lock — the old byte-cut would spend it all on the lock.
         let max = src.len() + 50;
-        let input = pr(&diff, &["Cargo.lock", "src/auth/store.rs"]);
-        let out = render_diff_for_prompt(&input, max);
+        let out = render_diff_for_prompt(&diff, max);
         assert!(
             out.text.contains("src/auth/store.rs"),
             "source file must be rendered"
@@ -364,8 +353,7 @@ mod tests {
     #[test]
     fn renders_lockfile_only_pr_so_the_diff_is_not_blank() {
         let lock = section("Cargo.lock", 3);
-        let input = pr(&lock, &["Cargo.lock"]);
-        let out = render_diff_for_prompt(&input, lock.len() + 10);
+        let out = render_diff_for_prompt(&lock, lock.len() + 10);
         assert!(out.text.contains("Cargo.lock"));
         assert!(out.low_signal.is_empty());
         assert!(out.omitted_for_budget.is_empty());
@@ -375,8 +363,7 @@ mod tests {
     fn a_single_oversized_file_is_boundary_truncated_not_blanked() {
         let big = section("src/huge.rs", 100);
         let max = big.len() / 2;
-        let input = pr(&big, &["src/huge.rs"]);
-        let out = render_diff_for_prompt(&input, max);
+        let out = render_diff_for_prompt(&big, max);
         assert!(
             !out.text.is_empty(),
             "must show a partial rather than nothing"
@@ -388,8 +375,7 @@ mod tests {
     #[test]
     fn whole_diff_under_budget_renders_verbatim() {
         let a = section("src/a.rs", 2);
-        let input = pr(&a, &["src/a.rs"]);
-        let out = render_diff_for_prompt(&input, a.len() + 1000);
+        let out = render_diff_for_prompt(&a, a.len() + 1000);
         assert_eq!(out.text, a);
         assert!(out.omitted_for_budget.is_empty());
         assert!(out.low_signal.is_empty());

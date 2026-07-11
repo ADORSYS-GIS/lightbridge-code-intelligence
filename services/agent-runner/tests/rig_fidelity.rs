@@ -2,7 +2,7 @@
 //!
 //! Our review agent talks **OpenAI-compatible Chat Completions** to the internal eaig gateway, not to
 //! native provider SDKs. The hand-rolled transport that carries that traffic is
-//! [`crate::review::native::chat`](../src/review/native/chat.rs). It depends on three provider-quirk
+//! `lci_review_agent::model` (../../review-agent/src/model.rs). It depends on three provider-quirk
 //! fields that a naive typed deserializer silently drops:
 //!
 //!   1. **`thought_signature`** — Gemini 3 hangs an opaque round-trip blob off each tool call as

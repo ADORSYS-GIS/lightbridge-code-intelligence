@@ -2453,12 +2453,14 @@ name = "lci-review-agent"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "futures",
  "lci-agent-clients",
  "lci-agent-loop",
  "lci-agent-step",
  "lci-agent-testkit",
  "lci-agent-tools",
  "lci-agent-types",
+ "reqwest",
  "serde",
  "serde_json",
  "tempfile",

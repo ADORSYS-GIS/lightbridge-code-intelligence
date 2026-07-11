@@ -112,8 +112,19 @@ pub fn tool_registry(
     Ok(registry)
 }
 
+/// A [`Workspace`] that eagerly holds an already-materialized checkout root — the current Job host has
+/// the working tree on disk before the agent starts, so `root()` resolves immediately. Public so the
+/// host (and the golden test) can build the [`ToolCx`] the loop runs under; see
+/// [`crate::flows::eager_workspace`].
 #[derive(Clone)]
-struct EagerWorkspace(PathBuf);
+pub struct EagerWorkspace(PathBuf);
+
+impl EagerWorkspace {
+    #[must_use]
+    pub fn new(root: PathBuf) -> Self {
+        Self(root)
+    }
+}
 
 impl Workspace for EagerWorkspace {
     fn root(&self) -> BoxFuture<'_, Result<&Path, WorkspaceError>> {

@@ -1,82 +1,34 @@
 //! OpenAI-compatible **Chat Completions** client with function/tool calling (ADR-0026).
 //!
 //! Talks to `POST {base}/chat/completions` on the eaig gateway — the same gateway and key the review
-//! model already uses (`LLM_BASE_URL` / `LLM_API_KEY` / `LLM_MODEL`, see
-//! [`ReviewConfig`](crate::bootstrap::config::ReviewConfig)). Unlike the embeddings base URL, the LLM
-//! base URL already includes the `/v1` segment, so we only append `/chat/completions`.
+//! model already uses (`LLM_BASE_URL` / `LLM_API_KEY` / `LLM_MODEL`, mapped from the runner's
+//! `ReviewConfig` at the call boundary). Unlike the embeddings base URL, the LLM base URL already
+//! includes the `/v1` segment, so we only append `/chat/completions`.
 //!
-//! This is the transport layer for the native agent loop: it serializes the multi-turn `messages`
-//! array (system / user / assistant-with-tool-calls / tool-result), advertises the available `tools`,
-//! and returns the assistant's reply — which is either text or a set of `tool_calls` the loop then
+//! This is the [`ModelClient`] the [`lci_agent_loop`] engine drives: it serializes the multi-turn
+//! `messages` array (system / user / assistant-with-tool-calls / tool-result), advertises the available
+//! `tools`, and returns the assistant's reply — either text or a set of `tool_calls` the loop then
 //! dispatches. It deliberately knows nothing about *which* tools exist or *how* to run them; that is
-//! the dispatcher's job (a later PR).
+//! the registry's job. It speaks the engine's [`ChatMessage`]/[`ChatRequest`] wire types directly.
 
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
 use lci_agent_clients::ratelimit::{self, RateLimitSnapshot};
-pub use lci_agent_types::{FunctionCall, FunctionDef, ToolCall, ToolDef};
+use lci_agent_loop::{ChatMessage, ChatRequest, ModelClient, StreamOptions};
+pub use lci_agent_types::{AssistantTurn, FunctionCall, FunctionDef, StepError, ToolCall, ToolDef};
 
-/// A single message in the Chat Completions `messages` array.
-///
-/// The same type is used both for messages we send (system/user prompts, tool results, and the
-/// assistant turns we echo back) and for the assistant reply we parse out of a response — hence the
-/// optional fields: a `tool` message carries `tool_call_id` + `content`; an assistant turn that calls
-/// tools carries `tool_calls` and often no `content`.
-///
-/// `Eq` is deliberately *not* derived: [`ToolCall::extra_content`] holds an opaque
-/// `serde_json::Value` (which is only `PartialEq`) so a provider's round-trip blob can ride along.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct ChatMessage {
-    pub role: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub content: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub tool_calls: Vec<ToolCall>,
-    /// Set only on `role = "tool"` messages — ties a tool result back to the call it answers.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tool_call_id: Option<String>,
-}
-
-impl ChatMessage {
-    /// A `system` message — the reviewer guidance + output contract.
-    pub fn system(content: impl Into<String>) -> Self {
-        Self::text("system", content)
-    }
-
-    /// A `user` message — the requested command + the diff/context.
-    pub fn user(content: impl Into<String>) -> Self {
-        Self::text("user", content)
-    }
-
-    /// A `tool` message carrying the result of a tool call back to the model.
-    pub fn tool(tool_call_id: impl Into<String>, content: impl Into<String>) -> Self {
-        Self {
-            role: "tool".to_string(),
-            content: Some(content.into()),
-            tool_calls: Vec::new(),
-            tool_call_id: Some(tool_call_id.into()),
-        }
-    }
-
-    fn text(role: &str, content: impl Into<String>) -> Self {
-        Self {
-            role: role.to_string(),
-            content: Some(content.into()),
-            tool_calls: Vec::new(),
-            tool_call_id: None,
-        }
-    }
-}
-
-/// `skip_serializing_if` helper for a borrowed slice field (the predicate receives `&&[T]`).
-fn slice_is_empty<T>(slice: &&[T]) -> bool {
-    slice.is_empty()
-}
+/// Default per-request timeout (seconds) for one chat round-trip (ADR-0039). eaig can legitimately take
+/// ~2 minutes per turn, so this is deliberately generous. Re-homed here (it was
+/// `crate::bootstrap::config::DEFAULT_REQUEST_TIMEOUT_SECS`) so `review-agent` owns no dependency on the
+/// runner's config module — the runner maps its `ReviewConfig` timeout onto [`ChatClient::with_timeout`]
+/// at the call boundary.
+pub const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 180;
 
 /// Per-request generation parameters. All optional — `None` leaves the provider/model default. Mirrors
-/// the knobs on [`ReviewConfig`](crate::bootstrap::config::ReviewConfig) (#71).
+/// the runner's `ReviewConfig` generation knobs (#71), mapped in at the call boundary.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ChatParams {
     pub temperature: Option<f64>,
@@ -140,33 +92,6 @@ impl Usage {
     }
 }
 
-#[derive(Serialize)]
-struct ChatRequest<'a> {
-    model: &'a str,
-    messages: &'a [ChatMessage],
-    #[serde(skip_serializing_if = "slice_is_empty")]
-    tools: &'a [ToolDef],
-    /// Only sent alongside `tools`; `"auto"` lets the model choose when to call them.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tool_choice: Option<&'static str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    temperature: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    top_p: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    max_tokens: Option<i64>,
-    /// `true` requests a streamed (SSE) response so a long-but-progressing turn is bounded by an
-    /// inter-chunk idle timeout rather than one whole-request timeout (spike). Omitted when unset.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    stream: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    stream_options: Option<StreamOptions>,
-    /// Provider-specific passthrough (e.g. a reasoning budget) merged at the top level of the request
-    /// body. Empty → nothing extra emitted.
-    #[serde(flatten)]
-    extra: &'a serde_json::Map<String, serde_json::Value>,
-}
-
 #[derive(Deserialize)]
 struct ChatResponse {
     choices: Vec<Choice>,
@@ -195,13 +120,6 @@ struct ResponseMessage {
     reasoning_content: Option<String>,
     #[serde(default)]
     tool_calls: Vec<ToolCall>,
-}
-
-/// `stream_options` — ask the gateway to send a final `usage` chunk so token accounting still works
-/// when streaming (it is otherwise omitted on streamed responses).
-#[derive(Serialize)]
-struct StreamOptions {
-    include_usage: bool,
 }
 
 // ── Streaming (SSE) chunk shapes (spike) ─────────────────────────────────────────────────────────
@@ -354,18 +272,41 @@ pub struct ChatClient {
     /// Inter-chunk idle timeout used on the streaming path — the max silence between SSE chunks before
     /// the turn is treated as stalled. Seeded from the per-request timeout.
     idle_timeout: Duration,
+    /// Per-turn retry/backoff policy (ADR-0039) applied on the [`ModelClient::complete`] engine path, so
+    /// a transient turn failure is retried before the loop's circuit breaker sees it — preserving the
+    /// legacy `complete_with_retry` behaviour. From `review.resilience.max_retries` (default policy
+    /// otherwise). The engine still classifies the *final* failure via [`StepError`].
+    retry_policy: RetryPolicy,
+    /// Interior-mutability side-channel for per-turn model telemetry (ADR-0034): [`AssistantTurn`] and
+    /// the engine's `TranscriptEvent::Assistant` drop token/reasoning fields, so [`ModelClient::complete`]
+    /// records the model + prompt/completion/reasoning tokens + reasoning text here per call. Sequential
+    /// calls ⇒ index == turn; the host zips it with the sink's assistant messages into the transcript.
+    /// Drained via [`ChatClient::telemetry_handle`].
+    telemetry: Arc<Mutex<Vec<TurnTelemetry>>>,
+}
+
+/// One turn's model telemetry captured by [`ModelClient::complete`] (ADR-0034). The engine's
+/// [`AssistantTurn`] carries only the model-visible content + tool calls, so the token/reasoning
+/// fields ride this side-channel and are re-joined with the transcript host-side.
+#[derive(Debug, Clone)]
+pub struct TurnTelemetry {
+    pub model: String,
+    pub prompt_tokens: Option<i64>,
+    pub completion_tokens: Option<i64>,
+    pub reasoning_tokens: Option<i64>,
+    pub reasoning: Option<String>,
 }
 
 impl ChatClient {
     /// `base_url` is the LLM gateway base **including** the `/v1` segment (`LLM_BASE_URL`); the model
     /// is the chat model id (`LLM_MODEL`). Uses the default per-request timeout
-    /// ([`DEFAULT_REQUEST_TIMEOUT_SECS`](crate::bootstrap::config::DEFAULT_REQUEST_TIMEOUT_SECS)).
+    /// ([`DEFAULT_REQUEST_TIMEOUT_SECS`]).
     pub fn new(base_url: &str, api_key: impl Into<String>, model: impl Into<String>) -> Self {
         Self::with_timeout(
             base_url,
             api_key,
             model,
-            Duration::from_secs(crate::bootstrap::config::DEFAULT_REQUEST_TIMEOUT_SECS),
+            Duration::from_secs(DEFAULT_REQUEST_TIMEOUT_SECS),
         )
     }
 
@@ -386,11 +327,14 @@ impl ChatClient {
             extra: serde_json::Map::new(),
             stream: false,
             idle_timeout: request_timeout,
+            retry_policy: RetryPolicy::default(),
+            telemetry: Arc::default(),
         }
     }
 
-    /// Return a copy of this client that targets a different model id (same gateway/key/timeout).
-    /// Cheap: clones the shared `reqwest::Client`.
+    /// Return a copy of this client that targets a different model id (same gateway/key/timeout/retry).
+    /// Cheap: clones the shared `reqwest::Client`. The telemetry side-channel is fresh — a retargeted
+    /// client is a distinct logical model, so its turns don't interleave with the original's.
     pub fn for_model(&self, model: impl Into<String>) -> Self {
         Self {
             url: self.url.clone(),
@@ -401,7 +345,24 @@ impl ChatClient {
             extra: self.extra.clone(),
             stream: self.stream,
             idle_timeout: self.idle_timeout,
+            retry_policy: self.retry_policy,
+            telemetry: Arc::default(),
         }
+    }
+
+    /// Set the per-turn retry/backoff policy applied on the engine [`ModelClient::complete`] path.
+    #[must_use]
+    pub fn with_retry_policy(mut self, policy: RetryPolicy) -> Self {
+        self.retry_policy = policy;
+        self
+    }
+
+    /// A shared handle to the per-turn telemetry captured by [`ModelClient::complete`]. Grab this
+    /// **before** moving the client into the loop; drain it (`handle.lock()…drain(..)`) after the run to
+    /// zip token/reasoning fields back into the transcript (sequential calls ⇒ index == turn).
+    #[must_use]
+    pub fn telemetry_handle(&self) -> Arc<Mutex<Vec<TurnTelemetry>>> {
+        Arc::clone(&self.telemetry)
     }
 
     /// Set provider-specific passthrough request fields (e.g. a reasoning budget). Merged verbatim into
@@ -466,6 +427,40 @@ impl ChatClient {
         self
     }
 
+    /// The provider-passthrough request fields in force — **after** [`with_extra`](Self::with_extra)
+    /// stripped any reserved structural keys. On the engine path the request `extra` rides the
+    /// conversation's `RequestOptions`, so the host reads this to carry the *sanitized* map through
+    /// rather than re-flattening the raw operator config.
+    #[must_use]
+    pub fn extra(&self) -> &serde_json::Map<String, serde_json::Value> {
+        &self.extra
+    }
+
+    /// Build the engine [`ChatRequest`] for one turn from this client's config + the turn's messages
+    /// and advertised tools. The engine's request type is field-for-field the wire shape, so the legacy
+    /// inherent helpers and the [`ModelClient`] impl POST the identical body.
+    fn build_request<'a>(
+        &'a self,
+        messages: &'a [ChatMessage],
+        tools: &'a [ToolDef],
+        params: ChatParams,
+    ) -> ChatRequest<'a> {
+        ChatRequest {
+            model: &self.model,
+            messages,
+            tools,
+            tool_choice: (!tools.is_empty()).then_some("auto"),
+            temperature: params.temperature,
+            top_p: params.top_p,
+            max_tokens: params.max_tokens,
+            stream: self.stream.then_some(true),
+            stream_options: self.stream.then_some(StreamOptions {
+                include_usage: true,
+            }),
+            extra: &self.extra,
+        }
+    }
+
     /// One completion turn: send the conversation so far + the advertised `tools`, return the
     /// assistant's reply. `tools` may be empty for a plain completion.
     ///
@@ -495,9 +490,21 @@ impl ChatClient {
         params: ChatParams,
         policy: RetryPolicy,
     ) -> Result<Completion, ChatError> {
+        let request = self.build_request(messages, tools, params);
+        self.send_with_retry(&request, policy).await
+    }
+
+    /// Send a pre-built request under `policy`'s retry/backoff (ADR-0039). Shared by the legacy
+    /// [`complete_with_retry`](Self::complete_with_retry) and the [`ModelClient`] engine path, so
+    /// per-turn retry is identical on both.
+    async fn send_with_retry(
+        &self,
+        request: &(impl Serialize + ?Sized),
+        policy: RetryPolicy,
+    ) -> Result<Completion, ChatError> {
         let mut attempt = 0u32;
         loop {
-            match self.complete_inner(messages, tools, params).await {
+            match self.send_request(request).await {
                 Ok(completion) => return Ok(completion),
                 Err(err) => {
                     if !err.transient || attempt >= policy.max_retries {
@@ -530,27 +537,23 @@ impl ChatClient {
         tools: &[ToolDef],
         params: ChatParams,
     ) -> Result<Completion, ChatError> {
-        let request = ChatRequest {
-            model: &self.model,
-            messages,
-            tools,
-            tool_choice: (!tools.is_empty()).then_some("auto"),
-            temperature: params.temperature,
-            top_p: params.top_p,
-            max_tokens: params.max_tokens,
-            stream: self.stream.then_some(true),
-            stream_options: self.stream.then_some(StreamOptions {
-                include_usage: true,
-            }),
-            extra: &self.extra,
-        };
+        let request = self.build_request(messages, tools, params);
+        self.send_request(&request).await
+    }
 
+    /// POST a pre-serialized request body, then parse the completion — classifying any failure as a
+    /// [`ChatError`] (transient vs deterministic). The single home of the HTTP / stream / idle-timeout /
+    /// rate-limit machinery, shared by the legacy helpers and the [`ModelClient`] impl.
+    async fn send_request(
+        &self,
+        request: &(impl Serialize + ?Sized),
+    ) -> Result<Completion, ChatError> {
         let response = self
             .http
             .post(&self.url)
             .bearer_auth(&self.api_key)
             .headers(self.attribution.clone())
-            .json(&request)
+            .json(request)
             .send()
             .await
             .map_err(|e| {
@@ -777,6 +780,49 @@ impl ChatClient {
                 tool_call_id: None,
             },
         })
+    }
+}
+
+impl ModelClient for ChatClient {
+    /// Drive one engine turn: POST the engine's [`ChatRequest`] verbatim under this client's retry
+    /// policy, record the turn's telemetry (model + tokens + reasoning) on the side-channel, and return
+    /// the model-visible [`AssistantTurn`]. Failures map to [`StepError`]: transient
+    /// (timeout/connect/429/5xx/stream-stall) preserves the `Retry-After` hint; deterministic
+    /// (4xx/malformed/no-choices) folds the response body into the terminal reason so the loop's
+    /// context-overflow detection ("context length", …) still matches.
+    async fn complete(&self, request: ChatRequest<'_>) -> Result<AssistantTurn, StepError> {
+        let completion = self
+            .send_with_retry(&request, self.retry_policy)
+            .await
+            .map_err(chat_error_to_step)?;
+        // Sequential per-turn push (calls are serialized by the loop ⇒ index == turn). The engine
+        // records exactly one `TranscriptEvent::Assistant` per successful turn, so the host zips the
+        // Nth telemetry entry with the Nth assistant message.
+        self.telemetry
+            .lock()
+            .expect("telemetry mutex")
+            .push(TurnTelemetry {
+                model: self.model.clone(),
+                prompt_tokens: completion.usage.and_then(|u| u.prompt_tokens),
+                completion_tokens: completion.usage.and_then(|u| u.completion_tokens),
+                reasoning_tokens: completion.usage.and_then(|u| u.reasoning_tokens()),
+                reasoning: completion.reasoning,
+            });
+        Ok(AssistantTurn {
+            content: completion.message.content,
+            tool_calls: completion.message.tool_calls,
+        })
+    }
+}
+
+/// Map a classified transport failure onto the engine's [`StepError`]. Transient failures carry the
+/// `Retry-After` hint through; a deterministic failure folds the (body-bearing) error text into the
+/// terminal reason so the loop's context-overflow detection still matches the gateway's message.
+fn chat_error_to_step(err: ChatError) -> StepError {
+    if err.transient {
+        StepError::transient(err.error, err.retry_after)
+    } else {
+        StepError::terminal(format!("{:#}", err.error))
     }
 }
 
@@ -1683,5 +1729,135 @@ mod tests {
             Some(serde_json::json!({ "google": { "thought_signature": "sig==" } })),
             "a later delta (incl. explicit null) must not clobber the captured signature"
         );
+    }
+
+    // ── ModelClient (engine) path ─────────────────────────────────────────────────────────────────
+
+    /// Build the engine request the loop presents to a [`ModelClient`], borrowing `messages`/`tools`.
+    fn engine_request<'a>(
+        messages: &'a [ChatMessage],
+        tools: &'a [ToolDef],
+        extra: &'a serde_json::Map<String, serde_json::Value>,
+    ) -> ChatRequest<'a> {
+        ChatRequest {
+            model: "m",
+            messages,
+            tools,
+            tool_choice: (!tools.is_empty()).then_some("auto"),
+            temperature: None,
+            top_p: None,
+            max_tokens: None,
+            stream: None,
+            stream_options: None,
+            extra,
+        }
+    }
+
+    // The engine path returns the model-visible `AssistantTurn` and records the turn's token/reasoning
+    // telemetry on the side-channel (ADR-0034), keyed positionally to the turn.
+    #[tokio::test]
+    async fn model_client_complete_returns_turn_and_records_telemetry() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{
+                    "finish_reason": "tool_calls",
+                    "message": {
+                        "role": "assistant",
+                        "content": null,
+                        "reasoning_content": "thinking...",
+                        "tool_calls": [{
+                            "id": "call_1",
+                            "type": "function",
+                            "function": { "name": "read_file", "arguments": "{}" }
+                        }]
+                    }
+                }],
+                "usage": { "prompt_tokens": 11, "completion_tokens": 7,
+                    "completion_tokens_details": { "reasoning_tokens": 3 } }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = ChatClient::new(&format!("{}/v1", server.uri()), "key", "m");
+        let telemetry = client.telemetry_handle();
+        let messages = [ChatMessage::user("hi")];
+        let tools = [search_tool()];
+        let extra = serde_json::Map::new();
+        let turn = ModelClient::complete(&client, engine_request(&messages, &tools, &extra))
+            .await
+            .expect("engine turn");
+
+        assert!(turn.content.is_none());
+        assert_eq!(turn.tool_calls.len(), 1);
+        assert_eq!(turn.tool_calls[0].function.name, "read_file");
+
+        let recorded = telemetry.lock().unwrap();
+        assert_eq!(recorded.len(), 1, "one turn ⇒ one telemetry row");
+        assert_eq!(recorded[0].model, "m");
+        assert_eq!(recorded[0].prompt_tokens, Some(11));
+        assert_eq!(recorded[0].completion_tokens, Some(7));
+        assert_eq!(recorded[0].reasoning_tokens, Some(3));
+        assert_eq!(recorded[0].reasoning.as_deref(), Some("thinking..."));
+    }
+
+    // A deterministic 4xx maps to a TERMINAL StepError with the response body folded into the reason —
+    // the exact text the loop's context-overflow detection matches on. No telemetry is recorded.
+    #[tokio::test]
+    async fn model_client_maps_deterministic_failure_to_terminal_error_with_body() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(400)
+                    .set_body_string("This model's maximum context length is 8192 tokens"),
+            )
+            .mount(&server)
+            .await;
+
+        let client = ChatClient::new(&format!("{}/v1", server.uri()), "key", "m");
+        let telemetry = client.telemetry_handle();
+        let messages = [ChatMessage::user("hi")];
+        let extra = serde_json::Map::new();
+        let err = ModelClient::complete(&client, engine_request(&messages, &[], &extra))
+            .await
+            .expect_err("400 is terminal");
+        assert!(!err.is_transient(), "a 400 is deterministic");
+        assert!(
+            err.to_string().to_lowercase().contains("context length"),
+            "body folded into the terminal reason for overflow detection: {err}"
+        );
+        assert!(
+            telemetry.lock().unwrap().is_empty(),
+            "a failed turn records no telemetry"
+        );
+    }
+
+    // A transient 5xx is retried under the client's own retry policy (as the legacy `complete_with_retry`
+    // did) and succeeds once the gateway recovers — the loop never sees the transient failure.
+    #[tokio::test]
+    async fn model_client_retries_transient_then_succeeds() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(503))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ok_reply()))
+            .mount(&server)
+            .await;
+
+        let client = ChatClient::new(&format!("{}/v1", server.uri()), "key", "m")
+            .with_retry_policy(fast_policy());
+        let messages = [ChatMessage::user("hi")];
+        let extra = serde_json::Map::new();
+        let turn = ModelClient::complete(&client, engine_request(&messages, &[], &extra))
+            .await
+            .expect("recovers after a transient 503");
+        assert_eq!(turn.content.as_deref(), Some("ok"));
     }
 }
