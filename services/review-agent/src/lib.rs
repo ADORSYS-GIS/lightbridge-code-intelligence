@@ -2,4 +2,5 @@
 
 pub mod model;
 pub mod policies;
+pub mod prompt;
 pub mod tools;
