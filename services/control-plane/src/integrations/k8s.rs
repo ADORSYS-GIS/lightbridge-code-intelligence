@@ -447,6 +447,22 @@ fn job_manifest(name: &str, cfg: JobConfig, task: &ClaimedTask) -> Value {
         env.push(json!({ "name": "REVIEW_SYSTEM_PROMPT", "value": prompt }));
     }
 
+    // Operator-tunable indexer knobs (INDEX_*): forwarded from the control-plane's own environment so
+    // they can be set once on the control-plane deployment (Helm) instead of baked into the runner
+    // image. Unset → the runner's built-in defaults apply (embed batch 32, chunk-line ceiling 150,
+    // window 100/50). Chief use: shrinking INDEX_EMBED_BATCH_SIZE when a gateway caps the batched
+    // embeddings response body.
+    for key in [
+        "INDEX_EMBED_BATCH_SIZE",
+        "INDEX_MAX_CHUNK_LINES",
+        "INDEX_WINDOW_SIZE",
+        "INDEX_WINDOW_STEP",
+    ] {
+        if let Ok(value) = std::env::var(key) {
+            env.push(json!({ "name": key, "value": value }));
+        }
+    }
+
     // Internal CA: when configured, mount the gateway's CA so the Job can verify the HTTPS eaig
     // endpoint (the gateway's cert is from a private issuer, ClusterIssuer/self-signed-ca). The
     // runner's reqwest clients (embeddings + the review LLM) add it via `add_root_certificate`
