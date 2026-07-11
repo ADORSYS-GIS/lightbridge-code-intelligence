@@ -427,6 +427,15 @@ impl ChatClient {
         self
     }
 
+    /// The provider-passthrough request fields in force — **after** [`with_extra`](Self::with_extra)
+    /// stripped any reserved structural keys. On the engine path the request `extra` rides the
+    /// conversation's `RequestOptions`, so the host reads this to carry the *sanitized* map through
+    /// rather than re-flattening the raw operator config.
+    #[must_use]
+    pub fn extra(&self) -> &serde_json::Map<String, serde_json::Value> {
+        &self.extra
+    }
+
     /// Build the engine [`ChatRequest`] for one turn from this client's config + the turn's messages
     /// and advertised tools. The engine's request type is field-for-field the wire shape, so the legacy
     /// inherent helpers and the [`ModelClient`] impl POST the identical body.

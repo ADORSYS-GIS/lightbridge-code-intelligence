@@ -36,7 +36,7 @@ const RANKED_FILES: &[&str] = &[
 
 /// Read the repo's agent instruction files from `checkout` and render them as a single labelled,
 /// size-capped block, or `None` when none are present. The block is appended to the agent prompt as
-/// untrusted context (see [`super::native::agent`]).
+/// untrusted context (see [`lci_review_agent::prompt`]).
 pub async fn read_agent_instructions(checkout: &Path) -> Option<String> {
     let mut paths: Vec<(String, std::path::PathBuf)> = RANKED_FILES
         .iter()

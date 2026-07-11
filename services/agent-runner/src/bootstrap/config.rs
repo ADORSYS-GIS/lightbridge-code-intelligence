@@ -227,7 +227,7 @@ pub struct ReviewFile {
 /// `review.<tier>.tools` allowlist is validated when the config is parsed — an unknown name fails the
 /// config with serde listing the valid variants — instead of a free-form string the runner has to
 /// re-validate by hand. Each serde name is the EXACT tool name the agent dispatches (see
-/// [`crate::review::native::tools`]); a sync test asserts the enum can't drift from that surface.
+/// [`lci_review_agent::tools`]); a sync test asserts the enum can't drift from that surface.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 pub enum ReviewTool {
     #[serde(rename = "lightbridge_vector_semantic_search")]
@@ -267,7 +267,7 @@ impl ReviewTool {
         ReviewTool::Abort,
     ];
 
-    /// The canonical tool name the agent dispatches — the exact string in [`crate::review::native::tools`].
+    /// The canonical tool name the agent dispatches — the exact string in [`lci_review_agent::tools`].
     pub fn as_str(self) -> &'static str {
         match self {
             ReviewTool::VectorSemanticSearch => "lightbridge_vector_semantic_search",
@@ -331,7 +331,7 @@ impl<'de> Deserialize<'de> for ReviewToolSelector {
         }
         // Not a built-in. It MUST be an `mcp__` selector, else it's a typo we fail loud on rather
         // than treating a mistyped built-in as a regex that silently matches nothing.
-        if let Some(pattern) = s.strip_prefix(crate::review::native::tools::MCP_TOOL_PREFIX) {
+        if let Some(pattern) = s.strip_prefix(lci_review_agent::tools::MCP_TOOL_PREFIX) {
             // Anchor to a FULL match and keep the `mcp__` prefix in the compiled regex, so
             // `mcp__brave-search__brave_web_search` matches exactly that discovered name and
             // `mcp__context7__.*` matches all of context7's — never a partial/substring hit. The
@@ -340,7 +340,7 @@ impl<'de> Deserialize<'de> for ReviewToolSelector {
             // `(^mcp__brave__foo)|(bar$)` and match any tool ending in `bar` on ANY server.
             let anchored = format!(
                 "^{}(?:{})$",
-                regex::escape(crate::review::native::tools::MCP_TOOL_PREFIX),
+                regex::escape(lci_review_agent::tools::MCP_TOOL_PREFIX),
                 pattern
             );
             let regex = Regex::new(&anchored)
@@ -1437,7 +1437,7 @@ mod tests {
     fn review_tool_enum_matches_the_dispatch_surface() {
         use std::collections::BTreeSet;
         let enum_names: BTreeSet<&str> = ReviewTool::ALL.iter().map(|t| t.as_str()).collect();
-        let known: BTreeSet<&str> = crate::review::native::tools::known_tool_names()
+        let known: BTreeSet<&str> = lci_review_agent::tools::known_tool_names()
             .into_iter()
             .collect();
         assert_eq!(
