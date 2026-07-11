@@ -86,39 +86,38 @@ Adopt **A + D**, organized as a platform crate decomposition that mirrors ADR-00
 
 ### 1. The workspace DAG (all components)
 
-The control plane decomposes into **five domain crates + the host binary**; together with
+The control plane decomposes into **five domain crates + the host binary** (packages take the
+`lci-*` prefix — see the naming note in the [agent-core architecture](../restate-phase-d-agent-core-architecture.md)); together with
 ADR-0082's agent family this is the whole workspace (arrows = depends-on, downward):
 
 ```
-                    ┌────────────────┐   ┌───────────────┐
-                    │  agent family  │   │ lightbridge-  │  cratestack schema + repositories
-                    │   (ADR-0082)   │   │     data      │  (the ONLY cratestack-pg/sqlx manifest)
-                    └───────┬────────┘   └──┬────┬────┬──┘
-                            │       ┌───────┘    │    └────────┐
-                    ┌───────▼───────▼┐  ┌────────▼───────┐  ┌──▼───────────────┐
-                    │ lightbridge-   │  │ lightbridge-   │  │ lightbridge-a2a  │
-                    │   platform     │  │    egress      │  │ protocol handler,│
-                    │ CodePlatform + │  │ outbox shaping,│  │ store, events,   │
-                    │ github, gitlab │  │ router, the    │  │ card, ssrf,      │
-                    └───────┬────────┘  │ PlatformEgress │  │ push crypto +    │
-                            │           │ handler (lib)  │  │ notifier delivery│
-                    ┌───────▼────────┐  └────────┬───────┘  └──┬───────────────┘
-                    │ lightbridge-   │           │             │
-                    │    queue       │           │             │
-                    │ dispatch, reap,│           │             │
-                    │ sweep + the k8s│           │             │
-                    │ Job launcher   │           │             │
-                    └───────┬────────┘           │             │
-                            └──────────┬─────────┴─────────────┘
-                                ┌──────▼────────┐
-                                │ control-plane │  the HOST: role mux (serve, dispatcher,
-                                │   (binary)    │  reconciler, restate-worker, a2a, notifier,
-                                │ http/, jwt,   │  NEW `shared`), Axum routers, config, metrics
-                                │ config, main  │
-                                └───────────────┘
+                 ┌────────────────┐    ┌────────────────┐
+                 │  agent family  │    │    lci-data    │ cratestack schema + repositories
+                 │   (ADR-0082)   │    │ (repositories) │ (the ONLY cratestack-pg/sqlx manifest)
+                 └───────┬────────┘    └─┬────┬────┬────┘
+                         │       ┌───────┘    │    └─────────┐
+                 ┌───────▼───────▼┐   ┌───────▼────────┐   ┌─▼──────────────────┐
+                 │  lci-platform  │   │   lci-egress   │   │      lci-a2a       │
+                 │ CodePlatform + │   │ outbox shaping,│   │ protocol handler,  │
+                 │ github, gitlab │   │ router, the    │   │ store, events,     │
+                 └───────┬────────┘   │ PlatformEgress │   │ card, ssrf, push   │
+                         │            │ handler (lib)  │   │ crypto + notifier  │
+                 ┌───────▼────────┐   └───────┬────────┘   │ delivery (lib)     │
+                 │   lci-queue    │           │            └─┬──────────────────┘
+                 │ dispatch, reap,│           │              │
+                 │ sweep + the k8s│           │              │
+                 │ Job launcher   │           │              │
+                 └───────┬────────┘           │              │
+                         └───────────┬────────┴──────────────┘
+                             ┌───────▼───────┐
+                             │ control-plane │  the HOST: role mux (serve, dispatcher,
+                             │   (binary)    │  reconciler, restate-worker, a2a, notifier,
+                             │ http/, jwt,   │  NEW `shared`), Axum routers, config, metrics
+                             │ config, main  │
+                             └───────────────┘
 ```
 
-| Crate (`lightbridge-…`) | Takes over (today) | Single-manifest deps it owns |
+| Crate (`lci-…`) | Takes over (today) | Single-manifest deps it owns |
 |---|---|---|
 | `data` | `db.rs` (4,930) decomposed into per-domain repositories; the `.cstack` schema; `types.rs` rows; `integrations/neo4j.rs` (it is a store client) | **`cratestack-pg`** (and thereby `sqlx`), `neo4rs` |
 | `platform` | `integrations/platform.rs` + `github.rs` + `gitlab.rs` (ADR-0072 trait + impls) | forge HTTP (via workspace `reqwest`) |
@@ -169,12 +168,12 @@ what the crate decomposition buys. Config remains one file; subsystems read thei
 
 **Shape of adoption (ORM-only, contained):**
 
-- `lightbridge-data` holds the regenerated `.cstack` and the single
+- `lci-data` holds the regenerated `.cstack` and the single
   `include_server_schema!("schema/control-plane.cstack", db = Postgres)` invocation. **The
   generated Axum routes are not mounted** — delegates only. Generated types stay `pub(crate)`.
 - Every domain gets a **repository trait** (`TaskRepo`, `OutboxRepo`, `A2aTaskRepo`, `PushRepo`,
   `FeedbackRepo`, `TelemetryRepo`, …) defined next to its consumers' needs and implemented in
-  `lightbridge-data` over the delegates. Domain crates and hosts speak repositories, never
+  `lci-data` over the delegates. Domain crates and hosts speak repositories, never
   cratestack types — the same seam discipline as ADR-0082's `Tool`/`StepRuntime`, and the swap/test
   seam if cratestack v0 churns (R20). `agent-testkit`-style in-memory fakes come for free.
 - **Transactions:** multi-row invariants move onto `run_in_isolated_tx_with_retries` (the
@@ -206,7 +205,7 @@ the bet ADR-0005 rightly declined.
 
 - **P0 — schema truth:** regenerate `.cstack` from the live schema; CI validate + drift gate. No
   runtime change.
-- **P1 — data spike (the S1 gate for cratestack):** `lightbridge-data` skeleton; port **one
+- **P1 — data spike (the S1 gate for cratestack):** `lci-data` skeleton; port **one
   low-risk domain** (review-run telemetry) to delegates behind its repo trait, with a parity
   suite (same `#[sqlx::test]` corpus, old vs new implementations, identical results) and a perf
   sanity check on a claim-adjacent path. **Failing P1 falls back to Option B for the data layer**
@@ -228,7 +227,7 @@ the bet ADR-0005 rightly declined.
 - **Good:** the schema returns to one reviewable source of truth with a drift gate; ~80% of 4,930
   hand-written SQL lines become generated delegates; serialization-retry and optimistic-locking
   stop being hand-rolled.
-- **Bad:** cratestack is v0 — API churn lands on us (contained to `lightbridge-data` by the
+- **Bad:** cratestack is v0 — API churn lands on us (contained to `lci-data` by the
   repository seam, but real; R20).
 - **Bad:** the migration window runs two data paths (delegates + raw) over one pool; parity suites
   and the per-slice sequencing bound it, but reviewers must hold the line on "every P-slice ships
@@ -243,7 +242,7 @@ the bet ADR-0005 rightly declined.
 
 | # | Risk | Likelihood | Impact | Mitigation |
 |---|---|---|---|---|
-| R20 | cratestack v0 churn breaks `lightbridge-data` on upgrade | High | Medium | Exact pin; repository seam confines the blast radius to one crate's impls; parity suite re-run per upgrade; Option-B fallback (raw impls behind the same traits) recorded |
+| R20 | cratestack v0 churn breaks `lci-data` on upgrade | High | Medium | Exact pin; repository seam confines the blast radius to one crate's impls; parity suite re-run per upgrade; Option-B fallback (raw impls behind the same traits) recorded |
 | R21 | Advisory-lock semantics surprise (pool reconnects release session locks; a wedged holder starves the subsystem) | Medium | Medium | Session-scoped locks on a dedicated connection with health-checked renewal; standby logs loudly; the existing per-loop metrics show a silent-standby immediately |
 | R22 | `shared` role config/behavior drift vs dedicated roles (combinations prod never exercises) | Medium | Medium | `shared` is pure composition of the same crate entrypoints (no seventh code path); CI smoke matrix boots `shared` and asserts each subsystem's readiness; handbook documents the supported matrix |
 | R23 | Dual data-path window: a repo migrated to delegates diverges subtly from the raw twin it replaced | Medium | High (silent data drift) | Per-slice parity suites on the real corpus; slices small; `// raw:` residue is named and reviewed; drift gate keeps schema honest |
@@ -257,7 +256,7 @@ the bet ADR-0005 rightly declined.
   [agent-core architecture](../restate-phase-d-agent-core-architecture.md) — the agent half of the
   workspace and the seam style this extends; the R-series this P-series interleaves with.
 - [ADR-0072](0072-platform-abstraction-layer.md) — the `CodePlatform` trait that
-  becomes `lightbridge-platform`'s core.
+  becomes `lci-platform`'s core.
 - [ADR-0059](0059-reconciler-owns-all-github-egress.md) / [ADR-0074](0074-restate-egress-pilot.md)
   — the singleton-egress invariant the advisory locks generalize and the Restate path they
   complement.

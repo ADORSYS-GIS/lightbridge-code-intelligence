@@ -60,6 +60,6 @@ codegen is enabled. Revisit adoption once cratestack matures.
 Revisited: [ADR-0083](0083-platform-crate-architecture-and-cratestack-data-layer.md) **executes
 this ADR's intent and supersedes the deferral clause** — cratestack (`cratestack-pg`, still 0.4.9)
 is adopted as the **data layer only** (generated SQLx-backed delegates behind repository traits in
-a dedicated `lightbridge-data` crate; generated routes not mounted), with the `.cstack` regenerated
+a dedicated `lci-data` crate; generated routes not mounted), with the `.cstack` regenerated
 from the live 27-migration schema and a CI drift gate. The "whole-server codegen" bet this ADR
 declined stays declined; the containment that makes ORM-only adoption acceptable is argued there.

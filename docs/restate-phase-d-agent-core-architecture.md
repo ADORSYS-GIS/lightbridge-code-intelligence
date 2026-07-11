@@ -31,8 +31,11 @@ one (`control-plane`); `sqlx` in exactly one (`control-plane`). No agent crate l
 
 ## 1. Crate DAG
 
-Seven new workspace members plus one reshaped existing one. Package names follow the existing
-`lightbridge-*` convention (`services/config` → `lightbridge-config`); directories stay flat under
+Seven new workspace members plus one reshaped existing one. Package names take the **`lci-*`
+prefix** (LCI = Lightbridge Code Intelligence — short, and already the name of the TUI client
+package `clients/lci`, which stays bare `lci`). The one existing `lightbridge-*` package,
+`lightbridge-config`, is renamed **`lci-config`** in the R1a mechanical slice (manifest `name` +
+every `[dependencies]` reference updated in the same commit). Directories stay flat under
 `services/` like every current member.
 
 ```
@@ -61,7 +64,7 @@ Seven new workspace members plus one reshaped existing one. Package names follow
           agent-testkit ──(dev-dep only)──> loop / tools / review-agent
 ```
 
-| Crate (`lightbridge-…`) | Responsibility | May depend on | Must never depend on |
+| Crate (`lci-…`) | Responsibility | May depend on | Must never depend on |
 |---|---|---|---|
 | `agent-types` | Pure data: `ChatMessage`, `AssistantTurn`, `ToolCallReq`, `ToolSpec`, `ToolOutcome`, `LoopOutcome`, `StepName`, `TranscriptEntry`, error enums | serde, uuid | tokio, reqwest, anything async |
 | `agent-step` | The durability seam: `StepRuntime`, `StepError`, `Passthrough`, step-name stability testing | agent-types, tokio | restate-sdk, sqlx, kube |
