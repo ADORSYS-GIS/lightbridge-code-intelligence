@@ -6,6 +6,9 @@
 # engine — over COPY-only Dockerfiles. PRs build + assemble (validate only, no push). Pushes to main
 # and version tags also push to GHCR and cosign-sign each digest; argocd-image-updater promotes the
 # newest signed `sha-<gitsha>` by committing it to adorsys-gis/ai-helm-values (see deploy/README.md).
+#
+# The pipeline itself lives in the reusable image-pipeline.yml (shared with release-please.yml, which
+# publishes the versioned `:X.Y.Z` image on a release). This file only wires the triggers.
 name: Build images
 
 on:
@@ -23,185 +26,13 @@ permissions:
   contents: read
 
 jobs:
-  # ── Compile the Rust workspace natively → one static-musl binary per service ──────────────────────
-  rust-build:
-    runs-on: ubuntu-latest
-    env:
-      TARGET: x86_64-unknown-linux-musl
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-unknown-linux-musl
-      # musl-gcc (musl-tools) links the static target; cmake+clang build aws-lc-sys' C/asm for musl.
-      - name: Install musl + C toolchain
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools cmake clang
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: "."
-      - uses: ./.github/actions/rust-sccache
-        with:
-          bucket: ${{ vars.SCCACHE_BUCKET }}
-          endpoint: ${{ vars.SCCACHE_ENDPOINT }}
-          access-key-id: ${{ secrets.SCCACHE_S3_ACCESS_KEY_ID }}
-          secret-access-key: ${{ secrets.SCCACHE_S3_SECRET_ACCESS_KEY }}
-      - name: cargo build --release (static musl)
-        env:
-          CC_x86_64_unknown_linux_musl: musl-gcc
-          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
-        run: |
-          cargo build --release --locked --target "$TARGET" -p control-plane -p agent-runner
-          mkdir -p dist
-          cp "target/$TARGET/release/control-plane" "target/$TARGET/release/agent-runner" dist/
-          file dist/*
-      - name: sccache stats
-        if: always()
-        run: sccache --show-stats || true
-      # Hand the binaries to the images job via Actions cache (run-unique key), NOT upload-artifact:
-      # artifact storage is a hard quota that fails closed, whereas cache is a separate LRU store that
-      # never blocks the build.
-      - uses: actions/cache/save@v4
-        with:
-          path: dist
-          key: rust-bins-${{ github.run_id }}
-
-  # ── Compile the Next.js app natively → the standalone bundle ──────────────────────────────────────
-  web-build:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-      - run: corepack enable
-      - name: pnpm install
-        run: pnpm install --frozen-lockfile
-      - name: turbo build (remote cache)
-        env:
-          TURBO_API: ${{ vars.TURBO_API }}
-          TURBO_TEAM: ${{ vars.TURBO_TEAM }}
-          TURBO_TOKEN: ${{ secrets.TURBO_TOKEN }}
-        run: pnpm turbo run build --filter=@lightbridge/web
-      - name: Stage bundle
-        run: |
-          mkdir -p web/standalone web/static web/public
-          cp -a apps/web/.next/standalone/. web/standalone/
-          cp -a apps/web/.next/static/.     web/static/
-          cp -a apps/web/public/.           web/public/
-      - uses: actions/cache/save@v4
-        with:
-          path: web
-          key: web-bundle-${{ github.run_id }}
-
-  # ── Assemble images from the prebuilt artifacts, daemonless, with buildah ─────────────────────────
-  images:
-    needs: [rust-build, web-build]
-    runs-on: ubuntu-latest
+  pipeline:
+    # push on main / v* tags; validate-only on PRs. No `version` → tags derive from the git ref.
     permissions:
       contents: read
-      packages: write # push (main only)
-      id-token: write # cosign keyless (main only)
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - image: lightbridge-control-plane
-            dockerfile: services/control-plane/Dockerfile
-            target: ""
-            artifact: rust-bins
-          - image: lightbridge-web
-            dockerfile: apps/web/Dockerfile
-            target: ""
-            artifact: web-bundle
-          # Two agent images from one Dockerfile: `indexer` (full) keeps the historical name;
-          # `review` is the leaner no-Python image. Both COPY the same runner binary from context.
-          - image: lightbridge-agent-runner
-            dockerfile: services/agent-runner/Dockerfile
-            target: indexer
-            artifact: rust-bins
-          - image: lightbridge-agent-review
-            dockerfile: services/agent-runner/Dockerfile
-            target: review
-            artifact: rust-bins
-    steps:
-      - uses: actions/checkout@v4 # the Dockerfiles
-      - uses: actions/cache/restore@v4
-        with:
-          path: ${{ matrix.artifact == 'rust-bins' && 'dist' || 'web' }}
-          key: ${{ matrix.artifact }}-${{ github.run_id }}
-          fail-on-cache-miss: true
-      - name: Install buildah
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends buildah
-      - uses: sigstore/cosign-installer@v3
-        if: github.event_name != 'pull_request'
-      # Let buildah resolve bare base-image names (node:22-slim, python:…, debian:…) to Docker Hub
-      # non-interactively; gcr.io/distroless is already fully qualified.
-      - name: Configure buildah registries
-        run: |
-          sudo tee /etc/containers/registries.conf >/dev/null <<'EOF'
-          unqualified-search-registries = ["docker.io"]
-          short-name-mode = "permissive"
-          EOF
-      - name: Stage build context
-        id: ctx
-        run: |
-          ctx="$(mktemp -d)"
-          case "${{ matrix.artifact }}" in
-            rust-bins)  cp dist/* "$ctx"/ && chmod +x "$ctx"/* ;;
-            web-bundle) cp -a web/standalone web/static web/public "$ctx"/ ;;
-          esac
-          echo "dir=$ctx" >> "$GITHUB_OUTPUT"
-      # Tag strings only — metadata-action needs no Docker daemon.
-      - name: Image tags
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}
-          tags: |
-            type=ref,event=branch
-            type=semver,pattern={{version}}
-            type=sha,prefix=sha-
-            type=raw,value=latest,enable={{is_default_branch}}
-      - name: Build (buildah)
-        env:
-          DOCKERFILE: ${{ matrix.dockerfile }}
-          TARGET: ${{ matrix.target }}
-          CTX: ${{ steps.ctx.outputs.dir }}
-          TAGS: ${{ steps.meta.outputs.tags }}
-        run: |
-          args=(--platform linux/amd64 -f "$DOCKERFILE")
-          [ -n "$TARGET" ] && args+=(--target "$TARGET")
-          while IFS= read -r tag; do [ -n "$tag" ] && args+=(-t "$tag"); done <<< "$TAGS"
-          sudo buildah bud "${args[@]}" "$CTX"
-      - name: Report image size
-        continue-on-error: true
-        run: |
-          size=$(sudo buildah images --format '{{.Size}}' "ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}" | head -1)
-          printf '### 📦 %s\n\n**%s**\n' "${{ matrix.image }}" "$size" >> "$GITHUB_STEP_SUMMARY"
-      # main / tags only: push every tag, then cosign-sign the (single) digest they share.
-      - name: Push + sign
-        if: github.event_name != 'pull_request'
-        env:
-          IMAGE: ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}
-          TAGS: ${{ steps.meta.outputs.tags }}
-        run: |
-          # buildah (root) pushes the image; cosign (runner) pushes the signature — each needs its
-          # own GHCR login (separate auth stores).
-          sudo buildah login -u "${{ github.actor }}" -p "${{ secrets.GITHUB_TOKEN }}" ghcr.io
-          cosign login ghcr.io -u "${{ github.actor }}" -p "${{ secrets.GITHUB_TOKEN }}"
-          # buildah runs the push in a mount/user namespace even under sudo, so --digestfile must land
-          # in a world-writable dir the namespaced uid can create into — a runner-owned mktemp file
-          # (mode 0600) is not writable by that uid ("permission denied"). Let buildah create the file.
-          dgdir="$(mktemp -d)"; chmod 777 "$dgdir"; digestfile="$dgdir/digest"
-          first=1
-          while IFS= read -r tag; do
-            [ -z "$tag" ] && continue
-            if [ "$first" = 1 ]; then
-              sudo buildah push --digestfile "$digestfile" "$tag" "docker://$tag"; first=0
-            else
-              sudo buildah push "$tag" "docker://$tag"
-            fi
-          done <<< "$TAGS"
-          digest="$(sudo cat "$digestfile")"
-          echo "signing ${IMAGE}@${digest}"
-          cosign sign --yes "${IMAGE}@${digest}"
+      packages: write
+      id-token: write
+    uses: ./.github/workflows/image-pipeline.yml
+    with:
+      push: ${{ github.event_name != 'pull_request' }}
+    secrets: inherit
