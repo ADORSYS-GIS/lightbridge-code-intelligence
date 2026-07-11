@@ -1,0 +1,10 @@
+{
+  "scenario":"exhausted_backstop",
+  "messages":[{"role":"assistant","content":null}],
+  "offered_tool_names":[["add_review_comment","retract_finding","add_comment","finish","abort"]],
+  "offered_specs":[[]],
+  "calls_and_results":[],
+  "policy_events":["turn_budget_exhausted"],
+  "control_plane_writes":[],
+  "final_outcome":"exhausted"
+}

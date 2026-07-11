@@ -1,0 +1,10 @@
+{
+  "scenario":"wind_down_entry",
+  "messages":[{"role":"user","content":"⏳ Turn budget almost spent. Stop investigating — record any remaining findings now with add_review_comment/add_comment, then call `finish` with your overall verdict. (The investigation tools are no longer available.)"}],
+  "offered_tool_names":[["lightbridge_vector_semantic_search","lightbridge_graph_find_symbol","lightbridge_graph_get_callers","read_file","add_review_comment","retract_finding","add_comment","finish","report_progress","abort"],["add_review_comment","retract_finding","add_comment","finish","abort"]],
+  "offered_specs":[[],[]],
+  "calls_and_results":[],
+  "policy_events":["wind_down:turn_budget"],
+  "control_plane_writes":[],
+  "final_outcome":"exhausted"
+}

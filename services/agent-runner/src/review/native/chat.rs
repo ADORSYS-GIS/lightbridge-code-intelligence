@@ -16,6 +16,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use lci_agent_clients::ratelimit::{self, RateLimitSnapshot};
+pub use lci_agent_types::{FunctionCall, FunctionDef, ToolCall, ToolDef};
 
 /// A single message in the Chat Completions `messages` array.
 ///
@@ -69,76 +70,9 @@ impl ChatMessage {
     }
 }
 
-/// A tool call the model wants the loop to execute. `arguments` is a JSON-encoded **string** (per the
-/// OpenAI spec), not an object — the dispatcher parses it against the tool's parameter schema.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct ToolCall {
-    pub id: String,
-    #[serde(rename = "type", default = "function_kind")]
-    pub kind: String,
-    pub function: FunctionCall,
-    /// Provider-specific state attached to the call that MUST be echoed back **verbatim** on the next
-    /// turn. Gemini 3 puts its `thought_signature` here as `{"google":{"thought_signature":"…"}}`: the
-    /// model emits it on a `tool_calls` turn and then **rejects the follow-up request with a 400** if it
-    /// is missing ("Function call is missing a thought_signature in functionCall parts"). We never
-    /// inspect it — it is an opaque round-trip blob, preserved on parse and re-serialized on the
-    /// echo-back — so any OpenAI-compatible provider that hangs required state off `extra_content` keeps
-    /// working without a client change. `None` (and omitted from the wire) for providers that don't use
-    /// it, and for the non-first calls of a parallel batch (Gemini only signs the first). See
-    /// <https://ai.google.dev/gemini-api/docs/thought-signatures>.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub extra_content: Option<serde_json::Value>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct FunctionCall {
-    pub name: String,
-    /// JSON-encoded arguments (a string, e.g. `"{\"query\":\"auth\"}"`).
-    #[serde(default)]
-    pub arguments: String,
-}
-
-fn function_kind() -> String {
-    "function".to_string()
-}
-
 /// `skip_serializing_if` helper for a borrowed slice field (the predicate receives `&&[T]`).
 fn slice_is_empty<T>(slice: &&[T]) -> bool {
     slice.is_empty()
-}
-
-/// A tool advertised to the model in the request's `tools` array.
-#[derive(Debug, Clone, Serialize)]
-pub struct ToolDef {
-    #[serde(rename = "type")]
-    pub kind: String,
-    pub function: FunctionDef,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct FunctionDef {
-    pub name: String,
-    pub description: String,
-    /// JSON Schema for the function's parameters.
-    pub parameters: serde_json::Value,
-}
-
-impl ToolDef {
-    /// Build a `function`-type tool definition.
-    pub fn function(
-        name: impl Into<String>,
-        description: impl Into<String>,
-        parameters: serde_json::Value,
-    ) -> Self {
-        Self {
-            kind: "function".to_string(),
-            function: FunctionDef {
-                name: name.into(),
-                description: description.into(),
-                parameters,
-            },
-        }
-    }
 }
 
 /// Per-request generation parameters. All optional — `None` leaves the provider/model default. Mirrors

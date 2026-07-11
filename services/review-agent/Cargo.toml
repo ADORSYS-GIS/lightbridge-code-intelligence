@@ -11,11 +11,19 @@ publish = false
 path = "src/lib.rs"
 
 [dependencies]
+anyhow.workspace = true
 lci-agent-clients = { path = "../agent-clients" }
 lci-agent-loop = { path = "../agent-loop" }
 lci-agent-step = { path = "../agent-step" }
 lci-agent-tools = { path = "../agent-tools" }
 lci-agent-types = { path = "../agent-types" }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
 lci-agent-testkit = { path = "../agent-testkit" }
+tempfile.workspace = true
+wiremock.workspace = true

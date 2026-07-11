@@ -1,0 +1,20 @@
+{
+  "scenario": "plain_converge_finish",
+  "messages": [
+    {"role":"assistant","content":null},
+    {"role":"tool","content":"recorded finding at src/lib.rs:7"},
+    {"role":"assistant","content":null}
+  ],
+  "offered_tool_names": [["lightbridge_vector_semantic_search","lightbridge_graph_find_symbol","lightbridge_graph_get_callers","read_file","add_review_comment","retract_finding","add_comment","finish","report_progress","abort"],["lightbridge_vector_semantic_search","lightbridge_graph_find_symbol","lightbridge_graph_get_callers","read_file","add_review_comment","retract_finding","add_comment","finish","report_progress","abort"]],
+  "offered_specs": [[],[]],
+  "calls_and_results": [
+    {"id":"call-0","name":"add_review_comment","arguments":"{\"file\":\"src/lib.rs\",\"line\":7}","result":"recorded finding at src/lib.rs:7"},
+    {"id":"call-1","name":"finish","arguments":"{\"summary\":\"one finding\"}","result":"finish"}
+  ],
+  "policy_events": [],
+  "control_plane_writes": [
+    {"endpoint":"/review/inline","body":{"file":"src/lib.rs","line":7}},
+    {"endpoint":"/review/summary","body":{"summary":"one finding"}}
+  ],
+  "final_outcome": "finished"
+}

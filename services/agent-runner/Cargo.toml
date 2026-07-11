@@ -14,6 +14,8 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 lci-agent-clients = { path = "../agent-clients" }
+lci-agent-types = { path = "../agent-types" }
+lci-review-agent = { path = "../review-agent" }
 lci-config = { path = "../config" }
 mimalloc.workspace = true
 serde.workspace = true

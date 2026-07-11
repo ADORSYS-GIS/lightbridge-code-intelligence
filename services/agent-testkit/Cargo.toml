@@ -16,3 +16,5 @@ lci-agent-loop = { path = "../agent-loop" }
 lci-agent-step = { path = "../agent-step" }
 lci-agent-tools = { path = "../agent-tools" }
 lci-agent-types = { path = "../agent-types" }
+serde.workspace = true
+serde_json.workspace = true

@@ -1,0 +1,10 @@
+{
+  "scenario":"coverage_bounce",
+  "messages":[{"role":"user","content":"Before finishing, inspect the changed files you have not engaged and then call finish again."}],
+  "offered_tool_names":[["lightbridge_vector_semantic_search","lightbridge_graph_find_symbol","lightbridge_graph_get_callers","read_file","add_review_comment","retract_finding","add_comment","finish","report_progress","abort"]],
+  "offered_specs":[[]],
+  "calls_and_results":[{"id":"call-0","name":"finish","arguments":"{\"summary\":\"done\"}","result":"finish bounced"}],
+  "policy_events":["coverage_bounce:1"],
+  "control_plane_writes":[{"endpoint":"/review/summary","body":{"summary":"done"}}],
+  "final_outcome":"finished"
+}

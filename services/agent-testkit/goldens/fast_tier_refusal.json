@@ -1,0 +1,10 @@
+{
+  "scenario":"fast_tier_refusal",
+  "messages":[{"role":"tool","content":"`read_file` is not available in this fast review pass — review the diff directly, record any findings with add_review_comment, then call finish."}],
+  "offered_tool_names":[["add_review_comment","retract_finding","add_comment","finish","abort"]],
+  "offered_specs":[[]],
+  "calls_and_results":[{"id":"call-0","name":"read_file","arguments":"{\"path\":\"src/lib.rs\"}","result":"`read_file` is not available in this fast review pass — review the diff directly, record any findings with add_review_comment, then call finish."}],
+  "policy_events":["fast_tier_refusal:read_file"],
+  "control_plane_writes":[],
+  "final_outcome":"exhausted"
+}
