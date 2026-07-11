@@ -127,4 +127,5 @@ ring = "0.17.14"
 tempfile = "3.27"
 rsa = "0.9.10"
 rand = "0.10"
+rand_08 = { package = "rand", version = "0.8" }
 wiremock = "0.6.5"

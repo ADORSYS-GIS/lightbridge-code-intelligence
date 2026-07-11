@@ -682,7 +682,7 @@ dependencies = [
  "metrics-exporter-prometheus",
  "mimalloc",
  "neo4rs",
- "rand 0.10.2",
+ "rand 0.8.6",
  "reqwest",
  "restate-sdk",
  "ring",
