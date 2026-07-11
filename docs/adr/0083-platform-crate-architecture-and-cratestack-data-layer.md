@@ -201,6 +201,62 @@ surface we need is verified real, and the alternative is compounding 4,930 hand-
 containment — pin + seam + parity tests + escape hatch — is the difference between this ADR and
 the bet ADR-0005 rightly declined.
 
+### 4. Workspace tooling & crates baseline
+
+The revamp is the moment to fix the toolbox, once, workspace-wide. Verdict per candidate —
+**adopt** / **already in** / **targeted** (specific crates only) / **declined** (with the reason,
+so it isn't re-litigated per PR). Everything adopted goes through `[workspace.dependencies]`
+(single-version rule) and, where marked, the `xtask` single-manifest check.
+
+| Crate / tool | Verdict | Where & why |
+|---|---|---|
+| `bon` | **Adopt — the builder idiom** | Typed, compile-time-checked builders via `#[derive(Builder)]` / `#[builder]` on functions; zero runtime cost. The designated boilerplate killer for the wide constructor surfaces this revamp creates: `AgentLoop::new`, `ToolSpec`, `ChatRequest`, repository DTOs, config structs. House rule: **never hand-roll a builder again**; `bon` before any bespoke macro (§5). |
+| `thiserror` | **Adopt** | Typed error enums (`StepError`, per-crate errors) replacing stringly `anyhow` at crate boundaries; `anyhow` stays at binary edges. |
+| `clap` (derive + `env` + version) | **Adopt** | Replaces the hand-rolled `std::env::args` in the control-plane role mux and `xtask`. The `env` feature keeps the deploy contract intact: `--role` falls back to `CONTROL_PLANE_ROLE`, so charts change nothing. All bins gain `--version` (release/image traceability). |
+| `config` (config-rs) | **Adopt, contract-preserving** | Becomes the loading engine inside `lci-config` (file + env layering, defaults). The external contract is frozen: same JSON shapes, `deny_unknown_fields`, read-once-at-boot, and the ADR-0021 `{env:VAR:-default}` markers keep working (prod ConfigMaps embed them) — a compat test renders a prod-shaped config and asserts identical resolution. |
+| `camino` | **Adopt** | `Utf8PathBuf` for every path that serializes (JSON, logs, journal payloads — most of ours). Convert at `std::path` interop edges only. |
+| `cargo-deny` (+ `deny.toml`) | **Adopt** | Advisories (subsumes `cargo-audit`'s DB), license allowlist, duplicate-version bans, source pinning — wired into `xtask` + CI. The **single-manifest placement rule stays in `xtask`** (deny can't express "this dep only in that crate"). Standalone `cargo-audit`: not needed. |
+| `rustfmt.toml` | **Adopt (committed)** | Stable-channel options only: `edition` (2024 after R1a), `newline_style = "Unix"`, `use_field_init_shorthand`, `use_try_shorthand`. Nightly-only options (`imports_granularity`, `group_imports`, `wrap_comments`) deliberately excluded until fmt runs on nightly in CI — noted so nobody adds them and breaks stable contributors. |
+| `schemars` | **Adopt (agent crates)** | Derives the JSON schema for tool argument structs — `ToolSpec` schemas stop being hand-written strings; pairs with the `Tool` derive macro (§5). |
+| `insta` | **Adopt (dev-dep)** | Snapshot testing for the golden-transcript harness (`agent-testkit`) and the config compat tests — reviewable `.snap` diffs instead of hand-maintained fixtures. |
+| `ignore` | **Adopt (runner/worker)** | Gitignore-aware repo walking (ripgrep's walker) for changed-file discovery and future repo iteration — the mature answer to the niche walkers below. |
+| `mimalloc` | **Already in** | Workspace dep + `#[global_allocator]` in the service binaries (ADR-0080 musl rationale); the `agent-worker` bin adopts the same. |
+| `tokio` | **Already in** | Workspace dep. New crates inherit; no second runtime. |
+| `rayon` | **Targeted only** | For provably CPU-bound parallel work — realistically the indexer (tree-sitter parse/chunk). Bridged via `spawn_blocking`; **forbidden inside async handlers** (a rayon pool inside tokio workers is a latency footgun). Not a workspace default. |
+| `crossbeam` | **Declined (for now)** | No current need tokio channels + `std::sync` don't cover; `std` scoped threads are stable. Revisit only with a measured contention case. |
+| `fff` (`fff-search`) | **Targeted, future tool** | Verified healthy (9.6k★, v0.9.6 2026-06). An in-memory frecency/fuzzy/grep index built for AI agents in long-running processes — the natural engine for a future `find_files`/`grep_repo` **review tool** in the Phase-D `agent-worker` (a long-lived process amortizes the index; the one-shot Job cannot). Used as an in-process crate, not via its MCP server (knowledge-tools stay remote-HTTP-only, ADR-0066). A capability decision → its own slice, not a baseline dep. |
+| `dir-structure` | **Declined** | Neat idea (typed directory layouts), but 1 star and zero published releases — the infrastructure maturity bar isn't met (the same bar ADR-0005 applied to cratestack 0.4.x, and that one had strategic commitment behind it). `ignore` + plain `std::fs` cover the actual need. |
+| `fp-core.rs` | **Declined** | FP type-classes (Functor/Monad/HKT emulation) fight the borrow checker, wreck inference and compile errors, and create a dialect every contributor must learn; the crate is effectively unmaintained. `Option`/`Result`/`Iterator` + `?` already deliver the railway style; `itertools` as a dev-convenience covers most of the rest. Functional *discipline* yes — FP *framework* no. |
+
+### 5. Repetition strategy: `bon` → `macro_rules!` → `lci-macros`
+
+Repetitive code gets eliminated in a fixed escalation order, so macros stay a tool and never
+become the codebase's personality:
+
+1. **Ecosystem derives first** — `serde`, `bon`, `thiserror`, `clap`, `schemars` cover most
+   boilerplate classes. A pattern one of these can express never gets a bespoke macro.
+2. **Local `macro_rules!`** when a pattern repeats **≥ 3×** within one crate and a function or a
+   generic can't express it. Lives next to its uses; not exported across crates.
+3. **`lci-macros`** (a proc-macro crate, created **only when first needed**) for patterns that are
+   cross-crate, non-`macro_rules!`-expressible, and **stable** — never macro a trait that is still
+   moving. Every proc macro ships `trybuild` UI tests + a `cargo expand` snapshot (via insta) so
+   the expansion stays reviewable.
+
+Identified candidates, mapped to the ladder:
+
+| Repetition | Mechanism | When |
+|---|---|---|
+| Wide constructors/builders everywhere | `bon` (level 1) | From R1a |
+| Tool impls: arg parse + schema + kind/replay + error framing per tool | `#[derive(ReviewTool)]`-style attribute in `lci-macros` (level 3); schemas via `schemars` | **After** the `Tool` trait stabilizes (post-R1e) — macro a frozen trait, never a moving one |
+| Repository CRUD forwarding to cratestack delegates | `delegate_repo!` `macro_rules!` in `lci-data` (level 2) | With the P4+ drawdown slices |
+| `StepName` constants + the frozen-list stability test | `step_names!` `macro_rules!` (level 2) | R1a |
+| Config env-fallback plumbing | **No macro** — absorbed by config-rs + serde defaults | The `lci-config` slice |
+| Singleton advisory-lock wrapper | **No macro** — a plain `run_singleton(name, key, fut)` function | P3 |
+
+Anti-goals, stated once: no DSLs; no macro-generated *public* API a reader can't follow in
+rustdoc; `bon` over any hand-rolled builder macro; a macro that saves fewer lines than its own
+definition + tests costs is deleted in review.
+
 ## Sequencing (P-series; interleaves with ADR-0082's R-series, independent of Restate gates)
 
 - **P0 — schema truth:** regenerate `.cstack` from the live schema; CI validate + drift gate. No
@@ -247,6 +303,7 @@ the bet ADR-0005 rightly declined.
 | R22 | `shared` role config/behavior drift vs dedicated roles (combinations prod never exercises) | Medium | Medium | `shared` is pure composition of the same crate entrypoints (no seventh code path); CI smoke matrix boots `shared` and asserts each subsystem's readiness; handbook documents the supported matrix |
 | R23 | Dual data-path window: a repo migrated to delegates diverges subtly from the raw twin it replaced | Medium | High (silent data drift) | Per-slice parity suites on the real corpus; slices small; `// raw:` residue is named and reviewed; drift gate keeps schema honest |
 | R24 | The `.cstack` regeneration mis-models a live corner (27 migrations of accretion) | Medium | Medium | P0 diffs the `.cstack`-derived DDL against a scratch DB migrated by the real pipeline; discrepancies block at CI, not in prod |
+| R25 | Macro creep: `lci-macros` grows into a house DSL that hides control flow and stalls contributors | Medium | Medium | The §5 escalation ladder (ecosystem derive → local `macro_rules!` ≥3× → proc macro only for stable cross-crate patterns); trybuild + expansion snapshots make every macro reviewable; the "saves fewer lines than it costs → delete" rule |
 
 ## More Information
 
