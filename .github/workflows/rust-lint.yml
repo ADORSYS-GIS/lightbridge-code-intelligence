@@ -68,6 +68,12 @@ jobs:
         run: cargo run --locked --package xtask -- dependency-hygiene
       - name: xtask tests
         run: cargo test --locked -p xtask
+      # Runs the workspace test suite INCLUDING integration tests under `tests/` (which the `--lib`
+      # coverage steps below deliberately skip) — notably the review-agent 6-golden byte-parity bar
+      # (`services/review-agent/tests/golden_parity.rs`), the R1 extraction's merge gate. control-plane
+      # is excluded here (it needs a live Postgres) and covered by control-plane-tests.yml.
+      - name: cargo test (workspace, excl. control-plane)
+        run: cargo test --workspace --exclude control-plane --locked
       - name: cargo fmt --all --check
         run: cargo fmt --all -- --check
       - name: cargo clippy --workspace -D warnings
