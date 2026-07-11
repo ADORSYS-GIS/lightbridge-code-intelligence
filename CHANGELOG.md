@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.3.1](https://github.com/vymalo/lightbridge-code-intelligence/compare/v0.3.0...v0.3.1) (2026-07-11)
+
+
+### Documentation
+
+* **adr:** accept ADR-0082 and bound R1a ([#342](https://github.com/vymalo/lightbridge-code-intelligence/issues/342)) ([4544fde](https://github.com/vymalo/lightbridge-code-intelligence/commit/4544fdedb23d270f7fdb46d9f9aba29df2231144))
+* **adr:** ADR-0082/0083/0084 — durable agent runtime, platform crate architecture + cratestack ORM, customer handbook (design-only) ([#338](https://github.com/vymalo/lightbridge-code-intelligence/issues/338)) ([453f405](https://github.com/vymalo/lightbridge-code-intelligence/commit/453f405ef393ee15af2bc90802083450f0623669))
+
 ## [0.3.0](https://github.com/vymalo/lightbridge-code-intelligence/compare/v0.2.0...v0.3.0) (2026-07-11)
 
 
