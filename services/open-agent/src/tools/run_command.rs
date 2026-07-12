@@ -136,9 +136,11 @@ async fn run(
     // pod; capturing into a capped buffer bounds peak memory. Crucially, once the cap is reached we do
     // NOT stop reading — we keep draining the remainder of the pipe to `sink()` (discarding it) so a
     // verbose-but-finite command (e.g. `cargo build`) never blocks on a full ~64 KB OS pipe buffer.
-    // Before this drain, such a command would wedge (`child.wait()` never completes) and get falsely
-    // reported as a timeout and killed. A truly runaway/infinite writer keeps the sink busy but never
-    // exits, so the outer timeout still fires and kills it (correct); a finite writer drains and exits.
+    // Before this drain, such a command would block on the full pipe — wedging until the timeout
+    // (`child.wait()` never completes → falsely reported as a timeout), or dying by SIGPIPE where
+    // dropping the read end signals the writer — instead of finishing. A truly runaway/infinite writer
+    // keeps the sink busy but never exits, so the outer timeout still fires and kills it (correct); a
+    // finite writer drains and exits.
     let read_cap = (output_cap + 1024) as u64;
     let stdout_pipe = child.stdout.take();
     let stderr_pipe = child.stderr.take();
@@ -272,7 +274,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let output_cap = 4096usize; // read_cap = 5120 bytes; the child writes ~1.2 MB, far exceeding it.
         // `yes` would run forever; instead emit a bounded-but-large stream then exit 0 immediately.
-        let script = "for i in $(seq 1 200000); do echo line$i; done";
+        let script = r#"awk 'BEGIN { for (i = 1; i <= 200000; i++) print "line" i }'"#;
         let out = run(
             dir.path(),
             "sh",
