@@ -38,6 +38,9 @@ anyhow = "1.0.103"
 # Workspace-standard compile-time builders (ADR-0083). New wide constructors use `bon` rather than
 # hand-written builder types.
 bon = "3.9.3"
+# Flag+env parsing for the agent-plane `mode × host` entrypoint (ADR-0085). `derive` for the CLI
+# struct/value-enums; `env` so each axis is a flag OR an env var (the dispatcher can set either).
+clap = { version = "4.5.53", features = ["derive", "env"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 tokio = { version = "1.52.3", features = ["full"] }

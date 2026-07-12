@@ -4,13 +4,20 @@ How work flows through Lightbridge: what triggers a task, the two job kinds, the
 runs at, the states a task moves through, how it's gated behind a fresh index, and how cancellation +
 data purge work. Diagrams are Mermaid (rendered by GitHub).
 
-> **Evolving toward v2 ([RFC-0007](rfc/0007-control-plane-v2-planes.md)).** The two job kinds become
-> **modes** of one `agent-plane` binary ([ADR-0085](adr/0085-agent-execution-plane.md)) — `index` and
-> `review` (plus a new write-capable `open`, [ADR-0088](adr/0088-open-mode-autonomous-ticket-agent.md))
-> — each deployable as an isolated Job (`run-once`) or a shared Deployment (`serve`). A pod death no
-> longer restarts a deep review from turn 0: `CheckpointRuntime`
-> ([ADR-0087](adr/0087-durable-replay-checkpoint-runtime.md)) journals each step and resumes at the one
-> it left. The state machine, cancellation, and purge described here carry over.
+> **Migrating to v2 ([RFC-0007](rfc/0007-control-plane-v2-planes.md)) — partially landed.** The two
+> job kinds are becoming **modes** of one `agent-plane` binary
+> ([ADR-0085](adr/0085-agent-execution-plane.md)) — `index` and `review` (plus a future write-capable
+> `open`, [ADR-0088](adr/0088-open-mode-autonomous-ticket-agent.md)) — selected by **mode × host**.
+> **Landed (slice 2):** the `agent-plane` entrypoint exists and drives `index`/`review` under the
+> `run-once` host **behaviour-identically** to the Jobs described below — it reuses the exact same
+> `run_once` orchestration as `agent-runner` (`services/agent-runner/src/{run.rs,plane.rs}`,
+> `src/bin/agent_plane.rs`), and the mode×host routing guard is enforced at startup. **Still pending:**
+> the dispatcher still launches the `agent-runner` binary (the cutover to `agent-plane --mode … --host
+> run-once` is a later one-liner), so the two Job images have **not** yet collapsed to one; the `serve`
+> host (slice 5) and `open` mode (slice 4) are guard scaffolding only and rejected at startup; and
+> `CheckpointRuntime` replay ([ADR-0087](adr/0087-durable-replay-checkpoint-runtime.md), slice 3) is
+> not built — a pod death still restarts a deep review from turn 0. The state machine, cancellation,
+> and purge described here are unchanged.
 
 > Source of truth in code:
 > `services/control-plane/src/db.rs` (task status fns, idempotency, `create_task` /
