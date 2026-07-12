@@ -232,7 +232,17 @@ async fn run(
         // ── Structural index: Graphify → Neo4j (epic #5, slice 3, ADR-0019) ──────────────────
         // Best-effort: the semantic index already landed, and the graph store may be unconfigured
         // (control plane returns 503). A graph failure is logged, not fatal — the task still succeeds.
-        let graph = match indexer::graph::index_graph(&context, &checkout, client).await {
+        // ADR-0086 slice 1: `LCI_CODEGRAPH_GRAPH` opts a run into the in-house Rust graph
+        // (`lci-codegraph`) instead of Graphify; default (unset) keeps Graphify, so prod is unchanged.
+        let graph_result = if indexer::codegraph_graph::enabled() {
+            tracing::info!(
+                "structural graph: using in-house lci-codegraph (LCI_CODEGRAPH_GRAPH set)"
+            );
+            indexer::codegraph_graph::index_graph(&context, &checkout, client).await
+        } else {
+            indexer::graph::index_graph(&context, &checkout, client).await
+        };
+        let graph = match graph_result {
             Ok((nodes, edges)) => format!("{nodes} nodes / {edges} edges"),
             Err(error) => {
                 tracing::warn!(%error, "structural graph indexing failed (non-fatal)");
