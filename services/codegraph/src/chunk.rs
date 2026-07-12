@@ -193,10 +193,15 @@ fn window_chunks(file_path: &str, source: &str, language: &str, tuning: IndexTun
     if lines.is_empty() {
         return Vec::new();
     }
+    // `IndexTuning::from_env` clamps these, but the fields are `pub` — a caller can construct
+    // `IndexTuning { window_step: 0, .. }` directly, which would wedge this loop forever (start
+    // never advances). Clamp locally to `>= 1` as a belt-and-suspenders guard.
+    let window_size = tuning.window_size.max(1);
+    let window_step = tuning.window_step.max(1);
     let mut chunks = Vec::new();
     let mut start = 0usize;
     while start < lines.len() {
-        let end = (start + tuning.window_size).min(lines.len());
+        let end = (start + window_size).min(lines.len());
         let content = lines[start..end].join("\n");
         chunks.push(Chunk {
             file_path: file_path.to_string(),
@@ -210,7 +215,7 @@ fn window_chunks(file_path: &str, source: &str, language: &str, tuning: IndexTun
         if end == lines.len() {
             break;
         }
-        start += tuning.window_step;
+        start += window_step;
     }
     chunks
 }

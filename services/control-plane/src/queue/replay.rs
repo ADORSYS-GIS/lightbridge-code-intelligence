@@ -62,6 +62,9 @@ pub async fn run(pool: PgPool, retention: Duration) -> anyhow::Result<()> {
         "replay role: durable-step TTL sweep starting"
     );
     let mut ticker = tokio::time::interval(SWEEP_INTERVAL);
+    // After a long stall (e.g. DB unavailable) don't fire a burst of catch-up ticks all at once —
+    // one sweep per interval is enough; skip the missed ones.
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         ticker.tick().await;
         match crate::db::sweep_durable_steps(&pool, retention_secs).await {

@@ -21,9 +21,12 @@ pub const ENV_CODEGRAPH_GRAPH: &str = "LCI_CODEGRAPH_GRAPH";
 /// True when the operator has opted this run into the in-house graph.
 #[must_use]
 pub fn enabled() -> bool {
-    std::env::var(ENV_CODEGRAPH_GRAPH)
-        .ok()
-        .is_some_and(|v| matches!(v.trim(), "1" | "true" | "rust" | "on"))
+    std::env::var(ENV_CODEGRAPH_GRAPH).ok().is_some_and(|v| {
+        matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "rust" | "on"
+        )
+    })
 }
 
 /// Build the structural graph with `lci-codegraph` (Rust only) and submit it to the control plane.

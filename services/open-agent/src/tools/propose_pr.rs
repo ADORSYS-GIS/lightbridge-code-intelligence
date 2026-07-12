@@ -31,8 +31,10 @@ pub const PROPOSE_PR: &str = "propose_pr";
 struct Args {
     title: String,
     body: String,
-    /// The base ref/sha the change is proposed against (the branch the PR targets). Defaults to the
-    /// repository default branch when omitted.
+    /// The base ref/sha the change is proposed against — the branch the PR targets AND the point the
+    /// local patch is captured from (`git format-patch base..HEAD`). Required: there is no reliable
+    /// in-sandbox default (the old `HEAD~1` fallback silently captured only the last commit, which
+    /// mismatches a multi-commit branch and the PR's real base). Pass the branch you started from.
     #[serde(default)]
     base: Option<String>,
     /// The local branch name the agent committed to; the egress plane pushes it under this name.
@@ -50,9 +52,9 @@ pub fn spec() -> ToolSpec {
         serde_json::json!({"type":"object","properties":{
             "title":{"type":"string","description":"The pull request title."},
             "body":{"type":"string","description":"The PR body — MUST include the AI Usage Declaration, source-of-truth issue #, and Verification (sandbox build/test results)."},
-            "base":{"type":"string","description":"Optional base ref/branch the PR targets (defaults to the repo default branch)."},
+            "base":{"type":"string","description":"The base ref/branch the PR targets and that your branch was started from (used to capture the patch as base..HEAD). Pass the branch you branched off."},
             "branch":{"type":"string","description":"The local branch name you committed to."}
-        },"required":["title","body","branch"]}),
+        },"required":["title","body","base","branch"]}),
     )
 }
 
@@ -101,7 +103,15 @@ impl Tool for ProposePrTool {
                     ));
                 }
             };
-            let base = args.base.as_deref().unwrap_or("HEAD~1");
+            // No silent default: capturing `HEAD~1..HEAD` would ship only the last commit for a
+            // multi-commit branch while the PR targets `base`. Require the caller to name the base.
+            let Some(base) = args.base.as_deref().filter(|b| !b.trim().is_empty()) else {
+                return ToolOutcome::Continue(
+                    "error: `base` is required — it is the branch you started from and the patch is \
+                     captured as `base..HEAD`. Pass the base branch (e.g. the repo default branch)."
+                        .into(),
+                );
+            };
             let patch = match capture_patch(&root, base).await {
                 Ok(patch) if patch.trim().is_empty() => {
                     return ToolOutcome::Continue(
@@ -125,7 +135,7 @@ impl Tool for ProposePrTool {
                     cx.task_id,
                     &args.title,
                     &args.body,
-                    args.base.as_deref(),
+                    Some(base),
                     &args.branch,
                     &patch,
                 )

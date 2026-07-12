@@ -487,11 +487,23 @@ pub async fn fetch_step(
     match crate::db::fetch_durable_step(pool, id, run_epoch, &body.step_name).await {
         Ok(Some(row)) => {
             // `result::text` round-trips through serde_json; a NULL result (future offload) is `null`.
-            let result = row
-                .result
-                .as_deref()
-                .and_then(|text| serde_json::from_str(text).ok())
-                .unwrap_or(serde_json::Value::Null);
+            // A NON-NULL value that fails to parse is store corruption — surface it loud (error +
+            // 500) instead of silently coercing to `null`, which would hand the runner a wrong,
+            // journaled-looking result and mask the corruption.
+            let result = match row.result.as_deref() {
+                None => serde_json::Value::Null,
+                Some(text) => match serde_json::from_str(text) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        tracing::error!(
+                            %error, task_id = %id, step = %body.step_name,
+                            "durable step result is not valid JSON — corrupted store data"
+                        );
+                        return (StatusCode::INTERNAL_SERVER_ERROR, "corrupted store data")
+                            .into_response();
+                    }
+                },
+            };
             Json(StoredStepResponse {
                 result,
                 content_hash: row.content_hash,

@@ -5,6 +5,7 @@
 //! This is the crate's top-level entry point; the agent-plane's `index` mode (and today's
 //! `agent-runner`, behind a flag) drives it and maps the results onto the internal-API payloads.
 
+use std::io::Read as _;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -143,14 +144,20 @@ pub fn walk_checkout(root: &Path, options: &WalkOptions) -> anyhow::Result<WalkO
         let Some(lang) = language::from_path(path) else {
             continue;
         };
-        // Guard large files before allocating memory for them.
-        if path.metadata().map(|m| m.len()).unwrap_or(0) > MAX_FILE_BYTES as u64 {
-            continue;
+        // Bound the read at the I/O level, not via `metadata().len()`: the file could grow (or be a
+        // pipe/special file) between the stat and the read (TOCTOU), so cap the bytes we actually
+        // pull. Read at most MAX_FILE_BYTES + 1 — if we hit the extra byte the file is over cap.
+        let mut source = String::new();
+        let read = std::fs::File::open(path).and_then(|f| {
+            f.take(MAX_FILE_BYTES as u64 + 1)
+                .read_to_string(&mut source)
+        });
+        if read.is_err() {
+            continue; // binary, unreadable, or non-UTF8
         }
-        let source = match std::fs::read_to_string(path) {
-            Ok(s) => s,
-            Err(_) => continue, // binary or unreadable
-        };
+        if source.len() > MAX_FILE_BYTES {
+            continue; // over the byte cap
+        }
 
         let file_chunks = if options.build_graph && language::has_graph(lang) {
             // Parse ONCE and feed both the chunker and the graph builder (ADR-0086 "parse once").

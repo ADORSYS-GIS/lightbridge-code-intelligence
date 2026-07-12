@@ -114,28 +114,66 @@ async fn run(
     timeout: Duration,
     output_cap: usize,
 ) -> String {
+    use tokio::io::AsyncReadExt as _;
+
     let mut cmd = Command::new(command);
     cmd.args(args)
         .current_dir(cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let output = match tokio::time::timeout(timeout, cmd.output()).await {
-        Ok(Ok(output)) => output,
-        Ok(Err(error)) => return format!("error: could not run {command:?}: {error}"),
+        .stderr(Stdio::piped())
+        // If this future is dropped (e.g. the whole tool call is cancelled) the child would otherwise
+        // be orphaned — tokio's default is NOT to kill on drop. Reap it instead of leaking a process.
+        .kill_on_drop(true);
+
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(error) => return format!("error: could not run {command:?}: {error}"),
+    };
+
+    // Drain both pipes concurrently, each bounded to `output_cap + 1024` bytes. `cmd.output()` would
+    // buffer stdout/stderr *unbounded*, so a pathological process could OOM the pod; a bounded reader
+    // caps peak memory. Reading past the cap is intentionally left un-drained: a runaway writer then
+    // blocks on a full pipe and is reaped by the timeout below rather than being served forever.
+    let read_cap = (output_cap + 1024) as u64;
+    let stdout_pipe = child.stdout.take();
+    let stderr_pipe = child.stderr.take();
+    let drain_out = async {
+        let mut buf = Vec::new();
+        if let Some(pipe) = stdout_pipe {
+            let _ = pipe.take(read_cap).read_to_end(&mut buf).await;
+        }
+        buf
+    };
+    let drain_err = async {
+        let mut buf = Vec::new();
+        if let Some(pipe) = stderr_pipe {
+            let _ = pipe.take(read_cap).read_to_end(&mut buf).await;
+        }
+        buf
+    };
+    let combined = async { tokio::join!(child.wait(), drain_out, drain_err) };
+
+    let (status, stdout_bytes, stderr_bytes) = match tokio::time::timeout(timeout, combined).await {
+        Ok((Ok(status), out, err)) => (status, out, err),
+        Ok((Err(error), _, _)) => return format!("error: could not run {command:?}: {error}"),
         Err(_) => {
+            // Timed out. Explicitly kill + reap so the process is gone before we return, rather than
+            // relying only on `kill_on_drop` firing when `child` drops at end of scope.
+            let _ = child.start_kill();
+            let _ = child.wait().await;
             return format!(
                 "error: {command:?} exceeded the per-command timeout of {}s and was aborted.",
                 timeout.as_secs()
             );
         }
     };
-    let code = output
-        .status
+
+    let code = status
         .code()
         .map_or_else(|| "signal".to_string(), |c| c.to_string());
-    let stdout = truncate(&String::from_utf8_lossy(&output.stdout), output_cap);
-    let stderr = truncate(&String::from_utf8_lossy(&output.stderr), output_cap);
+    let stdout = truncate(&String::from_utf8_lossy(&stdout_bytes), output_cap);
+    let stderr = truncate(&String::from_utf8_lossy(&stderr_bytes), output_cap);
     format!("exit code: {code}\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}")
 }
 
@@ -188,5 +226,31 @@ mod tests {
         )
         .await;
         assert!(out.contains("timeout"), "{out}");
+    }
+
+    // A hung command must be actually TERMINATED on timeout, not just reported as one and left to run
+    // as an orphan (the pre-fix `timeout(.., cmd.output())` dropped the future without killing the
+    // child). Prove it behaviourally: the child would `touch` a marker after a sleep that outlasts the
+    // timeout; if it were truly killed the marker never appears, if it leaked it creates the file.
+    #[tokio::test]
+    async fn kills_the_child_on_timeout_leaving_no_orphan() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("survived");
+        let script = format!("sleep 1; touch {}", marker.display());
+        let out = run(
+            dir.path(),
+            "sh",
+            &["-c".to_string(), script],
+            Duration::from_millis(150),
+            1024,
+        )
+        .await;
+        assert!(out.contains("timeout"), "{out}");
+        // Wait past the child's sleep. A killed child never reaches `touch`; a leaked orphan would.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert!(
+            !marker.exists(),
+            "the child survived the timeout and ran `touch` — it was not killed"
+        );
     }
 }

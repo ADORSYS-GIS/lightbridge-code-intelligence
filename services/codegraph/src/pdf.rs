@@ -1,13 +1,19 @@
 //! Bounded PDF text extraction (ADR-0086 §3, R2). Repos carry docs as PDFs; we extract their text and
 //! feed it to the same windowed-chunk → embed path text files take.
 //!
-//! PDF parsing over untrusted repo input is a crash/OOM surface, so it is bounded defensively:
-//! 1. **Cap bytes at the I/O level BEFORE the parser sees the file** — we read at most
-//!    [`MAX_PDF_BYTES`] via a limited reader, so a multi-GB "PDF" never lands in memory.
+//! PDF parsing over untrusted repo input is a crash/OOM surface. This module bounds the **input**
+//! and the **output**, but does NOT yet bound peak parse memory/time — see the caveat below:
+//! 1. **Cap input bytes at the I/O level BEFORE the parser sees the file** — we read at most
+//!    [`MAX_PDF_BYTES`] via a limited reader, so a multi-GB "PDF" never lands in memory whole.
 //! 2. **Catch panics** — `pdf-extract` can panic on malformed input; the parse runs inside
 //!    `catch_unwind` so a crafted file is skipped, never unwinding into the index Job.
 //! 3. **Bound output** — extracted text over [`MAX_PDF_TEXT_BYTES`] is truncated, so a decompression
 //!    blow-up can't turn into an unbounded chunk set.
+//!
+//! **Not yet bounded:** a bounded-input PDF can still expand during parsing (stream decompression,
+//! font/glyph tables, object graphs), so peak *parse-time* memory and CPU are NOT capped here. A
+//! small crafted file can still spike memory/time inside `pdf-extract`. Bounding the parse itself
+//! (e.g. a memory/time-limited subprocess or a streaming parser) is tracked in the cutover gate.
 //!
 //! We picked **`pdf-extract`** over raw `lopdf`: it is purpose-built for text-out (it wraps `lopdf`
 //! and walks content streams for us), so we don't hand-roll content-stream/font decoding. It is
