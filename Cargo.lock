@@ -2772,6 +2772,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "lci-open-agent"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "lci-agent-clients",
+ "lci-agent-loop",
+ "lci-agent-step",
+ "lci-agent-testkit",
+ "lci-agent-tools",
+ "lci-agent-types",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "uuid",
+ "wiremock",
+]
+
+[[package]]
 name = "lci-review-agent"
 version = "0.1.0"
 dependencies = [

@@ -506,6 +506,105 @@ pub async fn fetch_step(
     }
 }
 
+// ── ADR-0088 open-mode mediated PR-open egress ───────────────────────────────────────────────────
+// The open agent (a credential-light, sandboxed run-once pod) commits to a LOCAL branch and calls this
+// endpoint with the branch patch + PR metadata. It holds no forge token: the control plane offloads the
+// patch (content-hashed) and enqueues a `pr_open` intent onto the SAME outbox the reconciler drains;
+// the egress plane (which holds the forge creds) pushes + opens the PR. `run_epoch` is resolved
+// server-side — the agent never knows the run identity (trust boundary, ADR-0002/0037). Never
+// auto-merges. DORMANT: no trigger creates an `open` task, and the reconciler's `pr_open` delivery is
+// gated on a security sign-off — so nothing exercises this in prod yet.
+
+/// Body for `POST /internal/tasks/{id}/propose-pr` — the open agent's terminal PR proposal (ADR-0088).
+#[derive(Debug, Deserialize)]
+pub struct ProposePrBody {
+    pub title: String,
+    pub body: String,
+    /// The base ref the PR targets; `None` → the repo default branch.
+    #[serde(default)]
+    pub base: Option<String>,
+    /// The local branch name the sandbox committed to.
+    pub branch: String,
+    /// The branch as a `git format-patch` series (offloaded here, content-hashed, before the intent).
+    pub patch: String,
+}
+
+/// `POST /internal/tasks/{id}/propose-pr` — accept an open-mode PR proposal (ADR-0088). Offloads the
+/// branch patch (content-hashed) and enqueues a `pr_open` intent dedup-keyed by `(task_id, run_epoch)`
+/// so a replay opens exactly one PR. 202 on accept; 404 if the task is unknown; 503 without a DB /
+/// configured platform. Never pushes here — the reconciler owns the credentialed push.
+pub async fn propose_pr(
+    _auth: RunnerAuth,
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(a): Json<ProposePrBody>,
+) -> Response {
+    use sha2::{Digest, Sha256};
+
+    let Some(pool) = state.db.as_ref() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "no database").into_response();
+    };
+    let context = match crate::db::get_task_context(pool, id).await {
+        Ok(Some(c)) => c,
+        Ok(None) => return (StatusCode::NOT_FOUND, "task not found").into_response(),
+        Err(error) => {
+            tracing::error!(%error, task_id = %id, "load task for propose_pr failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "query error").into_response();
+        }
+    };
+    // `run_epoch` is the dedup discriminator — resolved from the task row, never trusted from the pod.
+    let run_epoch = match crate::db::durable_step_run_epoch(pool, id).await {
+        Ok(Some(epoch)) => epoch,
+        Ok(None) => return (StatusCode::NOT_FOUND, "task not found").into_response(),
+        Err(error) => {
+            tracing::error!(%error, task_id = %id, "resolving run_epoch for propose_pr failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "query error").into_response();
+        }
+    };
+
+    // Offload rule (ADR-0082/0088): content-hash the branch and store the bytes; the intent carries the
+    // hash + key, not the payload. `put_pr_open_blob` is idempotent, so a replay re-stores the same bytes.
+    let content_hash = hex::encode(Sha256::digest(a.patch.as_bytes()));
+    if let Err(error) =
+        crate::db::put_pr_open_blob(pool, &content_hash, id, run_epoch, a.patch.as_bytes()).await
+    {
+        tracing::error!(%error, task_id = %id, "offloading pr_open patch failed");
+        return (StatusCode::INTERNAL_SERVER_ERROR, "store error").into_response();
+    }
+
+    let target = crate::outbox::Target {
+        task_id: Some(id),
+        platform: context.platform,
+        installation_id: context.installation_id,
+        owner: &context.owner,
+        repo: &context.name,
+        egress: &state.egress,
+    };
+    let payload = crate::outbox::PrOpenPayload {
+        branch: a.branch,
+        base: a.base,
+        title: a.title,
+        body: a.body,
+        content_hash,
+    };
+    match crate::outbox::enqueue_pr_open(pool, &target, id, run_epoch, &payload).await {
+        Ok(inserted) => {
+            tracing::info!(
+                task_id = %id,
+                run_epoch,
+                deduped = !inserted,
+                "open-mode PR proposal enqueued (pr_open intent)"
+            );
+            // 202 whether newly enqueued or deduped — the proposal is (already) accepted either way.
+            StatusCode::ACCEPTED.into_response()
+        }
+        Err(error) => {
+            tracing::error!(%error, task_id = %id, "enqueuing pr_open intent failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "enqueue error").into_response()
+        }
+    }
+}
+
 /// `POST /internal/tasks/{id}/chunks` — ingest indexed code chunks from the runner.
 ///
 /// The runner submits chunks in batches as it processes files; the control plane writes them to

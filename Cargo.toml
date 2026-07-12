@@ -16,6 +16,7 @@ members = [
     "services/codegraph",
     "services/agent-testkit",
     "services/review-agent",
+    "services/open-agent",
     "clients/lci",
     "xtask",
 ]
