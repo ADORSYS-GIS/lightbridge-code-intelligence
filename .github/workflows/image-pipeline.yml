@@ -39,7 +39,7 @@ permissions:
 jobs:
   # ── Compile the Rust workspace natively → one static-musl binary per service ──────────────────────
   rust-build:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, vymalo-vps]
     env:
       TARGET: x86_64-unknown-linux-musl
     steps:
@@ -81,7 +81,7 @@ jobs:
 
   # ── Compile the Next.js app natively → the standalone bundle ──────────────────────────────────────
   web-build:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, vymalo-vps]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -110,7 +110,7 @@ jobs:
   # ── Assemble images from the prebuilt artifacts, daemonless, with buildah ─────────────────────────
   images:
     needs: [rust-build, web-build]
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, vymalo-vps]
     permissions:
       contents: read
       packages: write # push (inputs.push only)

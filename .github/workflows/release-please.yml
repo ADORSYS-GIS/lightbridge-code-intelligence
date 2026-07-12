@@ -31,7 +31,7 @@ permissions:
 
 jobs:
   release-please:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, vymalo-vps]
     permissions:
       contents: write
       pull-requests: write

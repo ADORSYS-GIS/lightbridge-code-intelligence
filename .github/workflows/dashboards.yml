@@ -21,7 +21,7 @@ permissions:
 
 jobs:
   generate-and-verify:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, vymalo-vps]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -40,7 +40,7 @@ jobs:
           fi
 
   helm-lint:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, vymalo-vps]
     steps:
       - uses: actions/checkout@v4
       - uses: azure/setup-helm@v4
