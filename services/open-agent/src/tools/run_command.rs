@@ -131,24 +131,34 @@ async fn run(
         Err(error) => return format!("error: could not run {command:?}: {error}"),
     };
 
-    // Drain both pipes concurrently, each bounded to `output_cap + 1024` bytes. `cmd.output()` would
-    // buffer stdout/stderr *unbounded*, so a pathological process could OOM the pod; a bounded reader
-    // caps peak memory. Reading past the cap is intentionally left un-drained: a runaway writer then
-    // blocks on a full pipe and is reaped by the timeout below rather than being served forever.
+    // Drain both pipes concurrently, keeping only the first `output_cap + 1024` bytes of each.
+    // `cmd.output()` would buffer stdout/stderr *unbounded*, so a pathological process could OOM the
+    // pod; capturing into a capped buffer bounds peak memory. Crucially, once the cap is reached we do
+    // NOT stop reading — we keep draining the remainder of the pipe to `sink()` (discarding it) so a
+    // verbose-but-finite command (e.g. `cargo build`) never blocks on a full ~64 KB OS pipe buffer.
+    // Before this drain, such a command would block on the full pipe — wedging until the timeout
+    // (`child.wait()` never completes → falsely reported as a timeout), or dying by SIGPIPE where
+    // dropping the read end signals the writer — instead of finishing. A truly runaway/infinite writer
+    // keeps the sink busy but never exits, so the outer timeout still fires and kills it (correct); a
+    // finite writer drains and exits.
     let read_cap = (output_cap + 1024) as u64;
     let stdout_pipe = child.stdout.take();
     let stderr_pipe = child.stderr.take();
     let drain_out = async {
         let mut buf = Vec::new();
-        if let Some(pipe) = stdout_pipe {
-            let _ = pipe.take(read_cap).read_to_end(&mut buf).await;
+        if let Some(mut pipe) = stdout_pipe {
+            let _ = (&mut pipe).take(read_cap).read_to_end(&mut buf).await;
+            // Discard anything past the cap so the child doesn't block on a full pipe.
+            let _ = tokio::io::copy(&mut pipe, &mut tokio::io::sink()).await;
         }
         buf
     };
     let drain_err = async {
         let mut buf = Vec::new();
-        if let Some(pipe) = stderr_pipe {
-            let _ = pipe.take(read_cap).read_to_end(&mut buf).await;
+        if let Some(mut pipe) = stderr_pipe {
+            let _ = (&mut pipe).take(read_cap).read_to_end(&mut buf).await;
+            // Discard anything past the cap so the child doesn't block on a full pipe.
+            let _ = tokio::io::copy(&mut pipe, &mut tokio::io::sink()).await;
         }
         buf
     };
@@ -251,6 +261,44 @@ mod tests {
         assert!(
             !marker.exists(),
             "the child survived the timeout and ran `touch` — it was not killed"
+        );
+    }
+
+    // The discriminating case for the drain fix: a command that writes FAR more than `read_cap` bytes
+    // on stdout and then exits promptly. Without draining the excess to `sink()`, the child fills the
+    // ~64 KB OS pipe buffer, blocks on write, `child.wait()` never returns, and the outer timeout
+    // fires — falsely reporting a fast, benign command as a timeout. With the drain it exits normally
+    // and we return success with TRUNCATED output. This test FAILS on the pre-fix (un-drained) version.
+    #[tokio::test]
+    async fn verbose_but_fast_command_returns_truncated_success_not_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let output_cap = 4096usize; // read_cap = 5120 bytes; the child writes ~1.2 MB, far exceeding it.
+        // `yes` would run forever; instead emit a bounded-but-large stream then exit 0 immediately.
+        let script = r#"awk 'BEGIN { for (i = 1; i <= 200000; i++) print "line" i }'"#;
+        let out = run(
+            dir.path(),
+            "sh",
+            &["-c".to_string(), script.to_string()],
+            // A generous timeout: the command is fast, so if we still hit this it's the pipe deadlock,
+            // not slowness. Pre-fix this test would report a timeout regardless of how large we set it.
+            Duration::from_secs(20),
+            output_cap,
+        )
+        .await;
+        assert!(
+            !out.contains("exceeded the per-command timeout"),
+            "verbose-but-fast command was falsely reported as a timeout (pipe deadlock not drained): {out}"
+        );
+        assert!(out.contains("exit code: 0"), "expected a clean exit: {out}");
+        assert!(
+            out.contains("truncated at"),
+            "expected truncated stdout: {out}"
+        );
+        // The captured stdout must be bounded near `output_cap`, not the child's full ~1.2 MB output.
+        assert!(
+            out.len() < output_cap * 3,
+            "captured output was not bounded to roughly output_cap: {} bytes",
+            out.len()
         );
     }
 }
