@@ -54,3 +54,12 @@ bind a "banking-grade" control plane to; `src/types.rs` stays the hand-written, 
 constructs the public docs do not specify — procedure-level policy syntax and the `autoincrement`
 default — are flagged `# TODO(grammar)` in the schema and must be confirmed with the validator before
 codegen is enabled. Revisit adoption once cratestack matures.
+
+## Update (2026-07-11)
+
+Revisited: [ADR-0083](0083-platform-crate-architecture-and-cratestack-data-layer.md) **executes
+this ADR's intent and supersedes the deferral clause** — cratestack (`cratestack-pg`, still 0.4.9)
+is adopted as the **data layer only** (generated SQLx-backed delegates behind repository traits in
+a dedicated `lci-data` crate; generated routes not mounted), with the `.cstack` regenerated
+from the live 27-migration schema and a CI drift gate. The "whole-server codegen" bet this ADR
+declined stays declined; the containment that makes ORM-only adoption acceptable is argued there.

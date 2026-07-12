@@ -11,17 +11,17 @@
 //! clone_url (the runner splices `x-access-token:<token>@`). GitLab embeds the token in the
 //! clone_url itself (`oauth2:<token>@host`) and sends an empty token field.
 
-use axum::extract::{FromRequestParts, Path, State};
-use axum::http::request::Parts;
-use axum::http::StatusCode;
-use axum::response::{IntoResponse, Response};
 use axum::Json;
+use axum::extract::{FromRequestParts, Path, State};
+use axum::http::StatusCode;
+use axum::http::request::Parts;
+use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 use uuid::Uuid;
 
-use crate::integrations::platform::{CodePlatform, Platform, RepoRef};
 use crate::AppState;
+use crate::integrations::platform::{CodePlatform, Platform, RepoRef};
 
 /// Authenticates a runner request by comparing its `Authorization: Bearer` token against the
 /// configured `AGENT_RUNNER_TOKEN`, in constant time. A unit extractor: presence of the value is
@@ -391,6 +391,228 @@ pub async fn record_review_telemetry(
         Err(error) => {
             tracing::error!(%error, task_id = %id, "storing review telemetry failed");
             (StatusCode::INTERNAL_SERVER_ERROR, "store error").into_response()
+        }
+    }
+}
+
+// ── ADR-0087 durable-step journal (the `CheckpointRuntime` replay store) ─────────────────────────
+// The agent, running under `CheckpointRuntime`, journals each step's RESULT here through this
+// mediated API (it holds no DB credential — ADR-0002/0037). `run_epoch` is resolved server-side from
+// the task row: the agent supplies only `(task_id, step_name)`, so it can neither know nor spoof the
+// run identity. Additive + prod-neutral: unused while the agent runs `Passthrough` (the default).
+
+/// Body for `POST /internal/tasks/{id}/steps/upsert` — one journaled step result (ADR-0087).
+#[derive(Debug, Deserialize)]
+pub struct UpsertStepBody {
+    /// The stability-tested step name (`llm_turn:{n}` / `tools:{n}` / `tool:{n}:{id}`).
+    pub step_name: String,
+    /// The step's serialized result — stored verbatim as `jsonb`.
+    pub result: serde_json::Value,
+    /// Content hash of `result` (ADR-0087 C3), so replay can verify the rehydrated bytes.
+    pub content_hash: String,
+}
+
+/// Body for `POST /internal/tasks/{id}/steps/fetch`.
+#[derive(Debug, Deserialize)]
+pub struct FetchStepBody {
+    pub step_name: String,
+}
+
+/// A journaled step result, returned by `fetch_step` on a hit.
+#[derive(Debug, Serialize)]
+pub struct StoredStepResponse {
+    pub result: serde_json::Value,
+    pub content_hash: String,
+}
+
+/// `POST /internal/tasks/{id}/steps/upsert` — journal one step result (replay-idempotent on the
+/// `(task_id, run_epoch, step_name)` key). 404 if the task is unknown.
+pub async fn upsert_step(
+    _auth: RunnerAuth,
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<UpsertStepBody>,
+) -> Response {
+    let Some(pool) = state.db.as_ref() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "no database").into_response();
+    };
+    let run_epoch = match crate::db::durable_step_run_epoch(pool, id).await {
+        Ok(Some(epoch)) => epoch,
+        Ok(None) => return (StatusCode::NOT_FOUND, "task not found").into_response(),
+        Err(error) => {
+            tracing::error!(%error, task_id = %id, "resolving run_epoch for durable step failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "query error").into_response();
+        }
+    };
+    // Store the result as its serialized text, cast to `jsonb` in-SQL (no extra sqlx feature needed).
+    let result_json = body.result.to_string();
+    match crate::db::upsert_durable_step(
+        pool,
+        id,
+        run_epoch,
+        &body.step_name,
+        &result_json,
+        &body.content_hash,
+    )
+    .await
+    {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => {
+            tracing::error!(%error, task_id = %id, step = %body.step_name, "upserting durable step failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "store error").into_response()
+        }
+    }
+}
+
+/// `POST /internal/tasks/{id}/steps/fetch` — read one journaled step result. 200 with the result on a
+/// hit; 404 when the step has not run yet (the replay gap where the loop continues live) or the task
+/// is unknown.
+pub async fn fetch_step(
+    _auth: RunnerAuth,
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<FetchStepBody>,
+) -> Response {
+    let Some(pool) = state.db.as_ref() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "no database").into_response();
+    };
+    let run_epoch = match crate::db::durable_step_run_epoch(pool, id).await {
+        Ok(Some(epoch)) => epoch,
+        Ok(None) => return (StatusCode::NOT_FOUND, "task not found").into_response(),
+        Err(error) => {
+            tracing::error!(%error, task_id = %id, "resolving run_epoch for durable step failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "query error").into_response();
+        }
+    };
+    match crate::db::fetch_durable_step(pool, id, run_epoch, &body.step_name).await {
+        Ok(Some(row)) => {
+            // `result::text` round-trips through serde_json; a NULL result (future offload) is `null`.
+            // A NON-NULL value that fails to parse is store corruption — surface it loud (error +
+            // 500) instead of silently coercing to `null`, which would hand the runner a wrong,
+            // journaled-looking result and mask the corruption.
+            let result = match row.result.as_deref() {
+                None => serde_json::Value::Null,
+                Some(text) => match serde_json::from_str(text) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        tracing::error!(
+                            %error, task_id = %id, step = %body.step_name,
+                            "durable step result is not valid JSON — corrupted store data"
+                        );
+                        return (StatusCode::INTERNAL_SERVER_ERROR, "corrupted store data")
+                            .into_response();
+                    }
+                },
+            };
+            Json(StoredStepResponse {
+                result,
+                content_hash: row.content_hash,
+            })
+            .into_response()
+        }
+        Ok(None) => (StatusCode::NOT_FOUND, "step not journaled").into_response(),
+        Err(error) => {
+            tracing::error!(%error, task_id = %id, step = %body.step_name, "fetching durable step failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "query error").into_response()
+        }
+    }
+}
+
+// ── ADR-0088 open-mode mediated PR-open egress ───────────────────────────────────────────────────
+// The open agent (a credential-light, sandboxed run-once pod) commits to a LOCAL branch and calls this
+// endpoint with the branch patch + PR metadata. It holds no forge token: the control plane offloads the
+// patch (content-hashed) and enqueues a `pr_open` intent onto the SAME outbox the reconciler drains;
+// the egress plane (which holds the forge creds) pushes + opens the PR. `run_epoch` is resolved
+// server-side — the agent never knows the run identity (trust boundary, ADR-0002/0037). Never
+// auto-merges. DORMANT: no trigger creates an `open` task, and the reconciler's `pr_open` delivery is
+// gated on a security sign-off — so nothing exercises this in prod yet.
+
+/// Body for `POST /internal/tasks/{id}/propose-pr` — the open agent's terminal PR proposal (ADR-0088).
+#[derive(Debug, Deserialize)]
+pub struct ProposePrBody {
+    pub title: String,
+    pub body: String,
+    /// The base ref the PR targets; `None` → the repo default branch.
+    #[serde(default)]
+    pub base: Option<String>,
+    /// The local branch name the sandbox committed to.
+    pub branch: String,
+    /// The branch as a `git format-patch` series (offloaded here, content-hashed, before the intent).
+    pub patch: String,
+}
+
+/// `POST /internal/tasks/{id}/propose-pr` — accept an open-mode PR proposal (ADR-0088). Offloads the
+/// branch patch (content-hashed) and enqueues a `pr_open` intent dedup-keyed by `(task_id, run_epoch)`
+/// so a replay opens exactly one PR. 202 on accept; 404 if the task is unknown; 503 without a DB /
+/// configured platform. Never pushes here — the reconciler owns the credentialed push.
+pub async fn propose_pr(
+    _auth: RunnerAuth,
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(a): Json<ProposePrBody>,
+) -> Response {
+    use sha2::{Digest, Sha256};
+
+    let Some(pool) = state.db.as_ref() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "no database").into_response();
+    };
+    let context = match crate::db::get_task_context(pool, id).await {
+        Ok(Some(c)) => c,
+        Ok(None) => return (StatusCode::NOT_FOUND, "task not found").into_response(),
+        Err(error) => {
+            tracing::error!(%error, task_id = %id, "load task for propose_pr failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "query error").into_response();
+        }
+    };
+    // `run_epoch` is the dedup discriminator — resolved from the task row, never trusted from the pod.
+    let run_epoch = match crate::db::durable_step_run_epoch(pool, id).await {
+        Ok(Some(epoch)) => epoch,
+        Ok(None) => return (StatusCode::NOT_FOUND, "task not found").into_response(),
+        Err(error) => {
+            tracing::error!(%error, task_id = %id, "resolving run_epoch for propose_pr failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "query error").into_response();
+        }
+    };
+
+    // Offload rule (ADR-0082/0088): content-hash the branch and store the bytes; the intent carries the
+    // hash + key, not the payload. `put_pr_open_blob` is idempotent, so a replay re-stores the same bytes.
+    let content_hash = hex::encode(Sha256::digest(a.patch.as_bytes()));
+    if let Err(error) =
+        crate::db::put_pr_open_blob(pool, &content_hash, id, run_epoch, a.patch.as_bytes()).await
+    {
+        tracing::error!(%error, task_id = %id, "offloading pr_open patch failed");
+        return (StatusCode::INTERNAL_SERVER_ERROR, "store error").into_response();
+    }
+
+    let target = crate::outbox::Target {
+        task_id: Some(id),
+        platform: context.platform,
+        installation_id: context.installation_id,
+        owner: &context.owner,
+        repo: &context.name,
+        egress: &state.egress,
+    };
+    let payload = crate::outbox::PrOpenPayload {
+        branch: a.branch,
+        base: a.base,
+        title: a.title,
+        body: a.body,
+        content_hash,
+    };
+    match crate::outbox::enqueue_pr_open(pool, &target, id, run_epoch, &payload).await {
+        Ok(inserted) => {
+            tracing::info!(
+                task_id = %id,
+                run_epoch,
+                deduped = !inserted,
+                "open-mode PR proposal enqueued (pr_open intent)"
+            );
+            // 202 whether newly enqueued or deduped — the proposal is (already) accepted either way.
+            StatusCode::ACCEPTED.into_response()
+        }
+        Err(error) => {
+            tracing::error!(%error, task_id = %id, "enqueuing pr_open intent failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "enqueue error").into_response()
         }
     }
 }
@@ -918,11 +1140,20 @@ pub async fn clear_inline(
     }
 }
 
-/// Body for `POST /internal/tasks/{id}/review/comment` (`add_comment`) and
-/// `POST /internal/tasks/{id}/review/summary` (`set_summary`).
+/// Body for `POST /internal/tasks/{id}/review/summary` (`set_summary`).
 #[derive(Debug, Deserialize)]
 pub struct TextActionBody {
     pub body: String,
+}
+
+/// Body for `POST /internal/tasks/{id}/review/comment` (`add_comment`). `call_id` is the tool-call id
+/// the agent threads so a replayed reply dedups on `(task_id, run_epoch, call_id)` (ADR-0087 C2);
+/// `None` (legacy / flag-off) keeps the append-only behavior.
+#[derive(Debug, Deserialize)]
+pub struct ReplyActionBody {
+    pub body: String,
+    #[serde(default)]
+    pub call_id: Option<String>,
 }
 
 /// `POST /internal/tasks/{id}/review/inline` — buffer one inline finding (ADR-0037). Last write wins
@@ -958,16 +1189,30 @@ pub async fn add_review_comment(
 }
 
 /// `POST /internal/tasks/{id}/review/comment` — buffer one plain reply (`add_comment`, ADR-0037).
+/// When the agent threads a `call_id`, `run_epoch` is resolved server-side (trust boundary — the pod
+/// never supplies the run identity) so the insert dedups a replayed reply on
+/// `(task_id, run_epoch, call_id)` (ADR-0087 C2). A resolution failure degrades to a NULL epoch,
+/// which the partial dedup index ignores → the reply appends (fail-safe, no data loss).
 pub async fn add_review_reply(
     _auth: RunnerAuth,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
-    Json(a): Json<TextActionBody>,
+    Json(a): Json<ReplyActionBody>,
 ) -> Response {
     let Some(pool) = state.db.as_ref() else {
         return (StatusCode::SERVICE_UNAVAILABLE, "no database").into_response();
     };
-    match crate::db::add_pending_comment(pool, id, &a.body).await {
+    let run_epoch = match crate::db::durable_step_run_epoch(pool, id).await {
+        Ok(Some(epoch)) => Some(epoch),
+        // Task not found (e.g. purged mid-run): 404 like the sibling endpoints, rather than appending
+        // an orphaned comment row for a non-existent task (gemini review on #370).
+        Ok(None) => return (StatusCode::NOT_FOUND, "task not found").into_response(),
+        Err(error) => {
+            tracing::warn!(%error, task_id = %id, "resolving run_epoch for comment dedup failed; appending without a dedup key");
+            None
+        }
+    };
+    match crate::db::add_pending_comment(pool, id, run_epoch, a.call_id.as_deref(), &a.body).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(error) => {
             tracing::error!(%error, task_id = %id, "buffering comment failed");
@@ -1505,8 +1750,8 @@ pub async fn finalize_review(
             // reacts 👎 with its truthful note), or 👍 for a clean finish that still posts because prior
             // findings exist on this target (retraction visibility, ADR-0065 composition). Best-effort:
             // the review itself is queued, the reaction is cosmetic.
-            if let Some(content) = policy.verdict {
-                if let Err(error) = crate::outbox::enqueue_verdict_reaction(
+            if let Some(content) = policy.verdict
+                && let Err(error) = crate::outbox::enqueue_verdict_reaction(
                     pool,
                     &t,
                     context.target_id,
@@ -1515,14 +1760,13 @@ pub async fn finalize_review(
                     &context.target_type,
                 )
                 .await
-                {
-                    tracing::warn!(%error, task_id = %id, content, "enqueueing verdict reaction failed (non-fatal)");
-                }
+            {
+                tracing::warn!(%error, task_id = %id, content, "enqueueing verdict reaction failed (non-fatal)");
             }
             // An aborted run posted an apology, not a verdict → 😕 (same dedup key as the failure-path
             // 😕, so a run that also reports `failed` isn't double-reacted).
-            if policy.react_confused {
-                if let Err(error) = crate::outbox::enqueue_reaction(
+            if policy.react_confused
+                && let Err(error) = crate::outbox::enqueue_reaction(
                     pool,
                     &t,
                     context.target_id,
@@ -1531,9 +1775,8 @@ pub async fn finalize_review(
                     &context.target_type,
                 )
                 .await
-                {
-                    tracing::warn!(%error, task_id = %id, "enqueueing aborted 😕 failed (non-fatal)");
-                }
+            {
+                tracing::warn!(%error, task_id = %id, "enqueueing aborted 😕 failed (non-fatal)");
             }
         }
     }
@@ -1547,6 +1790,23 @@ pub async fn finalize_review(
     };
     let _ = crate::db::set_task_kind(pool, id, kind).await;
 
+    // 4) Purge-on-success (ADR-0087): the run has finalized (review/reply queued for egress), so its
+    // durable-step journal is dead weight — drop it now rather than waiting for the TTL sweep. A no-op
+    // (0 rows) when the run wasn't journaling (the default `Passthrough` prod path), so it stays
+    // prod-neutral. Best-effort: the TTL sweep in the `replay` role is the backstop, so a purge blip
+    // never fails a finalize.
+    match crate::db::durable_step_run_epoch(pool, id).await {
+        Ok(Some(run_epoch)) => {
+            if let Err(error) = crate::db::purge_durable_steps(pool, id, run_epoch).await {
+                tracing::warn!(%error, task_id = %id, "purge-on-success of durable steps failed (non-fatal; TTL sweep backstops)");
+            }
+        }
+        Ok(None) => {}
+        Err(error) => {
+            tracing::warn!(%error, task_id = %id, "resolving run_epoch for durable-step purge failed (non-fatal)");
+        }
+    }
+
     Json(serde_json::json!({ "kind": kind, "review": queued_review, "reply": queued_reply }))
         .into_response()
 }
@@ -1558,6 +1818,31 @@ pub struct StatusUpdate {
     pub status: String,
     #[serde(default)]
     pub detail: Option<String>,
+}
+
+/// Is the `running` transition a *genuinely fresh* attempt — i.e. this run has journaled NO durable
+/// steps yet (ADR-0087)? Fresh → the review buffer may be cleared (today's ADR-0037 behavior).
+/// Resumed (durable steps present) → the buffer must be preserved, because the resumed run replays
+/// its write-step results from the journal rather than re-buffering them.
+///
+/// Fails toward `true` (fresh → clear) on any resolution error or missing task, so the
+/// `LCI_DURABLE_REPLAY`-off path (where `durable_step` is always empty) is byte-identical to before.
+pub(crate) async fn is_fresh_attempt(pool: &sqlx::PgPool, id: Uuid) -> bool {
+    let run_epoch = match crate::db::durable_step_run_epoch(pool, id).await {
+        Ok(Some(epoch)) => epoch,
+        Ok(None) => return true,
+        Err(error) => {
+            tracing::warn!(%error, task_id = %id, "resolving run_epoch for resume-aware clear failed; treating as a fresh attempt");
+            return true;
+        }
+    };
+    match crate::db::has_durable_steps(pool, id, run_epoch).await {
+        Ok(has) => !has,
+        Err(error) => {
+            tracing::warn!(%error, task_id = %id, "checking durable steps for resume-aware clear failed; treating as a fresh attempt");
+            true
+        }
+    }
 }
 
 /// `POST /internal/tasks/{id}/status` — apply a runner-reported status transition.
@@ -1584,10 +1869,20 @@ pub async fn set_status(
         Ok(true) => {
             // ADR-0037 idempotency: a runner (re)starting its task clears any buffer left by a prior
             // attempt, so a retry accumulates from empty rather than appending to a partial review.
-            if update.status == "running" {
-                if let Err(error) = crate::db::clear_pending_review(pool, id).await {
-                    tracing::warn!(%error, task_id = %id, "clearing pending buffer on (re)start failed (non-fatal)");
-                }
+            //
+            // ADR-0087 resume-awareness: only clear on a *genuinely fresh* attempt — i.e. when NO
+            // `durable_step` rows exist for this run. Under `CheckpointRuntime` a *resumed* run (same
+            // run_epoch, new Job) replays its write-steps' results from the journal instead of
+            // re-executing them, so a cleared buffer would never get repopulated and the run would
+            // finalize with findings MISSING. With `LCI_DURABLE_REPLAY` off, `durable_step` is always
+            // empty → `has_durable_steps` is always false → the clear always runs (byte-identical to
+            // pre-ADR-0087). run_epoch is resolved server-side; any resolution error fails toward
+            // today's behavior (clear) so the flag-off path can never regress.
+            if update.status == "running"
+                && is_fresh_attempt(pool, id).await
+                && let Err(error) = crate::db::clear_pending_review(pool, id).await
+            {
+                tracing::warn!(%error, task_id = %id, "clearing pending buffer on (re)start failed (non-fatal)");
             }
             // A terminal failure gets 😕 + a fallback "review failed, retry" comment on the PR when the
             // review never finalized (ADR-0056), so the author isn't left in silence. Success is

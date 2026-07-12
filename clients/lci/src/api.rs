@@ -10,7 +10,7 @@
 //! ready when a view surfaces them — hence the module-level `dead_code` allow.
 #![allow(dead_code)]
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use reqwest::StatusCode;
 use serde::Deserialize;
 use serde_json::Value;
@@ -526,14 +526,20 @@ mod tests {
 
     #[test]
     fn status_mapping_is_friendly() {
-        assert!(map_status(StatusCode::UNAUTHORIZED, "x")
-            .to_string()
-            .contains("re-login"));
-        assert!(map_status(StatusCode::FORBIDDEN, "approve")
-            .to_string()
-            .contains("permission"));
-        assert!(map_status(StatusCode::SERVICE_UNAVAILABLE, "x")
-            .to_string()
-            .contains("unavailable"));
+        assert!(
+            map_status(StatusCode::UNAUTHORIZED, "x")
+                .to_string()
+                .contains("re-login")
+        );
+        assert!(
+            map_status(StatusCode::FORBIDDEN, "approve")
+                .to_string()
+                .contains("permission")
+        );
+        assert!(
+            map_status(StatusCode::SERVICE_UNAVAILABLE, "x")
+                .to_string()
+                .contains("unavailable")
+        );
     }
 }

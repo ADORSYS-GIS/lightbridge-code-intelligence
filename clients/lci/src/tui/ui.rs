@@ -9,7 +9,8 @@
 
 use super::app::{App, DetailState, ToastKind, View};
 use crate::api::TaskRow;
-use crate::theme::{status_label, ButtonKind, Theme};
+use crate::theme::{ButtonKind, Theme, status_label};
+use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
@@ -17,7 +18,6 @@ use ratatui::widgets::{
     Block, BorderType, Borders, Cell, Clear, Paragraph, Row, Scrollbar, ScrollbarOrientation,
     ScrollbarState, Table, TableState,
 };
-use ratatui::Frame;
 use time::OffsetDateTime;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -554,24 +554,24 @@ fn draw_detail_meta(f: &mut Frame, area: Rect, d: &DetailState, theme: &Theme) {
     f.render_widget(Paragraph::new(right), cols[1]);
 
     // On a failed/timed-out run, surface the error detail across the full inner width (last row).
-    if matches!(t.status.as_str(), "failed" | "timed_out") {
-        if let Some(err) = t.error_detail.as_deref() {
-            let err_area = Rect {
-                y: inner.y + inner.height.saturating_sub(1),
-                height: 1,
-                ..pad_left(inner, 1)
-            };
-            let line = Line::from(vec![
-                Span::styled(format!("{:<10}", "error"), theme.muted_text()),
-                Span::styled(
-                    truncate_ellipsis(err, err_area.width.saturating_sub(10) as usize),
-                    Style::default()
-                        .fg(theme.error)
-                        .add_modifier(Modifier::BOLD),
-                ),
-            ]);
-            f.render_widget(Paragraph::new(line), err_area);
-        }
+    if matches!(t.status.as_str(), "failed" | "timed_out")
+        && let Some(err) = t.error_detail.as_deref()
+    {
+        let err_area = Rect {
+            y: inner.y + inner.height.saturating_sub(1),
+            height: 1,
+            ..pad_left(inner, 1)
+        };
+        let line = Line::from(vec![
+            Span::styled(format!("{:<10}", "error"), theme.muted_text()),
+            Span::styled(
+                truncate_ellipsis(err, err_area.width.saturating_sub(10) as usize),
+                Style::default()
+                    .fg(theme.error)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]);
+        f.render_widget(Paragraph::new(line), err_area);
     }
 }
 
@@ -891,12 +891,12 @@ fn wrap_spans(spans: Vec<Span<'static>>, width: usize) -> Vec<Line<'static>> {
                 used = 0;
             }
             // Append to the last span if same style, else push a new one.
-            if let Some(last) = cur.last_mut() {
-                if last.style == style {
-                    last.content.to_mut().push(ch);
-                    used += w;
-                    continue;
-                }
+            if let Some(last) = cur.last_mut()
+                && last.style == style
+            {
+                last.content.to_mut().push(ch);
+                used += w;
+                continue;
             }
             cur.push(Span::styled(ch.to_string(), style));
             used += w;
@@ -1476,7 +1476,7 @@ mod tests {
     fn draw_detail_to_string(task: TaskRow, w: u16, h: u16) -> String {
         use crate::api::{Claims, Me};
         use crate::tui::app::{App, View};
-        use ratatui::{backend::TestBackend, Terminal};
+        use ratatui::{Terminal, backend::TestBackend};
         let me = Me {
             claims: Claims {
                 sub: "s".into(),
@@ -1584,7 +1584,7 @@ mod tests {
 
     #[test]
     fn status_bar_hint_is_not_hard_cut_at_80_cols() {
-        use crate::render::{render_to_string, Screen};
+        use crate::render::{Screen, render_to_string};
         use crate::theme::ThemeKind;
         // The old rigid 30/40/30 split hard-cut the hint; now the last visible glyph before the edge
         // is an ellipsis, never a mid-word slice.
@@ -1598,7 +1598,7 @@ mod tests {
 
     #[test]
     fn draws_every_screen_at_many_sizes_without_panicking() {
-        use crate::render::{render_to_string, Screen};
+        use crate::render::{Screen, render_to_string};
         let screens = [
             Screen::Repos,
             Screen::Runs,

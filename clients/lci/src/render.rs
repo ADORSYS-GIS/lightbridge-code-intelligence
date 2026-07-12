@@ -10,8 +10,8 @@ use crate::api::RepositoryRow;
 use crate::api::{Claims, Me, ReviewRow, TaskRow, TranscriptRow};
 use crate::theme::{ButtonKind, ThemeKind};
 use crate::tui::app::{App, DetailState, PendingAction, View};
-use ratatui::backend::TestBackend;
 use ratatui::Terminal;
+use ratatui::backend::TestBackend;
 use time::OffsetDateTime;
 
 /// The screens the renderer can draw.
@@ -337,7 +337,9 @@ fn sample_transcript() -> Vec<TranscriptRow> {
         mk(
             0,
             "assistant",
-            Some("Starting the review. Let me read the diff and the surrounding files to ground the findings."),
+            Some(
+                "Starting the review. Let me read the diff and the surrounding files to ground the findings.",
+            ),
             None,
             None,
             Some(1240),
@@ -364,7 +366,9 @@ fn sample_transcript() -> Vec<TranscriptRow> {
         mk(
             3,
             "assistant",
-            Some("Two small nits (naming + an unused import) and one deferred concern: the retry loop has no jittered backoff, which can thundering-herd the IdP. Posting the review."),
+            Some(
+                "Two small nits (naming + an unused import) and one deferred concern: the retry loop has no jittered backoff, which can thundering-herd the IdP. Posting the review.",
+            ),
             None,
             None,
             Some(2980),

@@ -60,5 +60,7 @@ cancelled upstream, complementing the dispatcher reaper deleting the Job (#116).
 
 ## Tests
 
-`cargo nextest run -p agent-runner` — the control-plane contract is covered with **wiremock** (no cluster
-needed).
+`cargo nextest run -p agent-runner` covers the Job host and review behavior. The extracted HTTP
+clients own their **wiremock** control-plane contract suite under
+`services/agent-clients/tests/control_plane_contract.rs`; run it with
+`cargo nextest run -p lci-agent-clients` (no cluster needed).

@@ -3,42 +3,69 @@
 # the agent runner is the per-task Kubernetes Job that clones/indexes/reviews a repo;
 # `xtask` is the build/CI automation entrypoint invoked from the justfile.
 [workspace]
-resolver = "2"
-members = ["services/config", "services/control-plane", "services/agent-runner", "clients/lci", "xtask"]
+resolver = "3"
+members = [
+    "services/config",
+    "services/control-plane",
+    "services/agent-runner",
+    "services/agent-types",
+    "services/agent-step",
+    "services/agent-tools",
+    "services/agent-clients",
+    "services/agent-loop",
+    "services/agent-status",
+    "services/codegraph",
+    "services/agent-testkit",
+    "services/review-agent",
+    "services/open-agent",
+    "clients/lci",
+    "xtask",
+]
 # `services/a2a-probe` is a THROWAWAY evaluation crate (RFC-0006 / #298), deliberately kept out of
 # the members list so it never builds in CI/release — build it explicitly with `-p a2a-probe`.
 # Remove the directory once the resulting ADR lands. Listed as an exclude to document intent.
 exclude = ["services/a2a-probe"]
 
 [workspace.package]
-edition = "2021"
+edition = "2024"
 license = "MIT"
 repository = "https://github.com/vymalo/lightbridge-code-intelligence"
 
 # Single source of truth for every third-party version. Member crates declare deps as
 # `<crate>.workspace = true` (features are set here, not per-member) so a version bump happens
-# in exactly one place. Internal path deps (e.g. lightbridge-config) stay in the member manifests.
+# in exactly one place. Internal path deps (e.g. lci-config) stay in the member manifests.
 [workspace.dependencies]
 # --- Shared across the Rust services ---
-anyhow = "1"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-tokio = { version = "1", features = ["full"] }
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+anyhow = "1.0.103"
+# Workspace-standard compile-time builders (ADR-0083). New wide constructors use `bon` rather than
+# hand-written builder types.
+bon = "3.9.3"
+# Flag+env parsing for the agent-plane `mode × host` entrypoint (ADR-0085). `derive` for the CLI
+# struct/value-enums; `env` so each axis is a flag OR an env var (the dispatcher can set either).
+clap = { version = "4.5.53", features = ["derive", "env"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+tokio = { version = "1.52.3", features = ["full"] }
+# Global allocator for the two long-running service binaries. We ship static-musl images (ADR-0080),
+# and musl's built-in malloc regresses badly under multithreaded allocation load; mimalloc restores
+# glibc-class throughput. Wired via #[global_allocator] in each binary's main (control-plane,
+# agent-runner) — not the TUI/xtask, which are short-lived.
+mimalloc = "0.1.52"
+tracing = "0.1.31"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
 # Ergonomic async generators — used by the a2a role's SSE replay-then-tail stream (ADR-0077).
-async-stream = "0.3"
+async-stream = "0.3.6"
 # rustls everywhere (no OpenSSL in the runtime images).
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream", "form"] }
 # Explicit rustls handle so the control-plane binary can pin ONE crypto provider at startup. Two are
 # linked in this workspace — `ring` (via sqlx's `tls-rustls-ring-webpki`) and `aws-lc-rs` (pulled
 # transitively by `rmcp` → reqwest 0.13 → rustls-platform-verifier). With both present, rustls 0.23
 # can't auto-select a process-default provider and panics on the first TLS handshake; we install
 # `ring` up front in `main`. Only control-plane pulls both, so only it needs the handle.
-rustls = { version = "0.23", default-features = false, features = ["ring"] }
-uuid = { version = "1", features = ["v4", "serde"] }
+rustls = { version = "0.23.41", default-features = false, features = ["ring"] }
+uuid = { version = "1.23.4", features = ["v4", "serde"] }
 # Concurrent joins for batched read-only tool dispatch (ADR-0042).
-futures = "0.3"
+futures = "0.3.32"
 # Durable orchestration (RFC-0005 / ADR-0074): the Restate SDK serves a discoverable HTTP endpoint
 # the Restate server invokes. Pinned exactly while the sdk-rust 0.10 ↔ server compat is being
 # validated (ticket #296). Default features give `http_server` (hyper/hyper-util, plain h2c — NO
@@ -48,17 +75,17 @@ futures = "0.3"
 restate-sdk = "=0.10.0"
 
 # --- control-plane: HTTP + auth ---
-async-trait = "0.1"
-axum = "0.8"
-jsonwebtoken = "9"
-hmac = "0.12"
-sha2 = "0.10"
-hex = "0.4"
-subtle = "2.5"
-time = { version = "0.3", features = ["serde-well-known", "formatting"] }
+async-trait = "0.1.89"
+axum = "0.8.9"
+jsonwebtoken = "10"
+hmac = "0.13"
+sha2 = "0.11"
+hex = "0.4.3"
+subtle = "2.6.1"
+time = { version = "0.3.53", features = ["serde-well-known", "formatting"] }
 
 # --- control-plane: persistence + platform ---
-sqlx = { version = "0.8", default-features = false, features = [
+sqlx = { version = "0.9", default-features = false, features = [
     "runtime-tokio",
     "tls-rustls-ring-webpki",
     "postgres",
@@ -68,18 +95,18 @@ sqlx = { version = "0.8", default-features = false, features = [
     "migrate",
 ] }
 # One Kubernetes Job per task (ADR-0004); rustls to match the rest of the crate.
-kube = { version = "0.99", default-features = false, features = ["client", "rustls-tls"] }
-k8s-openapi = { version = "0.24", features = ["v1_31"] }
+kube = { version = "4", default-features = false, features = ["client", "rustls-tls"] }
+k8s-openapi = { version = "0.28", features = ["v1_32"] }
 # Prometheus /metrics, rendered as text exposition and served on our own route.
-metrics = "0.24"
-metrics-exporter-prometheus = { version = "0.16", default-features = false }
+metrics = "0.24.6"
+metrics-exporter-prometheus = { version = "0.18", default-features = false }
 # Neo4j (Bolt) structural graph; the control plane owns the write (trust boundary, ADR-0002/0019).
 neo4rs = "0.8"
 # MCP client (ADR-0066): calls whatever in-cluster MCP servers are configured
 # (knowledge_tools.mcp_servers, e.g. brave-search/context7) as the review agent's dynamically
 # discovered external-knowledge tools. `reqwest` feature pulls rustls (matches the workspace TLS
 # policy above), not native-tls.
-rmcp = { version = "2", default-features = false, features = [
+rmcp = { version = "2.2", default-features = false, features = [
     "client",
     "reqwest",
     "transport-streamable-http-client-reqwest",
@@ -98,28 +125,40 @@ a2a-server-lf = "=0.4.0"
 
 # --- agent-runner: indexing + MCP ---
 # tree-sitter grammars compile their C grammar via build script (cc in the builder image).
-tree-sitter = "0.24"
-tree-sitter-rust = "0.23"
-tree-sitter-javascript = "0.23"
-tree-sitter-typescript = "0.23"
-tree-sitter-python = "0.23"
+tree-sitter = "0.26"
+tree-sitter-rust = "0.24"
+tree-sitter-javascript = "0.25"
+tree-sitter-typescript = "0.23.2"
+tree-sitter-python = "0.25"
+# --- lci-codegraph: in-house code-graph crate (ADR-0086 / RFC-0007 slice 1) ---
+# ripgrep's ignore engine: honours the repo's own `.gitignore` (git_ignore) AND lets us layer an
+# operator-configurable glob list on top with the SAME gitignore semantics (`GitignoreBuilder`). This
+# is how the crate *composes with* — rather than replaces — the repo ignores (ADR-0086 R3). Default
+# features are fine; no globset/regex-heavy extras needed beyond the gitignore matcher we use.
+ignore = "0.4"
+# Pure-Rust PDF *text* extraction (ADR-0086 capability 3). `pdf-extract` is purpose-built for
+# text-out (it wraps `lopdf` and walks content streams for us), so we don't hand-roll stream parsing
+# the way raw `lopdf` would force. Treated as untrusted-input code: bytes are capped BEFORE the parser
+# sees them and the parse is wrapped in `catch_unwind` (it can panic on malformed input) — ADR-0086 R2.
+pdf-extract = "0.9"
 # Regex selectors for the per-tier tool allowlist's `mcp__<server>__<tool>` patterns (ADR-0066).
-regex = "1"
+regex = "1.13"
 # Run-config audit trail (ADR-0034/0062/0066): base64 for the redacted-config encoding; url to strip
 # userinfo/query credentials from the persisted base_url. (base64 is also used by control-plane tests.)
-base64 = "0.22"
-url = "2"
+base64 = "0.22.1"
+url = "2.5"
 # Parse + containment-test the configurable extra SSRF deny-list CIDRs (ADR-0079 §2). The fixed
 # blocked ranges stay hand-rolled and auditable; ipnet only backs the operator-supplied extra list.
-ipnet = "2"
+ipnet = "2.12"
 # AEAD (ChaCha20-Poly1305) for encrypting the A2A webhook auth token at rest (ADR-0079 §3). `ring` is
 # already this workspace's single pinned rustls crypto provider (installed process-wide in
 # control-plane's `main`), so `ring::aead` reuses an audited, already-compiled primitive — it adds no
 # new crypto crate and no second provider. Version-matched to the transitive `ring` sqlx already pulls.
-ring = "0.17"
+ring = "0.17.14"
 
 # --- Dev / test only ---
-tempfile = "3"
-rsa = "0.9"
-rand = "0.8"
-wiremock = "0.6"
+tempfile = "3.27"
+rsa = "0.9.10"
+rand = "0.10"
+rand_08 = { package = "rand", version = "0.8" }
+wiremock = "0.6.5"

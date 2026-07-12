@@ -10,7 +10,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+use hmac::KeyInit;
+use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use serde::{Deserialize, Serialize};
 
 /// A cached installation token with its expiry epoch-second. GitHub installation
@@ -795,7 +796,7 @@ mod tests {
     use rsa::pkcs8::EncodePrivateKey as _;
 
     fn test_app(app_id: &str) -> GithubApp {
-        let private = rsa::RsaPrivateKey::new(&mut rand::rngs::OsRng, 2048).expect("gen rsa");
+        let private = rsa::RsaPrivateKey::new(&mut rand_08::rngs::OsRng, 2048).expect("gen rsa");
         let pem = private
             .to_pkcs8_pem(rsa::pkcs8::LineEnding::LF)
             .expect("pkcs8 pem");

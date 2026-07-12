@@ -36,7 +36,7 @@ const RANKED_FILES: &[&str] = &[
 
 /// Read the repo's agent instruction files from `checkout` and render them as a single labelled,
 /// size-capped block, or `None` when none are present. The block is appended to the agent prompt as
-/// untrusted context (see [`super::native::agent`]).
+/// untrusted context (see [`lci_review_agent::prompt`]).
 pub async fn read_agent_instructions(checkout: &Path) -> Option<String> {
     let mut paths: Vec<(String, std::path::PathBuf)> = RANKED_FILES
         .iter()
@@ -50,10 +50,10 @@ pub async fn read_agent_instructions(checkout: &Path) -> Option<String> {
         while let Ok(Some(entry)) = entries.next_entry().await {
             // `file_type().await` is the async metadata query; `path().is_file()` would block the
             // executor thread.
-            if let Ok(ft) = entry.file_type().await {
-                if ft.is_file() {
-                    rule_files.push(entry.path());
-                }
+            if let Ok(ft) = entry.file_type().await
+                && ft.is_file()
+            {
+                rule_files.push(entry.path());
             }
         }
         rule_files.sort();

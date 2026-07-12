@@ -4,6 +4,55 @@ How work flows through Lightbridge: what triggers a task, the two job kinds, the
 runs at, the states a task moves through, how it's gated behind a fresh index, and how cancellation +
 data purge work. Diagrams are Mermaid (rendered by GitHub).
 
+> **Migrating to v2 ([RFC-0007](rfc/0007-control-plane-v2-planes.md)) — partially landed.** The two
+> job kinds are becoming **modes** of one `agent-plane` binary
+> ([ADR-0085](adr/0085-agent-execution-plane.md)) — `index` and `review` (plus a future write-capable
+> `open`, [ADR-0088](adr/0088-open-mode-autonomous-ticket-agent.md)) — selected by **mode × host**.
+> **Landed (slice 2):** the `agent-plane` entrypoint exists and drives `index`/`review` under the
+> `run-once` host **behaviour-identically** to the Jobs described below — it reuses the exact same
+> `run_once` orchestration as `agent-runner` (`services/agent-runner/src/{run.rs,plane.rs}`,
+> `src/bin/agent_plane.rs`), and the mode×host routing guard is enforced at startup. **Still pending:**
+> the dispatcher still launches the `agent-runner` binary (the cutover to `agent-plane --mode … --host
+> run-once` is a later one-liner), so the two Job images have **not** yet collapsed to one; and the
+> `serve` host (slice 5) is guard scaffolding only and rejected at startup.
+> **Landed (slice 5, non-gated half), behind a flag:** the **live per-review status API**
+> ([ADR-0085](adr/0085-agent-execution-plane.md) "a live per-review status API") — a host-agnostic,
+> read-only projection of the running loop's progress (current turn, current/last tool **name**,
+> findings recorded so far, token usage, coarse phase `indexing`/`sast`/`reviewing`/`finalizing`, and
+> elapsed time), served over a tiny bearer-authenticated axum endpoint (`GET /status`) the `run-once`
+> host runs **alongside** the loop (`services/agent-status`, wired in
+> `services/agent-runner/src/{run.rs,review/mod.rs}`). It exposes **only progress metadata** — never
+> the diff, file contents, finding bodies, secrets, or env — and is sourced by teeing the existing
+> loop transcript sink, so the loop's behaviour and the ADR-0034 transcript are **unchanged** (a
+> `StatusSink` that forwards every event verbatim). It is **flag-gated and OFF in prod**
+> (`LCI_STATUS_API` unset ⇒ no handle, no sink wrapping, no server started — byte-identical to today);
+> a NetworkPolicy/Service to actually reach the port is deploy-side and out of scope. The **`serve`
+> host topology itself remains deferred** to its measurement gate — the post-Graphify review-footprint
+> go/no-go in **#358** — so this slice ships the status *mechanism* only, reusable by a future `serve`
+> host without change; the `serve` arm still rejects at startup.
+> **Landed (slice 4), dormant:** the write-capable **`open`** mode
+> ([ADR-0088](adr/0088-open-mode-autonomous-ticket-agent.md)) exists as **dormant machinery** — see
+> [The `open` mode](#the-open-mode-dormant-adr-0088) below. `open + run-once` now *routes* (the guard
+> admits it — a security property: `open → run-once, always`), but **no trigger creates an `open` task
+> and the `run-once` host refuses to execute one**, so nothing in prod runs it. Activation is gated on
+> a security sign-off.
+> **Landed (slice 3), behind a flag:** `CheckpointRuntime` replay
+> ([ADR-0087](adr/0087-durable-replay-checkpoint-runtime.md)) now **exists** — the third `StepRuntime`
+> impl (`services/agent-clients/src/checkpoint.rs`), a `durable_step` store
+> (migration `0028`, keyed `(task_id, run_epoch, step_name)`), additive internal-API endpoints
+> (`/internal/tasks/{id}/steps/{upsert,fetch}`, the agent journaling THROUGH the API — still DB-less),
+> and a `replay` control-plane role that owns the store lifecycle (purge-on-success on `finalize`
+> + a `DURABLE_STEP_RETENTION` TTL sweep, validated `> 0` at load). Under it, a step's result is
+> journaled and served from storage on a requeue of the **same `run_epoch`**, so the loop resumes at
+> the step it left instead of turn 0 — **proven in-process** (an `AgentLoop` under `CheckpointRuntime`
+> + an in-memory store + a `ScriptedModel` resumes with **zero duplicate model calls**). It is
+> **opt-in and OFF in prod**: the default is still `Passthrough`, so a pod death today still restarts a
+> deep review from turn 0 until `LCI_DURABLE_REPLAY` is enabled on the host. **Known gap before
+> prod-enable:** the runner clears the `pending_review_actions` buffer at run start (ADR-0037), so a
+> resumed run whose write steps replay from storage would not re-buffer their findings — reconciling
+> that (resume-aware buffer, or re-executing write steps) is a follow-up, as is the `add_comment`
+> server-side dedup key. The state machine, cancellation, and purge described here are unchanged.
+
 > Source of truth in code:
 > `services/control-plane/src/db.rs` (task status fns, idempotency, `create_task` /
 > `create_index_task` / `create_explicit_task`),
@@ -52,6 +101,55 @@ single-image behaviour.
 > is absent). In practice the approval-time index task indexes a repo before any review runs, so
 > reviews are normally warm. Removing the residual cold self-index path is a later
 > runner-differentiation slice.
+
+## The `open` mode (dormant, ADR-0088)
+
+`open` is the third agent-plane mode ([ADR-0088](adr/0088-open-mode-autonomous-ticket-agent.md)): a
+write-capable autonomous ticket→PR agent that investigates a repo, edits code, builds/tests its change
+in a sandbox, and **proposes** (never merges) a pull request. It is the highest-security-risk surface —
+it both writes and *executes* untrusted repo + LLM-generated code — so it is built **dormant and
+additive**: the machinery + hardened sandbox spec land, but **the trigger is not wired**, so nothing in
+prod can invoke it. Activation is gated on a security sign-off.
+
+What exists today (all dormant):
+
+- **Routing.** The mode×host guard admits `open + run-once` and *permanently forbids* `open + serve`
+  (a shared tenant cannot sandbox arbitrary execution) — `open → run-once, always` is a security
+  property, not a tunable (`services/agent-runner/src/plane.rs`). The `run-once` host **refuses** to
+  execute an `open` task (`run.rs`): the loop assembly, egress, and sandbox exist, but the ticket→prompt
+  pipeline lands with the (unwired) trigger, so the host declines rather than mis-running open outside
+  the sandbox.
+- **The write-capable loop** (`services/open-agent`, `lci-open-agent`) — the same `AgentLoop` as
+  `review`, composed with a write+execute toolset: `read_file`/`grep`/`find_files` (navigation),
+  `edit_file` (writes confined to the sandbox workdir — `..` traversal **and** out-of-workdir symlinks
+  are rejected, canonicalized), `run_command` (the sandboxed build/test runner, per-command timeout),
+  and terminal `propose_pr`/`abort`. The crate depends only on the mediated control-plane client — **no
+  forge, no DB dependency** (the trust boundary in the dependency graph).
+- **Credential-light mediated PR egress** (the crux). `propose_pr` holds no forge token: it captures the
+  local branch as a `git format-patch` series and hands it to the new `POST
+  /internal/tasks/{id}/propose-pr` endpoint, which **content-hashes + offloads** the branch
+  (`pr_open_blob`) and enqueues a `pr_open` intent on the **same outbox** the reconciler drains,
+  dedup-keyed by `(task_id, run_epoch)` so a replay opens exactly one PR. This extends the
+  ADR-0037 mediated-action boundary from comments to code. The reconciler's `pr_open` delivery
+  (branch push + PR open) is **deferred, gated on a security sign-off** — it rehydrates + verifies the
+  offloaded branch but refuses to push, so a stray intent fails loud rather than pushing through an
+  unreviewed path.
+- **The hardened sandbox Job spec** (`k8s.rs`, for `command == "open"`): non-root,
+  `readOnlyRootFilesystem` with a single writable work `emptyDir`, `seccompProfile: RuntimeDefault`,
+  all capabilities dropped, `allowPrivilegeEscalation: false`, `automountServiceAccountToken: false`,
+  and a **credential-light env** — the LLM key + runner token only, **no embeddings/forge/DB secret**
+  (a manifest test asserts both the hardening and the credential-light env). Egress restriction is a
+  **NetworkPolicy** — a deploy-side, default-deny + allowlist (LLM gateway, package registries, git
+  remote) control that cannot be expressed on the Job manifest, so it is enforced alongside the chart,
+  not here.
+- **Durability.** The open loop runs under the same `StepRuntime` seam, so it inherits
+  `CheckpointRuntime` replay ([ADR-0087](adr/0087-durable-replay-checkpoint-runtime.md)) when a
+  replaying host is wired; `propose_pr` is the dedup'd terminal step.
+
+**Not built (needs the trigger slice + a security sign-off):** the @mention-issue → `open`-task
+creation, the dispatcher routing for `open`, the ticket→prompt pipeline in the host, brokered
+retrieval, and the reconciler's credentialed branch push + PR open. Until those land, `open` is a
+recorded, tested shape — not a running mode.
 
 ## The review tier (ADR-0062)
 

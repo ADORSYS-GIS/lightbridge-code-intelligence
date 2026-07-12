@@ -41,16 +41,22 @@ mod restate_worker;
 mod review;
 mod types;
 
+// Global allocator. The release images are static-musl (ADR-0080); musl's built-in malloc regresses
+// sharply under this server's multithreaded allocation load, so we route every allocation through
+// mimalloc, which restores glibc-class throughput. Harmless on glibc builds too.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+use axum::Router;
 use axum::extract::{DefaultBodyLimit, MatchedPath, Request, State};
-use axum::http::{header, StatusCode};
+use axum::http::{StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use axum::Router;
 use metrics_exporter_prometheus::PrometheusHandle;
 use sqlx::PgPool;
 use tracing_subscriber::EnvFilter;
@@ -259,11 +265,12 @@ impl AppState {
 
 /// A boolean env flag that is true for `1`/`true`/`yes` (case-insensitive), false otherwise.
 fn env_flag(name: &str) -> bool {
+    env_flag_value(std::env::var(name).ok().as_deref())
+}
+
+fn env_flag_value(value: Option<&str>) -> bool {
     matches!(
-        std::env::var(name)
-            .unwrap_or_default()
-            .to_ascii_lowercase()
-            .as_str(),
+        value.unwrap_or_default().to_ascii_lowercase().as_str(),
         "1" | "true" | "yes"
     )
 }
@@ -360,6 +367,17 @@ fn app(state: AppState) -> Router {
             "/internal/tasks/{id}/review/telemetry",
             post(internal::record_review_telemetry),
         )
+        // ADR-0087 durable-step journal: the agent, running under `CheckpointRuntime` (opt-in),
+        // journals each step's result and fetches it back on replay. `run_epoch` is resolved
+        // server-side from the task row. Additive — unused on the default `Passthrough` path.
+        .route(
+            "/internal/tasks/{id}/steps/upsert",
+            post(internal::upsert_step),
+        )
+        .route(
+            "/internal/tasks/{id}/steps/fetch",
+            post(internal::fetch_step),
+        )
         // ADR-0037 mediated write actions: the native agent buffers findings/replies/summary, then
         // flushes them as one grouped review on finalize.
         .route(
@@ -385,6 +403,14 @@ fn app(state: AppState) -> Router {
         .route(
             "/internal/tasks/{id}/review/finalize",
             post(internal::finalize_review),
+        )
+        // ADR-0088 open mode: the sandboxed open agent proposes a PR (branch + metadata) via this
+        // mediated endpoint; the control plane offloads the branch and enqueues a dedup'd `pr_open`
+        // intent for the egress plane to push. A branch patch can be large, so raise the body limit.
+        // DORMANT: no trigger creates an open task, so nothing calls this in prod yet.
+        .route(
+            "/internal/tasks/{id}/propose-pr",
+            post(internal::propose_pr).layer(DefaultBodyLimit::max(32 * 1024 * 1024)),
         )
         .layer(axum::middleware::from_fn(track_http_metrics))
         .with_state(state)
@@ -464,7 +490,7 @@ async fn readiness(State(state): State<AppState>) -> impl IntoResponse {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 "OIDC_ISSUER not configured",
-            )
+            );
         }
         Some(validator) => {
             if validator.warm().await.is_err() {
@@ -486,13 +512,13 @@ async fn readiness(State(state): State<AppState>) -> impl IntoResponse {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 "database connection failed",
-            )
+            );
         }
         DbReadiness::NotConfigured => {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 "database not configured (set DATABASE_URL; ALLOW_NO_DB=1 for dev only)",
-            )
+            );
         }
     }
     (StatusCode::OK, "ok")
@@ -549,8 +575,10 @@ async fn main() -> anyhow::Result<()> {
         "a2a" => a2a::run(state).await,
         // The A2A push-notification webhook-delivery actor (RFC-0006 Phase 3 / ADR-0079).
         "notifier" => run_notifier(state).await,
+        // The durable-replay store lifecycle owner (ADR-0087): TTL-sweeps the `durable_step` journal.
+        "replay" => run_replay(state).await,
         other => anyhow::bail!(
-            "unknown role {other:?} (expected: serve | dispatcher | reconciler | restate-worker | a2a | notifier [| poller])"
+            "unknown role {other:?} (expected: serve | dispatcher | reconciler | restate-worker | a2a | notifier | replay [| poller])"
         ),
     }
 }
@@ -625,6 +653,23 @@ async fn run_reconciler(state: AppState) -> anyhow::Result<()> {
         drain_enabled,
     )
     .await
+}
+
+/// The `replay` role (ADR-0087): owns the `durable_step` journal's lifecycle. Runs the periodic TTL
+/// sweep (`DURABLE_STEP_RETENTION`, validated `> 0` at load — a non-positive value is rejected here,
+/// not clamped, since it would sweep in-flight resume state). Purge-on-success lives on the finalize
+/// write path; this role is the backstop for abandoned/failed runs. Requires a database; run as a
+/// singleton (the sweep is idempotent, so extra replicas are harmless but pointless).
+async fn run_replay(state: AppState) -> anyhow::Result<()> {
+    let pool = state
+        .db
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("replay role requires DATABASE_URL"))?;
+    let retention =
+        queue::replay::retention_from_env().map_err(|reason| anyhow::anyhow!(reason))?;
+    // Headless role: stand up the metrics-only listener like the dispatcher/reconciler.
+    spawn_metrics_server(state.metrics.clone());
+    queue::replay::run(pool, retention).await
 }
 
 /// The HTTP control surface (webhook ingress, `/tasks`, health, OIDC-protected routes).
@@ -822,14 +867,11 @@ mod tests {
     #[test]
     fn env_flag_parses_truthy_values_only() {
         for truthy in ["1", "true", "TRUE", "Yes"] {
-            std::env::set_var("CP_TEST_FLAG", truthy);
-            assert!(env_flag("CP_TEST_FLAG"), "{truthy} should be truthy");
+            assert!(env_flag_value(Some(truthy)), "{truthy} should be truthy");
         }
         for falsy in ["0", "false", "no", "", "off"] {
-            std::env::set_var("CP_TEST_FLAG", falsy);
-            assert!(!env_flag("CP_TEST_FLAG"), "{falsy} should be falsy");
+            assert!(!env_flag_value(Some(falsy)), "{falsy} should be falsy");
         }
-        std::env::remove_var("CP_TEST_FLAG");
-        assert!(!env_flag("CP_TEST_FLAG"));
+        assert!(!env_flag_value(None));
     }
 }

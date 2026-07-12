@@ -53,18 +53,35 @@ runs:
           echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
           exit 0
         fi
-        {
-          echo "RUSTC_WRAPPER=sccache"
-          # Incremental compilation and sccache are mutually exclusive; incremental artifacts are not
-          # cacheable, so disabling it lets sccache cache every codegen unit.
-          echo "CARGO_INCREMENTAL=0"
-          echo "SCCACHE_BUCKET=$SCCACHE_S3_BUCKET"
-          echo "SCCACHE_ENDPOINT=$SCCACHE_S3_ENDPOINT"
-          echo "SCCACHE_S3_USE_SSL=true"
-          # opendal's S3 backend has no region auto-detection against a custom endpoint and errors
-          # "region is missing" without this. MinIO accepts (and defaults to) us-east-1.
-          echo "SCCACHE_REGION=us-east-1"
-          echo "AWS_ACCESS_KEY_ID=$SCCACHE_ACCESS_KEY_ID"
-          echo "AWS_SECRET_ACCESS_KEY=$SCCACHE_SECRET_ACCESS_KEY"
-        } >> "$GITHUB_ENV"
-        echo "sccache enabled → s3://$SCCACHE_S3_BUCKET @ $SCCACHE_S3_ENDPOINT"
+        # Export the sccache S3 config into *this step's* environment first, then health-check the
+        # server against the real backend before committing later steps to it. A transient S3
+        # cold-start / unreachable-service flake ("Timed out waiting for server startup") must
+        # degrade to an uncached-but-green build, never a red lint.
+        export CARGO_INCREMENTAL=0
+        export SCCACHE_BUCKET="$SCCACHE_S3_BUCKET"
+        export SCCACHE_ENDPOINT="$SCCACHE_S3_ENDPOINT"
+        export SCCACHE_S3_USE_SSL=true
+        # opendal's S3 backend has no region auto-detection against a custom endpoint and errors
+        # "region is missing" without this. MinIO accepts (and defaults to) us-east-1.
+        export SCCACHE_REGION=us-east-1
+        export AWS_ACCESS_KEY_ID="$SCCACHE_ACCESS_KEY_ID"
+        export AWS_SECRET_ACCESS_KEY="$SCCACHE_SECRET_ACCESS_KEY"
+        if timeout 90 sccache --start-server >/dev/null 2>&1 && sccache --show-stats >/dev/null 2>&1; then
+          {
+            echo "RUSTC_WRAPPER=sccache"
+            # Incremental compilation and sccache are mutually exclusive; incremental artifacts are not
+            # cacheable, so disabling it lets sccache cache every codegen unit.
+            echo "CARGO_INCREMENTAL=0"
+            echo "SCCACHE_BUCKET=$SCCACHE_S3_BUCKET"
+            echo "SCCACHE_ENDPOINT=$SCCACHE_S3_ENDPOINT"
+            echo "SCCACHE_S3_USE_SSL=true"
+            echo "SCCACHE_REGION=us-east-1"
+            echo "AWS_ACCESS_KEY_ID=$SCCACHE_ACCESS_KEY_ID"
+            echo "AWS_SECRET_ACCESS_KEY=$SCCACHE_SECRET_ACCESS_KEY"
+          } >> "$GITHUB_ENV"
+          echo "sccache enabled → s3://$SCCACHE_S3_BUCKET @ $SCCACHE_S3_ENDPOINT"
+        else
+          echo "::warning::sccache server did not start / could not reach the S3 backend within 90s — compiling uncached (build stays green)."
+          # Neutralize any wrapper so cargo compiles directly instead of through a dead sccache.
+          echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
+        fi

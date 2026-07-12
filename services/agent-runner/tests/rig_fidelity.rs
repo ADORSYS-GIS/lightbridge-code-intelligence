@@ -2,7 +2,7 @@
 //!
 //! Our review agent talks **OpenAI-compatible Chat Completions** to the internal eaig gateway, not to
 //! native provider SDKs. The hand-rolled transport that carries that traffic is
-//! [`crate::review::native::chat`](../src/review/native/chat.rs). It depends on three provider-quirk
+//! `lci_review_agent::model` (../../review-agent/src/model.rs). It depends on three provider-quirk
 //! fields that a naive typed deserializer silently drops:
 //!
 //!   1. **`thought_signature`** — Gemini 3 hangs an opaque round-trip blob off each tool call as
@@ -34,7 +34,7 @@
 //! `#[ignore]`d, post-merge step); see the run command in that file.
 
 use rig_core::providers::openai::completion::{CompletionResponse, Message};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// A per-field verdict: did rig's OpenAI provider preserve the field through a parse round-trip?
 #[derive(Debug, Clone, PartialEq)]

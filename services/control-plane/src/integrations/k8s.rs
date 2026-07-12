@@ -9,7 +9,7 @@ use k8s_openapi::api::batch::v1::Job;
 use k8s_openapi::api::core::v1::ServiceAccount;
 use kube::api::{DeleteParams, PostParams};
 use kube::{Api, Client};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::db::ClaimedTask;
 
@@ -403,6 +403,12 @@ fn job_manifest(name: &str, cfg: JobConfig, task: &ClaimedTask) -> Value {
         resources,
         owner_reference,
     } = cfg;
+    // ADR-0088: the `open` mode is the highest-risk surface — it executes untrusted repo + generated
+    // code — so its pod is hardened AND credential-light. It carries **only** the LLM key + runner
+    // token (retrieval is brokered, not a direct DB reach), never the embeddings/index credentials the
+    // read-only index/review paths use, and never a forge or DB credential (those live on the egress
+    // plane / control plane). This split is enforced below.
+    let is_open = task.command_text == "open";
     // Pass the claimed task's context so the runner knows what to act on (target + SHAs) and how to
     // report back: the task id, plus where to call (CONTROL_PLANE_URL) and the shared bearer it
     // presents (AGENT_RUNNER_TOKEN). The runner fetches full context from the internal API rather
@@ -417,17 +423,10 @@ fn job_manifest(name: &str, cfg: JobConfig, task: &ClaimedTask) -> Value {
         json!({ "name": "ATTEMPT", "value": task.attempts.to_string() }),
         json!({ "name": "CONTROL_PLANE_URL", "value": control_plane_url }),
         json!({ "name": "AGENT_RUNNER_TOKEN", "value": runner_token }),
-        // Embeddings config (ADR-0018): all three are required — no defaults — so a misconfigured
-        // Job fails loud rather than silently embedding with the wrong model.
-        json!({ "name": "EMBEDDINGS_BASE_URL",
-            "valueFrom": { "secretKeyRef": { "name": "lightbridge-agent-secrets", "key": "embeddings-base-url" } } }),
-        json!({ "name": "EMBEDDINGS_API_KEY",
-            "valueFrom": { "secretKeyRef": { "name": "lightbridge-agent-secrets", "key": "embeddings-api-key" } } }),
-        json!({ "name": "EMBEDDINGS_MODEL",
-            "valueFrom": { "secretKeyRef": { "name": "lightbridge-agent-secrets", "key": "embeddings-model" } } }),
         // Review LLM config (ADR-0021). `optional: true`: absent these keys, the secretKeyRef
         // resolves to unset (not a pod start failure), so `LLM_MODEL` is unset and the runner skips
         // the review step (indexing-only). The operator enables review by populating these keys.
+        // `open` keeps this (its loop needs the LLM) but NOT the embeddings creds below.
         json!({ "name": "LLM_BASE_URL",
             "valueFrom": { "secretKeyRef": { "name": "lightbridge-agent-secrets", "key": "llm-base-url", "optional": true } } }),
         json!({ "name": "LLM_API_KEY",
@@ -435,6 +434,17 @@ fn job_manifest(name: &str, cfg: JobConfig, task: &ClaimedTask) -> Value {
         json!({ "name": "LLM_MODEL",
             "valueFrom": { "secretKeyRef": { "name": "lightbridge-agent-secrets", "key": "llm-model", "optional": true } } }),
     ];
+    if !is_open {
+        // Embeddings config (ADR-0018): required for index/review — a misconfigured Job fails loud
+        // rather than silently embedding with the wrong model. `open` never gets these: it does not
+        // embed, and retrieval (if any) is brokered through the mediated API, not a direct index reach.
+        env.push(json!({ "name": "EMBEDDINGS_BASE_URL",
+            "valueFrom": { "secretKeyRef": { "name": "lightbridge-agent-secrets", "key": "embeddings-base-url" } } }));
+        env.push(json!({ "name": "EMBEDDINGS_API_KEY",
+            "valueFrom": { "secretKeyRef": { "name": "lightbridge-agent-secrets", "key": "embeddings-api-key" } } }));
+        env.push(json!({ "name": "EMBEDDINGS_MODEL",
+            "valueFrom": { "secretKeyRef": { "name": "lightbridge-agent-secrets", "key": "embeddings-model" } } }));
+    }
     if let Some(base_sha) = &task.base_sha {
         env.push(json!({ "name": "BASE_SHA", "value": base_sha }));
     }
@@ -445,6 +455,24 @@ fn job_manifest(name: &str, cfg: JobConfig, task: &ClaimedTask) -> Value {
     // the runner uses its built-in default guidance.
     if let Some(prompt) = review_system_prompt {
         env.push(json!({ "name": "REVIEW_SYSTEM_PROMPT", "value": prompt }));
+    }
+
+    // Operator-tunable indexer knobs (INDEX_*): forwarded from the control-plane's own environment so
+    // they can be set once on the control-plane deployment (Helm) instead of baked into the runner
+    // image. Unset → the runner's built-in defaults apply (embed batch 32, chunk-line ceiling 150,
+    // window 100/50). Chief use: shrinking INDEX_EMBED_BATCH_SIZE when a gateway caps the batched
+    // embeddings response body.
+    if !is_open {
+        for key in [
+            "INDEX_EMBED_BATCH_SIZE",
+            "INDEX_MAX_CHUNK_LINES",
+            "INDEX_WINDOW_SIZE",
+            "INDEX_WINDOW_STEP",
+        ] {
+            if let Ok(value) = std::env::var(key) {
+                env.push(json!({ "name": key, "value": value }));
+            }
+        }
     }
 
     // Internal CA: when configured, mount the gateway's CA so the Job can verify the HTTPS eaig
@@ -522,7 +550,46 @@ fn job_manifest(name: &str, cfg: JobConfig, task: &ClaimedTask) -> Value {
     if let Some(owner) = owner_reference {
         manifest["metadata"]["ownerReferences"] = json!([owner]);
     }
+    if is_open {
+        harden_open_pod(&mut manifest);
+    }
     manifest
+}
+
+/// Apply the ADR-0088 sandbox posture to an `open` Job manifest. `open` executes untrusted repo +
+/// generated code, so containment is at the pod boundary: non-root, all Linux capabilities dropped,
+/// seccomp `RuntimeDefault`, no privilege escalation, a **read-only root filesystem** with a single
+/// writable work `emptyDir` (the checkout root, wiped with the pod), and **no projected service-account
+/// token** (the pod has no reason to reach the Kubernetes API). Egress restriction is a NetworkPolicy —
+/// a deploy-side control (default-deny + a three-entry allowlist: LLM gateway, package registries, git
+/// remote); it cannot be expressed on the Job manifest, so it is enforced alongside the chart, not here.
+/// The credential-light env (LLM key + runner token only — no embeddings/forge/DB secret) is set in
+/// [`job_manifest`]; this only adds the containment fields.
+fn harden_open_pod(manifest: &mut Value) {
+    let pod = &mut manifest["spec"]["template"]["spec"];
+    // The pod never talks to the Kubernetes API — do not project its service-account token.
+    pod["automountServiceAccountToken"] = json!(false);
+    pod["securityContext"] = json!({
+        "runAsNonRoot": true,
+        "seccompProfile": { "type": "RuntimeDefault" },
+    });
+    // The ONLY writable surface: a per-task work emptyDir at the checkout root (`WORKDIR` default).
+    // Everything the agent edits, the build outputs, and the test artifacts live here and die with
+    // the pod. The root filesystem itself is read-only (below).
+    if let Some(volumes) = pod["volumes"].as_array_mut() {
+        volumes.push(json!({ "name": "work", "emptyDir": {} }));
+    }
+    let container = &mut manifest["spec"]["template"]["spec"]["containers"][0];
+    container["securityContext"] = json!({
+        "runAsNonRoot": true,
+        "allowPrivilegeEscalation": false,
+        "readOnlyRootFilesystem": true,
+        "capabilities": { "drop": ["ALL"] },
+        "seccompProfile": { "type": "RuntimeDefault" },
+    });
+    if let Some(mounts) = container["volumeMounts"].as_array_mut() {
+        mounts.push(json!({ "name": "work", "mountPath": "/workspace" }));
+    }
 }
 
 #[cfg(test)]
@@ -768,6 +835,140 @@ mod tests {
         assert_eq!(
             cfg_vol.config_map.as_ref().map(|c| c.name.as_str()),
             Some("lightbridge-agent-config")
+        );
+    }
+
+    // ADR-0088 merge bar: the `open` Job manifest satisfies every sandbox hard requirement (non-root,
+    // caps dropped, seccomp, read-only root FS + single writable emptyDir, no projected SA token), and
+    // is credential-light — it carries the LLM key + runner token and NO forge/DB/embeddings secret.
+    #[test]
+    fn open_manifest_is_hardened_and_credential_light() {
+        let mut task = sample_task();
+        task.command_text = "open".to_string();
+        let value = job_manifest(
+            &job_name(&task),
+            JobConfig {
+                image: "img:tag",
+                service_account: "sa",
+                control_plane_url: "http://cp:8080",
+                runner_token: "runner-secret",
+                ca_secret: None,
+                active_deadline_seconds: 1800,
+                review_system_prompt: None,
+                agent_config_map: None,
+                resources: None,
+                owner_reference: None,
+            },
+            &task,
+        );
+        // Structurally valid Job.
+        let job: Job = serde_json::from_value(value.clone()).expect("valid open Job manifest");
+
+        // Pod-level hardening: non-root + seccomp + no projected SA token.
+        let pod = &value["spec"]["template"]["spec"];
+        assert_eq!(
+            pod["automountServiceAccountToken"],
+            serde_json::json!(false)
+        );
+        assert_eq!(
+            pod["securityContext"]["runAsNonRoot"],
+            serde_json::json!(true)
+        );
+        assert_eq!(
+            pod["securityContext"]["seccompProfile"]["type"],
+            serde_json::json!("RuntimeDefault")
+        );
+
+        // Container-level hardening: read-only root FS, no priv-esc, all caps dropped, seccomp.
+        let container = &value["spec"]["template"]["spec"]["containers"][0];
+        let sc = &container["securityContext"];
+        assert_eq!(sc["readOnlyRootFilesystem"], serde_json::json!(true));
+        assert_eq!(sc["allowPrivilegeEscalation"], serde_json::json!(false));
+        assert_eq!(sc["runAsNonRoot"], serde_json::json!(true));
+        assert_eq!(sc["capabilities"]["drop"], serde_json::json!(["ALL"]));
+        assert_eq!(
+            sc["seccompProfile"]["type"],
+            serde_json::json!("RuntimeDefault")
+        );
+
+        // The ONLY writable surface is the work emptyDir at the checkout root.
+        let pod_spec = job.spec.unwrap().template.spec.unwrap();
+        let work_vol = pod_spec
+            .volumes
+            .as_ref()
+            .and_then(|v| v.iter().find(|v| v.name == "work"))
+            .expect("work emptyDir volume");
+        assert!(work_vol.empty_dir.is_some(), "work must be an emptyDir");
+        let mount = pod_spec.containers[0]
+            .volume_mounts
+            .as_ref()
+            .and_then(|m| m.iter().find(|m| m.name == "work"))
+            .expect("work volumeMount");
+        assert_eq!(mount.mount_path, "/workspace");
+
+        // Credential-light: LLM key + runner token present; NO embeddings/index/forge/DB secret.
+        let env = pod_spec.containers[0].env.as_ref().expect("env");
+        assert!(env.iter().any(|e| e.name == "AGENT_RUNNER_TOKEN"));
+        assert!(
+            env.iter().any(|e| e.name == "LLM_MODEL"),
+            "open keeps the LLM key"
+        );
+        assert!(
+            !env.iter().any(|e| e.name.starts_with("EMBEDDINGS")),
+            "open must NOT carry embeddings credentials"
+        );
+        assert!(
+            !env.iter().any(|e| e.name.starts_with("INDEX_")),
+            "open must NOT carry index knobs"
+        );
+        // Every secret this pod references is an `llm-*` key of the agent secret — no forge/DB secret.
+        for e in env {
+            if let Some(sel) = e
+                .value_from
+                .as_ref()
+                .and_then(|v| v.secret_key_ref.as_ref())
+            {
+                assert!(
+                    sel.key.starts_with("llm-"),
+                    "open pod references a non-LLM secret {:?} (forge/DB/embeddings creds are forbidden)",
+                    sel.key
+                );
+            }
+        }
+    }
+
+    // The hardening is `open`-only: a review Job keeps the relaxed posture (writable root FS, its
+    // embeddings credentials, a projected SA token) — the hardening must not regress the read paths.
+    #[test]
+    fn review_manifest_is_not_hardened() {
+        let task = sample_task(); // command_text == "review"
+        let value = job_manifest(
+            &job_name(&task),
+            JobConfig {
+                image: "img:tag",
+                service_account: "sa",
+                control_plane_url: "http://cp:8080",
+                runner_token: "runner-secret",
+                ca_secret: None,
+                active_deadline_seconds: 1800,
+                review_system_prompt: None,
+                agent_config_map: None,
+                resources: None,
+                owner_reference: None,
+            },
+            &task,
+        );
+        assert!(value["spec"]["template"]["spec"]["securityContext"].is_null());
+        assert!(value["spec"]["template"]["spec"]["automountServiceAccountToken"].is_null());
+        assert!(value["spec"]["template"]["spec"]["containers"][0]["securityContext"].is_null());
+        let job: Job = serde_json::from_value(value).unwrap();
+        let env = job.spec.unwrap().template.spec.unwrap().containers[0]
+            .env
+            .clone()
+            .unwrap();
+        assert!(
+            env.iter().any(|e| e.name == "EMBEDDINGS_MODEL"),
+            "review keeps its embeddings credentials"
         );
     }
 

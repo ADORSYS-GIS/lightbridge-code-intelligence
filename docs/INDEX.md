@@ -2,6 +2,17 @@
 
 This directory contains the complete documentation set for Lightbridge Code Intelligence.
 
+> **Active architecture redesign — control-plane v2 ([RFC-0007](rfc/0007-control-plane-v2-planes.md)).**
+> The system is being restructured into **two binaries, three planes**: a `control-plane`
+> (ingress → orchestration → egress; DB + forge creds; no checkout) and a new **`agent-plane`**
+> ([ADR-0085](adr/0085-agent-execution-plane.md)) selected by **mode × host** (`{index, review, open} ×
+> {run-once, serve}`). Enabling decisions: an in-house code-graph crate retires Graphify
+> ([ADR-0086](adr/0086-in-house-code-graph-crate.md)); `CheckpointRuntime` gives the loop replay
+> without Restate ([ADR-0087](adr/0087-durable-replay-checkpoint-runtime.md)); the `open` autonomous
+> ticket→PR agent ([ADR-0088](adr/0088-open-mode-autonomous-ticket-agent.md)) is the first new
+> capability. The "Core docs" below describe the **currently running** system; each carries a pointer
+> to the v2 target.
+
 ## Table of contents
 
 ### Core docs
