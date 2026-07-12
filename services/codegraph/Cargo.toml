@@ -31,6 +31,10 @@ tree-sitter-python.workspace = true
 ignore.workspace = true
 # Bounded PDF text extraction over untrusted repo input (ADR-0086 §3 / R2).
 pdf-extract.workspace = true
+# Pre-flight, *bounded* inflate of a PDF's content streams to catch a decompression bomb BEFORE
+# `pdf-extract` (which wraps `lopdf`/`flate2`) inflates them unbounded. Already in the tree
+# transitively via `pdf-extract`; pinned direct for the guard. Untrusted-input code (ADR-0086 R2).
+flate2 = "1"
 
 [dev-dependencies]
 tempfile.workspace = true
