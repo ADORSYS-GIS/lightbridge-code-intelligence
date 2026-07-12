@@ -51,7 +51,7 @@ impl Tool for ReplyTool {
                 Ok(args) => match self
                     .services
                     .client
-                    .add_review_reply(cx.task_id, &args.body)
+                    .add_review_reply(cx.task_id, Some(&call.id), &args.body)
                     .await
                 {
                     Ok(()) => ToolOutcome::Continue("comment recorded".into()),

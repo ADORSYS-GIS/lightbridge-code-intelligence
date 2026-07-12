@@ -290,7 +290,7 @@ async fn review_and_knowledge_endpoints_preserve_their_wire_contracts() {
         .await;
     authenticated_post(
         "/review/comment",
-        serde_json::json!({ "body": "A plain reply" }),
+        serde_json::json!({ "body": "A plain reply", "call_id": "call_abc" }),
     )
     .mount(&server)
     .await;
@@ -393,7 +393,7 @@ async fn review_and_knowledge_endpoints_preserve_their_wire_contracts() {
         .await
         .expect("clear findings");
     client
-        .add_review_reply(task_id, "A plain reply")
+        .add_review_reply(task_id, Some("call_abc"), "A plain reply")
         .await
         .expect("reply");
     client
