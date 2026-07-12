@@ -29,6 +29,9 @@ uuid.workspace = true
 axum.workspace = true
 # Constant-time bearer-token comparison — the `/status` gate must not leak the secret via `==` timing.
 subtle.workspace = true
+# Hash both tokens to a fixed 32-byte digest before the constant-time compare, so equality is checked
+# on equal-length inputs and the secret's *length* never leaks via a short-circuiting length guard.
+sha2.workspace = true
 
 [dev-dependencies]
 # Drive the actual loop engine with the deterministic testkit fakes (ScriptedModel, CapturingSink,

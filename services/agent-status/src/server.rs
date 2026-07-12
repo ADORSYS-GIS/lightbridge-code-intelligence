@@ -153,12 +153,17 @@ fn authorized(headers: &HeaderMap, expected: &str) -> bool {
 }
 
 /// Constant-time bearer-token comparison. A plain `==` on `&str` short-circuits on the first
-/// differing byte, leaking the shared secret's length/prefix to a timing attacker. `subtle`'s
-/// `ConstantTimeEq` compares in time independent of the contents — but only for equal-length inputs,
-/// so guard the length first (an unavoidable, non-secret length check).
+/// differing byte, and even `subtle`'s `ConstantTimeEq` needs equal-length inputs — guarding the
+/// length with `presented.len() == expected.len()` short-circuits on a mismatch and thereby leaks the
+/// secret's *length* to a timing attacker. Instead hash both sides to a fixed 32-byte SHA-256 digest
+/// (always equal-length, so no length branch) and `ct_eq` the digests. Byte-for-byte constant time
+/// regardless of the presented token's length; a collision would require breaking SHA-256.
 fn constant_time_eq(presented: &[u8], expected: &[u8]) -> bool {
+    use sha2::{Digest, Sha256};
     use subtle::ConstantTimeEq as _;
-    presented.len() == expected.len() && presented.ct_eq(expected).into()
+    let presented = Sha256::digest(presented);
+    let expected = Sha256::digest(expected);
+    presented.ct_eq(&expected).into()
 }
 
 #[cfg(test)]
