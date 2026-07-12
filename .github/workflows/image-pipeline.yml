@@ -55,7 +55,7 @@ jobs:
       # as root in-container, so plain apt-get (no sudo, which is password-gated on the host).
       - name: Install musl + C toolchain
         run: |
-          apt-get update && apt-get install -y --no-install-recommends musl-tools cmake clang
+          apt-get update && apt-get install -y --no-install-recommends musl-tools cmake clang file
           rustup target add x86_64-unknown-linux-musl
       - uses: Swatinem/rust-cache@v2
         with:
