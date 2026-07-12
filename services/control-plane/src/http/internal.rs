@@ -1140,11 +1140,20 @@ pub async fn clear_inline(
     }
 }
 
-/// Body for `POST /internal/tasks/{id}/review/comment` (`add_comment`) and
-/// `POST /internal/tasks/{id}/review/summary` (`set_summary`).
+/// Body for `POST /internal/tasks/{id}/review/summary` (`set_summary`).
 #[derive(Debug, Deserialize)]
 pub struct TextActionBody {
     pub body: String,
+}
+
+/// Body for `POST /internal/tasks/{id}/review/comment` (`add_comment`). `call_id` is the tool-call id
+/// the agent threads so a replayed reply dedups on `(task_id, run_epoch, call_id)` (ADR-0087 C2);
+/// `None` (legacy / flag-off) keeps the append-only behavior.
+#[derive(Debug, Deserialize)]
+pub struct ReplyActionBody {
+    pub body: String,
+    #[serde(default)]
+    pub call_id: Option<String>,
 }
 
 /// `POST /internal/tasks/{id}/review/inline` — buffer one inline finding (ADR-0037). Last write wins
@@ -1180,16 +1189,30 @@ pub async fn add_review_comment(
 }
 
 /// `POST /internal/tasks/{id}/review/comment` — buffer one plain reply (`add_comment`, ADR-0037).
+/// When the agent threads a `call_id`, `run_epoch` is resolved server-side (trust boundary — the pod
+/// never supplies the run identity) so the insert dedups a replayed reply on
+/// `(task_id, run_epoch, call_id)` (ADR-0087 C2). A resolution failure degrades to a NULL epoch,
+/// which the partial dedup index ignores → the reply appends (fail-safe, no data loss).
 pub async fn add_review_reply(
     _auth: RunnerAuth,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
-    Json(a): Json<TextActionBody>,
+    Json(a): Json<ReplyActionBody>,
 ) -> Response {
     let Some(pool) = state.db.as_ref() else {
         return (StatusCode::SERVICE_UNAVAILABLE, "no database").into_response();
     };
-    match crate::db::add_pending_comment(pool, id, &a.body).await {
+    let run_epoch = match crate::db::durable_step_run_epoch(pool, id).await {
+        Ok(Some(epoch)) => Some(epoch),
+        // Task not found (e.g. purged mid-run): 404 like the sibling endpoints, rather than appending
+        // an orphaned comment row for a non-existent task (gemini review on #370).
+        Ok(None) => return (StatusCode::NOT_FOUND, "task not found").into_response(),
+        Err(error) => {
+            tracing::warn!(%error, task_id = %id, "resolving run_epoch for comment dedup failed; appending without a dedup key");
+            None
+        }
+    };
+    match crate::db::add_pending_comment(pool, id, run_epoch, a.call_id.as_deref(), &a.body).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(error) => {
             tracing::error!(%error, task_id = %id, "buffering comment failed");
@@ -1797,6 +1820,31 @@ pub struct StatusUpdate {
     pub detail: Option<String>,
 }
 
+/// Is the `running` transition a *genuinely fresh* attempt — i.e. this run has journaled NO durable
+/// steps yet (ADR-0087)? Fresh → the review buffer may be cleared (today's ADR-0037 behavior).
+/// Resumed (durable steps present) → the buffer must be preserved, because the resumed run replays
+/// its write-step results from the journal rather than re-buffering them.
+///
+/// Fails toward `true` (fresh → clear) on any resolution error or missing task, so the
+/// `LCI_DURABLE_REPLAY`-off path (where `durable_step` is always empty) is byte-identical to before.
+pub(crate) async fn is_fresh_attempt(pool: &sqlx::PgPool, id: Uuid) -> bool {
+    let run_epoch = match crate::db::durable_step_run_epoch(pool, id).await {
+        Ok(Some(epoch)) => epoch,
+        Ok(None) => return true,
+        Err(error) => {
+            tracing::warn!(%error, task_id = %id, "resolving run_epoch for resume-aware clear failed; treating as a fresh attempt");
+            return true;
+        }
+    };
+    match crate::db::has_durable_steps(pool, id, run_epoch).await {
+        Ok(has) => !has,
+        Err(error) => {
+            tracing::warn!(%error, task_id = %id, "checking durable steps for resume-aware clear failed; treating as a fresh attempt");
+            true
+        }
+    }
+}
+
 /// `POST /internal/tasks/{id}/status` — apply a runner-reported status transition.
 pub async fn set_status(
     _auth: RunnerAuth,
@@ -1821,7 +1869,17 @@ pub async fn set_status(
         Ok(true) => {
             // ADR-0037 idempotency: a runner (re)starting its task clears any buffer left by a prior
             // attempt, so a retry accumulates from empty rather than appending to a partial review.
+            //
+            // ADR-0087 resume-awareness: only clear on a *genuinely fresh* attempt — i.e. when NO
+            // `durable_step` rows exist for this run. Under `CheckpointRuntime` a *resumed* run (same
+            // run_epoch, new Job) replays its write-steps' results from the journal instead of
+            // re-executing them, so a cleared buffer would never get repopulated and the run would
+            // finalize with findings MISSING. With `LCI_DURABLE_REPLAY` off, `durable_step` is always
+            // empty → `has_durable_steps` is always false → the clear always runs (byte-identical to
+            // pre-ADR-0087). run_epoch is resolved server-side; any resolution error fails toward
+            // today's behavior (clear) so the flag-off path can never regress.
             if update.status == "running"
+                && is_fresh_attempt(pool, id).await
                 && let Err(error) = crate::db::clear_pending_review(pool, id).await
             {
                 tracing::warn!(%error, task_id = %id, "clearing pending buffer on (re)start failed (non-fatal)");

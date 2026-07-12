@@ -422,14 +422,21 @@ impl ControlPlaneClient {
         Ok(())
     }
 
-    /// `POST /internal/tasks/{id}/review/comment` — buffer one plain reply (ADR-0037).
-    pub async fn add_review_reply(&self, task_id: Uuid, body: &str) -> anyhow::Result<()> {
+    /// `POST /internal/tasks/{id}/review/comment` — buffer one plain reply (ADR-0037). `call_id` is
+    /// the tool-call id; threading it lets the control plane dedup a replayed reply on
+    /// `(task_id, run_epoch, call_id)` (ADR-0087 C2). `None` keeps the append-only behavior.
+    pub async fn add_review_reply(
+        &self,
+        task_id: Uuid,
+        call_id: Option<&str>,
+        body: &str,
+    ) -> anyhow::Result<()> {
         use anyhow::Context;
         let url = format!("{}/internal/tasks/{task_id}/review/comment", self.base_url);
         self.http
             .post(&url)
             .bearer_auth(&self.token)
-            .json(&serde_json::json!({ "body": body }))
+            .json(&serde_json::json!({ "body": body, "call_id": call_id }))
             .send()
             .await
             .context("buffering comment")?

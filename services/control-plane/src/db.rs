@@ -1026,15 +1026,29 @@ pub async fn upsert_pending_inline(
 
 /// Buffer one plain thread comment (the `add_comment` payload). Append-only; the bodies are
 /// consolidated into a single reply at flush so multiple calls don't fan out into notifications.
+///
+/// Replay dedup (ADR-0087 C2): under `CheckpointRuntime` a crash in the persist window can re-execute
+/// this write step on resume and double-append. When the caller threads the tool `call_id` (and the
+/// run's `run_epoch`, resolved server-side) the insert is idempotent on the partial unique index
+/// `(task_id, run_epoch, call_id) WHERE action = 'comment' AND call_id IS NOT NULL` via
+/// `ON CONFLICT DO NOTHING` — a replayed reply is a no-op. Legacy callers pass `call_id = None`: the
+/// partial index ignores NULL `call_id`, so those rows always append exactly as before (prod-neutral).
 pub async fn add_pending_comment(
     pool: &PgPool,
     task_id: Uuid,
+    run_epoch: Option<i32>,
+    call_id: Option<&str>,
     body: &str,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
-        "INSERT INTO pending_review_actions (task_id, action, body) VALUES ($1, 'comment', $2)",
+        "INSERT INTO pending_review_actions (task_id, action, run_epoch, call_id, body) \
+         VALUES ($1, 'comment', $2, $3, $4) \
+         ON CONFLICT (task_id, run_epoch, call_id) WHERE action = 'comment' AND call_id IS NOT NULL \
+         DO NOTHING",
     )
     .bind(task_id)
+    .bind(run_epoch)
+    .bind(call_id)
     .bind(body)
     .execute(pool)
     .await
@@ -2089,6 +2103,25 @@ pub async fn durable_step_run_epoch(
         .bind(task_id)
         .fetch_optional(pool)
         .await
+}
+
+/// Does this run have ANY journaled steps (ADR-0087)? A cheap `EXISTS` used at the `running`
+/// transition to tell a *fresh* attempt (no rows → clear the review buffer, today's behavior) from a
+/// *resumed* run (rows present → the replay rehydrates write-step results, so clearing would drop
+/// findings that never get re-buffered). With `LCI_DURABLE_REPLAY` off, `durable_step` is always
+/// empty, so this is always `false` and the clear always runs — byte-identical to pre-ADR-0087.
+pub async fn has_durable_steps(
+    pool: &PgPool,
+    task_id: Uuid,
+    run_epoch: i32,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM durable_step WHERE task_id = $1 AND run_epoch = $2)",
+    )
+    .bind(task_id)
+    .bind(run_epoch)
+    .fetch_one(pool)
+    .await
 }
 
 /// Upsert one journaled step result (replay-idempotent on the `(task_id, run_epoch, step_name)` key:
@@ -4791,10 +4824,10 @@ mod tests {
         .await
         .unwrap();
         // Comments append; the summary is single-valued (last write wins).
-        add_pending_comment(&pool, task_id, "first comment")
+        add_pending_comment(&pool, task_id, None, None, "first comment")
             .await
             .unwrap();
-        add_pending_comment(&pool, task_id, "second comment")
+        add_pending_comment(&pool, task_id, None, None, "second comment")
             .await
             .unwrap();
         upsert_pending_summary(&pool, task_id, "draft summary")
@@ -4821,6 +4854,125 @@ mod tests {
         clear_pending_review(&pool, task_id).await.unwrap();
         let after = load_pending_review(&pool, task_id).await.unwrap();
         assert!(after.is_empty(), "buffer cleared on restart/flush");
+    }
+
+    /// ADR-0087 Gap 1 (resume-aware buffer): the `running` transition only clears the review buffer
+    /// on a *genuinely fresh* attempt (no journaled steps). A *resumed* run (a `durable_step` row
+    /// exists for the same `(task, run_epoch)`) replays its write-step results instead of
+    /// re-executing them, so clearing would drop findings that never get re-buffered. This drives the
+    /// real handler decision (`is_fresh_attempt` + the conditional `clear_pending_review`) end to end.
+    #[sqlx::test]
+    async fn running_transition_preserves_buffer_on_resume_but_clears_on_fresh(pool: PgPool) {
+        let repo_id = seed(&pool).await;
+        let task = claim_after_create(&pool, repo_id, "head-resume").await;
+        let run_epoch = durable_step_run_epoch(&pool, task).await.unwrap().unwrap();
+
+        // Buffer one finding, then simulate a crash-and-resume: a journaled write step exists for the
+        // SAME run_epoch. The resumed runner reports `running`.
+        upsert_pending_inline(
+            &pool,
+            task,
+            "a.rs",
+            3,
+            Some("t"),
+            Some("P1"),
+            Some("correctness"),
+            None,
+            "a finding from the prior attempt",
+        )
+        .await
+        .unwrap();
+        upsert_durable_step(&pool, task, run_epoch, "tools:5", "{\"ok\":true}", "hash-5")
+            .await
+            .unwrap();
+
+        // The handler gate: a resumed run is NOT a fresh attempt, so the clear is SKIPPED.
+        assert!(
+            !crate::http::internal::is_fresh_attempt(&pool, task).await,
+            "a run with journaled steps is a resume, not a fresh attempt"
+        );
+        if crate::http::internal::is_fresh_attempt(&pool, task).await {
+            clear_pending_review(&pool, task).await.unwrap();
+        }
+        let after_resume = load_pending_review(&pool, task).await.unwrap();
+        assert_eq!(
+            after_resume.inline.len(),
+            1,
+            "the resumed run keeps the buffered finding (replay does not re-buffer it)"
+        );
+
+        // Inverse: with NO durable steps (the flag-off / first-attempt world) the clear runs — exactly
+        // today's ADR-0037 behavior.
+        purge_durable_steps(&pool, task, run_epoch).await.unwrap();
+        assert!(
+            crate::http::internal::is_fresh_attempt(&pool, task).await,
+            "with no journaled steps the run is a fresh attempt"
+        );
+        if crate::http::internal::is_fresh_attempt(&pool, task).await {
+            clear_pending_review(&pool, task).await.unwrap();
+        }
+        let after_fresh = load_pending_review(&pool, task).await.unwrap();
+        assert!(
+            after_fresh.is_empty(),
+            "a fresh attempt clears the buffer (byte-identical to pre-ADR-0087)"
+        );
+    }
+
+    /// ADR-0087 Gap 2 (`add_comment` dedup): a replayed reply with the same `(task, run_epoch,
+    /// call_id)` is a no-op (one row); a different `call_id` is a distinct reply (two rows); a NULL
+    /// `call_id` (legacy / flag-off path) still appends unconditionally (no dedup).
+    #[sqlx::test]
+    async fn add_pending_comment_dedups_on_call_id(pool: PgPool) {
+        let repo_id = seed(&pool).await;
+        let task = claim_after_create(&pool, repo_id, "head-dedup").await;
+        let run_epoch = durable_step_run_epoch(&pool, task).await.unwrap().unwrap();
+
+        let count = |pool: PgPool| async move {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM pending_review_actions WHERE action = 'comment'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        };
+
+        // Same call_id twice → the replay is a no-op.
+        add_pending_comment(&pool, task, Some(run_epoch), Some("call_1"), "first")
+            .await
+            .unwrap();
+        add_pending_comment(
+            &pool,
+            task,
+            Some(run_epoch),
+            Some("call_1"),
+            "first (replayed)",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            count(pool.clone()).await,
+            1,
+            "a replayed reply with the same call_id dedups to one row"
+        );
+
+        // A different call_id is a genuinely distinct reply.
+        add_pending_comment(&pool, task, Some(run_epoch), Some("call_2"), "second")
+            .await
+            .unwrap();
+        assert_eq!(count(pool.clone()).await, 2, "a different call_id appends");
+
+        // Legacy path: NULL call_id is excluded from the partial index → always appends.
+        add_pending_comment(&pool, task, None, None, "legacy-a")
+            .await
+            .unwrap();
+        add_pending_comment(&pool, task, None, None, "legacy-b")
+            .await
+            .unwrap();
+        assert_eq!(
+            count(pool.clone()).await,
+            4,
+            "NULL-call_id comments append unconditionally (no dedup)"
+        );
     }
 
     /// Phase 2 (ADR-0043): the refute pass retracts one buffered inline finding by (file, line),
