@@ -1,8 +1,19 @@
 # ADR-0082: Restate Phase D — the durable agent runtime (the review loop resumes at the step it left)
 
-- **Status:** Accepted (design-only; R1 owner-authorized; R2 remains gated, see §Gates)
+- **Status:** Accepted (design-only; R1 owner-authorized; **R2 endpoint superseded — see amendment**)
 - **Date:** 2026-07-11
 - **Deciders:** @stephane-segning
+- **Amended 2026-07-12:** the **R1 extraction stands entirely** (the `StepRuntime` seam, the `Tool`
+  registry, the unit-testable policies — all built and merged). Its **R2 endpoint changes**: running
+  the loop *inside* Restate (`RestateRuntime`, Option A) collides with the per-task isolated,
+  growable checkout that [RFC-0007](../rfc/0007-control-plane-v2-planes.md) requires (every host
+  shape is rejected on mechanism), so the loop's durability moves to the home-grown
+  **`CheckpointRuntime`** (this ADR's own Option B / third seam impl), recorded in
+  [ADR-0087](0087-durable-replay-checkpoint-runtime.md). Restate is **retained for egress** (Phase A,
+  live) and the task lifecycle (ADR-0076), not extended into the loop. The `agent-worker` role here
+  is generalized into the mode×host **agent-plane** of [ADR-0085](0085-agent-execution-plane.md).
+  Read this ADR for the seam, the step map, the offload rule, and the idempotency table (all still
+  normative); read ADR-0087 for where the loop's journal now lives.
 
 ## Context and Problem Statement
 

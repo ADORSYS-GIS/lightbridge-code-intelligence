@@ -5,6 +5,13 @@ through a single transactional outbox. This is the as-built picture after the si
 ([ADR-0058](adr/0058-rename-poller-role-to-reconciler.md), [ADR-0059](adr/0059-reconciler-owns-all-github-egress.md),
 live 2026-06-27).
 
+> **Evolving toward v2 ([RFC-0007](rfc/0007-control-plane-v2-planes.md)).** The six roles below are
+> being regrouped into **three planes** — ingress (`serve`/`a2a`/`mcp`), orchestration
+> (`dispatcher` + a new `replay` role), egress (`reconciler`/`notifier`) — inside a `control-plane`
+> binary that holds the DB + forge creds and **never touches a checkout**. All checkout-bearing work
+> moves to a separate **`agent-plane`** binary ([ADR-0085](adr/0085-agent-execution-plane.md)). The
+> single-writer egress invariant documented here is one of the invariants v2 preserves.
+
 ## One binary, several roles
 
 The control plane is a single image run as independent Deployments (RFC-0001), selected by the first

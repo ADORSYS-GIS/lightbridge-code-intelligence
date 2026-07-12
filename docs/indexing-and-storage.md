@@ -9,6 +9,14 @@ submits everything over the internal API).
 > pgvector answers "what reads like this" (cosine-nearest chunks). They are complementary, not
 > interchangeable — see [ADR-0003](adr/0003-dual-retrieval-neo4j-pgvector.md).
 
+> **Evolving toward v2 ([RFC-0007](rfc/0007-control-plane-v2-planes.md)).** The graph half of this
+> pipeline moves off the Python **Graphify** tool onto an in-house Rust crate, `lci-codegraph`
+> ([ADR-0086](adr/0086-in-house-code-graph-crate.md)) — tree-sitter directly, a structurally-resolved
+> graph, embeddings, PDF text, and a configurable ignore-list — which collapses the ~4 Gi index Job
+> and removes the Python runtime. Indexing becomes the `index` **mode** of the `agent-plane`
+> ([ADR-0085](adr/0085-agent-execution-plane.md)); the two datastores and the internal-API boundary
+> described here are unchanged.
+
 ## Who builds what
 
 ```mermaid

@@ -4,6 +4,14 @@ How work flows through Lightbridge: what triggers a task, the two job kinds, the
 runs at, the states a task moves through, how it's gated behind a fresh index, and how cancellation +
 data purge work. Diagrams are Mermaid (rendered by GitHub).
 
+> **Evolving toward v2 ([RFC-0007](rfc/0007-control-plane-v2-planes.md)).** The two job kinds become
+> **modes** of one `agent-plane` binary ([ADR-0085](adr/0085-agent-execution-plane.md)) — `index` and
+> `review` (plus a new write-capable `open`, [ADR-0088](adr/0088-open-mode-autonomous-ticket-agent.md))
+> — each deployable as an isolated Job (`run-once`) or a shared Deployment (`serve`). A pod death no
+> longer restarts a deep review from turn 0: `CheckpointRuntime`
+> ([ADR-0087](adr/0087-durable-replay-checkpoint-runtime.md)) journals each step and resumes at the one
+> it left. The state machine, cancellation, and purge described here carry over.
+
 > Source of truth in code:
 > `services/control-plane/src/db.rs` (task status fns, idempotency, `create_task` /
 > `create_index_task` / `create_explicit_task`),
