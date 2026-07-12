@@ -24,6 +24,10 @@ anyhow.workspace = true
 clap.workspace = true
 lci-agent-clients = { path = "../agent-clients" }
 lci-agent-loop = { path = "../agent-loop" }
+# Host-agnostic live per-review status projection + read-only HTTP surface (RFC-0007 slice 5,
+# ADR-0085). Flag-gated (`LCI_STATUS_API`, default off) so it is prod-neutral until an operator
+# enables it; the loop runs identically whether or not the status server is on.
+lci-agent-status = { path = "../agent-status" }
 lci-agent-step = { path = "../agent-step" }
 lci-agent-tools = { path = "../agent-tools" }
 lci-agent-types = { path = "../agent-types" }

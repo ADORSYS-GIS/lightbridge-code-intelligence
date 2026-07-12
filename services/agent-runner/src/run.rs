@@ -20,6 +20,7 @@ use crate::clone;
 use crate::plane::Mode;
 use crate::{indexer, review, sast};
 use lci_agent_clients::{ControlPlaneClient, EmbeddingsClient};
+use lci_agent_status::{Phase, StatusHandle, StatusServerConfig};
 
 /// Do exactly one task and exit — the `run-once` host (ADR-0085).
 ///
@@ -209,6 +210,23 @@ async fn run(
     // re-affirms it from the pod and is a no-op if already set).
     report(client, config, "running", None).await;
 
+    // Live per-review status projection (RFC-0007 slice 5, ADR-0085): flag-gated, default OFF. When
+    // `LCI_STATUS_API` is set, the run-once host runs a tiny read-only HTTP server alongside the loop
+    // exposing live progress (turn, current tool name, findings so far, tokens, phase, elapsed).
+    // Unset ⇒ no handle, no sink wrapping, no server — byte-identical to today's path (prod-neutral,
+    // dormant). The status mechanism is host-agnostic; the `serve` HOST topology stays gated on the
+    // measurement in #358.
+    let status_config = StatusServerConfig::from_env(&config.runner_token);
+    let status = status_config
+        .as_ref()
+        .map(|_| StatusHandle::new(config.task_id));
+    // Detached: the server runs until the process exits (the run-once model). Dropping the returned
+    // JoinHandle does not abort the task.
+    let _status_server = match (status.clone(), status_config) {
+        (Some(handle), Some(config)) => Some(lci_agent_status::spawn(handle, config)),
+        _ => None,
+    };
+
     let context = client.get_context(config.task_id).await?;
     tracing::info!(
         repo = format!("{}/{}", context.owner, context.name),
@@ -261,6 +279,9 @@ async fn run(
     // took roughly as long as an index every time (ADR-0025).
     let needs_index = is_index || !context.repo_indexed;
     let (chunk_count, graph_summary) = if needs_index {
+        if let Some(status) = &status {
+            status.set_phase(Phase::Indexing);
+        }
         // ── Semantic index: tree-sitter → pgvector (epic #5, slice 2) ────────────────────────
         let chunks = indexer::index_checkout(&context, &checkout, client, &embedder).await?;
         // ── Structural index: Graphify → Neo4j (epic #5, slice 3, ADR-0019) ──────────────────
@@ -315,13 +336,18 @@ async fn run(
             // re-report those lines. Opt-in (sast_config is None when disabled) and best-effort: a scan
             // failure is logged, never fatal. Needs the diff to scope to — without it, SAST is skipped.
             let sast_findings = match (sast_config, diff.as_ref()) {
-                (Some(cfg), Some(d)) => match sast::scan(cfg, &checkout, &d.files).await {
-                    Ok(findings) => findings,
-                    Err(error) => {
-                        tracing::warn!(%error, "sast: opengrep scan failed (non-fatal)");
-                        Vec::new()
+                (Some(cfg), Some(d)) => {
+                    if let Some(status) = &status {
+                        status.set_phase(Phase::Sast);
                     }
-                },
+                    match sast::scan(cfg, &checkout, &d.files).await {
+                        Ok(findings) => findings,
+                        Err(error) => {
+                            tracing::warn!(%error, "sast: opengrep scan failed (non-fatal)");
+                            Vec::new()
+                        }
+                    }
+                }
                 _ => Vec::new(),
             };
             // Buffer before the agent runs so a true (file, line) collision lets the agent's richer
@@ -334,6 +360,9 @@ async fn run(
             // fold them into the prompt as untrusted context so the review respects house rules.
             let repo_instructions = review::instructions::read_agent_instructions(&checkout).await;
             let mut transcript = Vec::new();
+            if let Some(status) = &status {
+                status.set_phase(Phase::Reviewing);
+            }
             let outcome = review::run_native_agent(
                 review,
                 &context.command,
@@ -348,8 +377,12 @@ async fn run(
                 config.task_id,
                 &checkout,
                 &mut transcript,
+                status.as_ref(),
             )
             .await;
+            if let Some(status) = &status {
+                status.set_phase(Phase::Finalizing);
+            }
             // Submit the transcript regardless of outcome (ADR-0034) — a failed run's reasoning is the
             // most useful to inspect. Best-effort: never let it change the task result.
             if !transcript.is_empty()
@@ -440,6 +473,10 @@ async fn run(
         }
         None => "review disabled".to_string(),
     };
+
+    if let Some(status) = &status {
+        status.set_phase(Phase::Done);
+    }
 
     Ok(RunResult {
         summary: format!(

@@ -108,6 +108,7 @@ dependencies = [
  "futures",
  "lci-agent-clients",
  "lci-agent-loop",
+ "lci-agent-status",
  "lci-agent-step",
  "lci-agent-testkit",
  "lci-agent-tools",
@@ -2694,6 +2695,25 @@ dependencies = [
  "lci-agent-types",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "lci-agent-status"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "bon",
+ "lci-agent-loop",
+ "lci-agent-step",
+ "lci-agent-testkit",
+ "lci-agent-tools",
+ "lci-agent-types",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tower",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]
