@@ -8,6 +8,44 @@
 > ([ADR-0062](adr/0062-two-tier-review-fast-auto-deep-on-demand.md)). For the per-subsystem detail see
 > the cross-links throughout and [INDEX.md](INDEX.md).
 
+> **Where this is heading — control-plane v2 (in design, [RFC-0007](rfc/0007-control-plane-v2-planes.md)).**
+> The as-built system below is a single `control-plane` binary selecting among **six** roles plus two
+> separate agent Job images — and it accreted there. v2 redraws it as **two binaries with a hard trust
+> boundary**, described next. Everything below this callout still reflects what runs today; the v2
+> sections are the target the strangler slices move toward.
+
+## Control-plane v2: two binaries, three planes (target)
+
+The redesign ([RFC-0007](rfc/0007-control-plane-v2-planes.md)) collapses the role sprawl into two
+programs you can hold in your head:
+
+- **`control-plane`** — coordination, grouped as **three planes**: *ingress* (`serve` /
+  [`a2a`](rfc/0006-a2a-agent-surface.md) / `mcp` — authenticate a trigger, make a task), *orchestration*
+  (`dispatcher` + a new `replay` role that owns durable execution-state), *egress* (`reconciler` /
+  `notifier` — deliver a result, at-least-once, isolated). Holds the **database and forge credentials**;
+  **never touches a checkout**.
+- **`agent-plane`** ([ADR-0085](adr/0085-agent-execution-plane.md)) — a single binary owning everything
+  that *does* touch a checkout, selected by **mode × host**: `{index, review, open} × {run-once, serve}`.
+  Holds the **checkout, LLM key, runner token**; **no DB, no forge creds** — it reports and acts only
+  through the mediated internal API ([ADR-0037](adr/0037-agent-acts-via-mediated-tools.md)). Topology
+  (isolated Job vs. shared Deployment) is a **per-mode deployment knob**, not an architecture bet;
+  `open`/execution is `run-once`-only because namespaces isolate files, not code.
+
+Two enabling changes make it lean and durable:
+
+- **In-house code-graph crate** ([ADR-0086](adr/0086-in-house-code-graph-crate.md)) retires the Python
+  **Graphify** dependency (the real driver of the 4 Gi index Job and the #207 image split) — tree-sitter
+  directly, a structurally-resolved graph, embeddings, PDF text, a configurable ignore-list. No Python →
+  `index` and `review` collapse into one lean binary.
+- **`CheckpointRuntime`** ([ADR-0087](adr/0087-durable-replay-checkpoint-runtime.md)) gives the agent
+  loop **resume-at-the-step** by journaling each step's result to a `durable_step` store and replaying
+  on requeue — inside the isolated Job, **without** running the loop in Restate. Restate is kept exactly
+  where it earns its keep (egress + task lifecycle), not extended into the loop.
+
+The new **`open`** mode ([ADR-0088](adr/0088-open-mode-autonomous-ticket-agent.md)) is the first
+capability the clean shape unlocks: @mention a ticket, and a sandboxed agent works it and proposes a PR
+— write access with the trust boundary intact (it commits locally; egress pushes).
+
 ## System context
 
 Lightbridge is a webhook-first GitHub App that turns pull-request activity into automated code review.

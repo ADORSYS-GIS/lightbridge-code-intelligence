@@ -1,14 +1,14 @@
 //! Read API for tasks — the dashboard's data source (ADR-0016). Bearer-protected via the `Claims`
 //! extractor (a valid OIDC access token is required).
 
+use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 use uuid::Uuid;
 
-use crate::jwt::Caller;
 use crate::AppState;
+use crate::jwt::Caller;
 
 const TASK_LIST_LIMIT: i64 = 100;
 

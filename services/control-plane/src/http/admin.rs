@@ -5,14 +5,14 @@
 //! gated by **permissions** carried in the OIDC token (`repo:read`/`repo:approve`/`repo:deny`,
 //! ADR-0023) via the [`Caller`] extractor.
 
+use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 use serde::Deserialize;
 
-use crate::jwt::Caller;
 use crate::AppState;
+use crate::jwt::Caller;
 
 #[derive(Debug, Deserialize)]
 pub struct RepoListQuery {

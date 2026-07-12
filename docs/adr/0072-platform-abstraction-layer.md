@@ -186,7 +186,7 @@ flowchart TD
   the current implementation.
 
 ### Agent Runner @-Passthrough Edge Case
-**Status:** Rare edge case, documented in `services/agent-runner/src/bootstrap/client.rs`
+**Status:** Rare edge case, documented in `services/agent-clients/src/control_plane.rs`
 
 - `authenticated_clone_url()` uses `rest.contains('@')` to detect a pre-authenticated URL. This is
   correct for GitLab's `oauth2:TOKEN@host` format, but if a GitLab subgroup path contains `@` (e.g.

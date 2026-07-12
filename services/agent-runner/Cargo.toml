@@ -10,10 +10,33 @@ description = "Lightbridge agent runner: the per-task Kubernetes Job that clones
 name = "agent-runner"
 path = "src/main.rs"
 
+# The consolidated agent execution plane (ADR-0085), selected by `mode × host`. Additive this slice:
+# the deployed image still runs `agent-runner`; the dispatcher cutover to `agent-plane` is a later
+# one-liner. Named explicitly so the binary is `agent-plane`, not the file-derived `agent_plane`.
+[[bin]]
+name = "agent-plane"
+path = "src/bin/agent_plane.rs"
+
 # Versions + features are centralized in the workspace root Cargo.toml.
 [dependencies]
 anyhow.workspace = true
-lightbridge-config = { path = "../config" }
+# Flag+env parsing for the `agent-plane` binary's `mode × host` selection (ADR-0085, src/bin/agent_plane.rs).
+clap.workspace = true
+lci-agent-clients = { path = "../agent-clients" }
+lci-agent-loop = { path = "../agent-loop" }
+# Host-agnostic live per-review status projection + read-only HTTP surface (RFC-0007 slice 5,
+# ADR-0085). Flag-gated (`LCI_STATUS_API`, default off) so it is prod-neutral until an operator
+# enables it; the loop runs identically whether or not the status server is on.
+lci-agent-status = { path = "../agent-status" }
+lci-agent-step = { path = "../agent-step" }
+lci-agent-tools = { path = "../agent-tools" }
+lci-agent-types = { path = "../agent-types" }
+lci-review-agent = { path = "../review-agent" }
+lci-config = { path = "../config" }
+# In-house code-graph crate (ADR-0086 / RFC-0007 slice 1). Wired behind a default-off flag
+# (`LCI_CODEGRAPH_GRAPH`) so this is behavior-neutral in prod until the Graphify parity cutover.
+lci-codegraph = { path = "../codegraph" }
+mimalloc.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
@@ -36,13 +59,14 @@ tree-sitter-typescript.workspace = true
 tree-sitter-python.workspace = true
 
 [dev-dependencies]
+lci-agent-testkit = { path = "../agent-testkit" }
 # HTTP mocking for the control-plane client contract tests (no live control plane).
 wiremock.workspace = true
 tempfile.workspace = true
 # ADR-0075 (#300) transport-fidelity spike ONLY — a dev/test dependency, never a runtime dep of the
 # review path. Pinned EXACTLY so the harness verdict is reproducible against one known rig release.
 # The harness (`tests/rig_fidelity.rs`) checks whether rig's OpenAI-compatible provider preserves the
-# provider-quirk fields our hand-rolled transport (`src/review/native/chat.rs`) depends on.
+# provider-quirk fields our hand-rolled transport (`lci_review_agent::model`) depends on.
 rig-core = "=0.39.0"
 # The live probe links two rustls providers in one test binary (workspace `ring` via agent-runner's
 # reqwest, plus `aws-lc-rs` pulled by rig-core → reqwest 0.13). Install one process default up front so

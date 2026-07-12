@@ -1,0 +1,32 @@
+[package]
+name = "lci-open-agent"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Open-mode (autonomous ticket→PR) assembly for the Lightbridge agent loop (ADR-0088)."
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+anyhow.workspace = true
+# The mediated channel to the control plane (ADR-0037): the open agent holds the runner token and no
+# forge/DB credential. `propose_pr` hands the branch to the control plane through this client — the
+# same trust boundary `review` uses. NO forge, NO DB dependency in this crate (the trust boundary).
+lci-agent-clients = { path = "../agent-clients" }
+lci-agent-loop = { path = "../agent-loop" }
+lci-agent-step = { path = "../agent-step" }
+lci-agent-tools = { path = "../agent-tools" }
+lci-agent-types = { path = "../agent-types" }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+lci-agent-testkit = { path = "../agent-testkit" }
+tempfile.workspace = true
+wiremock.workspace = true

@@ -19,7 +19,7 @@
 //! This is a different, lower layer than `run_epoch` (review-run idempotency on `tasks`); the two are
 //! deliberately not conflated.
 
-use a2a::{error_code, A2AError, ListTasksRequest, ListTasksResponse, Task, TaskState};
+use a2a::{A2AError, ListTasksRequest, ListTasksResponse, Task, TaskState, error_code};
 use a2a_server::task_store::{TaskStore, TaskVersion};
 use async_trait::async_trait;
 use serde_json::Value;
@@ -377,10 +377,12 @@ mod tests {
             1
         );
         // Duplicate create is rejected.
-        assert!(store
-            .create(task_with(id, "svc-a", TaskState::Submitted))
-            .await
-            .is_err());
+        assert!(
+            store
+                .create(task_with(id, "svc-a", TaskState::Submitted))
+                .await
+                .is_err()
+        );
 
         let fetched = store.get(&id.to_string()).await.unwrap().unwrap();
         assert_eq!(fetched.status.state, TaskState::Submitted);
@@ -388,11 +390,13 @@ mod tests {
         assert_eq!(meta_i64(&fetched, LB_VERSION), Some(1));
 
         // Unknown / non-uuid ids read as None (→ TaskNotFound at the handler), never an error.
-        assert!(store
-            .get(&Uuid::now_v7().to_string())
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            store
+                .get(&Uuid::now_v7().to_string())
+                .await
+                .unwrap()
+                .is_none()
+        );
         assert!(store.get("not-a-uuid").await.unwrap().is_none());
     }
 

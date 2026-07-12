@@ -13,7 +13,8 @@ path = "src/main.rs"
 # Versions + features are centralized in the workspace root Cargo.toml.
 [dependencies]
 anyhow.workspace = true
-lightbridge-config = { path = "../config" }
+lci-config = { path = "../config" }
+mimalloc.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
@@ -54,4 +55,8 @@ a2a-server-lf.workspace = true
 [dev-dependencies]
 # Test-only: generate an RSA keypair at runtime so no private key is committed (see src/jwt.rs).
 rsa.workspace = true
-rand.workspace = true
+rand_08.workspace = true
+# Test-only (ADR-0087 durable_step round-trip): the REAL journaled step-result types, so the sqlx
+# test proves `from_value::<AssistantTurn>` / `Vec<(usize, ToolOutcome)>` rehydrate through jsonb —
+# not a hand-authored Value that could drift from what the loop actually serializes.
+lci-agent-types = { path = "../agent-types" }

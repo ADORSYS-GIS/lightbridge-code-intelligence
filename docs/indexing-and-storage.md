@@ -9,6 +9,20 @@ submits everything over the internal API).
 > pgvector answers "what reads like this" (cosine-nearest chunks). They are complementary, not
 > interchangeable — see [ADR-0003](adr/0003-dual-retrieval-neo4j-pgvector.md).
 
+> **Migrating toward v2 ([RFC-0007](rfc/0007-control-plane-v2-planes.md)) — partial, in progress.**
+> The in-house Rust crate `lci-codegraph` ([ADR-0086](adr/0086-in-house-code-graph-crate.md)) that
+> will replace the Python **Graphify** tool now exists (RFC-0007 slice 1, `#354`): it owns chunking, a
+> configurable **ignore-list** (gitignore-style globs that compose with the repo's `.gitignore`),
+> bounded **PDF text extraction**, and a structurally-resolved call/reference **graph with cross-file
+> resolution for Rust** — over one tree-sitter parse, no Python. **Graphify is still the default graph
+> extractor.** The crate is wired into the runner behind a default-off flag (`LCI_CODEGRAPH_GRAPH`)
+> and, when set, produces the Rust graph in-house; all other languages stay on Graphify until they
+> reach parity (golden + side-by-side `graph.json` diff). It emits the **same**
+> `GraphNodePayload`/`GraphEdgePayload` shape, so the two datastores, the internal-API boundary, and
+> the retrieval tools described here are unchanged. Only once every actively-indexed language is at
+> parity do Graphify, the Python runtime, and the ~4 Gi index Job get retired; indexing then becomes
+> the `index` **mode** of the `agent-plane` ([ADR-0085](adr/0085-agent-execution-plane.md)).
+
 ## Who builds what
 
 ```mermaid
@@ -30,10 +44,13 @@ Two independent indexers run in the same task:
 
 - **Semantic** — our own tree-sitter chunker embeds each chunk and submits batches to the control
   plane, which upserts `code_chunks` rows (pgvector). Code: `services/agent-runner/src/indexer/mod.rs`,
-  `services/agent-runner/src/indexer/chunker.rs`, `services/agent-runner/src/indexer/embeddings.rs`.
+  `services/agent-runner/src/indexer/chunker.rs`, `services/agent-clients/src/embeddings.rs`.
 - **Structural** — Graphify (a bundled multi-grammar AST→graph extractor) emits `graph.json`; the
   runner keeps only the **code** nodes/edges and submits them; the control plane writes Neo4j. Code:
   `services/agent-runner/src/indexer/graph.rs`, `services/control-plane/src/integrations/neo4j.rs`.
+  With `LCI_CODEGRAPH_GRAPH` set, the runner instead builds the **Rust** graph in-house via
+  `lci-codegraph` and submits the identical payload shape (ADR-0086, migration in progress):
+  `services/agent-runner/src/indexer/codegraph_graph.rs`, `services/codegraph/`.
 
 The structural pass is **best-effort**: it runs after the semantic pass, and a Graphify failure (or
 an unconfigured graph store returning 503) is logged, not fatal — the task still succeeds with a

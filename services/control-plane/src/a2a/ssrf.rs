@@ -189,15 +189,15 @@ fn is_blocked(ip: IpAddr, policy: &SsrfPolicy) -> bool {
     // …and, for a v4-in-v6 transition form (mapped/compatible/NAT64/6to4/Teredo), the embedded v4
     // too, so `::ffff:<cluster-ip>` or `64:ff9b::<cluster-ip>` cannot slip past a v4 CIDR entry in
     // the extra list.
-    if let IpAddr::V6(v6) = ip {
-        if embedded_v4s(v6).into_iter().any(|v4| {
+    if let IpAddr::V6(v6) = ip
+        && embedded_v4s(v6).into_iter().any(|v4| {
             policy
                 .extra_denied_cidrs
                 .iter()
                 .any(|n| n.contains(&IpAddr::V4(v4)))
-        }) {
-            return true;
-        }
+        })
+    {
+        return true;
     }
 
     false

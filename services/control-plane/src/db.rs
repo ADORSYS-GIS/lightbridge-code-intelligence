@@ -8,8 +8,8 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
+use sqlx::postgres::PgPoolOptions;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -92,9 +92,9 @@ pub async fn reconcile_embedding_dimension(
         .await?;
     // `dimension` is an i64 from typed config (not user free-text), so formatting it into the DDL is
     // safe; the vector type width can't be a bind parameter.
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "ALTER TABLE code_chunks ALTER COLUMN embedding TYPE vector({dimension})"
-    ))
+    )))
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
@@ -344,7 +344,7 @@ pub async fn posted_findings_for_head(
 // ── ADR-0034 agent run transcript ──────────────────────────────────────────────────────────────
 
 /// One transcript entry submitted by the runner (the ingest shape; mirrors
-/// `agent-runner::bootstrap::client::TranscriptEntry`).
+/// `lci-agent-clients::TranscriptEntry`).
 #[derive(Debug, Deserialize)]
 pub struct TranscriptInput {
     pub role: String,
@@ -1026,15 +1026,29 @@ pub async fn upsert_pending_inline(
 
 /// Buffer one plain thread comment (the `add_comment` payload). Append-only; the bodies are
 /// consolidated into a single reply at flush so multiple calls don't fan out into notifications.
+///
+/// Replay dedup (ADR-0087 C2): under `CheckpointRuntime` a crash in the persist window can re-execute
+/// this write step on resume and double-append. When the caller threads the tool `call_id` (and the
+/// run's `run_epoch`, resolved server-side) the insert is idempotent on the partial unique index
+/// `(task_id, run_epoch, call_id) WHERE action = 'comment' AND call_id IS NOT NULL` via
+/// `ON CONFLICT DO NOTHING` — a replayed reply is a no-op. Legacy callers pass `call_id = None`: the
+/// partial index ignores NULL `call_id`, so those rows always append exactly as before (prod-neutral).
 pub async fn add_pending_comment(
     pool: &PgPool,
     task_id: Uuid,
+    run_epoch: Option<i32>,
+    call_id: Option<&str>,
     body: &str,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
-        "INSERT INTO pending_review_actions (task_id, action, body) VALUES ($1, 'comment', $2)",
+        "INSERT INTO pending_review_actions (task_id, action, run_epoch, call_id, body) \
+         VALUES ($1, 'comment', $2, $3, $4) \
+         ON CONFLICT (task_id, run_epoch, call_id) WHERE action = 'comment' AND call_id IS NOT NULL \
+         DO NOTHING",
     )
     .bind(task_id)
+    .bind(run_epoch)
+    .bind(call_id)
     .bind(body)
     .execute(pool)
     .await
@@ -1160,12 +1174,12 @@ pub struct TaskRow {
     pub repo_default_branch: Option<String>,
     pub repo_platform: Option<Platform>,
     /// The Kubernetes Job name (set once dispatched), so the console can stream the run's logs. `None`
-    /// before dispatch or after the Job is reaped/TTL'd. Already selected by `TASK_SELECT` (`t.*`).
+    /// before dispatch or after the Job is reaped/TTL'd.
     pub job_name: Option<String>,
     /// The runner's free-text status `detail` (#137), persisted on the last status report that carried
     /// one. `None` for a genuine clean success / runs that predate migration 0016; `Some` records why
     /// a run did not post a review (e.g. a failure reason, or a "posted nothing" no-op), so the console
-    /// can tell a silent no-op apart from a real clean review. Selected by `TASK_SELECT` (`t.*`).
+    /// can tell a silent no-op apart from a real clean review.
     pub error_detail: Option<String>,
 }
 
@@ -1174,6 +1188,7 @@ pub struct TaskRow {
 const TASK_SELECT: &str = "SELECT t.*, r.owner AS repo_owner, r.name AS repo_name, \
      r.default_branch AS repo_default_branch, r.platform AS repo_platform \
      FROM tasks t LEFT JOIN repositories r ON r.id = t.repository_id";
+
 
 /// Fields needed to create a task from a webhook event.
 pub struct NewTask {
@@ -1284,14 +1299,14 @@ async fn notify_or_log_initial_status(pool: &PgPool, id: Uuid, repository_id: i6
 /// is mid-index (ADR-0055).
 pub async fn create_task(pool: &PgPool, task: &NewTask) -> Result<Option<Uuid>, sqlx::Error> {
     let id = Uuid::new_v4();
-    let inserted: Option<(Uuid, String)> = sqlx::query_as(&format!(
+    let inserted: Option<(Uuid, String)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "INSERT INTO tasks (id, repository_id, installation_id, webhook_delivery_id, target_type, \
          target_id, command_text, base_sha, head_sha, run_epoch, tier, trigger_comment_id, status) \
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, {INITIAL_TASK_STATUS_SQL}) \
          ON CONFLICT (repository_id, target_type, target_id, command_text, head_sha, run_epoch) \
          DO NOTHING \
          RETURNING id, status"
-    ))
+    )))
     .bind(id)
     .bind(task.repository_id)
     .bind(task.installation_id)
@@ -1334,7 +1349,7 @@ pub async fn create_explicit_task(pool: &PgPool, task: &NewTask) -> Result<Uuid,
     loop {
         attempt += 1;
         let id = Uuid::new_v4();
-        let result = sqlx::query_as::<_, (Uuid, String)>(&format!(
+        let result = sqlx::query_as::<_, (Uuid, String)>(sqlx::AssertSqlSafe(format!(
             "INSERT INTO tasks (id, repository_id, installation_id, webhook_delivery_id, target_type, \
              target_id, command_text, base_sha, head_sha, tier, trigger_comment_id, run_epoch, status) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, \
@@ -1343,7 +1358,7 @@ pub async fn create_explicit_task(pool: &PgPool, task: &NewTask) -> Result<Uuid,
                   AND command_text = $7 AND head_sha IS NOT DISTINCT FROM $9), \
                {INITIAL_TASK_STATUS_SQL}) \
              RETURNING id, status"
-        ))
+        )))
         .bind(id)
         .bind(task.repository_id)
         .bind(task.installation_id)
@@ -1700,20 +1715,28 @@ pub async fn renew_lease(pool: &PgPool, id: Uuid, lease: Duration) -> Result<boo
 
 /// Most recent tasks first (the dashboard run list).
 pub async fn list_tasks(pool: &PgPool, limit: i64) -> Result<Vec<TaskRow>, sqlx::Error> {
-    let sql = format!("{TASK_SELECT} ORDER BY t.created_at DESC LIMIT $1");
-    sqlx::query_as::<_, TaskRow>(&sql)
-        .bind(limit)
-        .fetch_all(pool)
-        .await
+    sqlx::query_as::<_, TaskRow>(
+        "SELECT t.*, r.owner AS repo_owner, r.name AS repo_name, \
+         r.default_branch AS repo_default_branch \
+         FROM tasks t LEFT JOIN repositories r ON r.id = t.repository_id \
+         ORDER BY t.id DESC LIMIT $1",
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await
 }
 
 /// A single task by id.
 pub async fn get_task(pool: &PgPool, id: Uuid) -> Result<Option<TaskRow>, sqlx::Error> {
-    let sql = format!("{TASK_SELECT} WHERE t.id = $1");
-    sqlx::query_as::<_, TaskRow>(&sql)
-        .bind(id)
-        .fetch_optional(pool)
-        .await
+    sqlx::query_as::<_, TaskRow>(
+        "SELECT t.*, r.owner AS repo_owner, r.name AS repo_name, \
+         r.default_branch AS repo_default_branch \
+         FROM tasks t LEFT JOIN repositories r ON r.id = t.repository_id \
+         WHERE t.id = $1",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await
 }
 
 /// A connected repository for the dashboard's Repositories view (ADR-0016), with a small activity
@@ -2064,6 +2087,166 @@ pub async fn get_task_context(
     .await
 }
 
+// ── ADR-0087 durable-step store (the `CheckpointRuntime` journal) ────────────────────────────────
+// EXECUTION STATE only, keyed `(task_id, run_epoch, step_name)`. Written only when the agent runs
+// under `CheckpointRuntime` (opt-in). `run_epoch` is resolved server-side from the task row so the
+// agent never has to know or supply it (trust boundary — it journals `(task_id, step_name)` and the
+// control plane keys it against the run's identity tuple).
+
+/// One journaled step result: the stored JSON (as text, cast from `jsonb`) and its content hash.
+/// `result` is `None` only for a future offloaded payload (`offload_ref` — scaffolding).
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct DurableStepRow {
+    pub result: Option<String>,
+    pub content_hash: String,
+}
+
+/// Resolve a task's `run_epoch` (ADR-0076 idempotency tuple), or `None` if the task is gone. The
+/// durable-step key derives `run_epoch` from this rather than trusting the caller.
+pub async fn durable_step_run_epoch(
+    pool: &PgPool,
+    task_id: Uuid,
+) -> Result<Option<i32>, sqlx::Error> {
+    sqlx::query_scalar("SELECT run_epoch FROM tasks WHERE id = $1")
+        .bind(task_id)
+        .fetch_optional(pool)
+        .await
+}
+
+/// Does this run have ANY journaled steps (ADR-0087)? A cheap `EXISTS` used at the `running`
+/// transition to tell a *fresh* attempt (no rows → clear the review buffer, today's behavior) from a
+/// *resumed* run (rows present → the replay rehydrates write-step results, so clearing would drop
+/// findings that never get re-buffered). With `LCI_DURABLE_REPLAY` off, `durable_step` is always
+/// empty, so this is always `false` and the clear always runs — byte-identical to pre-ADR-0087.
+pub async fn has_durable_steps(
+    pool: &PgPool,
+    task_id: Uuid,
+    run_epoch: i32,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM durable_step WHERE task_id = $1 AND run_epoch = $2)",
+    )
+    .bind(task_id)
+    .bind(run_epoch)
+    .fetch_one(pool)
+    .await
+}
+
+/// Upsert one journaled step result (replay-idempotent on the `(task_id, run_epoch, step_name)` key:
+/// a re-run of the same step overwrites its row rather than duplicating). `result_json` is the
+/// serialized JSON body, cast to `jsonb` in-SQL so no extra sqlx feature is needed.
+pub async fn upsert_durable_step(
+    pool: &PgPool,
+    task_id: Uuid,
+    run_epoch: i32,
+    step_name: &str,
+    result_json: &str,
+    content_hash: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO durable_step (task_id, run_epoch, step_name, result, content_hash) \
+         VALUES ($1, $2, $3, $4::jsonb, $5) \
+         ON CONFLICT (task_id, run_epoch, step_name) \
+         DO UPDATE SET result = EXCLUDED.result, content_hash = EXCLUDED.content_hash",
+    )
+    .bind(task_id)
+    .bind(run_epoch)
+    .bind(step_name)
+    .bind(result_json)
+    .bind(content_hash)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Fetch one journaled step result, or `None` if this step has not run yet (the replay gap). Reads
+/// `result::text` so the JSON is rehydrated without the sqlx `json` feature.
+pub async fn fetch_durable_step(
+    pool: &PgPool,
+    task_id: Uuid,
+    run_epoch: i32,
+    step_name: &str,
+) -> Result<Option<DurableStepRow>, sqlx::Error> {
+    sqlx::query_as::<_, DurableStepRow>(
+        "SELECT result::text AS result, content_hash FROM durable_step \
+         WHERE task_id = $1 AND run_epoch = $2 AND step_name = $3",
+    )
+    .bind(task_id)
+    .bind(run_epoch)
+    .bind(step_name)
+    .fetch_optional(pool)
+    .await
+}
+
+/// Purge-on-success (ADR-0087): drop a completed run's whole journal in one statement once it
+/// finalizes. Idempotent — a re-finalize just deletes zero rows. Returns the rows removed.
+pub async fn purge_durable_steps(
+    pool: &PgPool,
+    task_id: Uuid,
+    run_epoch: i32,
+) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query("DELETE FROM durable_step WHERE task_id = $1 AND run_epoch = $2")
+        .bind(task_id)
+        .bind(run_epoch)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected())
+}
+
+/// TTL sweep (ADR-0087): the `replay` role's backstop for abandoned/failed/cancelled runs — delete
+/// every row older than `retention_secs`, success or failure. The caller validates `retention_secs`
+/// is `> 0` BEFORE calling (a `0` cutoff would be `now()` and sweep in-flight state); this function
+/// trusts that guard. Returns the rows removed.
+pub async fn sweep_durable_steps(pool: &PgPool, retention_secs: f64) -> Result<u64, sqlx::Error> {
+    // Belt-and-suspenders over the load-time guard: a non-positive cutoff would resolve to `now()`
+    // (or the future) and delete in-flight state. Refuse to sweep rather than trust the caller.
+    if retention_secs <= 0.0 {
+        return Ok(0);
+    }
+    let result = sqlx::query(
+        "DELETE FROM durable_step WHERE created_at < now() - make_interval(secs => $1)",
+    )
+    .bind(retention_secs)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}
+
+/// Store one open-mode branch patch in the offload table (ADR-0088 offload rule), keyed by its
+/// content hash. Idempotent (`ON CONFLICT DO NOTHING`), so a replayed `propose_pr` re-stores the same
+/// bytes without duplicating — the outbox `pr_open` intent then carries only the hash, not the patch.
+pub async fn put_pr_open_blob(
+    pool: &PgPool,
+    content_hash: &str,
+    task_id: Uuid,
+    run_epoch: i32,
+    patch: &[u8],
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO pr_open_blob (content_hash, task_id, run_epoch, patch) \
+         VALUES ($1, $2, $3, $4) ON CONFLICT (content_hash) DO NOTHING",
+    )
+    .bind(content_hash)
+    .bind(task_id)
+    .bind(run_epoch)
+    .bind(patch)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Rehydrate an offloaded open-mode branch patch by its content hash (the egress plane reads this
+/// before pushing + verifies the bytes still hash to the key). `None` if the blob was pruned.
+pub async fn get_pr_open_blob(
+    pool: &PgPool,
+    content_hash: &str,
+) -> Result<Option<Vec<u8>>, sqlx::Error> {
+    sqlx::query_scalar("SELECT patch FROM pr_open_blob WHERE content_hash = $1")
+        .bind(content_hash)
+        .fetch_optional(pool)
+        .await
+}
+
 /// Statuses the runner is allowed to report. Transitioning into a terminal one stamps
 /// `completed_at` and releases the lease; `running` (re)stamps `started_at`. Anything else is
 /// rejected by the handler before reaching here.
@@ -2338,11 +2521,6 @@ pub struct PushConfigRow {
     pub created_by: String,
 }
 
-/// Column list shared by the push-config point/list reads, matching [`PushConfigRow`]'s fields.
-const PUSH_CONFIG_SELECT: &str =
-    "SELECT config_id, a2a_task_id, url, token_enc, delivered_seq, attempts, state, created_by \
-     FROM a2a_push_configs";
-
 /// Insert a new push-notification config for a task (ADR-0079 §1). The caller MUST already have proven
 /// ownership of `a2a_task_id` (the handler does, via `load_owned`, before calling). `delivered_seq`
 /// (0), `attempts` (0), `next_attempt_at` (`now()`), and `state` (`active`) take their table defaults.
@@ -2374,11 +2552,14 @@ pub async fn get_push_config(
     pool: &PgPool,
     config_id: Uuid,
 ) -> Result<Option<PushConfigRow>, sqlx::Error> {
-    let sql = format!("{PUSH_CONFIG_SELECT} WHERE config_id = $1");
-    sqlx::query_as::<_, PushConfigRow>(&sql)
-        .bind(config_id)
-        .fetch_optional(pool)
-        .await
+    sqlx::query_as::<_, PushConfigRow>(
+        "SELECT config_id, a2a_task_id, url, token_enc, delivered_seq, attempts, state, created_by \
+         FROM a2a_push_configs \
+         WHERE config_id = $1",
+    )
+    .bind(config_id)
+    .fetch_optional(pool)
+    .await
 }
 
 /// List every push config registered on a task, oldest first. Caller-scoping is the handler's job
@@ -2387,13 +2568,14 @@ pub async fn list_push_configs_for_task(
     pool: &PgPool,
     a2a_task_id: Uuid,
 ) -> Result<Vec<PushConfigRow>, sqlx::Error> {
-    let sql = format!(
-        "{PUSH_CONFIG_SELECT} WHERE a2a_task_id = $1 ORDER BY created_at ASC, config_id ASC"
-    );
-    sqlx::query_as::<_, PushConfigRow>(&sql)
-        .bind(a2a_task_id)
-        .fetch_all(pool)
-        .await
+    sqlx::query_as::<_, PushConfigRow>(
+        "SELECT config_id, a2a_task_id, url, token_enc, delivered_seq, attempts, state, created_by \
+         FROM a2a_push_configs \
+         WHERE a2a_task_id = $1 ORDER BY created_at ASC, config_id ASC",
+    )
+    .bind(a2a_task_id)
+    .fetch_all(pool)
+    .await
 }
 
 /// Delete a push config, scoped to its owning task in one query. Returns whether a row was removed
@@ -2575,14 +2757,91 @@ pub async fn schedule_push_retry(
     .map(|_| ())
 }
 
+/// Count the **active** push configs a caller has registered on one task (ADR-0079 P7). The handler
+/// enforces a per-caller, per-task cap with this before an `insert_push_config`, so a single caller
+/// cannot register an unbounded fan-out of webhooks on one task. Dead-lettered (`disabled`) configs
+/// are excluded so a caller can always replace ones that were disabled by repeated delivery failure.
+/// Caller-scoping of the *task* is the handler's job (it `load_owned`s first); this narrows to the
+/// caller's own configs via `created_by` so one caller's configs never count against another's.
+pub async fn count_active_push_configs_for_caller(
+    pool: &PgPool,
+    a2a_task_id: Uuid,
+    created_by: &str,
+) -> Result<i64, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM a2a_push_configs \
+         WHERE a2a_task_id = $1 AND created_by = $2 AND state = 'active'",
+    )
+    .bind(a2a_task_id)
+    .bind(created_by)
+    .fetch_one(pool)
+    .await
+}
+
+/// Retention sweep for terminal A2A task mappings (ADR-0077 §S3 / #321). `a2a_tasks` (and, via
+/// `ON DELETE CASCADE`, its `a2a_task_events` and `a2a_push_configs`) is otherwise append-only — every
+/// A2A submission leaves a permanent mapping row plus its whole event log. Left alone it grows without
+/// bound. This deletes **terminal** mappings older than `ttl_days`, a bounded `batch` per call so one
+/// sweep never locks the table for long; the dispatcher's slow GC tick calls it repeatedly.
+///
+/// A mapping is treated as terminal when its append-only event log is **frozen** — a `final = true`
+/// event exists (every COMPLETED / FAILED / CANCELED / REJECTED outcome appends one; ADR-0077) — OR its
+/// last-persisted snapshot `state` is a terminal wire value (the belt-and-braces case where a
+/// best-effort terminal-event append was lost, e.g. a REJECTED gate outcome). A still-running
+/// (SUBMITTED / WORKING) mapping has neither and is **never** swept, whatever its age — the load-bearing
+/// safety property (retention must never reap a live task out from under a subscriber/poller). The age
+/// is anchored on `created_at`: an A2A review's whole lifetime is bounded by the deep-run cap (≤ ~2 h,
+/// ADR-0062) plus the 3 h stream backstop, so `created_at` is within hours of completion while `ttl_days`
+/// is in days — the distinction is immaterial and `created_at` cannot be newer than the true completion.
+///
+/// A non-positive `ttl_days` is a **skip** (returns 0), never "delete everything" — `now() -
+/// make_interval(days => 0)` is `now()`, which would match every terminal row. A non-positive `batch`
+/// likewise skips. Returns the number of mappings deleted.
+pub async fn sweep_terminal_a2a_tasks(
+    pool: &PgPool,
+    ttl_days: i64,
+    batch: i64,
+) -> Result<u64, sqlx::Error> {
+    if ttl_days <= 0 || batch <= 0 {
+        return Ok(0);
+    }
+    let deleted = sqlx::query(
+        "DELETE FROM a2a_tasks \
+         WHERE a2a_task_id IN ( \
+           SELECT t.a2a_task_id FROM a2a_tasks t \
+           WHERE t.created_at < now() - make_interval(days => $1::int) \
+             AND ( \
+               EXISTS (SELECT 1 FROM a2a_task_events e \
+                       WHERE e.a2a_task_id = t.a2a_task_id AND e.final) \
+               OR t.state IN ( \
+                 'TASK_STATE_COMPLETED', 'TASK_STATE_FAILED', \
+                 'TASK_STATE_CANCELED', 'TASK_STATE_REJECTED' \
+               ) \
+             ) \
+           ORDER BY t.created_at \
+           LIMIT $2 \
+         )",
+    )
+    .bind(ttl_days)
+    .bind(batch)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(deleted)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+    // The REAL journaled step-result types (ADR-0087) — used by the durable_step round-trip so the
+    // test proves `from_value::<T>` rehydration through jsonb, not a hand-authored Value.
+    use lci_agent_types::{AssistantTurn, FunctionCallReq, ToolCallReq, ToolOutcome};
 
     // Integration tests: `#[sqlx::test]` provisions a fresh database, runs the migrations, and hands
     // us a pool. Requires a reachable Postgres via `DATABASE_URL` (see `compose.yaml`); skipped when
-    // none is configured (CI builds images but runs no Rust test job today).
+    // none is configured locally. CI runs them against a live Postgres — see
+    // `.github/workflows/control-plane-tests.yml` (`cargo test -p control-plane` with a postgres service).
 
     /// The dedup contract that lets the control plane run multiple replicas: the `delivery_id`
     /// PRIMARY KEY + `ON CONFLICT DO NOTHING` means a replayed GitHub delivery is detected as a
@@ -2777,9 +3036,11 @@ mod tests {
             .await
             .unwrap()
             .expect("task");
-        assert!(!has_responded_or_pending_content(&pool, task2)
-            .await
-            .unwrap());
+        assert!(
+            !has_responded_or_pending_content(&pool, task2)
+                .await
+                .unwrap()
+        );
         upsert_review(
             &pool,
             task2,
@@ -2794,9 +3055,11 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(has_responded_or_pending_content(&pool, task2)
-            .await
-            .unwrap());
+        assert!(
+            has_responded_or_pending_content(&pool, task2)
+                .await
+                .unwrap()
+        );
     }
 
     /// ADR-0059: an enqueued intent is claimable in order, idempotent on `dedup_key`, and the
@@ -2876,6 +3139,81 @@ mod tests {
         );
     }
 
+    /// ADR-0088 merge bar: replaying the terminal `propose_pr` step opens EXACTLY ONE PR intent. The
+    /// dedup key `(task_id, run_epoch)` makes the outbox insert idempotent, and the offloaded branch
+    /// blob is idempotent on its content hash — so an at-least-once/replayed proposal never opens a
+    /// duplicate PR and never duplicates the offloaded patch.
+    #[sqlx::test]
+    async fn pr_open_intent_is_dedup_keyed_by_task_and_run_epoch(pool: PgPool) {
+        let repo_id = seed(&pool).await;
+        let task = create_task(&pool, &pr_task(repo_id, "open"))
+            .await
+            .unwrap()
+            .expect("task");
+        let run_epoch = 0;
+        let key = crate::outbox::pr_open_dedup_key(task, run_epoch);
+        let payload = serde_json::json!({
+            "branch": "open/357", "title": "Add feature", "body": "…", "content_hash": "abc123",
+        });
+
+        // Offload the patch twice (a replay re-stores the same bytes) — idempotent on content hash.
+        put_pr_open_blob(&pool, "abc123", task, run_epoch, b"PATCH-BYTES")
+            .await
+            .unwrap();
+        put_pr_open_blob(&pool, "abc123", task, run_epoch, b"PATCH-BYTES")
+            .await
+            .unwrap();
+        assert_eq!(
+            get_pr_open_blob(&pool, "abc123").await.unwrap().as_deref(),
+            Some(&b"PATCH-BYTES"[..]),
+            "the offloaded branch rehydrates by content hash"
+        );
+
+        // First proposal enqueues the intent; a replay with the SAME (task, run_epoch) key is a no-op.
+        assert!(
+            enqueue_outbox_post(
+                &pool,
+                Platform::GitHub,
+                Some(task),
+                99,
+                "o",
+                "r",
+                "pr_open",
+                &payload,
+                &key,
+            )
+            .await
+            .unwrap(),
+            "first propose_pr enqueues the pr_open intent"
+        );
+        assert!(
+            !enqueue_outbox_post(
+                &pool,
+                Platform::GitHub,
+                Some(task),
+                99,
+                "o",
+                "r",
+                "pr_open",
+                &payload,
+                &key,
+            )
+            .await
+            .unwrap(),
+            "a replayed propose_pr with the same (task, run_epoch) key opens no second PR"
+        );
+
+        // Exactly one pr_open row exists for this task.
+        let count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM outbox WHERE task_id = $1 AND kind = 'pr_open'",
+        )
+        .bind(task)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 1, "replay must open exactly one PR intent");
+    }
+
     /// RFC-0005 / ADR-0074 — the `PlatformEgress` virtual object's DB helpers: the status-guarded load,
     /// the id-by-dedup_key bridge, and the unconditional dead-letter. Verified against the same `outbox`
     /// row lifecycle the drain uses, so both egress paths agree on what "pending / settled" means.
@@ -2929,10 +3267,12 @@ mod tests {
             "a posted row is not pending → the handler skips it"
         );
         // … and neither does an absent id.
-        assert!(load_pending_outbox_row(&pool, 10_000_000)
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            load_pending_outbox_row(&pool, 10_000_000)
+                .await
+                .unwrap()
+                .is_none()
+        );
 
         // Dead-letter: park a *pending* row `failed` unconditionally (the engine's retry ceiling already
         // fired), recording the error and dropping it from the claim set — mirroring the drain's terminal
@@ -3103,18 +3443,22 @@ mod tests {
         let findings = serde_json::json!([]);
 
         // Nothing yet → the clean branch may proceed.
-        assert!(!has_review_intent_or_posted_review(&pool, task)
-            .await
-            .unwrap());
+        assert!(
+            !has_review_intent_or_posted_review(&pool, task)
+                .await
+                .unwrap()
+        );
 
         // A silent-clean persisted row (no platform_review_id) does NOT trip the guard — re-running the
         // clean path is harmless (insert-if-absent no-ops, verdict key no-ops).
         insert_review_if_absent(&pool, task, "clean", "body", 0, 0, 0, &findings)
             .await
             .unwrap();
-        assert!(!has_review_intent_or_posted_review(&pool, task)
-            .await
-            .unwrap());
+        assert!(
+            !has_review_intent_or_posted_review(&pool, task)
+                .await
+                .unwrap()
+        );
 
         // The reconciler upserts the POSTED copy (platform_review_id set) → guard trips…
         upsert_review(
@@ -3131,9 +3475,11 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(has_review_intent_or_posted_review(&pool, task)
-            .await
-            .unwrap());
+        assert!(
+            has_review_intent_or_posted_review(&pool, task)
+                .await
+                .unwrap()
+        );
 
         // …and a late clean-path insert is a no-op: the posted row keeps its platform_review_id.
         insert_review_if_absent(&pool, task, "clean", "body", 0, 0, 0, &findings)
@@ -3165,9 +3511,11 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(has_review_intent_or_posted_review(&pool, task2)
-            .await
-            .unwrap());
+        assert!(
+            has_review_intent_or_posted_review(&pool, task2)
+                .await
+                .unwrap()
+        );
     }
 
     /// #219 review: the failure-notice gate must treat a still-in-flight review intent as "responding",
@@ -3398,9 +3746,11 @@ mod tests {
         assert_eq!(embedding_dim(&pool).await, 4096);
 
         // A change without the flag fails loud (no destruction).
-        assert!(reconcile_embedding_dimension(&pool, 1536, false)
-            .await
-            .is_err());
+        assert!(
+            reconcile_embedding_dimension(&pool, 1536, false)
+                .await
+                .is_err()
+        );
         assert_eq!(
             embedding_dim(&pool).await,
             4096,
@@ -3557,10 +3907,12 @@ mod tests {
         let pending = list_repositories(&pool, Some("pending")).await.unwrap();
         assert_eq!(pending.len(), 2);
         assert!(pending.iter().all(|r| r.status == "pending" && !r.active));
-        assert!(list_repositories(&pool, Some("approved"))
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            list_repositories(&pool, Some("approved"))
+                .await
+                .unwrap()
+                .is_empty()
+        );
 
         // Approve → approved + active + records the approver; the gate opens.
         let row = set_repository_status_by_id(&pool, id, "approved", Some("alice"))
@@ -3594,11 +3946,13 @@ mod tests {
                 .unwrap(),
             "re-registering a disabled repo re-pends it"
         );
-        assert!(list_repositories(&pool, Some("pending"))
-            .await
-            .unwrap()
-            .iter()
-            .any(|r| r.platform_repo_id == 5555));
+        assert!(
+            list_repositories(&pool, Some("pending"))
+                .await
+                .unwrap()
+                .iter()
+                .any(|r| r.platform_repo_id == 5555)
+        );
         // Re-registering an APPROVED repo is a no-op (must not revert it).
         set_repository_status_by_id(&pool, id, "approved", Some("alice"))
             .await
@@ -4168,9 +4522,10 @@ mod tests {
         .unwrap();
         let fb = get_feedback(&pool, task_id).await.unwrap();
         assert_eq!(fb.len(), 2);
-        assert!(fb
-            .iter()
-            .any(|r| r.reactor == "alice" && r.reaction == "+1"));
+        assert!(
+            fb.iter()
+                .any(|r| r.reactor == "alice" && r.reaction == "+1")
+        );
         assert_eq!(
             fb[0].file.as_deref(),
             Some("a.rs"),
@@ -4193,9 +4548,10 @@ mod tests {
         let fb = get_feedback(&pool, task_id).await.unwrap();
         assert_eq!(fb.len(), 2);
         assert!(!fb.iter().any(|r| r.reactor == "alice"), "un-react removed");
-        assert!(fb
-            .iter()
-            .any(|r| r.reactor == "carol" && r.reaction == "heart"));
+        assert!(
+            fb.iter()
+                .any(|r| r.reactor == "carol" && r.reaction == "heart")
+        );
 
         // Empty cycle (all reactions gone) clears the comment's feedback.
         reconcile_comment_feedback(&pool, task_id, 555, "inline", &[])
@@ -4480,10 +4836,10 @@ mod tests {
         .await
         .unwrap();
         // Comments append; the summary is single-valued (last write wins).
-        add_pending_comment(&pool, task_id, "first comment")
+        add_pending_comment(&pool, task_id, None, None, "first comment")
             .await
             .unwrap();
-        add_pending_comment(&pool, task_id, "second comment")
+        add_pending_comment(&pool, task_id, None, None, "second comment")
             .await
             .unwrap();
         upsert_pending_summary(&pool, task_id, "draft summary")
@@ -4510,6 +4866,125 @@ mod tests {
         clear_pending_review(&pool, task_id).await.unwrap();
         let after = load_pending_review(&pool, task_id).await.unwrap();
         assert!(after.is_empty(), "buffer cleared on restart/flush");
+    }
+
+    /// ADR-0087 Gap 1 (resume-aware buffer): the `running` transition only clears the review buffer
+    /// on a *genuinely fresh* attempt (no journaled steps). A *resumed* run (a `durable_step` row
+    /// exists for the same `(task, run_epoch)`) replays its write-step results instead of
+    /// re-executing them, so clearing would drop findings that never get re-buffered. This drives the
+    /// real handler decision (`is_fresh_attempt` + the conditional `clear_pending_review`) end to end.
+    #[sqlx::test]
+    async fn running_transition_preserves_buffer_on_resume_but_clears_on_fresh(pool: PgPool) {
+        let repo_id = seed(&pool).await;
+        let task = claim_after_create(&pool, repo_id, "head-resume").await;
+        let run_epoch = durable_step_run_epoch(&pool, task).await.unwrap().unwrap();
+
+        // Buffer one finding, then simulate a crash-and-resume: a journaled write step exists for the
+        // SAME run_epoch. The resumed runner reports `running`.
+        upsert_pending_inline(
+            &pool,
+            task,
+            "a.rs",
+            3,
+            Some("t"),
+            Some("P1"),
+            Some("correctness"),
+            None,
+            "a finding from the prior attempt",
+        )
+        .await
+        .unwrap();
+        upsert_durable_step(&pool, task, run_epoch, "tools:5", "{\"ok\":true}", "hash-5")
+            .await
+            .unwrap();
+
+        // The handler gate: a resumed run is NOT a fresh attempt, so the clear is SKIPPED.
+        assert!(
+            !crate::http::internal::is_fresh_attempt(&pool, task).await,
+            "a run with journaled steps is a resume, not a fresh attempt"
+        );
+        if crate::http::internal::is_fresh_attempt(&pool, task).await {
+            clear_pending_review(&pool, task).await.unwrap();
+        }
+        let after_resume = load_pending_review(&pool, task).await.unwrap();
+        assert_eq!(
+            after_resume.inline.len(),
+            1,
+            "the resumed run keeps the buffered finding (replay does not re-buffer it)"
+        );
+
+        // Inverse: with NO durable steps (the flag-off / first-attempt world) the clear runs — exactly
+        // today's ADR-0037 behavior.
+        purge_durable_steps(&pool, task, run_epoch).await.unwrap();
+        assert!(
+            crate::http::internal::is_fresh_attempt(&pool, task).await,
+            "with no journaled steps the run is a fresh attempt"
+        );
+        if crate::http::internal::is_fresh_attempt(&pool, task).await {
+            clear_pending_review(&pool, task).await.unwrap();
+        }
+        let after_fresh = load_pending_review(&pool, task).await.unwrap();
+        assert!(
+            after_fresh.is_empty(),
+            "a fresh attempt clears the buffer (byte-identical to pre-ADR-0087)"
+        );
+    }
+
+    /// ADR-0087 Gap 2 (`add_comment` dedup): a replayed reply with the same `(task, run_epoch,
+    /// call_id)` is a no-op (one row); a different `call_id` is a distinct reply (two rows); a NULL
+    /// `call_id` (legacy / flag-off path) still appends unconditionally (no dedup).
+    #[sqlx::test]
+    async fn add_pending_comment_dedups_on_call_id(pool: PgPool) {
+        let repo_id = seed(&pool).await;
+        let task = claim_after_create(&pool, repo_id, "head-dedup").await;
+        let run_epoch = durable_step_run_epoch(&pool, task).await.unwrap().unwrap();
+
+        let count = |pool: PgPool| async move {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM pending_review_actions WHERE action = 'comment'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        };
+
+        // Same call_id twice → the replay is a no-op.
+        add_pending_comment(&pool, task, Some(run_epoch), Some("call_1"), "first")
+            .await
+            .unwrap();
+        add_pending_comment(
+            &pool,
+            task,
+            Some(run_epoch),
+            Some("call_1"),
+            "first (replayed)",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            count(pool.clone()).await,
+            1,
+            "a replayed reply with the same call_id dedups to one row"
+        );
+
+        // A different call_id is a genuinely distinct reply.
+        add_pending_comment(&pool, task, Some(run_epoch), Some("call_2"), "second")
+            .await
+            .unwrap();
+        assert_eq!(count(pool.clone()).await, 2, "a different call_id appends");
+
+        // Legacy path: NULL call_id is excluded from the partial index → always appends.
+        add_pending_comment(&pool, task, None, None, "legacy-a")
+            .await
+            .unwrap();
+        add_pending_comment(&pool, task, None, None, "legacy-b")
+            .await
+            .unwrap();
+        assert_eq!(
+            count(pool.clone()).await,
+            4,
+            "NULL-call_id comments append unconditionally (no dedup)"
+        );
     }
 
     /// Phase 2 (ADR-0043): the refute pass retracts one buffered inline finding by (file, line),
@@ -4564,9 +5039,11 @@ mod tests {
         let repo_id = seed(&pool).await;
         let task = claim_after_create(&pool, repo_id, "head1").await;
 
-        assert!(set_task_status(&pool, task, "succeeded", None)
-            .await
-            .unwrap());
+        assert!(
+            set_task_status(&pool, task, "succeeded", None)
+                .await
+                .unwrap()
+        );
 
         let row: (String, Option<OffsetDateTime>, Option<String>) =
             sqlx::query_as("SELECT status, completed_at, lease_owner FROM tasks WHERE id = $1")
@@ -4594,14 +5071,16 @@ mod tests {
         let task = claim_after_create(&pool, repo_id, "head1").await;
 
         // A report carrying a detail records it.
-        assert!(set_task_status(
-            &pool,
-            task,
-            "succeeded",
-            Some("Review produced no comments to post.")
-        )
-        .await
-        .unwrap());
+        assert!(
+            set_task_status(
+                &pool,
+                task,
+                "succeeded",
+                Some("Review produced no comments to post.")
+            )
+            .await
+            .unwrap()
+        );
         let detail: Option<String> =
             sqlx::query_scalar("SELECT error_detail FROM tasks WHERE id = $1")
                 .bind(task)
@@ -4614,9 +5093,11 @@ mod tests {
         );
 
         // A later report without a detail must not erase the recorded reason.
-        assert!(set_task_status(&pool, task, "succeeded", None)
-            .await
-            .unwrap());
+        assert!(
+            set_task_status(&pool, task, "succeeded", None)
+                .await
+                .unwrap()
+        );
         let preserved: Option<String> =
             sqlx::query_scalar("SELECT error_detail FROM tasks WHERE id = $1")
                 .bind(task)
@@ -4852,6 +5333,248 @@ mod tests {
             in_use_commits(&pool, repo_id).await.unwrap(),
             vec!["review-head".to_string()],
             "index task's (NULL) head_sha is not in the keep-set — the gate is its only protection"
+        );
+    }
+
+    // ── ADR-0087 durable-step store: the PRODUCTION journal path ─────────────────────────────────
+    // The resume proof (agent-clients `InMemoryStepStore` tests) never touches Postgres. These tests
+    // exercise the real `ControlPlaneStepStore` backing: the `jsonb` write + `result::text` read
+    // round-trip, the `(task_id, run_epoch, step_name)` keying, and the replay-idempotent upsert.
+
+    /// A realistic `AssistantTurn` (an `llm_turn:{n}` step result) built from the REAL loop type, so
+    /// the round-trip is asserted against exactly what the loop serializes — including the serde
+    /// contract the loop relies on: `ToolCallReq.kind` renames to `"type"` and `extra_content: None`
+    /// is skipped. A hand-authored `Value` would silently drift from this.
+    fn assistant_turn_result() -> AssistantTurn {
+        AssistantTurn {
+            content: Some("Looking at the diff now.".into()),
+            tool_calls: vec![ToolCallReq {
+                id: "call_abc".into(),
+                kind: "function".into(),
+                function: FunctionCallReq {
+                    name: "read_file".into(),
+                    arguments: "{\"path\":\"src/db.rs\"}".into(),
+                },
+                extra_content: None,
+            }],
+        }
+    }
+
+    /// A realistic `tools:{n}` step result: the loop journals `T = Vec<(usize, ToolOutcome)>` (the
+    /// ordered read-batch outcomes). `ToolOutcome` is externally tagged, so this serializes to
+    /// `[[0,{"Continue":"…"}]]` — a shape a hand-written literal is easy to get wrong.
+    fn tool_output_result() -> Vec<(usize, ToolOutcome)> {
+        vec![(0, ToolOutcome::Continue("fn main() {}\n".into()))]
+    }
+
+    /// The gate #363 P1: the entire resume proof runs on `InMemoryStepStore`; this drives the REAL
+    /// Postgres store with the REAL journaled types. For each of `AssistantTurn` (`llm_turn`) and
+    /// `Vec<(usize, ToolOutcome)>` (`tools`): serialize via `to_value` exactly as the loop does, upsert,
+    /// fetch back, and assert BOTH (a) the fetched `Value` semantically equals the journaled `Value`
+    /// (jsonb normalizes whitespace/key order/number formatting, so this is *not* a raw-string check),
+    /// AND (b) `serde_json::from_value::<T>(fetched)` rehydrates to the ORIGINAL typed value — the exact
+    /// call `CheckpointRuntime::step` makes on replay. (b) is the assertion that catches a type which
+    /// survives `Value`-equality but breaks typed rehydration through jsonb.
+    #[sqlx::test]
+    async fn durable_step_round_trips_a_real_step_result_through_jsonb(pool: PgPool) {
+        let task_id = Uuid::new_v4();
+        let run_epoch = 3;
+
+        // ── llm_turn: AssistantTurn ──────────────────────────────────────────────────────────────
+        let turn = assistant_turn_result();
+        let turn_value = serde_json::to_value(&turn).unwrap();
+        upsert_durable_step(
+            &pool,
+            task_id,
+            run_epoch,
+            "llm_turn:0",
+            &serde_json::to_string(&turn_value).unwrap(),
+            "sha256:turn",
+        )
+        .await
+        .expect("upsert the journaled AssistantTurn");
+
+        let fetched = fetch_durable_step(&pool, task_id, run_epoch, "llm_turn:0")
+            .await
+            .expect("fetch the journaled step")
+            .expect("the step was journaled, so it must be found");
+        assert_eq!(
+            fetched.content_hash, "sha256:turn",
+            "the content hash round-trips verbatim"
+        );
+        let fetched_value: serde_json::Value =
+            serde_json::from_str(fetched.result.as_deref().expect("result is set"))
+                .expect("result::text is valid JSON");
+        assert_eq!(
+            fetched_value, turn_value,
+            "(a) the AssistantTurn Value round-trips semantically through jsonb"
+        );
+        let rehydrated: AssistantTurn = serde_json::from_value(fetched_value).expect(
+            "(b) result::text rehydrates into the real AssistantTurn — the step<T> replay call",
+        );
+        assert_eq!(
+            rehydrated, turn,
+            "(b) from_value::<AssistantTurn> yields the original typed value (what CheckpointRuntime::step does)"
+        );
+
+        // ── tools: Vec<(usize, ToolOutcome)> ─────────────────────────────────────────────────────
+        let outputs = tool_output_result();
+        let outputs_value = serde_json::to_value(&outputs).unwrap();
+        upsert_durable_step(
+            &pool,
+            task_id,
+            run_epoch,
+            "tools:0",
+            &serde_json::to_string(&outputs_value).unwrap(),
+            "sha256:tools",
+        )
+        .await
+        .expect("upsert the journaled tool outputs");
+
+        let fetched_tools = fetch_durable_step(&pool, task_id, run_epoch, "tools:0")
+            .await
+            .unwrap()
+            .expect("tools:0 is journaled");
+        let fetched_tools_value: serde_json::Value =
+            serde_json::from_str(fetched_tools.result.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            fetched_tools_value, outputs_value,
+            "(a) the tool-output Vec Value round-trips semantically through jsonb"
+        );
+        let rehydrated_tools: Vec<(usize, ToolOutcome)> = serde_json::from_value(
+            fetched_tools_value,
+        )
+        .expect(
+            "(b) result::text rehydrates into Vec<(usize, ToolOutcome)> — the step<T> replay call",
+        );
+        assert_eq!(
+            rehydrated_tools, outputs,
+            "(b) from_value::<Vec<(usize, ToolOutcome)>> yields the original typed outputs"
+        );
+    }
+
+    /// The `(task_id, run_epoch, step_name)` keying + the replay-idempotent upsert: a wrong tuple
+    /// component finds nothing (the replay gap where the loop continues live), and re-upserting the
+    /// same key overwrites in place rather than duplicating (`ON CONFLICT DO UPDATE`).
+    #[sqlx::test]
+    async fn durable_step_keys_on_the_run_identity_tuple_and_upsert_is_idempotent(pool: PgPool) {
+        let task_id = Uuid::new_v4();
+        let run_epoch = 1;
+
+        let turn = assistant_turn_result();
+        let turn_value = serde_json::to_value(&turn).unwrap();
+        upsert_durable_step(
+            &pool,
+            task_id,
+            run_epoch,
+            "llm_turn:0",
+            &serde_json::to_string(&turn_value).unwrap(),
+            "hash-turn",
+        )
+        .await
+        .unwrap();
+        let tools_value = serde_json::to_value(tool_output_result()).unwrap();
+        upsert_durable_step(
+            &pool,
+            task_id,
+            run_epoch,
+            "tools:0",
+            &serde_json::to_string(&tools_value).unwrap(),
+            "hash-tools",
+        )
+        .await
+        .unwrap();
+
+        // Each step is keyed independently by name.
+        let got_turn = fetch_durable_step(&pool, task_id, run_epoch, "llm_turn:0")
+            .await
+            .unwrap()
+            .expect("llm_turn:0 is journaled");
+        let rehydrated: AssistantTurn =
+            serde_json::from_str(got_turn.result.as_deref().unwrap()).unwrap();
+        assert_eq!(rehydrated, turn, "the right step returns its own result");
+
+        // A wrong tuple component → the replay gap (Ok(None), continue live), not a spurious hit.
+        assert!(
+            fetch_durable_step(&pool, task_id, run_epoch, "llm_turn:99")
+                .await
+                .unwrap()
+                .is_none(),
+            "an un-journaled step name is a gap, not a hit"
+        );
+        assert!(
+            fetch_durable_step(&pool, task_id, run_epoch + 1, "llm_turn:0")
+                .await
+                .unwrap()
+                .is_none(),
+            "a different run_epoch is a different run — no cross-epoch bleed"
+        );
+        assert!(
+            fetch_durable_step(&pool, Uuid::new_v4(), run_epoch, "llm_turn:0")
+                .await
+                .unwrap()
+                .is_none(),
+            "a different task_id sees none of this run's journal"
+        );
+
+        // Re-running the same step overwrites its row (replay-idempotent) rather than duplicating.
+        let revised = json!({ "content": "revised", "tool_calls": [] });
+        upsert_durable_step(
+            &pool,
+            task_id,
+            run_epoch,
+            "llm_turn:0",
+            &serde_json::to_string(&revised).unwrap(),
+            "hash-revised",
+        )
+        .await
+        .unwrap();
+        let after = fetch_durable_step(&pool, task_id, run_epoch, "llm_turn:0")
+            .await
+            .unwrap()
+            .expect("still present after the re-upsert");
+        assert_eq!(
+            after.content_hash, "hash-revised",
+            "the upsert overwrote in place"
+        );
+        let rows: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM durable_step WHERE task_id = $1 AND run_epoch = $2 AND step_name = $3",
+        )
+        .bind(task_id)
+        .bind(run_epoch)
+        .bind("llm_turn:0")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            rows, 1,
+            "ON CONFLICT overwrote the row — it did not duplicate"
+        );
+    }
+
+    /// `durable_step_run_epoch` resolves the run's `run_epoch` from the task row (the server-side
+    /// derivation that keeps the agent from supplying its own epoch — the trust boundary), and returns
+    /// `None` for an unknown task.
+    #[sqlx::test]
+    async fn durable_step_run_epoch_resolves_from_the_task_row(pool: PgPool) {
+        let repo_id = seed(&pool).await;
+        let task_id = create_task(&pool, &pr_task(repo_id, "head1"))
+            .await
+            .unwrap()
+            .expect("the review task");
+
+        let epoch = durable_step_run_epoch(&pool, task_id)
+            .await
+            .unwrap()
+            .expect("a live task resolves its run_epoch");
+        assert_eq!(epoch, 0, "pr_task seeds run_epoch 0");
+
+        assert!(
+            durable_step_run_epoch(&pool, Uuid::new_v4())
+                .await
+                .unwrap()
+                .is_none(),
+            "an unknown task has no run_epoch"
         );
     }
 }

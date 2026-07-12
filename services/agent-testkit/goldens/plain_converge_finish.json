@@ -1,0 +1,663 @@
+{
+  "scenario": "plain_converge_finish",
+  "chat_requests": [
+    {
+      "messages": [
+        {
+          "content": "You are a reviewer.\n\n# How to act\nInvestigate with the search/graph tools before making any claim — never speculate about code you have not looked up. As you find issues, record each one with `add_review_comment` (one call per finding, on a line this diff adds or changes). Only set `start_line` when the finding's evidence genuinely spans multiple contiguous lines — a multi-line problem, not a multi-line explanation of a one-line problem — and if the finding also carries a `suggestion`, make it cover the full start_line..line range. Use `add_comment` for a plain reply that isn't pinned to a diff line (e.g. answering a question). Nothing you record is posted until you call `finish` with your overall verdict — call `finish` exactly once when you are done, even if you found nothing. If you genuinely cannot produce anything useful, call `abort` with a reason. You may not edit files or run commands.",
+          "role": "system"
+        },
+        {
+          "content": "The maintainer's request: review\n\nThis pull request changes 1 file(s):\n- a.rs\n\nUnified diff (review ONLY lines this diff changes):\n```diff\n@@ -1,1 +1,2 @@\n one\n+two\n\n```",
+          "role": "user"
+        }
+      ],
+      "model": "m",
+      "tool_choice": "auto",
+      "tools": [
+        {
+          "function": {
+            "description": "Semantic search over the repository's indexed code by meaning (pgvector). Returns the most similar code chunks with file path, line range, and score.",
+            "name": "lightbridge_vector_semantic_search",
+            "parameters": {
+              "properties": {
+                "limit": {
+                  "description": "Maximum number of results (default 10, max 100).",
+                  "type": "integer"
+                },
+                "query": {
+                  "description": "Natural-language or code query.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "query"
+              ],
+              "type": "object"
+            }
+          },
+          "type": "function"
+        },
+        {
+          "function": {
+            "description": "Find symbols (functions, classes, methods) by name, node id, or file-path substring. Returns matching nodes with their node id, label, and location.",
+            "name": "lightbridge_graph_find_symbol",
+            "parameters": {
+              "properties": {
+                "limit": {
+                  "description": "Maximum number of results (default 10, max 100).",
+                  "type": "integer"
+                },
+                "term": {
+                  "description": "Symbol name / node id / file path substring (case-insensitive).",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "term"
+              ],
+              "type": "object"
+            }
+          },
+          "type": "function"
+        },
+        {
+          "function": {
+            "description": "Return the symbols that call a given symbol (reverse call graph). Pass a node id from graph_find_symbol.",
+            "name": "lightbridge_graph_get_callers",
+            "parameters": {
+              "properties": {
+                "limit": {
+                  "description": "Maximum number of results (default 10, max 100).",
+                  "type": "integer"
+                },
+                "node_id": {
+                  "description": "Node id of the target symbol (from graph_find_symbol).",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "node_id"
+              ],
+              "type": "object"
+            }
+          },
+          "type": "function"
+        },
+        {
+          "function": {
+            "description": "Read a UTF-8 text file from the checked-out repository (the working tree under review). Path is relative to the repo root; absolute paths and `..` traversal are rejected. Returns up to 64 KiB; pass `start_line`/`end_line` (1-based, inclusive) to read a slice. Use this to look at the actual source when the search/graph tools come up empty.",
+            "name": "read_file",
+            "parameters": {
+              "properties": {
+                "end_line": {
+                  "description": "Optional 1-based last line to return (inclusive).",
+                  "type": "integer"
+                },
+                "path": {
+                  "description": "File path relative to the repo root (no leading `/`, no `..`).",
+                  "type": "string"
+                },
+                "start_line": {
+                  "description": "Optional 1-based first line to return (inclusive).",
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "path"
+              ],
+              "type": "object"
+            }
+          },
+          "type": "function"
+        },
+        {
+          "function": {
+            "description": "Record one inline review finding on a line the diff adds or changes. Call once per finding as you go; nothing posts until `finish`. Re-recording the same (file, line) refines it.",
+            "name": "add_review_comment",
+            "parameters": {
+              "properties": {
+                "body": {
+                  "description": "Why it matters.",
+                  "type": "string"
+                },
+                "category": {
+                  "description": "The dimension this finding is about.",
+                  "enum": [
+                    "security",
+                    "correctness",
+                    "quality",
+                    "style",
+                    "performance"
+                  ],
+                  "type": "string"
+                },
+                "evidence": {
+                  "description": "REQUIRED: the concrete proof — the exact lines / symbol this finding rests on, so it can be verified. If you can't cite it, don't record the finding.",
+                  "type": "string"
+                },
+                "file": {
+                  "description": "Path from repo root.",
+                  "type": "string"
+                },
+                "line": {
+                  "description": "The line this finding anchors to — a line the diff adds or changes. When `start_line` is also given, this is the LAST line of the multi-line range.",
+                  "type": "integer"
+                },
+                "priority": {
+                  "description": "P0 = must fix (bug/security/data-loss), P1 = should fix, P2 = minor/nit.",
+                  "enum": [
+                    "P0",
+                    "P1",
+                    "P2"
+                  ],
+                  "type": "string"
+                },
+                "start_line": {
+                  "description": "Optional. The FIRST line of a multi-line range; the range ends at `line`. Omit for a single-line finding. Leave unset unless the finding's evidence genuinely spans multiple contiguous lines.",
+                  "type": "integer"
+                },
+                "suggestion": {
+                  "description": "Optional exact replacement source for `line` (no diff markers).",
+                  "type": "string"
+                },
+                "title": {
+                  "description": "Short (≤ ~8 words).",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "file",
+                "line",
+                "title",
+                "priority",
+                "category",
+                "body"
+              ],
+              "type": "object"
+            }
+          },
+          "type": "function"
+        },
+        {
+          "function": {
+            "description": "Drop a finding you previously recorded that did NOT survive verification (its claim doesn't hold against the cited evidence). Use during your pre-finish review of your own P0/P1 findings — a wrong finding costs more trust than a missed one.",
+            "name": "retract_finding",
+            "parameters": {
+              "properties": {
+                "file": {
+                  "description": "The finding's file (as recorded).",
+                  "type": "string"
+                },
+                "line": {
+                  "description": "The finding's line (as recorded).",
+                  "type": "integer"
+                },
+                "reason": {
+                  "description": "Why it didn't hold (optional).",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "file",
+                "line"
+              ],
+              "type": "object"
+            }
+          },
+          "type": "function"
+        },
+        {
+          "function": {
+            "description": "Post a plain reply on the thread (GitHub-flavored Markdown) — for answering a question or a general remark, not pinned to a diff line. Multiple calls are consolidated into one reply.",
+            "name": "add_comment",
+            "parameters": {
+              "properties": {
+                "body": {
+                  "description": "Markdown reply body.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "body"
+              ],
+              "type": "object"
+            }
+          },
+          "type": "function"
+        },
+        {
+          "function": {
+            "description": "Finish the run: record your overall verdict/summary and post everything you buffered. Call exactly once when done — investigate and record findings/replies first.",
+            "name": "finish",
+            "parameters": {
+              "properties": {
+                "summary": {
+                  "description": "1–3 sentence overall verdict: does the change do what it intends, and is it correct and safe?",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "summary"
+              ],
+              "type": "object"
+            }
+          },
+          "type": "function"
+        },
+        {
+          "function": {
+            "description": "Optionally report a short progress note for observability. Does not affect the result.",
+            "name": "report_progress",
+            "parameters": {
+              "properties": {
+                "note": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "note"
+              ],
+              "type": "object"
+            }
+          },
+          "type": "function"
+        },
+        {
+          "function": {
+            "description": "Abort when you cannot produce a useful result (e.g. the diff is unreadable). Recorded as a clean abort, not a crash. Nothing you buffered is posted.",
+            "name": "abort",
+            "parameters": {
+              "properties": {
+                "reason": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "reason"
+              ],
+              "type": "object"
+            }
+          },
+          "type": "function"
+        }
+      ]
+    },
+    {
+      "messages": [
+        {
+          "content": "You are a reviewer.\n\n# How to act\nInvestigate with the search/graph tools before making any claim — never speculate about code you have not looked up. As you find issues, record each one with `add_review_comment` (one call per finding, on a line this diff adds or changes). Only set `start_line` when the finding's evidence genuinely spans multiple contiguous lines — a multi-line problem, not a multi-line explanation of a one-line problem — and if the finding also carries a `suggestion`, make it cover the full start_line..line range. Use `add_comment` for a plain reply that isn't pinned to a diff line (e.g. answering a question). Nothing you record is posted until you call `finish` with your overall verdict — call `finish` exactly once when you are done, even if you found nothing. If you genuinely cannot produce anything useful, call `abort` with a reason. You may not edit files or run commands.",
+          "role": "system"
+        },
+        {
+          "content": "The maintainer's request: review\n\nThis pull request changes 1 file(s):\n- a.rs\n\nUnified diff (review ONLY lines this diff changes):\n```diff\n@@ -1,1 +1,2 @@\n one\n+two\n\n```",
+          "role": "user"
+        },
+        {
+          "role": "assistant",
+          "tool_calls": [
+            {
+              "extra_content": {
+                "provider": {
+                  "signature": "opaque"
+                }
+              },
+              "function": {
+                "arguments": "{\"file\":\"a.rs\",\"line\":2,\"title\":\"Issue\",\"priority\":\"P2\",\"category\":\"quality\",\"body\":\"body\",\"evidence\":\"line 2\"}",
+                "name": "add_review_comment"
+              },
+              "id": "plain-record",
+              "type": "function"
+            }
+          ]
+        },
+        {
+          "content": "recorded finding at a.rs:2",
+          "role": "tool",
+          "tool_call_id": "plain-record"
+        },
+        {
+          "content": "You have recorded at least one finding. When your investigation is complete, call `finish` with your overall verdict to post everything you've buffered — don't keep investigating past the point of useful work.",
+          "role": "user"
+        }
+      ],
+      "model": "m",
+      "tool_choice": "auto",
+      "tools": [
+        {
+          "function": {
+            "description": "Semantic search over the repository's indexed code by meaning (pgvector). Returns the most similar code chunks with file path, line range, and score.",
+            "name": "lightbridge_vector_semantic_search",
+            "parameters": {
+              "properties": {
+                "limit": {
+                  "description": "Maximum number of results (default 10, max 100).",
+                  "type": "integer"
+                },
+                "query": {
+                  "description": "Natural-language or code query.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "query"
+              ],
+              "type": "object"
+            }
+          },
+          "type": "function"
+        },
+        {
+          "function": {
+            "description": "Find symbols (functions, classes, methods) by name, node id, or file-path substring. Returns matching nodes with their node id, label, and location.",
+            "name": "lightbridge_graph_find_symbol",
+            "parameters": {
+              "properties": {
+                "limit": {
+                  "description": "Maximum number of results (default 10, max 100).",
+                  "type": "integer"
+                },
+                "term": {
+                  "description": "Symbol name / node id / file path substring (case-insensitive).",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "term"
+              ],
+              "type": "object"
+            }
+          },
+          "type": "function"
+        },
+        {
+          "function": {
+            "description": "Return the symbols that call a given symbol (reverse call graph). Pass a node id from graph_find_symbol.",
+            "name": "lightbridge_graph_get_callers",
+            "parameters": {
+              "properties": {
+                "limit": {
+                  "description": "Maximum number of results (default 10, max 100).",
+                  "type": "integer"
+                },
+                "node_id": {
+                  "description": "Node id of the target symbol (from graph_find_symbol).",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "node_id"
+              ],
+              "type": "object"
+            }
+          },
+          "type": "function"
+        },
+        {
+          "function": {
+            "description": "Read a UTF-8 text file from the checked-out repository (the working tree under review). Path is relative to the repo root; absolute paths and `..` traversal are rejected. Returns up to 64 KiB; pass `start_line`/`end_line` (1-based, inclusive) to read a slice. Use this to look at the actual source when the search/graph tools come up empty.",
+            "name": "read_file",
+            "parameters": {
+              "properties": {
+                "end_line": {
+                  "description": "Optional 1-based last line to return (inclusive).",
+                  "type": "integer"
+                },
+                "path": {
+                  "description": "File path relative to the repo root (no leading `/`, no `..`).",
+                  "type": "string"
+                },
+                "start_line": {
+                  "description": "Optional 1-based first line to return (inclusive).",
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "path"
+              ],
+              "type": "object"
+            }
+          },
+          "type": "function"
+        },
+        {
+          "function": {
+            "description": "Record one inline review finding on a line the diff adds or changes. Call once per finding as you go; nothing posts until `finish`. Re-recording the same (file, line) refines it.",
+            "name": "add_review_comment",
+            "parameters": {
+              "properties": {
+                "body": {
+                  "description": "Why it matters.",
+                  "type": "string"
+                },
+                "category": {
+                  "description": "The dimension this finding is about.",
+                  "enum": [
+                    "security",
+                    "correctness",
+                    "quality",
+                    "style",
+                    "performance"
+                  ],
+                  "type": "string"
+                },
+                "evidence": {
+                  "description": "REQUIRED: the concrete proof — the exact lines / symbol this finding rests on, so it can be verified. If you can't cite it, don't record the finding.",
+                  "type": "string"
+                },
+                "file": {
+                  "description": "Path from repo root.",
+                  "type": "string"
+                },
+                "line": {
+                  "description": "The line this finding anchors to — a line the diff adds or changes. When `start_line` is also given, this is the LAST line of the multi-line range.",
+                  "type": "integer"
+                },
+                "priority": {
+                  "description": "P0 = must fix (bug/security/data-loss), P1 = should fix, P2 = minor/nit.",
+                  "enum": [
+                    "P0",
+                    "P1",
+                    "P2"
+                  ],
+                  "type": "string"
+                },
+                "start_line": {
+                  "description": "Optional. The FIRST line of a multi-line range; the range ends at `line`. Omit for a single-line finding. Leave unset unless the finding's evidence genuinely spans multiple contiguous lines.",
+                  "type": "integer"
+                },
+                "suggestion": {
+                  "description": "Optional exact replacement source for `line` (no diff markers).",
+                  "type": "string"
+                },
+                "title": {
+                  "description": "Short (≤ ~8 words).",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "file",
+                "line",
+                "title",
+                "priority",
+                "category",
+                "body"
+              ],
+              "type": "object"
+            }
+          },
+          "type": "function"
+        },
+        {
+          "function": {
+            "description": "Drop a finding you previously recorded that did NOT survive verification (its claim doesn't hold against the cited evidence). Use during your pre-finish review of your own P0/P1 findings — a wrong finding costs more trust than a missed one.",
+            "name": "retract_finding",
+            "parameters": {
+              "properties": {
+                "file": {
+                  "description": "The finding's file (as recorded).",
+                  "type": "string"
+                },
+                "line": {
+                  "description": "The finding's line (as recorded).",
+                  "type": "integer"
+                },
+                "reason": {
+                  "description": "Why it didn't hold (optional).",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "file",
+                "line"
+              ],
+              "type": "object"
+            }
+          },
+          "type": "function"
+        },
+        {
+          "function": {
+            "description": "Post a plain reply on the thread (GitHub-flavored Markdown) — for answering a question or a general remark, not pinned to a diff line. Multiple calls are consolidated into one reply.",
+            "name": "add_comment",
+            "parameters": {
+              "properties": {
+                "body": {
+                  "description": "Markdown reply body.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "body"
+              ],
+              "type": "object"
+            }
+          },
+          "type": "function"
+        },
+        {
+          "function": {
+            "description": "Finish the run: record your overall verdict/summary and post everything you buffered. Call exactly once when done — investigate and record findings/replies first.",
+            "name": "finish",
+            "parameters": {
+              "properties": {
+                "summary": {
+                  "description": "1–3 sentence overall verdict: does the change do what it intends, and is it correct and safe?",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "summary"
+              ],
+              "type": "object"
+            }
+          },
+          "type": "function"
+        },
+        {
+          "function": {
+            "description": "Optionally report a short progress note for observability. Does not affect the result.",
+            "name": "report_progress",
+            "parameters": {
+              "properties": {
+                "note": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "note"
+              ],
+              "type": "object"
+            }
+          },
+          "type": "function"
+        },
+        {
+          "function": {
+            "description": "Abort when you cannot produce a useful result (e.g. the diff is unreadable). Recorded as a clean abort, not a crash. Nothing you buffered is posted.",
+            "name": "abort",
+            "parameters": {
+              "properties": {
+                "reason": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "reason"
+              ],
+              "type": "object"
+            }
+          },
+          "type": "function"
+        }
+      ]
+    }
+  ],
+  "calls": [
+    {
+      "turn": 0,
+      "call": {
+        "id": "plain-record",
+        "type": "function",
+        "function": {
+          "name": "add_review_comment",
+          "arguments": "{\"file\":\"a.rs\",\"line\":2,\"title\":\"Issue\",\"priority\":\"P2\",\"category\":\"quality\",\"body\":\"body\",\"evidence\":\"line 2\"}"
+        },
+        "extra_content": {
+          "provider": {
+            "signature": "opaque"
+          }
+        }
+      },
+      "outcome": {
+        "Continue": "recorded finding at a.rs:2"
+      }
+    },
+    {
+      "turn": 1,
+      "call": {
+        "id": "plain-finish",
+        "type": "function",
+        "function": {
+          "name": "finish",
+          "arguments": "{\"summary\":\"one finding\"}"
+        }
+      },
+      "outcome": "Finish"
+    }
+  ],
+  "policy_events": [
+    {
+      "detail": {
+        "findings": 1
+      },
+      "name": "finding_finish_nudge",
+      "turn": 0,
+      "type": "policy"
+    }
+  ],
+  "control_plane_writes": [
+    {
+      "endpoint": "/internal/tasks/00000000-0000-0000-0000-000000000000/review/inline",
+      "body": {
+        "body": "body\n\n**Evidence:** line 2",
+        "category": "quality",
+        "file": "a.rs",
+        "line": 2,
+        "priority": "P2",
+        "start_line": null,
+        "suggestion": null,
+        "title": "Issue"
+      }
+    },
+    {
+      "endpoint": "/internal/tasks/00000000-0000-0000-0000-000000000000/review/summary",
+      "body": {
+        "body": "one finding"
+      }
+    }
+  ],
+  "outcome": {
+    "status": "finished"
+  }
+}

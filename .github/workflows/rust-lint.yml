@@ -1,4 +1,6 @@
-# Workspace-wide Rust lint gate: `cargo fmt --check` + `cargo clippy -D warnings`.
+# Workspace-wide Rust architecture/lint gate: dependency hygiene, `cargo fmt --check`, and
+# `cargo clippy -D warnings`. The first populated `lci-*` crate also starts the per-crate coverage
+# floor required by ADR-0083.
 #
 # Why this exists: the other CI (build-images, control-plane-tests) compiles and tests but never
 # checked formatting or lints, so `cargo fmt` drift and clippy warnings landed on `main` unnoticed
@@ -12,17 +14,21 @@ on:
   push:
     branches: [main]
     paths:
+      - "clients/**"
       - "services/**"
       - "xtask/**"
       - "Cargo.toml"
       - "Cargo.lock"
+      - "rustfmt.toml"
       - ".github/workflows/rust-lint.yml"
   pull_request:
     paths:
+      - "clients/**"
       - "services/**"
       - "xtask/**"
       - "Cargo.toml"
       - "Cargo.lock"
+      - "rustfmt.toml"
       - ".github/workflows/rust-lint.yml"
 
 permissions:
@@ -41,6 +47,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      # v2.83.1, pinned to immutable reviewed code; checksums stay enabled explicitly.
+      - uses: taiki-e/install-action@2ca9b94c269419b7b0c711c09d0b21c4e1d51145
+        with:
+          tool: cargo-llvm-cov@0.8.7
+          checksum: true
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: "."
@@ -53,10 +64,40 @@ jobs:
           endpoint: ${{ vars.SCCACHE_ENDPOINT }}
           access-key-id: ${{ secrets.SCCACHE_S3_ACCESS_KEY_ID }}
           secret-access-key: ${{ secrets.SCCACHE_S3_SECRET_ACCESS_KEY }}
+      - name: dependency hygiene
+        run: cargo run --locked --package xtask -- dependency-hygiene
+      - name: xtask tests
+        run: cargo test --locked -p xtask
+      # Runs the workspace test suite INCLUDING integration tests under `tests/` (which the `--lib`
+      # coverage steps below deliberately skip) — notably the review-agent 6-golden byte-parity bar
+      # (`services/review-agent/tests/golden_parity.rs`), the R1 extraction's merge gate. control-plane
+      # is excluded here (it needs a live Postgres) and covered by control-plane-tests.yml.
+      - name: cargo test (workspace, excl. control-plane)
+        run: cargo test --workspace --exclude control-plane --locked
       - name: cargo fmt --all --check
         run: cargo fmt --all -- --check
       - name: cargo clippy --workspace -D warnings
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: lci-agent-types line coverage
+        run: cargo llvm-cov -p lci-agent-types --locked --fail-under-lines 85
+      - name: lci-agent-step line coverage
+        run: cargo llvm-cov -p lci-agent-step --locked --fail-under-lines 85
+      # R1e moved the loop's end-to-end driver out of agent-runner (deleted) into the review-agent
+      # 6-golden integration test, so agent-loop's coverage is measured while running review-agent's
+      # full suite (NOT `--lib`, which would skip the integration test) with review-agent excluded
+      # from the report.
+      - name: lci-agent-loop line coverage
+        run: cargo llvm-cov -p lci-agent-loop -p lci-review-agent --locked --exclude-from-report lci-review-agent --fail-under-lines 85
+      - name: lci-agent-clients line coverage
+        run: cargo llvm-cov -p lci-agent-clients --locked --fail-under-lines 85
+      - name: lci-agent-tools line coverage
+        run: cargo llvm-cov -p lci-agent-tools --locked --fail-under-lines 85
+      - name: lci-review-agent line coverage
+        run: cargo llvm-cov -p lci-review-agent -p agent-runner --lib --locked --exclude-from-report agent-runner --fail-under-lines 85
+      # agent-testkit's fakes are exercised by the review-agent golden integration test (the old
+      # agent-runner lib driver was deleted in R1e); measure under review-agent's full suite.
+      - name: lci-agent-testkit line coverage
+        run: cargo llvm-cov -p lci-agent-testkit -p lci-review-agent --locked --exclude-from-report lci-review-agent --fail-under-lines 85
       - name: sccache stats
         if: always()
         run: sccache --show-stats || true

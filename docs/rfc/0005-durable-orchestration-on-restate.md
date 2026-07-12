@@ -163,6 +163,13 @@ flowchart LR
   `waiting_for_index` status, `LISTEN/NOTIFY` wakeups, and the never-built `scheduler` subcommand
   are deleted or reduced to Restate-driven equivalents. RFC-0001's remaining phases are closed as
   superseded.
+- **Phase D — the durable agent runtime** (added 2026-07-11,
+  [ADR-0082](../adr/0082-restate-durable-agent-runtime.md)). The stated end goal of adopting the
+  engine: the deep-tier review loop itself becomes a durable `ReviewAgent` workflow — every LLM
+  call and every tool batch a journaled step, so a crashed 2 h / 150-turn run resumes at the step
+  it left instead of restarting from zero. Gated on Phase B soaking (plus its own journal-scale
+  and cross-pod-resume spikes); orthogonal to Phase C. Phases A–C are the plumbing; D is the
+  payoff.
 
 Each phase gets its own ADR; a later phase can be abandoned without unwinding an earlier one.
 

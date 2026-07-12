@@ -576,10 +576,10 @@ fn validated_range_start(finding: &Finding, file_lines: Option<&BTreeSet<u32>>) 
 pub fn strip_model_artifacts(text: &str) -> String {
     let mut s = text.to_string();
     // Leading orphan reasoning ("reasoning… </think> answer" with no opener) → drop through the close.
-    if let Some(i) = s.find("</think>") {
-        if !s[..i].contains("<think>") {
-            s = s[i + "</think>".len()..].to_string();
-        }
+    if let Some(i) = s.find("</think>")
+        && !s[..i].contains("<think>")
+    {
+        s = s[i + "</think>".len()..].to_string();
     }
     s = remove_spans(&s, "<think>", "</think>"); // paired blocks (unclosed → drop remainder)
     s = remove_spans(&s, "<｜", "｜>"); // deepseek special tokens (fullwidth pipe)
@@ -697,8 +697,7 @@ pub fn render_body(summary: &str, deferred: &[Finding], out_of_scope: &[Finding]
 /// The untrusted-output disclosure appended to every review body (the AI-governance working agreement:
 /// AI output is untrusted; a human owns the decision). Shared by [`render_body`] and
 /// [`render_fast_body`] so the two paths can't drift.
-const REVIEW_DISCLOSURE: &str =
-    "\n\n---\n_🤖 AI-generated review — treat it as untrusted, verify before acting; a human \
+const REVIEW_DISCLOSURE: &str = "\n\n---\n_🤖 AI-generated review — treat it as untrusted, verify before acting; a human \
      owns the final decision ([AI governance](https://adorsys-gis.github.io/ai-governance/))._";
 
 /// Append the "Notes on changed files" (deferred findings) and the collapsed out-of-scope section to a
@@ -815,8 +814,7 @@ mod tests {
     use super::*;
 
     // Explicit `\n` (no backslash-continuation) so the leading diff markers (' ', '+', '-') survive.
-    const PATCH: &str =
-        "@@ -1,3 +1,4 @@ fn main() {\n let a = 1;\n-    let b = 2;\n+    let b = 3;\n+    let c = 4;\n println!(\"{a}\");";
+    const PATCH: &str = "@@ -1,3 +1,4 @@ fn main() {\n let a = 1;\n-    let b = 2;\n+    let b = 3;\n+    let c = 4;\n println!(\"{a}\");";
 
     #[test]
     fn commentable_lines_are_added_and_context() {

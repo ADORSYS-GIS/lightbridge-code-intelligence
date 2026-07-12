@@ -183,6 +183,32 @@ is the append-only record of that resolution; the terms above stand as the pre-s
   reference design (tool mediation, streaming, usage accounting), so deciding scope + running
   the spike now de-risks that RFC. The spike is half a day; deferral saves nothing.
 
+## Update (2026-07-11) — rig 0.40.0 movement; the revisit trigger becomes mechanical
+
+rig-core **0.40.0** (released 2026-07-11) ships *reasoning-text preservation* on the OpenAI path
+plus several field-preservation fixes — movement **adjacent to** this ADR's revisit trigger, but
+the decisive mechanism (`thought_signature`/`extra_content` round-trip on the Chat-Completions
+path against eaig — the #262 hard-400) is **unverified by changelog alone**. Verdict unchanged.
+
+Two changes going forward:
+
+1. **The revisit trigger is now mechanical, not changelog-vibes:** the #300/#303 fidelity harness
+   is to be resurrected as **`rig-fidelity-probe`** — an excluded workspace crate (the `a2a-probe`
+   precedent) re-running the fixture (multi-turn tool use with `thought_signature`, reasoning
+   capture, streaming usage, via eaig) against each rig release. A **passing probe** is what
+   reopens this decision; nothing else does.
+2. **If the probe passes, adoption is bounded by the ADR-0082/0083 seams:** rig would enter as a
+   `ModelClient` *implementation* behind `agent-core`'s trait — never the loop, never its
+   agent/RAG abstractions (retrieval stays control-plane-mediated, ADR-0037). Even then it is
+   optional: `chat.rs` is dogfood-hardened against the exact quirks rig would have to re-prove;
+   a green probe *unlocks* rig where it genuinely helps (e.g., new providers we don't want to
+   hand-write), it does not compel a swap.
+
+(Related, same date: delegating the agent core to an external agent CLI — OpenCode over ACP — was
+raised and rejected for the core in [ADR-0082](0082-restate-durable-agent-runtime.md)
+§Alternatives: ACP grants per-tool-call visibility/gating but not the per-step loop ownership
+Phase D journaling requires.)
+
 ## References
 
 - [RFC-0006](../rfc/0006-a2a-agent-surface.md) — the new agent surfaces this decision equips;

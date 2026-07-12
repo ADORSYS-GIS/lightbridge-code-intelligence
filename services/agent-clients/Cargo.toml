@@ -1,0 +1,36 @@
+[package]
+name = "lci-agent-clients"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "HTTP clients shared by Lightbridge agent hosts."
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# The durability seam + stable step names, so `CheckpointRuntime` (ADR-0087) can implement
+# `StepRuntime` here in a host crate — keeping the dep-light agent-step/agent-loop crates free of any
+# store/transport machinery (ADR-0083).
+lci-agent-step = { path = "../agent-step" }
+lci-agent-types = { path = "../agent-types" }
+anyhow.workspace = true
+# Content hash of a journaled step result (ADR-0087 C3).
+sha2.workspace = true
+hex.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+# The resume merge bar (#356) drives the real `AgentLoop` over `CheckpointRuntime` + the in-memory
+# store with the testkit's `ScriptedModel`/`StaticTool` — no DB, no control plane.
+lci-agent-loop = { path = "../agent-loop" }
+lci-agent-testkit = { path = "../agent-testkit" }
+lci-agent-tools = { path = "../agent-tools" }
+wiremock.workspace = true

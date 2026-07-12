@@ -12,7 +12,7 @@
 //! flags win). See [`crate::config`].
 
 use crate::config::Flags;
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 
 /// What the parsed command line asks us to do.
 #[derive(Debug, PartialEq)]

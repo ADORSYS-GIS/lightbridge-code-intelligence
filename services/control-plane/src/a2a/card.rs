@@ -25,7 +25,7 @@ const OIDC_SCHEME_NAME: &str = "keycloak-oidc";
 /// sync. Full calling guide: `docs/a2a-review-skill.md`.
 const REVIEW_SKILL_DESCRIPTION: &str = r#"Request a deep review of a pull/merge request. The review runs the deep tier through the same pipeline as an `@mention` and posts to the PR; the A2A task additionally returns, on completion, a summary + structured findings + a review-context part (the submitted baseSha/headSha, the request-derived scope diff|whole-tree, and the posted-review permalink) to the caller.
 
-Send the request as the JSON object below, carried in a `data` part of a `ROLE_USER` message (`message.parts[].data`). Input schema (JSON Schema draft-07):
+Send the target as the JSON object below, carried in a `data` part of a `ROLE_USER` message (`message.parts[].data`). You MAY also add one or more natural-language `text` parts carrying the review instruction (e.g. "focus on the auth changes and the new migration"): the `text` sets **emphasis only — never the target or scope**. The target (`repo`/`pr`/`headSha`) and scope (`baseSha`) come solely from the `data` part; a `text` part cannot redirect the review to a different PR/repo or change diff-vs-whole-tree. When `text` is present it becomes the review's prompt, winning over any `data.prompt` (a lower-priority hint); the text parts are concatenated in message order, newline-joined, and trimmed. A `text`-only message (no `data` part) is rejected with guidance naming the required precise fields, since this server holds no forge credentials to resolve a target from prose. Input schema (JSON Schema draft-07):
 
 ```json
 {
@@ -40,7 +40,7 @@ Send the request as the JSON object below, carried in a `data` part of a `ROLE_U
     "pr":      { "type": ["integer", "string"], "description": "REQUIRED PR (GitHub) / MR (GitLab) number. Integer > 0, given as a JSON integer or a numeric string, e.g. 164 or \"164\". Identifies which change set to review." },
     "headSha": { "type": "string", "minLength": 1, "description": "REQUIRED commit SHA to review — the exact PR/MR head. The repo is checked out at this commit and the review runs against it. This server holds NO forge credentials and cannot resolve a head itself, so an absent head is REJECTED (a null head would silently review the default branch). Also accepted under the snake_case key head_sha." },
     "baseSha": { "type": "string", "minLength": 1, "description": "OPTIONAL but STRONGLY RECOMMENDED base commit SHA — the PR/MR's base (target-branch) commit. SCOPING EFFECT: when present, the review is DIFF-SCOPED to just the PR's changes (the runner computes git diff merge-base(baseSha, headSha)..headSha — the same three-dot 'Files changed' set the forge shows). When ABSENT, no diff can be computed and the review FALLS BACK to the WHOLE WORKING TREE at headSha — a broader, unfocused audit of the entire repo snapshot, NOT the PR's delta. The role can't resolve the base itself (no forge credentials), so the caller must supply it to get a diff-scoped review. Also accepted under the snake_case key base_sha." },
-    "prompt":  { "type": "string", "description": "OPTIONAL free-text focus prompt, recorded as the run's intent and shown to the agent (e.g. 'focus on the auth changes'). It steers emphasis but does NOT change scope (diff vs whole-tree is decided by baseSha). Omitted → a generic deep-review intent." }
+    "prompt":  { "type": "string", "description": "OPTIONAL free-text focus prompt, recorded as the run's intent and shown to the agent (e.g. 'focus on the auth changes'). It steers emphasis but does NOT change scope (diff vs whole-tree is decided by baseSha) or target. A natural-language `text` part on the message, if present, is the preferred way to carry this and WINS over this field (which is then a lower-priority hint). Omitted with no text part → a generic deep-review intent." }
   }
 }
 ```
@@ -91,7 +91,12 @@ pub fn build_agent_card(base_url: &str, oidc_discovery_url: &str) -> AgentCard {
             extensions: None,
             extended_agent_card: None,
         },
-        default_input_modes: vec!["application/json".to_string()],
+        // `application/json` for the structured target `data` part; `text/plain` for the optional
+        // natural-language instruction part (ADR-0078 — text sets emphasis only, never target/scope).
+        default_input_modes: vec![
+            "application/json".to_string(),
+            "text/plain".to_string(),
+        ],
         default_output_modes: vec!["text/plain".to_string(), "application/json".to_string()],
         skills: vec![AgentSkill {
             id: "review".to_string(),
@@ -114,8 +119,17 @@ pub fn build_agent_card(base_url: &str, oidc_discovery_url: &str) -> AgentCard {
                 // GitLab merge request, minimal.
                 r#"{"skill":"review","forge":"gitlab","repo":"acme/platform","pr":"57","headSha":"3e8b6d041b0dd7a4c9e2f6538a0c4b1e9d7f2a5c"}"#
                     .to_string(),
+                // ADR-0078: a natural-language instruction (`text` part) alongside the structured
+                // target (`data` part) — the full `message.parts` shape. The text sets emphasis only;
+                // the target/scope still come solely from the data part. Here it also wins over any
+                // `data.prompt`.
+                r#"{"parts":[{"text":"Focus on the auth changes and the new migration; check the token TTL."},{"data":{"skill":"review","repo":"acme/api","pr":"164","headSha":"9f2a1c4e8b7d6053a1f4c2e9b8d70a5c3e1f2b6d","baseSha":"1b0dd7a4c9e2f6538a0c4b1e9d7f2a5c3e8b6d04"}}]}"#
+                    .to_string(),
             ]),
-            input_modes: Some(vec!["application/json".to_string()]),
+            input_modes: Some(vec![
+                "application/json".to_string(),
+                "text/plain".to_string(),
+            ]),
             output_modes: Some(vec![
                 "text/plain".to_string(),
                 "application/json".to_string(),
@@ -190,23 +204,63 @@ mod tests {
             "a2a:review"
         );
 
-        // Self-documenting: multiple examples of usage, each a parseable JSON object carrying the
-        // required fields; and an inline JSON-Schema in the description covering the input contract.
+        // Self-documenting: multiple examples of usage, each a parseable JSON object; a data-object
+        // example carries the required target fields, and the ADR-0078 multipart example carries the
+        // target in a `data` part next to a natural-language `text` instruction part.
         let examples = skills[0]["examples"].as_array().unwrap();
         assert!(
             examples.len() >= 2,
             "review skill should advertise multiple usage examples"
         );
+        let mut saw_text_part = false;
         for ex in examples {
             let obj: serde_json::Value =
                 serde_json::from_str(ex.as_str().unwrap()).expect("example is valid JSON");
-            assert_eq!(obj["skill"], "review");
-            assert!(obj.get("repo").is_some() && obj.get("pr").is_some());
+            // Two shapes: a bare `data` object, or a full `{ "parts": [...] }` message.
+            let data = if let Some(parts) = obj.get("parts").and_then(|p| p.as_array()) {
+                // A multipart example (ADR-0078) must carry a text instruction part…
+                assert!(
+                    parts.iter().any(|p| p.get("text").is_some()),
+                    "multipart example carries a natural-language text part"
+                );
+                saw_text_part = true;
+                // …and the target in a data part.
+                parts
+                    .iter()
+                    .find_map(|p| p.get("data"))
+                    .expect("multipart example carries a data target part")
+                    .clone()
+            } else {
+                obj
+            };
+            assert_eq!(data["skill"], "review");
+            assert!(data.get("repo").is_some() && data.get("pr").is_some());
             assert!(
-                obj["headSha"].as_str().is_some(),
-                "every example carries the required headSha"
+                data["headSha"].as_str().is_some(),
+                "every example's target carries the required headSha"
             );
         }
+        assert!(
+            saw_text_part,
+            "the skill advertises the ADR-0078 text+data form"
+        );
+
+        // Input modes advertise both the structured target and the natural-language instruction.
+        let input_modes = skills[0]["inputModes"].as_array().unwrap();
+        assert!(input_modes.iter().any(|m| m == "application/json"));
+        assert!(
+            input_modes.iter().any(|m| m == "text/plain"),
+            "text/plain is an accepted input mode for the NL instruction (ADR-0078)"
+        );
+        let default_modes = card["defaultInputModes"].as_array().unwrap();
+        assert!(default_modes.iter().any(|m| m == "text/plain"));
+
+        // The description states plainly that text sets emphasis only — never target or scope.
+        let desc = skills[0]["description"].as_str().unwrap();
+        assert!(
+            desc.contains("emphasis only") && desc.contains("never the target or scope"),
+            "description states text sets emphasis only, not target/scope"
+        );
         let description = skills[0]["description"].as_str().unwrap();
         assert!(
             description.contains("json-schema.org/draft-07"),

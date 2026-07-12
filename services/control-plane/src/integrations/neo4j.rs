@@ -5,7 +5,7 @@
 //! the Neo4j credentials so the untrusted per-task Job never holds them (trust boundary, ADR-0002) —
 //! the same reason chunk ingestion routes through the control plane rather than direct DB access.
 
-use neo4rs::{query, Graph};
+use neo4rs::{Graph, query};
 use serde::Serialize;
 
 /// One graph node submitted by the runner (mirrors a Graphify `graph.json` node).
@@ -342,10 +342,12 @@ mod tests {
         assert_eq!(callers[0].node_id, "src_math_calc_bump");
 
         // Scope isolation: the same query under a different repo id returns nothing.
-        assert!(find_symbol(&graph, 999, commit, "add", 10)
-            .await
-            .expect("find other repo")
-            .is_empty());
+        assert!(
+            find_symbol(&graph, 999, commit, "add", 10)
+                .await
+                .expect("find other repo")
+                .is_empty()
+        );
 
         // Cleanup.
         graph

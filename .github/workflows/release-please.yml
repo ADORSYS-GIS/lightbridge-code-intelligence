@@ -1,0 +1,65 @@
+# Release automation (googleapis/release-please-action) — no PAT required.
+#
+# On every push to main, release-please maintains a single, repo-wide "release PR" that accumulates
+# the pending CHANGELOG (grouped by conventional-commit type) and the next semantic version. Merging
+# that PR tags `v<version>` and cuts a GitHub Release.
+#
+# ## Why the publish job lives here (the GITHUB_TOKEN constraint)
+# release-please runs under the default GITHUB_TOKEN. A tag pushed by GITHUB_TOKEN does NOT trigger
+# other workflows, so build-images.yml (`tags: ["v*"]`) would never fire for a release. Instead, when
+# release-please reports it cut a release, the `publish` job calls the shared reusable pipeline
+# (image-pipeline.yml) IN THE SAME RUN, passing the new tag as an explicit semver — so the versioned,
+# cosign-signed images (ghcr.io/<owner>/lightbridge-*:<version>) get built and pushed with no PAT and
+# no second workflow hop. The plain main push that merged the release PR still runs build-images.yml,
+# which owns the sha-<gitsha> + latest tags for that commit; the two are complementary.
+#
+# ## Versioning
+# Pre-1.0 policy (config): `feat` → minor, `fix`/`perf` → patch, breaking (`feat!` / `BREAKING CHANGE`)
+# → minor (capped below 1.0.0 via `bump-minor-pre-major`). Version state lives in
+# .release-please-manifest.json; section mapping + policy in release-please-config.json.
+# `release-type: simple` → the release PR touches only CHANGELOG.md + the manifest.
+#
+# Action SHA-pinned to the v5.0.0 commit (not a movable tag). Bump deliberately.
+name: Release Please
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    outputs:
+      # Root-component convenience outputs (manifest mode still exposes these for the "." package):
+      # `release_created` is true iff the root release was cut; `tag_name` is that tag (e.g. "v0.3.0").
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+    steps:
+      # googleapis/release-please-action @ v5.0.0
+      - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7
+        id: release
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+  # Only when a release was actually cut: build + push + cosign-sign the versioned images via the same
+  # pipeline build-images uses. The perms here are what the reusable workflow's GITHUB_TOKEN gets.
+  publish:
+    needs: release-please
+    if: needs.release-please.outputs.release_created == 'true'
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    uses: ./.github/workflows/image-pipeline.yml
+    with:
+      push: true
+      version: ${{ needs.release-please.outputs.tag_name }}
+    secrets: inherit

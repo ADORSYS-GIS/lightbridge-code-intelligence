@@ -121,6 +121,12 @@ pub fn outbox_prune_deleted(posted: u64, failed: u64) {
     counter!("lci_outbox_prune_failed_deleted_total").increment(failed);
 }
 
+/// Terminal `a2a_tasks` mappings reaped across one retention sweep (ADR-0077 §S3 / #321). Their
+/// `a2a_task_events` + `a2a_push_configs` cascade away with them.
+pub fn a2a_task_sweep_deleted(deleted: u64) {
+    counter!("lci_a2a_task_sweep_deleted_total").increment(deleted);
+}
+
 /// An outbox delivery outcome (ADR-0059/0072): `posted` (success), `skipped` (silently consumed —
 /// e.g. a `failure_notice` dedup gate), or `failed` (retry/dead-letter), labelled by `platform`
 /// (`"github"` / `"gitlab"`) and `kind` (`review` / `reply` / `reaction` / `failure_notice`).

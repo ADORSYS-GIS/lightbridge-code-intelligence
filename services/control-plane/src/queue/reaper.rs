@@ -180,10 +180,10 @@ pub async fn reap_once<L: TaskLauncher>(
 /// Best-effort delete of a stuck task's dead Job so its (task-id-derived) name is free for a retry.
 /// A failure is logged, not fatal: the reaper retries next cycle, and a lingering Job is harmless.
 async fn delete_dead_job<L: TaskLauncher>(launcher: &L, task: &db::ReapableTask) {
-    if let Some(name) = &task.job_name {
-        if let Err(error) = launcher.delete_job(name).await {
-            tracing::warn!(%error, task_id = %task.id, job_name = name, "reaper: failed to delete dead Job before requeue");
-        }
+    if let Some(name) = &task.job_name
+        && let Err(error) = launcher.delete_job(name).await
+    {
+        tracing::warn!(%error, task_id = %task.id, job_name = name, "reaper: failed to delete dead Job before requeue");
     }
 }
 

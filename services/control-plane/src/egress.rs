@@ -69,6 +69,13 @@ impl PlatformEgressRouter {
     /// base. Fails loud when `mode = restate` but no ingress URL resolves — the pilot must not silently
     /// enqueue rows nothing will deliver (the drain is off in restate mode).
     pub fn from_config(section: &EgressSection) -> anyhow::Result<Self> {
+        Self::from_config_with_env(section, std::env::var("RESTATE_INGRESS_URL").ok())
+    }
+
+    fn from_config_with_env(
+        section: &EgressSection,
+        restate_ingress_url: Option<String>,
+    ) -> anyhow::Result<Self> {
         match section.mode {
             EgressMode::Drain => Ok(Self {
                 inner: Router::Drain,
@@ -77,7 +84,7 @@ impl PlatformEgressRouter {
                 let ingress_base = section
                     .restate_ingress_url
                     .clone()
-                    .or_else(|| std::env::var("RESTATE_INGRESS_URL").ok())
+                    .or(restate_ingress_url)
                     .map(|s| s.trim().trim_end_matches('/').to_string())
                     .filter(|s| !s.is_empty())
                     .context(
@@ -188,12 +195,6 @@ mod tests {
     use super::*;
     use crate::config::EgressSection;
 
-    /// Serializes tests that mutate the process-global `RESTATE_INGRESS_URL` env var. `std::env::{set,
-    /// remove}_var` are process-wide, so any test that touches that var (reading the fallback or, in
-    /// future, setting it) must hold this guard for the duration to stay deterministic under the
-    /// concurrent test runner. Kept module-local so we don't pull in `serial_test` for one var.
-    static RESTATE_INGRESS_ENV_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     #[test]
     fn egress_key_is_platform_colon_installation() {
         assert_eq!(egress_key(Platform::GitHub, 12345), "github:12345");
@@ -222,17 +223,12 @@ mod tests {
 
     #[test]
     fn restate_mode_requires_an_ingress_url() {
-        // No URL configured and (in this test) RESTATE_INGRESS_URL unset → fail loud. Hold the env
-        // guard so a concurrent test setting the var can't make the fallback non-deterministic.
-        let _env = RESTATE_INGRESS_ENV_GUARD
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        std::env::remove_var("RESTATE_INGRESS_URL");
+        // No URL configured and no injected RESTATE_INGRESS_URL fallback → fail loud.
         let section = EgressSection {
             mode: EgressMode::Restate,
             restate_ingress_url: None,
         };
-        let err = PlatformEgressRouter::from_config(&section)
+        let err = PlatformEgressRouter::from_config_with_env(&section, None)
             .expect_err("restate mode without an ingress URL must fail");
         assert!(
             err.to_string().contains("restate_ingress_url"),

@@ -1,8 +1,15 @@
 # ADR-0078: A2A `review` accepts a natural-language `text` part alongside the `data` part (RFC-0006)
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-07-09
 - **Deciders:** @stephane-segning
+
+> **Accepted 2026-07-10, implemented in this PR.** `parse_review_request` now sources the prompt
+> from `text` parts (winning over `data.prompt`, concatenated in message order and trimmed) while the
+> target/scope stay read solely from `data`; a `text`-only message returns the guided `INVALID_PARAMS`
+> instead of a bare rejection. The agent card advertises `text/plain` as an input mode with a
+> `text`+`data` example, and `docs/a2a-review-skill.md` documents the form. Phase-4 `input-required`
+> remains the deferred upgrade of the text-only branch.
 
 ## Context and Problem Statement
 

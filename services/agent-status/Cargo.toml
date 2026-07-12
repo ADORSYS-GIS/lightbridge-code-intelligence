@@ -1,0 +1,44 @@
+[package]
+name = "lci-agent-status"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Host-agnostic live per-review status projection + read-only HTTP surface for the agent-plane (ADR-0085 / RFC-0007 slice 5)."
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+# Versions + features are centralized in the workspace root Cargo.toml.
+[dependencies]
+# The transcript seam this projection taps (read-only): TranscriptEvent + TranscriptSink.
+lci-agent-loop = { path = "../agent-loop" }
+# ToolOutcome, carried in a Tool transcript event — read to tell a successful finding-record apart
+# from a refused/terminal call.
+lci-agent-types = { path = "../agent-types" }
+# Compile-time builder for the ≥3-field server config (ADR-0083).
+bon.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+# The workspace server stack (ADR: control-plane's HTTP surface). The status server is a tiny,
+# read-only axum app the run-once host runs alongside the loop when the flag is on.
+axum.workspace = true
+# Constant-time bearer-token comparison — the `/status` gate must not leak the secret via `==` timing.
+subtle.workspace = true
+# Hash both tokens to a fixed 32-byte digest before the constant-time compare, so equality is checked
+# on equal-length inputs and the secret's *length* never leaks via a short-circuiting length guard.
+sha2.workspace = true
+
+[dev-dependencies]
+# Drive the actual loop engine with the deterministic testkit fakes (ScriptedModel, CapturingSink,
+# StaticTool) — no HTTP, no control plane — to prove the tap is behaviour-neutral and reflects
+# live progress.
+lci-agent-step = { path = "../agent-step" }
+lci-agent-tools = { path = "../agent-tools" }
+lci-agent-testkit = { path = "../agent-testkit" }
+# Exercise the read-only HTTP handlers (200 with a bearer, 401 without) without binding a port.
+tower = { version = "0.5.3", features = ["util"] }
