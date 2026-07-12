@@ -10,9 +10,18 @@ description = "Lightbridge agent runner: the per-task Kubernetes Job that clones
 name = "agent-runner"
 path = "src/main.rs"
 
+# The consolidated agent execution plane (ADR-0085), selected by `mode × host`. Additive this slice:
+# the deployed image still runs `agent-runner`; the dispatcher cutover to `agent-plane` is a later
+# one-liner. Named explicitly so the binary is `agent-plane`, not the file-derived `agent_plane`.
+[[bin]]
+name = "agent-plane"
+path = "src/bin/agent_plane.rs"
+
 # Versions + features are centralized in the workspace root Cargo.toml.
 [dependencies]
 anyhow.workspace = true
+# Flag+env parsing for the `agent-plane` binary's `mode × host` selection (ADR-0085, src/bin/agent_plane.rs).
+clap.workspace = true
 lci-agent-clients = { path = "../agent-clients" }
 lci-agent-loop = { path = "../agent-loop" }
 lci-agent-step = { path = "../agent-step" }

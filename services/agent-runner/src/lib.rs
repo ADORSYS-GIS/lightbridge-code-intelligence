@@ -14,9 +14,18 @@
 //!   and acts via mediated write tools the control plane flushes as one grouped review.
 //! - [`sast`] — a deterministic opengrep pass over the PR's changed files (ADR-0061), whose findings
 //!   ride the same review buffer; the agent is made aware of them but never gates them.
+//! - [`plane`] — the agent-plane `mode × host` matrix + routing guard (ADR-0085): pure data both
+//!   binaries select on.
+//! - [`run`] — the `run-once` host: [`run_once`] walks the pipeline above once and exits. Both the
+//!   `agent-runner` and `agent-plane` binaries are thin shells over it.
 
 pub mod bootstrap;
 pub mod clone;
 pub mod indexer;
+pub mod plane;
 pub mod review;
+pub mod run;
 pub mod sast;
+
+// The `run-once` host entrypoint (ADR-0085), shared by the `agent-runner` and `agent-plane` binaries.
+pub use run::run_once;
