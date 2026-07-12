@@ -31,8 +31,8 @@ pub fn has_grammar(language: &str) -> bool {
     matches!(language, "rust" | "typescript" | "javascript" | "python")
 }
 
-/// True for languages the structural **graph** builder resolves today. Slice 1 ships Rust only
-/// (ADR-0086: "Rust language first"); other languages keep Graphify for the graph and the
+/// True for languages the structural **graph** builder resolves today. Rust ships first
+/// (ADR-0086: "Rust language first"); other languages get no structural graph yet, but the
 /// windowed-text fallback keeps them semantically searchable.
 #[must_use]
 pub fn has_graph(language: &str) -> bool {

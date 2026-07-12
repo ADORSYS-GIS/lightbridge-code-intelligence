@@ -354,12 +354,13 @@ created_at DESC, id DESC)` (`0018`). Old snapshots are pruned by the index sweep
 
 ## Neo4j structural graph
 
-The structural graph is produced by Graphify/tree-sitter
-([ADR-0010](adr/0010-graphify-treesitter-indexing-baseline.md),
-[ADR-0019](adr/0019-graphify-cli-structural-graph.md)): the runner spawns Graphify to emit a
-`graph.json` (symbols + `contains`/`method`/`calls` edges), persisted over Bolt by
-`src/integrations/neo4j.rs`. Retrieval is server-side scoped to the task's repo snapshot. The graph
-holds code topology; Postgres remains the system of record.
+The structural graph is produced in-process by the in-house `lci-codegraph` crate (tree-sitter)
+([ADR-0086](adr/0086-in-house-code-graph-crate.md), which retired the Graphify path of
+[ADR-0010](adr/0010-graphify-treesitter-indexing-baseline.md) /
+[ADR-0019](adr/0019-graphify-cli-structural-graph.md)): the runner walks the checkout and submits
+symbols + `contains`/`method`/`calls` edges, persisted over Bolt by `src/integrations/neo4j.rs`.
+Retrieval is server-side scoped to the task's repo snapshot. The graph holds code topology; Postgres
+remains the system of record.
 
 ## Authorization context
 

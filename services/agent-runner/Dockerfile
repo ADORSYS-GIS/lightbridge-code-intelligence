@@ -2,41 +2,29 @@
 #
 # Assembly only — the Rust runner binary is compiled on the CI runner (native static-musl, sccache)
 # and delivered in the build CONTEXT (ADR-0080); this file does NOT compile Rust. Because the binary
-# is fully static it runs unchanged on the glibc bases below (it only *spawns* glibc subprocesses —
-# git, python/graphify, opengrep — which use the image's own libc).
+# is fully static it runs unchanged on the glibc base below (it only *spawns* glibc subprocesses —
+# git, opengrep — which use the image's own libc).
 #
-# TWO final targets (runner-differentiation, RFC-0001):
-#   • `indexer` (DEFAULT) — the full image. Bundles (ADR-0019):
-#       1. the Rust runner binary (orchestration: clone, embed→pgvector, report)
-#       2. Python + Graphify (`graphifyy`) — the 36-language structural-graph extractor it spawns
-#       3. git + ca-certificates — clone the target repo, TLS to the control plane
-#       4. opengrep + a vendored ruleset — the deterministic SAST pass (ADR-0061)
-#   • `review` — a leaner image WITHOUT the Python/Graphify venv (debian-slim + git + ca-certs +
-#       the runner binary + opengrep). The review path never invokes Graphify, so it needs no Python
-#       runtime, but it IS where the SAST pass runs, so it carries opengrep + the rules.
+# ONE lean runtime, TWO targets (runner-differentiation, RFC-0001):
+#   • `indexer` — `index` Jobs (clone, tree-sitter chunk → pgvector, in-house lci-codegraph structural
+#       graph → Neo4j, ADR-0086). The structural graph is now built IN-PROCESS by the Rust runner
+#       (the `lci-codegraph` crate); there is no Python/Graphify subprocess to bundle anymore, so this
+#       image is the same lean debian-slim runtime the review path uses.
+#   • `review` — the native agent loop (ADR-0026/0037), LLM/network-bound, reuses the latest indexed
+#       snapshot (ADR-0050). It is where the deterministic SAST pass runs.
+# Both targets alias one shared runtime stage (`runtime`): git + ca-certificates + the static runner
+# binary + opengrep (SAST, ADR-0061). Retiring the Python + Graphify venv (ADR-0086, supersedes
+# ADR-0019/ADR-0080's split) is what slims the indexer image and collapses the two into one runtime.
 #
 # Assemble (daemonless) with a context that contains the `agent-runner` binary at its root:
 #   buildah bud -f services/agent-runner/Dockerfile --target indexer -t lightbridge-agent-runner <ctx>
 #   buildah bud -f services/agent-runner/Dockerfile --target review  -t lightbridge-agent-review  <ctx>
 
-# ── Stage 1: install Graphify into a self-contained venv ────────────────────────────────────────
-# Built with compilers present (some tree-sitter grammars may ship sdists) but the toolchain is
-# left behind — only the venv is copied into the runtime image.
-FROM python:3.12-slim-bookworm AS pybuild
-RUN apt-get update \
-  && apt-get install -y --no-install-recommends build-essential \
-  && rm -rf /var/lib/apt/lists/*
-RUN python -m venv /opt/venv
-ENV PATH="/opt/venv/bin:$PATH"
-# Pin the version the runner's graph.json parser was validated against.
-RUN pip install --no-cache-dir "graphifyy==0.8.44" \
-  && graphify --help >/dev/null
-
-# ── Stage 2: opengrep (SAST engine + vendored rules, ADR-0061) ────────────────────────────────────
+# ── Stage 1: opengrep (SAST engine + vendored rules, ADR-0061) ────────────────────────────────────
 # opengrep (the LGPL Semgrep fork) has NO official image, so we fetch the release binary by arch and
 # vendor a pinned ruleset, so scans are hermetic — no registry fetch at runtime. The Linux asset arch
 # token is `x86`/`aarch64` (NOT Docker's `amd64`/`arm64`), so we map `TARGETARCH`; `manylinux` = glibc,
-# matching both debian/python-slim runtimes below. The single-file binary needs no Python runtime.
+# matching the debian-slim runtime below. The single-file binary needs no Python runtime.
 FROM debian:bookworm-slim AS opengrep
 ARG OPENGREP_VERSION=v1.23.0
 ARG TARGETARCH
@@ -63,53 +51,29 @@ RUN apt-get update \
             /opt/opengrep-rules/stats /opt/opengrep-rules/scripts \
   && test -d /opt/opengrep-rules/python && test -d /opt/opengrep-rules/rust
 
-# ── Stage 3a: indexer runtime (DEFAULT) ──────────────────────────────────────────────────────────
-# The full image: python-slim + Graphify venv + the runner. Used for `index` Jobs, which run the
-# heavy structural-graph extraction. This is the default target so a bare `docker build` (and any
-# tooling that doesn't pass `--target`) keeps producing today's image.
-FROM python:3.12-slim-bookworm AS indexer
-# git: clone the target repo (src/clone.rs). ca-certificates: TLS to control plane + GitHub.
-# The native review agent (ADR-0026/0037) runs in-process in the Rust runner — no subprocess to install.
+# ── Stage 2: shared lean runtime ──────────────────────────────────────────────────────────────────
+# One debian-slim base + git + ca-certificates + the static runner binary + opengrep (SAST). Since the
+# structural graph is now built in-process by `lci-codegraph` (ADR-0086) there is no Python/Graphify
+# venv, so `index` and `review` Jobs run identical images — this stage IS both. git: clone the target
+# repo (src/clone.rs). ca-certificates: TLS to control plane + GitHub. The native review agent
+# (ADR-0026/0037) runs in-process in the Rust runner — no subprocess to install.
+FROM debian:bookworm-slim AS runtime
 RUN apt-get update \
   && apt-get install -y --no-install-recommends ca-certificates git \
   && rm -rf /var/lib/apt/lists/* \
   && useradd --uid 1000 --create-home --user-group app \
   && mkdir -p /workspace && chown 1000:1000 /workspace
-# Graphify (venv) + the Rust runner.
-COPY --from=pybuild /opt/venv /opt/venv
 COPY agent-runner /usr/local/bin/agent-runner
 # opengrep + vendored rules for the deterministic SAST pass (ADR-0061).
-COPY --from=opengrep /usr/local/bin/opengrep /usr/local/bin/opengrep
-COPY --from=opengrep /opt/opengrep-rules /opt/opengrep-rules
-USER 1000
-ENV PATH="/opt/venv/bin:$PATH" \
-    WORKDIR=/workspace \
-    RUST_LOG=info
-ENTRYPOINT ["/usr/local/bin/agent-runner"]
-
-# ── Stage 3b: review runtime (leaner — no Python/Graphify) ────────────────────────────────────────
-# The review path is LLM/network-bound and reuses the latest indexed snapshot (ADR-0050); it never
-# spawns Graphify, so this image drops the entire Python venv (~hundreds of MB) and ships only the
-# runner binary on a plain debian-slim base with git + ca-certificates.
-#
-# Cold-repo caveat: a *cold-repo* review still self-indexes today (ADR-0050 only makes *warm* reviews
-# reuse the snapshot). On this image the structural-graph step is simply skipped — `index_graph`
-# (services/agent-runner/src/indexer/graph.rs) is best-effort/non-fatal: it logs and continues if
-# `graphify` is absent. So the first cold review still builds the semantic (pgvector) index and just
-# defers the graph until the next `index` task runs on the indexer image. (Proper fix — review never
-# self-indexes — is a separate runner-differentiation slice.)
-FROM debian:bookworm-slim AS review
-RUN apt-get update \
-  && apt-get install -y --no-install-recommends ca-certificates git \
-  && rm -rf /var/lib/apt/lists/* \
-  && useradd --uid 1000 --create-home --user-group app \
-  && mkdir -p /workspace && chown 1000:1000 /workspace
-COPY agent-runner /usr/local/bin/agent-runner
-# opengrep + vendored rules for the deterministic SAST pass (ADR-0061). The review path is where SAST
-# runs, so this leaner image carries it too.
 COPY --from=opengrep /usr/local/bin/opengrep /usr/local/bin/opengrep
 COPY --from=opengrep /opt/opengrep-rules /opt/opengrep-rules
 USER 1000
 ENV WORKDIR=/workspace \
     RUST_LOG=info
 ENTRYPOINT ["/usr/local/bin/agent-runner"]
+
+# ── Targets: `indexer` and `review` both alias the one lean runtime ───────────────────────────────
+# Kept as distinct targets so the image-pipeline matrix (and any `--target`) still resolves both
+# names and publishes both tags; they build to the same runtime now that Graphify is gone.
+FROM runtime AS indexer
+FROM runtime AS review

@@ -33,8 +33,8 @@ lci-agent-tools = { path = "../agent-tools" }
 lci-agent-types = { path = "../agent-types" }
 lci-review-agent = { path = "../review-agent" }
 lci-config = { path = "../config" }
-# In-house code-graph crate (ADR-0086 / RFC-0007 slice 1). Wired behind a default-off flag
-# (`LCI_CODEGRAPH_GRAPH`) so this is behavior-neutral in prod until the Graphify parity cutover.
+# In-house code-graph crate (ADR-0086 / RFC-0007 slice 1). The sole structural-graph engine, built
+# in-process (tree-sitter); replaced the retired Python Graphify CLI (ADR-0019).
 lci-codegraph = { path = "../codegraph" }
 mimalloc.workspace = true
 serde.workspace = true

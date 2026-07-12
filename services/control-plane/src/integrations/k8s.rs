@@ -43,11 +43,11 @@ pub struct KubeLauncher {
     jobs: Api<Job>,
     /// The agent-runner image. Shared fallback for both kinds when a per-kind image below is unset.
     image: String,
-    /// Image for **index** Jobs (`command_text == "index"`) — the full image bundling Python +
-    /// Graphify; falls back to `image`. See [`image_for`].
+    /// Image for **index** Jobs (`command_text == "index"`); falls back to `image`. Shares the one
+    /// lean runtime with review now that Graphify is retired (ADR-0086). See [`image_for`].
     indexer_image: Option<String>,
-    /// Image for **review** Jobs (everything else) — the leaner image without the Python/Graphify
-    /// venv; falls back to `image`. See [`image_for`].
+    /// Image for **review** Jobs (everything else); falls back to `image`. Same lean runtime as the
+    /// index image (ADR-0086); override kept so operators can pin the kinds separately. See [`image_for`].
     review_image: Option<String>,
     service_account: String,
     /// In-cluster URL the runner calls back for context + status (the control plane's own Service).
@@ -337,7 +337,7 @@ struct JobConfig<'a> {
 }
 
 /// Pick the resource block for a task's kind. **Index** Jobs (`command_text == "index"`) are the heavy
-/// path — full tree-sitter parse + embeddings + Graphify — and want more CPU/RAM; **review** Jobs are
+/// path — full tree-sitter parse + embeddings + in-process lci-codegraph — and want more CPU/RAM; **review** Jobs are
 /// read-mostly (they reuse the latest indexed snapshot, ADR-0050, and are LLM/network-bound) so they
 /// run leaner. Each kind falls back to the shared `resources` when its own block is unset, so a chart
 /// that sets only `resources` keeps today's behaviour.
@@ -361,19 +361,18 @@ fn resources_for<'a>(
     }
 }
 
-/// Pick the container image for a task's kind (runner-differentiation, RFC-0001). **Index** Jobs
-/// (`command_text == "index"`) run the *full* image — Python + Graphify bundled — to build the
-/// structural graph; **review** Jobs (everything else) run a *leaner* image without the Graphify
-/// venv, since the review path is LLM/network-bound and never spawns Graphify. Each kind falls back
-/// to the shared `shared` image when its own override is unset, so a chart that sets only
-/// `runner_image` keeps today's single-image behaviour.
+/// Pick the container image for a task's kind (runner-differentiation, RFC-0001). Since the structural
+/// graph is now built in-process by `lci-codegraph` (ADR-0086, retiring the Python Graphify CLI), the
+/// **index** and **review** images share one lean runtime — the split image (index bundled Python +
+/// Graphify) is gone. The per-kind overrides remain so operators can still pin the two Job kinds to
+/// different tags/digests; each falls back to the shared `shared` image when its override is unset, so
+/// a chart that sets only `runner_image` keeps single-image behaviour.
 ///
 /// CAVEAT: a *cold-repo* review still self-indexes (ADR-0050 only makes *warm* reviews reuse the
-/// snapshot). On the leaner review image Graphify is absent, but the structural-graph step
-/// (`index_graph` in services/agent-runner/src/indexer/graph.rs) is best-effort/non-fatal — it logs
-/// and skips when `graphify` can't run. So a first cold review still builds the semantic (pgvector)
-/// index and merely defers the graph until the next `index` task (on the indexer image) builds it.
-/// The proper fix — review never self-indexes — is a separate runner-differentiation slice.
+/// snapshot), including the structural-graph step — now in-process, so no separate image is needed for
+/// it. That step is best-effort/non-fatal (`index_graph` in services/agent-runner/src/indexer/graph.rs):
+/// it logs and skips on failure. So a first cold review still builds the semantic (pgvector) index and
+/// the graph inline. The proper fix — review never self-indexes — is a separate runner-differentiation slice.
 fn image_for<'a>(
     task: &ClaimedTask,
     indexer: Option<&'a str>,
@@ -515,7 +514,7 @@ fn job_manifest(name: &str, cfg: JobConfig, task: &ClaimedTask) -> Value {
         },
         "spec": {
             "backoffLimit": 1,
-            // Runtime cap: clone + tree-sitter chunk + embed + Graphify can legitimately run for
+            // Runtime cap: clone + tree-sitter chunk + embed + lci-codegraph can legitimately run for
             // tens of minutes on a large repo (observed >15min in prod purely on indexing). Operator-
             // tunable via AGENT_JOB_DEADLINE_SECONDS (default 3600 = 1h) rather than killing healthy
             // long indexers. `ttlSecondsAfterFinished` below is a separate post-completion cleanup.

@@ -7,7 +7,7 @@
 //! trust boundary — it mints the token and validates findings + writes to GitHub (ADR-0002, ADR-0022).
 //!
 //! The lifecycle: clone → semantic index (tree-sitter → pgvector, slice 2) → structural index
-//! (Graphify → Neo4j, slice 3) → review (the native agent loop, ADR-0026/0037, which acts via mediated
+//! (in-house lci-codegraph → Neo4j, slice 3, ADR-0086) → review (the native agent loop, ADR-0026/0037, which acts via mediated
 //! write tools the control plane flushes) → report. Indexing is required; the structural graph and the
 //! review are best-effort and non-fatal.
 //!

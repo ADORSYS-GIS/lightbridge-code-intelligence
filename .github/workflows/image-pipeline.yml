@@ -134,8 +134,9 @@ jobs:
             dockerfile: apps/web/Dockerfile
             target: ""
             artifact: web-bundle
-          # Two agent images from one Dockerfile: `indexer` (full) keeps the historical name;
-          # `review` is the leaner no-Python image. Both COPY the same runner binary from context.
+          # Two agent images from one Dockerfile. Since Graphify was retired (ADR-0086) both targets
+          # alias one lean runtime and build to the same image; kept as separate tags for the two Job
+          # kinds. Both COPY the same runner binary from context.
           - image: lightbridge-agent-runner
             dockerfile: services/agent-runner/Dockerfile
             target: indexer

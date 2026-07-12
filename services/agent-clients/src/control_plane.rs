@@ -529,7 +529,7 @@ impl ControlPlaneClient {
         Ok(())
     }
 
-    /// `POST /internal/tasks/{id}/graph` — submit the structural code graph (Graphify → Neo4j).
+    /// `POST /internal/tasks/{id}/graph` — submit the structural code graph (lci-codegraph → Neo4j).
     pub async fn submit_graph(&self, task_id: Uuid, batch: GraphBatch) -> anyhow::Result<()> {
         use anyhow::Context;
         let url = format!("{}/internal/tasks/{task_id}/graph", self.base_url);

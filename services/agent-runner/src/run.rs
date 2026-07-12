@@ -284,19 +284,12 @@ async fn run(
         }
         // ── Semantic index: tree-sitter → pgvector (epic #5, slice 2) ────────────────────────
         let chunks = indexer::index_checkout(&context, &checkout, client, &embedder).await?;
-        // ── Structural index: Graphify → Neo4j (epic #5, slice 3, ADR-0019) ──────────────────
+        // ── Structural index: in-house lci-codegraph → Neo4j (epic #5, slice 3, ADR-0086) ─────
+        // The structural graph is built in-process by the `lci-codegraph` crate (tree-sitter); it
+        // replaced the retired Python Graphify CLI (ADR-0019) — no flag, no fallback.
         // Best-effort: the semantic index already landed, and the graph store may be unconfigured
         // (control plane returns 503). A graph failure is logged, not fatal — the task still succeeds.
-        // ADR-0086 slice 1: `LCI_CODEGRAPH_GRAPH` opts a run into the in-house Rust graph
-        // (`lci-codegraph`) instead of Graphify; default (unset) keeps Graphify, so prod is unchanged.
-        let graph_result = if indexer::codegraph_graph::enabled() {
-            tracing::info!(
-                "structural graph: using in-house lci-codegraph (LCI_CODEGRAPH_GRAPH set)"
-            );
-            indexer::codegraph_graph::index_graph(&context, &checkout, client).await
-        } else {
-            indexer::graph::index_graph(&context, &checkout, client).await
-        };
+        let graph_result = indexer::graph::index_graph(&context, &checkout, client).await;
         let graph = match graph_result {
             Ok((nodes, edges)) => format!("{nodes} nodes / {edges} edges"),
             Err(error) => {

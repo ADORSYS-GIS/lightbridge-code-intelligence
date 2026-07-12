@@ -1,7 +1,8 @@
 //! Structural code graph (ADR-0086 §1). Built directly on tree-sitter — the same grammars and the
 //! same `interesting_node` symbol set the chunker uses — as **edges on top of the per-file symbols**.
 //!
-//! Output is payload-compatible with the current Graphify `graph.json` parse: [`GraphNode`] mirrors
+//! Output is payload-compatible with the graph payload the retired Graphify `graph.json` parse
+//! produced (schema history, ADR-0019 → ADR-0086): [`GraphNode`] mirrors
 //! `agent-clients::GraphNodePayload` (`node_id`, `label`, `source_file`, `start_line`) and
 //! [`GraphEdge`] mirrors `GraphEdgePayload` (`source`, `target`, `relation`). The control plane's
 //! generic `:Symbol` + `[:REL {relation}]` Neo4j write and the `graph_find_symbol` /
@@ -15,7 +16,7 @@
 //!   definition in file B). `graph_get_callers` traverses this relation, so the name must match.
 //!
 //! Line numbers are **1-based** and callable labels carry a `()` suffix (`add` → `add()`), both for
-//! parity with the Graphify `graph.json` this crate is replacing.
+//! parity with the Graphify `graph.json` schema this crate replaced.
 
 use std::collections::HashMap;
 
@@ -82,8 +83,8 @@ struct CallSite {
 }
 
 /// Extract the structural facts for one **pre-parsed** file. `language` gates which languages produce
-/// a graph (Rust only in slice 1); an unsupported language yields empty facts (Graphify still covers
-/// it). `source_file` is the repo-relative, forward-slashed path used as the file node id.
+/// a graph (Rust only for now); an unsupported language yields empty facts (no structural graph yet).
+/// `source_file` is the repo-relative, forward-slashed path used as the file node id.
 #[must_use]
 pub fn extract_file(tree: &Tree, source_file: &str, source: &str, language: &str) -> FileSymbols {
     let mut facts = FileSymbols::default();

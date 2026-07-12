@@ -1,14 +1,9 @@
-//! Parity-harness scaffold (ADR-0086 / #354 acceptance criteria: golden tests + a side-by-side diff
-//! target). It runs `lci-codegraph` over a committed fixture repo and compares the canonicalised
-//! structural graph against a committed golden JSON.
+//! Golden-graph harness (ADR-0086 / #354 acceptance criteria). It runs `lci-codegraph` over a
+//! committed fixture repo and asserts the canonicalised structural graph is byte-stable against a
+//! committed golden JSON — the regression guard for the sole (in-house) graph engine now that the
+//! Python Graphify CLI has been retired.
 //!
-//! Two roles, one growing into the other:
-//!   1. **Golden (this PR):** assert the in-house graph is byte-stable against `tests/golden/*.json`.
-//!      Regenerate intentionally with `UPDATE_GOLDEN=1 cargo test -p lci-codegraph --test parity`.
-//!   2. **Graphify parity (a later PR):** the same canonical form is what a future test diffs against
-//!      Graphify's `graph.json` (run Graphify over the *same* fixture, normalise, compare
-//!      precision/recall). The comparison helpers here (`canonical_json`) are written to be reused by
-//!      that diff — see `graphify_parity_placeholder`.
+//! Regenerate the golden intentionally with `UPDATE_GOLDEN=1 cargo test -p lci-codegraph --test parity`.
 
 use std::path::PathBuf;
 
@@ -23,7 +18,7 @@ fn golden_path() -> PathBuf {
 }
 
 /// Canonical JSON for the graph: nodes/edges are already sorted+deduped by `resolve`, so a plain
-/// pretty-print is stable. This is the exact shape a Graphify diff will normalise onto.
+/// pretty-print is stable.
 fn canonical_json(out: &lci_codegraph::WalkOutput) -> String {
     serde_json::to_string_pretty(&out.graph).expect("graph serialises")
 }
@@ -87,11 +82,3 @@ fn fixture_exercises_cross_file_resolution() {
         out.graph.edges
     );
 }
-
-/// Placeholder for the language-by-language Graphify parity diff (ADR-0086 merge bar). A later PR
-/// runs Graphify over the same fixture, normalises its `graph.json` into the [`canonical_json`] shape,
-/// and asserts precision/recall thresholds per language. Kept as an ignored test so the intent — and
-/// the reused normalisation seam — is committed now, not rediscovered later.
-#[test]
-#[ignore = "enabled in the Graphify cutover PR (ADR-0086): diffs canonical graph vs graphify graph.json"]
-fn graphify_parity_placeholder() {}
