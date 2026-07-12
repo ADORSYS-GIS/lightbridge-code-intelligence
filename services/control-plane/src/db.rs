@@ -3878,9 +3878,15 @@ mod tests {
         // order is unambiguous and independent of the (random) UUIDs.
         let mut ids = Vec::new();
         for (n, delivery) in ["r-1", "r-2", "r-3"].iter().enumerate() {
-            record_delivery(&pool, Platform::GitHub, delivery, "pull_request", &json!({}))
-                .await
-                .unwrap();
+            record_delivery(
+                &pool,
+                Platform::GitHub,
+                delivery,
+                "pull_request",
+                &json!({}),
+            )
+            .await
+            .unwrap();
             let id = create_task(
                 &pool,
                 &NewTask {
@@ -3906,12 +3912,14 @@ mod tests {
 
         // Insertion order is NOT recency order: make the first-inserted the newest.
         for (id, hours_ago) in [(newest, 1_i32), (middle, 2), (oldest, 3)] {
-            sqlx::query("UPDATE tasks SET created_at = now() - ($2 * interval '1 hour') WHERE id = $1")
-                .bind(id)
-                .bind(hours_ago)
-                .execute(&pool)
-                .await
-                .unwrap();
+            sqlx::query(
+                "UPDATE tasks SET created_at = now() - ($2 * interval '1 hour') WHERE id = $1",
+            )
+            .bind(id)
+            .bind(hours_ago)
+            .execute(&pool)
+            .await
+            .unwrap();
         }
 
         let tasks = list_tasks(&pool, 100).await.unwrap();
