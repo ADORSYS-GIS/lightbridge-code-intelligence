@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.4.0](https://github.com/vymalo/lightbridge-code-intelligence/compare/v0.3.1...v0.4.0) (2026-07-12)
+
+
+### Features
+
+* **agent-plane:** live per-review status API — flag-gated read-only progress projection (slice 5 non-gated half, ADR-0085, [#358](https://github.com/vymalo/lightbridge-code-intelligence/issues/358)) ([#366](https://github.com/vymalo/lightbridge-code-intelligence/issues/366)) ([2e537f9](https://github.com/vymalo/lightbridge-code-intelligence/commit/2e537f9dcd5e7840f0c6bea5bfc8e4404eec2100))
+* **agent-plane:** mode×host entrypoint, run-once first (slice 2, ADR-0085) ([#361](https://github.com/vymalo/lightbridge-code-intelligence/issues/361)) ([e3c8568](https://github.com/vymalo/lightbridge-code-intelligence/commit/e3c8568ef45dba679728ae9d604675975964181e))
+* **agent:** durable replay — CheckpointRuntime + durable_step store + replay role (slice 3, ADR-0087) ([#362](https://github.com/vymalo/lightbridge-code-intelligence/issues/362)) ([3b99ef6](https://github.com/vymalo/lightbridge-code-intelligence/commit/3b99ef6815982195b8d7bc1e5921d934ad4b908d))
+* **codegraph:** lci-codegraph crate — ignore-list, PDF, Rust graph behind a flag (slice 1) ([#359](https://github.com/vymalo/lightbridge-code-intelligence/issues/359)) ([e902976](https://github.com/vymalo/lightbridge-code-intelligence/commit/e902976cc7d600b6b965cb96cac091a85db3ffd0))
+* **indexer:** make embedding batch + chunk sizes operator-configurable ([#350](https://github.com/vymalo/lightbridge-code-intelligence/issues/350)) ([90d6892](https://github.com/vymalo/lightbridge-code-intelligence/commit/90d6892c655c22759ba72e8c443a8f9974c6c733))
+* **open:** slice 4 — dormant `open` mode: sandboxed ticket→PR agent, credential-light mediated egress (ADR-0088, [#357](https://github.com/vymalo/lightbridge-code-intelligence/issues/357)) ([#364](https://github.com/vymalo/lightbridge-code-intelligence/issues/364)) ([ecbd00d](https://github.com/vymalo/lightbridge-code-intelligence/commit/ecbd00dbc273f819639b0ccaf1927082bfcffcf3))
+* **replay:** resume-aware review buffer + add_comment dedup (gate [#363](https://github.com/vymalo/lightbridge-code-intelligence/issues/363)) ([#370](https://github.com/vymalo/lightbridge-code-intelligence/issues/370)) ([6f86bd9](https://github.com/vymalo/lightbridge-code-intelligence/commit/6f86bd935d758511ae2aee7d32c3e49f36cd9a3e))
+
+
+### Bug Fixes
+
+* **open:** run_command drains excess output to sink (no false timeout on verbose commands) ([#369](https://github.com/vymalo/lightbridge-code-intelligence/issues/369)) ([391caeb](https://github.com/vymalo/lightbridge-code-intelligence/commit/391caeb250f7c8b7c50e761f23c90e165e898dd6))
+
+
+### Documentation
+
+* **rfc:** control-plane v2 — planes + agent-plane (RFC-0007, ADRs 0085-0088) ([#352](https://github.com/vymalo/lightbridge-code-intelligence/issues/352)) ([59ba33c](https://github.com/vymalo/lightbridge-code-intelligence/commit/59ba33cc828d68f8e0159f7523f3e08febfad347))
+
 ## [0.3.1](https://github.com/vymalo/lightbridge-code-intelligence/compare/v0.3.0...v0.3.1) (2026-07-11)
 
 
