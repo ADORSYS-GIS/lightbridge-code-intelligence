@@ -382,15 +382,15 @@ pub fn resolve(files: Vec<FileSymbols>) -> Graph {
 
         for call in &f.calls {
             let qualifier = call.qualifier.as_deref();
-            // Same-file definitions win; fall through to the global table only when the local table
-            // offers nothing (or the qualifier rules the sole local candidate out).
-            let target = match pick(local.get(call.name.as_str()).map(Vec::as_slice), qualifier) {
+            let local_pick = pick(local.get(call.name.as_str()).map(Vec::as_slice), qualifier);
+            // Same-file definitions win on a clean single hit. Otherwise — no local match, OR a local
+            // set too ambiguous to attribute — consult the global table, where a qualifier may still
+            // single out exactly one definition (e.g. locals `A::new`+`B::new` don't shadow a global
+            // `C::new()` call). A local ambiguity is only *counted* ambiguous if the global fails too.
+            let local_ambiguous = matches!(local_pick, Pick::Ambiguous);
+            let target = match local_pick {
                 Pick::One(id) => Some(id.to_string()),
-                Pick::Ambiguous => {
-                    ambiguous += 1;
-                    None
-                }
-                Pick::None => {
+                Pick::None | Pick::Ambiguous => {
                     match pick(global.get(call.name.as_str()).map(Vec::as_slice), qualifier) {
                         Pick::One(id) => Some(id.to_string()),
                         Pick::Ambiguous => {
@@ -398,7 +398,11 @@ pub fn resolve(files: Vec<FileSymbols>) -> Graph {
                             None
                         }
                         Pick::None => {
-                            unresolved += 1;
+                            if local_ambiguous {
+                                ambiguous += 1;
+                            } else {
+                                unresolved += 1;
+                            }
                             None
                         }
                     }
@@ -541,12 +545,23 @@ mod tests {
         let src = "struct S;\nimpl S { fn run(&self) {} }\n";
         let g = graph_of(&[("src/s.rs", src)]);
         let run = g.nodes.iter().find(|n| n.label == "run()").unwrap();
-        assert!(
-            g.edges
-                .iter()
-                .any(|e| e.relation == "method" && e.target == run.node_id),
-            "S::run must be reached by a `method` edge; edges = {:?}",
-            g.edges
+        // The enclosing container is the `impl S` node (codegraph emits an anonymous `impl` node, not
+        // the named type — this asserts codegraph's own SELF-CONSISTENCY: the `method` edge's source
+        // is exactly that container node. Whether Graphify anchors `method` at the type name instead
+        // is a separate side-by-side parity check still open on the #360 gate.
+        let impl_node = g
+            .nodes
+            .iter()
+            .find(|n| n.label == "impl")
+            .expect("impl container node");
+        let method_edge = g
+            .edges
+            .iter()
+            .find(|e| e.relation == "method" && e.target == run.node_id)
+            .unwrap_or_else(|| panic!("S::run must be a `method` edge; edges = {:?}", g.edges));
+        assert_eq!(
+            method_edge.source, impl_node.node_id,
+            "method edge must originate from the `impl S` container node, not elsewhere"
         );
         assert!(
             !g.edges
@@ -554,6 +569,41 @@ mod tests {
                 .any(|e| e.relation == "contains" && e.target == run.node_id),
             "S::run must NOT also be a `contains` target; edges = {:?}",
             g.edges
+        );
+    }
+
+    #[test]
+    fn ambiguous_local_does_not_shadow_a_qualified_global() {
+        // file a: two colliding `new`s + a call to `C::new()` (a *different* type). The local set is
+        // ambiguous, but the qualifier singles out the global `C::new` in file c — the edge must
+        // resolve cross-file, not be dropped (P2-c).
+        let a = (
+            "src/a.rs",
+            "\
+struct A;
+struct B;
+impl A { fn new() -> A { A } }
+impl B { fn new() -> B { B } }
+fn make() { let _ = C::new(); }
+",
+        );
+        let c = ("src/c.rs", "struct C;\nimpl C { fn new() -> C { C } }\n");
+        let g = graph_of(&[a, c]);
+        let make = g.nodes.iter().find(|n| n.label == "make()").unwrap();
+        let c_new = g
+            .nodes
+            .iter()
+            .find(|n| n.label == "new()" && n.source_file == "src/c.rs")
+            .expect("C::new in c.rs");
+        let calls: Vec<_> = g
+            .edges
+            .iter()
+            .filter(|e| e.relation == "calls" && e.source == make.node_id)
+            .collect();
+        assert_eq!(calls.len(), 1, "one cross-file edge; got {calls:?}");
+        assert_eq!(
+            calls[0].target, c_new.node_id,
+            "ambiguous locals must not shadow the qualified global C::new"
         );
     }
 

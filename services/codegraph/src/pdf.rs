@@ -5,12 +5,15 @@
 //! layers so a crafted repo PDF can neither OOM-kill nor hang the index Job:
 //! 1. **Cap input bytes at the I/O level BEFORE the parser sees the file** — we read at most
 //!    [`MAX_PDF_BYTES`] via a limited reader, so a multi-GB "PDF" never lands in memory whole.
-//! 2. **Bound peak decompression memory** — a small input can still *inflate* to gigabytes (a
-//!    "decompression bomb"), and a Rust allocation failure ABORTS the process (uncatchable by
-//!    `catch_unwind`). Before `pdf-extract` runs, we pre-flight every FlateDecode content stream
-//!    through a **bounded** inflate ([`MAX_PDF_DECOMPRESSED_BYTES`]) that never materialises more than
-//!    a small buffer; a file whose streams blow the budget is rejected without ever inflating them
-//!    fully, so `pdf-extract`'s own (unbounded) inflate of the same streams never happens.
+//! 2. **Bound cumulative FlateDecode input and reject the worst bombs** — a small input can still
+//!    *inflate* to gigabytes (a "decompression bomb"), and a Rust allocation failure ABORTS the
+//!    process (uncatchable by `catch_unwind`). Before `pdf-extract` runs, we pre-flight every
+//!    FlateDecode content stream through a **bounded** inflate ([`MAX_PDF_DECOMPRESSED_BYTES`]) that
+//!    never materialises more than a small buffer, and reject a file whose streams blow the budget.
+//!    This bounds the *cumulative inflated size of the Flate streams we can see* and cheaply kills the
+//!    worst multipliers — it does **not** cap peak process RSS: a file that *passes* is handed to
+//!    `pdf-extract`, which re-inflates those streams itself (independently, up to the budget) and can
+//!    allocate further for fonts/glyphs/object graphs on top.
 //! 3. **Bound parse wall-clock** — the parse runs on a worker thread under a [`PDF_PARSE_TIMEOUT`]
 //!    watchdog; a pathological file that spins can't hang the Job past the deadline.
 //! 4. **Catch panics + bound output** — `pdf-extract` can panic on malformed input (contained by
@@ -18,10 +21,13 @@
 //!
 //! **Residual limits (honest):** the decompression guard covers FlateDecode streams found by a
 //! syntactic `stream…endstream` scan — a bomb behind a non-Flate or cascaded filter, or blow-up in
-//! font/glyph tables rather than stream inflation, is not pre-flighted (the wall-clock watchdog is
-//! the backstop there). On timeout the worker thread is *detached*, not killed, so a runaway parse
-//! keeps a core busy until it finishes — but its memory stays bounded by layer 2. A hard per-parse
-//! memory ceiling (subprocess + `RLIMIT_AS`) is the belt-and-braces option tracked for the cutover.
+//! font/glyph tables rather than stream inflation, is not pre-flighted; the wall-clock watchdog is the
+//! only backstop there, and it bounds **time, not peak RSS**. On timeout the worker thread is
+//! *abandoned*, not killed: its memory is **not reclaimed** and, on exactly the non-pre-flighted path
+//! the watchdog exists to catch, is **not bounded** — a runaway parse keeps allocating (and holding a
+//! core) after we stop waiting. So this module bounds wall-clock and the common decompression-bomb
+//! vector, but a **hard per-parse memory ceiling is still required before graduation** (subprocess +
+//! `RLIMIT_AS`, so an OOM kills only the child) — tracked as a #360 cutover gate item.
 //!
 //! We picked **`pdf-extract`** over raw `lopdf`: it is purpose-built for text-out (it wraps `lopdf`
 //! and walks content streams for us), so we don't hand-roll content-stream/font decoding. It is
@@ -109,8 +115,12 @@ fn extract_bounded(bytes: &[u8], decompress_budget: u64, timeout: Duration) -> P
         ));
     }
 
-    // Layer 3 — wall-clock watchdog: parse on a worker thread; if it overruns we stop waiting. The
-    // worker (detached) can't grow past the decompression budget above, so abandoning it is safe.
+    // Layer 3 — wall-clock watchdog: parse on a worker thread; if it overruns we stop waiting and
+    // return, bounding *time*. Caveat: on timeout the worker is ABANDONED, not killed — its memory is
+    // NOT reclaimed and, on precisely the path that makes a parse overrun (a non-Flate/cascaded-filter
+    // stream or font/glyph-table blow-up the layer-2 pre-flight can't see), is NOT bounded: the
+    // detached thread keeps allocating after this returns. This backstops CPU/hang, not peak RSS; the
+    // hard memory bound (subprocess + RLIMIT_AS) is still required before graduation (#360).
     let owned = bytes.to_vec();
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
