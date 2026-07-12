@@ -42,11 +42,15 @@ concurrency:
 jobs:
   lint:
     runs-on: [self-hosted, vymalo-vps]
+    # The vymalo-vps hosts have no C toolchain, so native `cc`-linked builds (proc-macro2, serde_json,
+    # ring, …) fail with `linker 'cc' not found`. Run inside the org's batteries-included ARC image,
+    # which bakes build-essential + rustup stable (clippy/rustfmt/rust-src) + sccache. `--user root`
+    # so apt/cargo/git operate without a password-gated sudo (the host user cannot sudo).
+    container:
+      image: ghcr.io/vymalo/arc-runners:latest
+      options: --user root
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
       # v2.83.1, pinned to immutable reviewed code; checksums stay enabled explicitly.
       - uses: taiki-e/install-action@2ca9b94c269419b7b0c711c09d0b21c4e1d51145
         with:
