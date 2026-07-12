@@ -18,9 +18,7 @@ CREATE TABLE IF NOT EXISTS durable_step (
     -- (the ADR-0082 offload rule). Exactly one is set; `offload_ref` is scaffolding for now.
     result       JSONB,
     offload_ref  TEXT,
-    -- Journaled so replay CAN verify a rehydrated result (ADR-0087 C3). NB: the check is not yet
-    -- wired on the replay path, and jsonb normalizes key order + number formatting, so any future
-    -- check must hash canonicalized bytes, not the raw `result::text`.
+    -- Lets replay verify a rehydrated result is the same bytes it journaled (ADR-0087 C3).
     content_hash TEXT        NOT NULL,
     -- Drives the TTL sweep (`DURABLE_STEP_RETENTION`).
     created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
