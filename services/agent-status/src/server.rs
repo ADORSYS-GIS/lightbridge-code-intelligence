@@ -149,7 +149,16 @@ fn authorized(headers: &HeaderMap, expected: &str) -> bool {
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "))
         .map(str::trim)
-        .is_some_and(|presented| presented == expected)
+        .is_some_and(|presented| constant_time_eq(presented.as_bytes(), expected.as_bytes()))
+}
+
+/// Constant-time bearer-token comparison. A plain `==` on `&str` short-circuits on the first
+/// differing byte, leaking the shared secret's length/prefix to a timing attacker. `subtle`'s
+/// `ConstantTimeEq` compares in time independent of the contents — but only for equal-length inputs,
+/// so guard the length first (an unavoidable, non-secret length check).
+fn constant_time_eq(presented: &[u8], expected: &[u8]) -> bool {
+    use subtle::ConstantTimeEq as _;
+    presented.len() == expected.len() && presented.ct_eq(expected).into()
 }
 
 #[cfg(test)]

@@ -27,6 +27,8 @@ uuid.workspace = true
 # The workspace server stack (ADR: control-plane's HTTP surface). The status server is a tiny,
 # read-only axum app the run-once host runs alongside the loop when the flag is on.
 axum.workspace = true
+# Constant-time bearer-token comparison — the `/status` gate must not leak the secret via `==` timing.
+subtle.workspace = true
 
 [dev-dependencies]
 # Drive the actual loop engine with the deterministic testkit fakes (ScriptedModel, CapturingSink,

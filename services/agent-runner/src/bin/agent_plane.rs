@@ -89,14 +89,12 @@ async fn main() -> std::process::ExitCode {
     let guard = match mode {
         Some(mode) => agent_runner::plane::validate(mode, host),
         // No mode → the runner infers index/review from the task, and both are `run-once` only. We
-        // only need the host to be admissible; `serve` is still deferred to slice 5.
+        // only need the host to be admissible; `serve` is still deferred to slice 5. Delegate the
+        // serve rejection to `plane::validate` (via a representative inferable mode) so the deferral
+        // string lives in exactly one place instead of being duplicated here.
         None => match host {
             Host::RunOnce => Ok(()),
-            Host::Serve => Err(
-                "the serve host is not implemented yet: it arrives in slice 5. index and review \
-                 run under run-once today (ADR-0085)."
-                    .to_string(),
-            ),
+            Host::Serve => agent_runner::plane::validate(Mode::Index, host),
         },
     };
     if let Err(reason) = guard {

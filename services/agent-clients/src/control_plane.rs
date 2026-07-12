@@ -676,13 +676,23 @@ impl ControlPlaneClient {
         content_hash: &str,
     ) -> anyhow::Result<()> {
         use anyhow::Context;
+        // Serialize `result` by reference rather than through `json!`, which would clone the
+        // (possibly large) step result into an intermediate `Value` before writing the body.
+        #[derive(Serialize)]
+        struct UpsertRequest<'a> {
+            step_name: &'a str,
+            result: &'a serde_json::Value,
+            content_hash: &'a str,
+        }
         let url = format!("{}/internal/tasks/{task_id}/steps/upsert", self.base_url);
         self.http
             .post(&url)
             .bearer_auth(&self.token)
-            .json(&serde_json::json!({
-                "step_name": step_name, "result": result, "content_hash": content_hash,
-            }))
+            .json(&UpsertRequest {
+                step_name,
+                result,
+                content_hash,
+            })
             .send()
             .await
             .context("journaling durable step")?

@@ -362,9 +362,19 @@ pub async fn run_native_agent(
         let telemetry = telemetry.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_secs(1));
+            // After a stall don't fire a burst of catch-up ticks — one usage mirror per second is
+            // enough; skip missed ticks rather than spin.
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 tick.tick().await;
-                let (prompt, completion) = sum_usage(&telemetry.lock().expect("telemetry mutex"));
+                // Recover from a poisoned mutex instead of panicking (consistent with
+                // `StatusHandle::with`): a panic elsewhere holding this lock must not also kill the
+                // best-effort usage poller — the totals it reads are advisory telemetry.
+                let guard = telemetry
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let (prompt, completion) = sum_usage(&guard);
+                drop(guard);
                 handle.observe_usage(prompt, completion);
             }
         })

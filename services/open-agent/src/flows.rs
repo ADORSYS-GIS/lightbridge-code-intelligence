@@ -169,7 +169,7 @@ mod tests {
             call(
                 "p",
                 PROPOSE_PR,
-                r#"{"title":"Add feature","body":"AI Usage Declaration: authored by the open agent. Source of truth: #357. Verification: cargo test passed.","branch":"open/357"}"#,
+                r#"{"title":"Add feature","body":"AI Usage Declaration: authored by the open agent. Source of truth: #357. Verification: cargo test passed.","base":"HEAD~1","branch":"open/357"}"#,
             ),
         ];
 

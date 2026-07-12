@@ -2157,6 +2157,11 @@ pub async fn purge_durable_steps(
 /// is `> 0` BEFORE calling (a `0` cutoff would be `now()` and sweep in-flight state); this function
 /// trusts that guard. Returns the rows removed.
 pub async fn sweep_durable_steps(pool: &PgPool, retention_secs: f64) -> Result<u64, sqlx::Error> {
+    // Belt-and-suspenders over the load-time guard: a non-positive cutoff would resolve to `now()`
+    // (or the future) and delete in-flight state. Refuse to sweep rather than trust the caller.
+    if retention_secs <= 0.0 {
+        return Ok(0);
+    }
     let result = sqlx::query(
         "DELETE FROM durable_step WHERE created_at < now() - make_interval(secs => $1)",
     )
