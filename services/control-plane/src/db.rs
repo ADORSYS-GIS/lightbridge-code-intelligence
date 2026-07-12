@@ -2793,10 +2793,14 @@ pub async fn sweep_terminal_a2a_tasks(
 mod tests {
     use super::*;
     use serde_json::json;
+    // The REAL journaled step-result types (ADR-0087) — used by the durable_step round-trip so the
+    // test proves `from_value::<T>` rehydration through jsonb, not a hand-authored Value.
+    use lci_agent_types::{AssistantTurn, FunctionCallReq, ToolCallReq, ToolOutcome};
 
     // Integration tests: `#[sqlx::test]` provisions a fresh database, runs the migrations, and hands
     // us a pool. Requires a reachable Postgres via `DATABASE_URL` (see `compose.yaml`); skipped when
-    // none is configured (CI builds images but runs no Rust test job today).
+    // none is configured locally. CI runs them against a live Postgres — see
+    // `.github/workflows/control-plane-tests.yml` (`cargo test -p control-plane` with a postgres service).
 
     /// The dedup contract that lets the control plane run multiple replicas: the `delivery_id`
     /// PRIMARY KEY + `ON CONFLICT DO NOTHING` means a replayed GitHub delivery is detected as a
@@ -5177,68 +5181,115 @@ mod tests {
     // exercise the real `ControlPlaneStepStore` backing: the `jsonb` write + `result::text` read
     // round-trip, the `(task_id, run_epoch, step_name)` keying, and the replay-idempotent upsert.
 
-    /// A realistic `AssistantTurn` payload (an `llm_turn` step result) — one tool call, matching the
-    /// shape the loop journals. Kept as a literal `Value` (not a serialized `AssistantTurn`) so the
-    /// round-trip is asserted against the exact bytes the loop would hand the store, independent of any
-    /// serde skip-if-none attributes.
-    fn assistant_turn_result() -> serde_json::Value {
-        json!({
-            "content": "Looking at the diff now.",
-            "tool_calls": [
-                {
-                    "id": "call_abc",
-                    "kind": "function",
-                    "function": { "name": "read_file", "arguments": "{\"path\":\"src/db.rs\"}" },
-                    "extra_content": null
-                }
-            ]
-        })
+    /// A realistic `AssistantTurn` (an `llm_turn:{n}` step result) built from the REAL loop type, so
+    /// the round-trip is asserted against exactly what the loop serializes — including the serde
+    /// contract the loop relies on: `ToolCallReq.kind` renames to `"type"` and `extra_content: None`
+    /// is skipped. A hand-authored `Value` would silently drift from this.
+    fn assistant_turn_result() -> AssistantTurn {
+        AssistantTurn {
+            content: Some("Looking at the diff now.".into()),
+            tool_calls: vec![ToolCallReq {
+                id: "call_abc".into(),
+                kind: "function".into(),
+                function: FunctionCallReq {
+                    name: "read_file".into(),
+                    arguments: "{\"path\":\"src/db.rs\"}".into(),
+                },
+                extra_content: None,
+            }],
+        }
     }
 
-    /// A realistic tool-output payload (a `tools:{n}` step result) — the read batch's outcomes.
-    fn tool_output_result() -> serde_json::Value {
-        json!({
-            "outcomes": [
-                { "call_id": "call_abc", "kind": "continue", "content": "fn main() {}\n" }
-            ]
-        })
+    /// A realistic `tools:{n}` step result: the loop journals `T = Vec<(usize, ToolOutcome)>` (the
+    /// ordered read-batch outcomes). `ToolOutcome` is externally tagged, so this serializes to
+    /// `[[0,{"Continue":"…"}]]` — a shape a hand-written literal is easy to get wrong.
+    fn tool_output_result() -> Vec<(usize, ToolOutcome)> {
+        vec![(0, ToolOutcome::Continue("fn main() {}\n".into()))]
     }
 
     /// The gate #363 P1: the entire resume proof runs on `InMemoryStepStore`; this drives the REAL
-    /// Postgres store. Upsert an `AssistantTurn` result, fetch it back, and assert it rehydrates to the
-    /// SAME value through the `jsonb` write + `result::text` read. Note the assertion is *semantic*
-    /// (`serde_json::Value` equality), not raw-string: `jsonb` normalizes whitespace and key order, so
-    /// the stored text is not byte-identical to the input — but it must rehydrate to the same value,
-    /// which is exactly what `serde_json::from_value::<T>` in `CheckpointRuntime::step` relies on.
+    /// Postgres store with the REAL journaled types. For each of `AssistantTurn` (`llm_turn`) and
+    /// `Vec<(usize, ToolOutcome)>` (`tools`): serialize via `to_value` exactly as the loop does, upsert,
+    /// fetch back, and assert BOTH (a) the fetched `Value` semantically equals the journaled `Value`
+    /// (jsonb normalizes whitespace/key order/number formatting, so this is *not* a raw-string check),
+    /// AND (b) `serde_json::from_value::<T>(fetched)` rehydrates to the ORIGINAL typed value — the exact
+    /// call `CheckpointRuntime::step` makes on replay. (b) is the assertion that catches a type which
+    /// survives `Value`-equality but breaks typed rehydration through jsonb.
     #[sqlx::test]
     async fn durable_step_round_trips_a_real_step_result_through_jsonb(pool: PgPool) {
         let task_id = Uuid::new_v4();
         let run_epoch = 3;
-        let step_name = "llm_turn:0";
 
-        let result = assistant_turn_result();
-        let result_json = serde_json::to_string(&result).unwrap();
-        let hash = "sha256:deadbeef";
+        // ── llm_turn: AssistantTurn ──────────────────────────────────────────────────────────────
+        let turn = assistant_turn_result();
+        let turn_value = serde_json::to_value(&turn).unwrap();
+        upsert_durable_step(
+            &pool,
+            task_id,
+            run_epoch,
+            "llm_turn:0",
+            &serde_json::to_string(&turn_value).unwrap(),
+            "sha256:turn",
+        )
+        .await
+        .expect("upsert the journaled AssistantTurn");
 
-        upsert_durable_step(&pool, task_id, run_epoch, step_name, &result_json, hash)
-            .await
-            .expect("upsert the journaled step");
-
-        let fetched = fetch_durable_step(&pool, task_id, run_epoch, step_name)
+        let fetched = fetch_durable_step(&pool, task_id, run_epoch, "llm_turn:0")
             .await
             .expect("fetch the journaled step")
             .expect("the step was journaled, so it must be found");
-
         assert_eq!(
-            fetched.content_hash, hash,
+            fetched.content_hash, "sha256:turn",
             "the content hash round-trips verbatim"
         );
-        let rehydrated: serde_json::Value =
+        let fetched_value: serde_json::Value =
             serde_json::from_str(fetched.result.as_deref().expect("result is set"))
                 .expect("result::text is valid JSON");
         assert_eq!(
-            rehydrated, result,
-            "the AssistantTurn rehydrates to the same value through jsonb (what `step<T>` replay relies on)"
+            fetched_value, turn_value,
+            "(a) the AssistantTurn Value round-trips semantically through jsonb"
+        );
+        let rehydrated: AssistantTurn = serde_json::from_value(fetched_value).expect(
+            "(b) result::text rehydrates into the real AssistantTurn — the step<T> replay call",
+        );
+        assert_eq!(
+            rehydrated, turn,
+            "(b) from_value::<AssistantTurn> yields the original typed value (what CheckpointRuntime::step does)"
+        );
+
+        // ── tools: Vec<(usize, ToolOutcome)> ─────────────────────────────────────────────────────
+        let outputs = tool_output_result();
+        let outputs_value = serde_json::to_value(&outputs).unwrap();
+        upsert_durable_step(
+            &pool,
+            task_id,
+            run_epoch,
+            "tools:0",
+            &serde_json::to_string(&outputs_value).unwrap(),
+            "sha256:tools",
+        )
+        .await
+        .expect("upsert the journaled tool outputs");
+
+        let fetched_tools = fetch_durable_step(&pool, task_id, run_epoch, "tools:0")
+            .await
+            .unwrap()
+            .expect("tools:0 is journaled");
+        let fetched_tools_value: serde_json::Value =
+            serde_json::from_str(fetched_tools.result.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            fetched_tools_value, outputs_value,
+            "(a) the tool-output Vec Value round-trips semantically through jsonb"
+        );
+        let rehydrated_tools: Vec<(usize, ToolOutcome)> = serde_json::from_value(
+            fetched_tools_value,
+        )
+        .expect(
+            "(b) result::text rehydrates into Vec<(usize, ToolOutcome)> — the step<T> replay call",
+        );
+        assert_eq!(
+            rehydrated_tools, outputs,
+            "(b) from_value::<Vec<(usize, ToolOutcome)>> yields the original typed outputs"
         );
     }
 
@@ -5251,23 +5302,24 @@ mod tests {
         let run_epoch = 1;
 
         let turn = assistant_turn_result();
+        let turn_value = serde_json::to_value(&turn).unwrap();
         upsert_durable_step(
             &pool,
             task_id,
             run_epoch,
             "llm_turn:0",
-            &serde_json::to_string(&turn).unwrap(),
+            &serde_json::to_string(&turn_value).unwrap(),
             "hash-turn",
         )
         .await
         .unwrap();
-        let tools = tool_output_result();
+        let tools_value = serde_json::to_value(tool_output_result()).unwrap();
         upsert_durable_step(
             &pool,
             task_id,
             run_epoch,
             "tools:0",
-            &serde_json::to_string(&tools).unwrap(),
+            &serde_json::to_string(&tools_value).unwrap(),
             "hash-tools",
         )
         .await
@@ -5278,7 +5330,7 @@ mod tests {
             .await
             .unwrap()
             .expect("llm_turn:0 is journaled");
-        let rehydrated: serde_json::Value =
+        let rehydrated: AssistantTurn =
             serde_json::from_str(got_turn.result.as_deref().unwrap()).unwrap();
         assert_eq!(rehydrated, turn, "the right step returns its own result");
 
