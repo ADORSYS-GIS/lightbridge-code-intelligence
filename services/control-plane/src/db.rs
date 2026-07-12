@@ -2065,6 +2065,107 @@ pub async fn get_task_context(
     .await
 }
 
+// ── ADR-0087 durable-step store (the `CheckpointRuntime` journal) ────────────────────────────────
+// EXECUTION STATE only, keyed `(task_id, run_epoch, step_name)`. Written only when the agent runs
+// under `CheckpointRuntime` (opt-in). `run_epoch` is resolved server-side from the task row so the
+// agent never has to know or supply it (trust boundary — it journals `(task_id, step_name)` and the
+// control plane keys it against the run's identity tuple).
+
+/// One journaled step result: the stored JSON (as text, cast from `jsonb`) and its content hash.
+/// `result` is `None` only for a future offloaded payload (`offload_ref` — scaffolding).
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct DurableStepRow {
+    pub result: Option<String>,
+    pub content_hash: String,
+}
+
+/// Resolve a task's `run_epoch` (ADR-0076 idempotency tuple), or `None` if the task is gone. The
+/// durable-step key derives `run_epoch` from this rather than trusting the caller.
+pub async fn durable_step_run_epoch(
+    pool: &PgPool,
+    task_id: Uuid,
+) -> Result<Option<i32>, sqlx::Error> {
+    sqlx::query_scalar("SELECT run_epoch FROM tasks WHERE id = $1")
+        .bind(task_id)
+        .fetch_optional(pool)
+        .await
+}
+
+/// Upsert one journaled step result (replay-idempotent on the `(task_id, run_epoch, step_name)` key:
+/// a re-run of the same step overwrites its row rather than duplicating). `result_json` is the
+/// serialized JSON body, cast to `jsonb` in-SQL so no extra sqlx feature is needed.
+pub async fn upsert_durable_step(
+    pool: &PgPool,
+    task_id: Uuid,
+    run_epoch: i32,
+    step_name: &str,
+    result_json: &str,
+    content_hash: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO durable_step (task_id, run_epoch, step_name, result, content_hash) \
+         VALUES ($1, $2, $3, $4::jsonb, $5) \
+         ON CONFLICT (task_id, run_epoch, step_name) \
+         DO UPDATE SET result = EXCLUDED.result, content_hash = EXCLUDED.content_hash",
+    )
+    .bind(task_id)
+    .bind(run_epoch)
+    .bind(step_name)
+    .bind(result_json)
+    .bind(content_hash)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Fetch one journaled step result, or `None` if this step has not run yet (the replay gap). Reads
+/// `result::text` so the JSON is rehydrated without the sqlx `json` feature.
+pub async fn fetch_durable_step(
+    pool: &PgPool,
+    task_id: Uuid,
+    run_epoch: i32,
+    step_name: &str,
+) -> Result<Option<DurableStepRow>, sqlx::Error> {
+    sqlx::query_as::<_, DurableStepRow>(
+        "SELECT result::text AS result, content_hash FROM durable_step \
+         WHERE task_id = $1 AND run_epoch = $2 AND step_name = $3",
+    )
+    .bind(task_id)
+    .bind(run_epoch)
+    .bind(step_name)
+    .fetch_optional(pool)
+    .await
+}
+
+/// Purge-on-success (ADR-0087): drop a completed run's whole journal in one statement once it
+/// finalizes. Idempotent — a re-finalize just deletes zero rows. Returns the rows removed.
+pub async fn purge_durable_steps(
+    pool: &PgPool,
+    task_id: Uuid,
+    run_epoch: i32,
+) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query("DELETE FROM durable_step WHERE task_id = $1 AND run_epoch = $2")
+        .bind(task_id)
+        .bind(run_epoch)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected())
+}
+
+/// TTL sweep (ADR-0087): the `replay` role's backstop for abandoned/failed/cancelled runs — delete
+/// every row older than `retention_secs`, success or failure. The caller validates `retention_secs`
+/// is `> 0` BEFORE calling (a `0` cutoff would be `now()` and sweep in-flight state); this function
+/// trusts that guard. Returns the rows removed.
+pub async fn sweep_durable_steps(pool: &PgPool, retention_secs: f64) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query(
+        "DELETE FROM durable_step WHERE created_at < now() - make_interval(secs => $1)",
+    )
+    .bind(retention_secs)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}
+
 /// Statuses the runner is allowed to report. Transitioning into a terminal one stamps
 /// `completed_at` and releases the lease; `running` (re)stamps `started_at`. Anything else is
 /// rejected by the handler before reaching here.

@@ -2668,9 +2668,16 @@ name = "lci-agent-clients"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "hex",
+ "lci-agent-loop",
+ "lci-agent-step",
+ "lci-agent-testkit",
+ "lci-agent-tools",
+ "lci-agent-types",
  "reqwest",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "tokio",
  "tracing",
  "uuid",

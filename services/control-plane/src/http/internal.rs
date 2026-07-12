@@ -395,6 +395,117 @@ pub async fn record_review_telemetry(
     }
 }
 
+// ── ADR-0087 durable-step journal (the `CheckpointRuntime` replay store) ─────────────────────────
+// The agent, running under `CheckpointRuntime`, journals each step's RESULT here through this
+// mediated API (it holds no DB credential — ADR-0002/0037). `run_epoch` is resolved server-side from
+// the task row: the agent supplies only `(task_id, step_name)`, so it can neither know nor spoof the
+// run identity. Additive + prod-neutral: unused while the agent runs `Passthrough` (the default).
+
+/// Body for `POST /internal/tasks/{id}/steps/upsert` — one journaled step result (ADR-0087).
+#[derive(Debug, Deserialize)]
+pub struct UpsertStepBody {
+    /// The stability-tested step name (`llm_turn:{n}` / `tools:{n}` / `tool:{n}:{id}`).
+    pub step_name: String,
+    /// The step's serialized result — stored verbatim as `jsonb`.
+    pub result: serde_json::Value,
+    /// Content hash of `result` (ADR-0087 C3), so replay can verify the rehydrated bytes.
+    pub content_hash: String,
+}
+
+/// Body for `POST /internal/tasks/{id}/steps/fetch`.
+#[derive(Debug, Deserialize)]
+pub struct FetchStepBody {
+    pub step_name: String,
+}
+
+/// A journaled step result, returned by `fetch_step` on a hit.
+#[derive(Debug, Serialize)]
+pub struct StoredStepResponse {
+    pub result: serde_json::Value,
+    pub content_hash: String,
+}
+
+/// `POST /internal/tasks/{id}/steps/upsert` — journal one step result (replay-idempotent on the
+/// `(task_id, run_epoch, step_name)` key). 404 if the task is unknown.
+pub async fn upsert_step(
+    _auth: RunnerAuth,
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<UpsertStepBody>,
+) -> Response {
+    let Some(pool) = state.db.as_ref() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "no database").into_response();
+    };
+    let run_epoch = match crate::db::durable_step_run_epoch(pool, id).await {
+        Ok(Some(epoch)) => epoch,
+        Ok(None) => return (StatusCode::NOT_FOUND, "task not found").into_response(),
+        Err(error) => {
+            tracing::error!(%error, task_id = %id, "resolving run_epoch for durable step failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "query error").into_response();
+        }
+    };
+    // Store the result as its serialized text, cast to `jsonb` in-SQL (no extra sqlx feature needed).
+    let result_json = body.result.to_string();
+    match crate::db::upsert_durable_step(
+        pool,
+        id,
+        run_epoch,
+        &body.step_name,
+        &result_json,
+        &body.content_hash,
+    )
+    .await
+    {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => {
+            tracing::error!(%error, task_id = %id, step = %body.step_name, "upserting durable step failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "store error").into_response()
+        }
+    }
+}
+
+/// `POST /internal/tasks/{id}/steps/fetch` — read one journaled step result. 200 with the result on a
+/// hit; 404 when the step has not run yet (the replay gap where the loop continues live) or the task
+/// is unknown.
+pub async fn fetch_step(
+    _auth: RunnerAuth,
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<FetchStepBody>,
+) -> Response {
+    let Some(pool) = state.db.as_ref() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "no database").into_response();
+    };
+    let run_epoch = match crate::db::durable_step_run_epoch(pool, id).await {
+        Ok(Some(epoch)) => epoch,
+        Ok(None) => return (StatusCode::NOT_FOUND, "task not found").into_response(),
+        Err(error) => {
+            tracing::error!(%error, task_id = %id, "resolving run_epoch for durable step failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "query error").into_response();
+        }
+    };
+    match crate::db::fetch_durable_step(pool, id, run_epoch, &body.step_name).await {
+        Ok(Some(row)) => {
+            // `result::text` round-trips through serde_json; a NULL result (future offload) is `null`.
+            let result = row
+                .result
+                .as_deref()
+                .and_then(|text| serde_json::from_str(text).ok())
+                .unwrap_or(serde_json::Value::Null);
+            Json(StoredStepResponse {
+                result,
+                content_hash: row.content_hash,
+            })
+            .into_response()
+        }
+        Ok(None) => (StatusCode::NOT_FOUND, "step not journaled").into_response(),
+        Err(error) => {
+            tracing::error!(%error, task_id = %id, step = %body.step_name, "fetching durable step failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "query error").into_response()
+        }
+    }
+}
+
 /// `POST /internal/tasks/{id}/chunks` — ingest indexed code chunks from the runner.
 ///
 /// The runner submits chunks in batches as it processes files; the control plane writes them to
@@ -1544,6 +1655,23 @@ pub async fn finalize_review(
         (false, false) => "review", // summary-only or empty → a (clean) review
     };
     let _ = crate::db::set_task_kind(pool, id, kind).await;
+
+    // 4) Purge-on-success (ADR-0087): the run has finalized (review/reply queued for egress), so its
+    // durable-step journal is dead weight — drop it now rather than waiting for the TTL sweep. A no-op
+    // (0 rows) when the run wasn't journaling (the default `Passthrough` prod path), so it stays
+    // prod-neutral. Best-effort: the TTL sweep in the `replay` role is the backstop, so a purge blip
+    // never fails a finalize.
+    match crate::db::durable_step_run_epoch(pool, id).await {
+        Ok(Some(run_epoch)) => {
+            if let Err(error) = crate::db::purge_durable_steps(pool, id, run_epoch).await {
+                tracing::warn!(%error, task_id = %id, "purge-on-success of durable steps failed (non-fatal; TTL sweep backstops)");
+            }
+        }
+        Ok(None) => {}
+        Err(error) => {
+            tracing::warn!(%error, task_id = %id, "resolving run_epoch for durable-step purge failed (non-fatal)");
+        }
+    }
 
     Json(serde_json::json!({ "kind": kind, "review": queued_review, "reply": queued_reply }))
         .into_response()

@@ -27,7 +27,9 @@ use std::time::Duration;
 use anyhow::Context;
 use uuid::Uuid;
 
-use lci_agent_clients::{ControlPlaneClient, EmbeddingsClient, TranscriptEntry};
+use lci_agent_clients::{
+    CheckpointRuntime, ControlPlaneClient, ControlPlaneStepStore, EmbeddingsClient, TranscriptEntry,
+};
 use lci_agent_loop::{Conversation, LoopOutcome, RequestOptions, TranscriptEvent, TranscriptSink};
 use lci_agent_step::Passthrough;
 use lci_agent_tools::{RuntimeCaps, ToolCx, TurnFilter};
@@ -55,6 +57,21 @@ pub enum ReviewOutcome {
     Finished,
     Exhausted,
     Aborted(String),
+}
+
+/// Whether to drive the loop under `CheckpointRuntime` (ADR-0087 durable replay) instead of the
+/// default `Passthrough`. Opt-in via `LCI_DURABLE_REPLAY` (`1`/`true`/`yes`, case-insensitive); unset
+/// or anything else keeps today's prod behavior. A run-once/agent-plane host env, so the dispatcher
+/// can flip it per deployment without a code change.
+fn durable_replay_enabled() -> bool {
+    std::env::var("LCI_DURABLE_REPLAY")
+        .map(|raw| {
+            matches!(
+                raw.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes"
+            )
+        })
+        .unwrap_or(false)
 }
 
 /// A [`TranscriptSink`] that captures the loop's events so the host can reconstruct the ADR-0034
@@ -275,12 +292,25 @@ pub async fn run_native_agent(
     )
     .with_filter(TurnFilter::only_names(initial_names));
 
+    // Durable replay (ADR-0087) is opt-in and OFF by default, so prod keeps running `Passthrough`
+    // (today's behavior). When enabled, the host runs `CheckpointRuntime` and declares replay-capable
+    // caps so a completed write is journaled per call and served (not re-run) on resume.
+    let durable_replay = durable_replay_enabled();
+    let runtime_caps = if durable_replay {
+        RuntimeCaps {
+            replays_completed_steps: true,
+            per_call_dedup: true,
+        }
+    } else {
+        RuntimeCaps::default()
+    };
+
     // ── Tool registry (built-ins + discovered) ──────────────────────────────────────────────────
     let registry = tool_registry(
         Arc::new(client.clone()),
         Arc::new(embedder.clone()),
         dispatch_discovered,
-        RuntimeCaps::default(),
+        runtime_caps,
     )
     .context("assembling review tool registry")?;
 
@@ -307,17 +337,37 @@ pub async fn run_native_agent(
     let sink = JobSink::default();
     let sink_handle = sink.clone();
     let telemetry = chat.telemetry_handle();
-    let outcome = flows::run_review(
-        Passthrough,
-        chat,
-        Box::new(sink),
-        &cx,
-        registry,
-        conversation,
-        params,
-        client,
-    )
-    .await;
+    // Runtime selection (ADR-0087): the same assembly runs over either `StepRuntime`. Off by default
+    // (`Passthrough` = today's prod behavior); when `LCI_DURABLE_REPLAY` is set, a `CheckpointRuntime`
+    // journals each step through the internal API so a requeued run resumes from storage. The move of
+    // the shared inputs into exactly one branch is what makes this a clean either/or.
+    let outcome = if durable_replay {
+        tracing::info!(task_id = %task_id, "durable replay enabled: driving the loop under CheckpointRuntime (ADR-0087)");
+        let store = ControlPlaneStepStore::new(client.clone(), task_id);
+        flows::run_review(
+            CheckpointRuntime::new(store),
+            chat,
+            Box::new(sink),
+            &cx,
+            registry,
+            conversation,
+            params,
+            client,
+        )
+        .await
+    } else {
+        flows::run_review(
+            Passthrough,
+            chat,
+            Box::new(sink),
+            &cx,
+            registry,
+            conversation,
+            params,
+            client,
+        )
+        .await
+    };
 
     // Reconstruct the ADR-0034 transcript from the sink events + the model client's per-turn telemetry
     // side-channel BEFORE propagating any loop error, so the caller still submits a failed run's

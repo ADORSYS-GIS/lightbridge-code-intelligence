@@ -367,6 +367,17 @@ fn app(state: AppState) -> Router {
             "/internal/tasks/{id}/review/telemetry",
             post(internal::record_review_telemetry),
         )
+        // ADR-0087 durable-step journal: the agent, running under `CheckpointRuntime` (opt-in),
+        // journals each step's result and fetches it back on replay. `run_epoch` is resolved
+        // server-side from the task row. Additive — unused on the default `Passthrough` path.
+        .route(
+            "/internal/tasks/{id}/steps/upsert",
+            post(internal::upsert_step),
+        )
+        .route(
+            "/internal/tasks/{id}/steps/fetch",
+            post(internal::fetch_step),
+        )
         // ADR-0037 mediated write actions: the native agent buffers findings/replies/summary, then
         // flushes them as one grouped review on finalize.
         .route(
@@ -556,8 +567,10 @@ async fn main() -> anyhow::Result<()> {
         "a2a" => a2a::run(state).await,
         // The A2A push-notification webhook-delivery actor (RFC-0006 Phase 3 / ADR-0079).
         "notifier" => run_notifier(state).await,
+        // The durable-replay store lifecycle owner (ADR-0087): TTL-sweeps the `durable_step` journal.
+        "replay" => run_replay(state).await,
         other => anyhow::bail!(
-            "unknown role {other:?} (expected: serve | dispatcher | reconciler | restate-worker | a2a | notifier [| poller])"
+            "unknown role {other:?} (expected: serve | dispatcher | reconciler | restate-worker | a2a | notifier | replay [| poller])"
         ),
     }
 }
@@ -632,6 +645,23 @@ async fn run_reconciler(state: AppState) -> anyhow::Result<()> {
         drain_enabled,
     )
     .await
+}
+
+/// The `replay` role (ADR-0087): owns the `durable_step` journal's lifecycle. Runs the periodic TTL
+/// sweep (`DURABLE_STEP_RETENTION`, validated `> 0` at load — a non-positive value is rejected here,
+/// not clamped, since it would sweep in-flight resume state). Purge-on-success lives on the finalize
+/// write path; this role is the backstop for abandoned/failed runs. Requires a database; run as a
+/// singleton (the sweep is idempotent, so extra replicas are harmless but pointless).
+async fn run_replay(state: AppState) -> anyhow::Result<()> {
+    let pool = state
+        .db
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("replay role requires DATABASE_URL"))?;
+    let retention =
+        queue::replay::retention_from_env().map_err(|reason| anyhow::anyhow!(reason))?;
+    // Headless role: stand up the metrics-only listener like the dispatcher/reconciler.
+    spawn_metrics_server(state.metrics.clone());
+    queue::replay::run(pool, retention).await
 }
 
 /// The HTTP control surface (webhook ingress, `/tasks`, health, OIDC-protected routes).

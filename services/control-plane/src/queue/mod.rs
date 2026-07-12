@@ -12,4 +12,5 @@ pub(crate) mod notifier;
 pub(crate) mod outbox_sweeper;
 pub(crate) mod reaper;
 pub(crate) mod reconciler;
+pub(crate) mod replay;
 pub(crate) mod tasks;

@@ -13,11 +13,24 @@ data purge work. Diagrams are Mermaid (rendered by GitHub).
 > `run_once` orchestration as `agent-runner` (`services/agent-runner/src/{run.rs,plane.rs}`,
 > `src/bin/agent_plane.rs`), and the mode×host routing guard is enforced at startup. **Still pending:**
 > the dispatcher still launches the `agent-runner` binary (the cutover to `agent-plane --mode … --host
-> run-once` is a later one-liner), so the two Job images have **not** yet collapsed to one; the `serve`
-> host (slice 5) and `open` mode (slice 4) are guard scaffolding only and rejected at startup; and
-> `CheckpointRuntime` replay ([ADR-0087](adr/0087-durable-replay-checkpoint-runtime.md), slice 3) is
-> not built — a pod death still restarts a deep review from turn 0. The state machine, cancellation,
-> and purge described here are unchanged.
+> run-once` is a later one-liner), so the two Job images have **not** yet collapsed to one; and the
+> `serve` host (slice 5) and `open` mode (slice 4) are guard scaffolding only and rejected at startup.
+> **Landed (slice 3), behind a flag:** `CheckpointRuntime` replay
+> ([ADR-0087](adr/0087-durable-replay-checkpoint-runtime.md)) now **exists** — the third `StepRuntime`
+> impl (`services/agent-clients/src/checkpoint.rs`), a `durable_step` store
+> (migration `0028`, keyed `(task_id, run_epoch, step_name)`), additive internal-API endpoints
+> (`/internal/tasks/{id}/steps/{upsert,fetch}`, the agent journaling THROUGH the API — still DB-less),
+> and a `replay` control-plane role that owns the store lifecycle (purge-on-success on `finalize`
+> + a `DURABLE_STEP_RETENTION` TTL sweep, validated `> 0` at load). Under it, a step's result is
+> journaled and served from storage on a requeue of the **same `run_epoch`**, so the loop resumes at
+> the step it left instead of turn 0 — **proven in-process** (an `AgentLoop` under `CheckpointRuntime`
+> + an in-memory store + a `ScriptedModel` resumes with **zero duplicate model calls**). It is
+> **opt-in and OFF in prod**: the default is still `Passthrough`, so a pod death today still restarts a
+> deep review from turn 0 until `LCI_DURABLE_REPLAY` is enabled on the host. **Known gap before
+> prod-enable:** the runner clears the `pending_review_actions` buffer at run start (ADR-0037), so a
+> resumed run whose write steps replay from storage would not re-buffer their findings — reconciling
+> that (resume-aware buffer, or re-executing write steps) is a follow-up, as is the `add_comment`
+> server-side dedup key. The state machine, cancellation, and purge described here are unchanged.
 
 > Source of truth in code:
 > `services/control-plane/src/db.rs` (task status fns, idempotency, `create_task` /
