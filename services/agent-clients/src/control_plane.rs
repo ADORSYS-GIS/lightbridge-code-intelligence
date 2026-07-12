@@ -254,6 +254,14 @@ struct StatusUpdate<'a> {
     detail: Option<&'a str>,
 }
 
+/// A journaled durable-step result read back from the control plane (ADR-0087): the stored value and
+/// its content hash (so replay can verify the rehydrated bytes).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct StoredStep {
+    pub result: serde_json::Value,
+    pub content_hash: String,
+}
+
 /// Talks to one control plane with one task's bearer.
 #[derive(Clone)]
 pub struct ControlPlaneClient {
@@ -655,6 +663,62 @@ impl ControlPlaneClient {
             .await
             .context("parsing knowledge-tool result")?;
         Ok(body.text)
+    }
+
+    /// `POST /internal/tasks/{id}/steps/upsert` — journal one agent-loop step result (ADR-0087).
+    /// The agent supplies `(step_name, result, content_hash)`; the control plane resolves `run_epoch`
+    /// from the task row (the agent never knows it — trust boundary). Idempotent on the key.
+    pub async fn upsert_step(
+        &self,
+        task_id: Uuid,
+        step_name: &str,
+        result: &serde_json::Value,
+        content_hash: &str,
+    ) -> anyhow::Result<()> {
+        use anyhow::Context;
+        let url = format!("{}/internal/tasks/{task_id}/steps/upsert", self.base_url);
+        self.http
+            .post(&url)
+            .bearer_auth(&self.token)
+            .json(&serde_json::json!({
+                "step_name": step_name, "result": result, "content_hash": content_hash,
+            }))
+            .send()
+            .await
+            .context("journaling durable step")?
+            .error_for_status()
+            .context("control plane rejected the durable-step upsert")?;
+        Ok(())
+    }
+
+    /// `POST /internal/tasks/{id}/steps/fetch` — read a journaled step result back (ADR-0087). `None`
+    /// when the step has not run yet (the replay gap where the loop continues live) — a `404` from the
+    /// control plane maps to `Ok(None)`, distinct from a transport/other error which is `Err`.
+    pub async fn fetch_step(
+        &self,
+        task_id: Uuid,
+        step_name: &str,
+    ) -> anyhow::Result<Option<StoredStep>> {
+        use anyhow::Context;
+        let url = format!("{}/internal/tasks/{task_id}/steps/fetch", self.base_url);
+        let response = self
+            .http
+            .post(&url)
+            .bearer_auth(&self.token)
+            .json(&serde_json::json!({ "step_name": step_name }))
+            .send()
+            .await
+            .context("fetching durable step")?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let stored = response
+            .error_for_status()
+            .context("control plane rejected the durable-step fetch")?
+            .json::<StoredStep>()
+            .await
+            .context("parsing durable step")?;
+        Ok(Some(stored))
     }
 
     /// `POST /internal/tasks/{id}/status` — report a status transition (best-effort `detail`).
