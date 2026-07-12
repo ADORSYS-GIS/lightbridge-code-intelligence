@@ -919,6 +919,7 @@ mod tests {
             });
             Mock::given(method("POST"))
                 .and(path(format!("/internal/tasks/{task_id}/steps/fetch")))
+                .and(bearer_token("tok"))
                 .respond_with(ResponseTemplate::new(200).set_body_json(stored))
                 .mount(&server)
                 .await;
@@ -945,6 +946,7 @@ mod tests {
             let task_id = Uuid::new_v4();
             Mock::given(method("POST"))
                 .and(path(format!("/internal/tasks/{task_id}/steps/fetch")))
+                .and(bearer_token("tok"))
                 .respond_with(ResponseTemplate::new(500))
                 .mount(&server)
                 .await;
