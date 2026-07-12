@@ -31,6 +31,7 @@ use lci_agent_clients::{
     CheckpointRuntime, ControlPlaneClient, ControlPlaneStepStore, EmbeddingsClient, TranscriptEntry,
 };
 use lci_agent_loop::{Conversation, LoopOutcome, RequestOptions, TranscriptEvent, TranscriptSink};
+use lci_agent_status::StatusHandle;
 use lci_agent_step::Passthrough;
 use lci_agent_tools::{RuntimeCaps, ToolCx, TurnFilter};
 use lci_agent_types::{ToolOutcome, ToolSpec};
@@ -119,6 +120,10 @@ pub async fn run_native_agent(
     // Accumulates the run transcript (ADR-0034). The caller owns it and submits it afterwards (even on
     // error), so a failed run's reasoning is still captured.
     transcript: &mut Vec<TranscriptEntry>,
+    // Live status projection (RFC-0007 slice 5), `Some` only when the operator enabled the status API.
+    // When set, the loop sink is teed through a `StatusSink` (behaviour-neutral) and token usage is fed
+    // from the telemetry side-channel; `None` keeps today's path exactly (no wrapping, no feed).
+    status: Option<&StatusHandle>,
 ) -> anyhow::Result<ReviewOutcome> {
     // ── Model client (ADR-0039) ──────────────────────────────────────────────────────────────────
     // Streaming (ADR-0039 / #206): opt-in via `review.stream`. `with_extra` strips reserved structural
@@ -337,6 +342,33 @@ pub async fn run_native_agent(
     let sink = JobSink::default();
     let sink_handle = sink.clone();
     let telemetry = chat.telemetry_handle();
+    // Live status projection (RFC-0007 slice 5): when the status API is on, tee the loop's events into
+    // the shared status handle (turn / current tool / findings) via a `StatusSink` that forwards every
+    // event UNCHANGED to `JobSink` — so the transcript reconstructed below is byte-identical whether or
+    // not the tap is installed. `None` ⇒ the bare `JobSink`, today's exact path.
+    let loop_sink: Box<dyn TranscriptSink> = match status {
+        Some(handle) => Box::new(lci_agent_status::StatusSink::new(
+            handle.clone(),
+            Box::new(sink),
+            [ADD_REVIEW_COMMENT],
+        )),
+        None => Box::new(sink),
+    };
+    // Token usage is NOT in the transcript events, so feed it from the model telemetry side-channel:
+    // a lightweight poller mirrors the running totals into the status handle while the loop runs, so
+    // "tokens so far" is live. Spawned only when the status API is on; aborted right after the loop.
+    let usage_poller = status.map(|handle| {
+        let handle = handle.clone();
+        let telemetry = telemetry.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(1));
+            loop {
+                tick.tick().await;
+                let (prompt, completion) = sum_usage(&telemetry.lock().expect("telemetry mutex"));
+                handle.observe_usage(prompt, completion);
+            }
+        })
+    });
     // Runtime selection (ADR-0087): the same assembly runs over either `StepRuntime`. Off by default
     // (`Passthrough` = today's prod behavior); when `LCI_DURABLE_REPLAY` is set, a `CheckpointRuntime`
     // journals each step through the internal API so a requeued run resumes from storage. The move of
@@ -347,7 +379,7 @@ pub async fn run_native_agent(
         flows::run_review(
             CheckpointRuntime::new(store),
             chat,
-            Box::new(sink),
+            loop_sink,
             &cx,
             registry,
             conversation,
@@ -359,7 +391,7 @@ pub async fn run_native_agent(
         flows::run_review(
             Passthrough,
             chat,
-            Box::new(sink),
+            loop_sink,
             &cx,
             registry,
             conversation,
@@ -368,6 +400,16 @@ pub async fn run_native_agent(
         )
         .await
     };
+
+    // Stop the poller and take one final, authoritative token reading (so the terminal snapshot is
+    // accurate even if the last turn landed between polls).
+    if let Some(poller) = usage_poller {
+        poller.abort();
+    }
+    if let Some(handle) = status {
+        let (prompt, completion) = sum_usage(&telemetry.lock().expect("telemetry mutex"));
+        handle.observe_usage(prompt, completion);
+    }
 
     // Reconstruct the ADR-0034 transcript from the sink events + the model client's per-turn telemetry
     // side-channel BEFORE propagating any loop error, so the caller still submits a failed run's
@@ -384,6 +426,22 @@ pub async fn run_native_agent(
         LoopOutcome::Exhausted => ReviewOutcome::Exhausted,
         LoopOutcome::Aborted { reason } => ReviewOutcome::Aborted(reason),
     })
+}
+
+/// Sum the running (prompt, completion) token totals across the per-turn telemetry for the live status
+/// projection (RFC-0007 slice 5). Tokens are not carried in the transcript events, so they come from the
+/// model client's telemetry side-channel. A negative/absent count clamps to `0` — a status metric must
+/// never be a nonsense number.
+fn sum_usage(telemetry: &[TurnTelemetry]) -> (u64, u64) {
+    let clamp = |value: Option<i64>| u64::try_from(value.unwrap_or(0).max(0)).unwrap_or(0);
+    telemetry
+        .iter()
+        .fold((0, 0), |(prompt, completion), entry| {
+            (
+                prompt + clamp(entry.prompt_tokens),
+                completion + clamp(entry.completion_tokens),
+            )
+        })
 }
 
 /// Reconstruct the ADR-0034 transcript rows from the loop's sink events + the model client's per-turn

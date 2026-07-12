@@ -15,6 +15,21 @@ data purge work. Diagrams are Mermaid (rendered by GitHub).
 > the dispatcher still launches the `agent-runner` binary (the cutover to `agent-plane --mode … --host
 > run-once` is a later one-liner), so the two Job images have **not** yet collapsed to one; and the
 > `serve` host (slice 5) is guard scaffolding only and rejected at startup.
+> **Landed (slice 5, non-gated half), behind a flag:** the **live per-review status API**
+> ([ADR-0085](adr/0085-agent-execution-plane.md) "a live per-review status API") — a host-agnostic,
+> read-only projection of the running loop's progress (current turn, current/last tool **name**,
+> findings recorded so far, token usage, coarse phase `indexing`/`sast`/`reviewing`/`finalizing`, and
+> elapsed time), served over a tiny bearer-authenticated axum endpoint (`GET /status`) the `run-once`
+> host runs **alongside** the loop (`services/agent-status`, wired in
+> `services/agent-runner/src/{run.rs,review/mod.rs}`). It exposes **only progress metadata** — never
+> the diff, file contents, finding bodies, secrets, or env — and is sourced by teeing the existing
+> loop transcript sink, so the loop's behaviour and the ADR-0034 transcript are **unchanged** (a
+> `StatusSink` that forwards every event verbatim). It is **flag-gated and OFF in prod**
+> (`LCI_STATUS_API` unset ⇒ no handle, no sink wrapping, no server started — byte-identical to today);
+> a NetworkPolicy/Service to actually reach the port is deploy-side and out of scope. The **`serve`
+> host topology itself remains deferred** to its measurement gate — the post-Graphify review-footprint
+> go/no-go in **#358** — so this slice ships the status *mechanism* only, reusable by a future `serve`
+> host without change; the `serve` arm still rejects at startup.
 > **Landed (slice 4), dormant:** the write-capable **`open`** mode
 > ([ADR-0088](adr/0088-open-mode-autonomous-ticket-agent.md)) exists as **dormant machinery** — see
 > [The `open` mode](#the-open-mode-dormant-adr-0088) below. `open + run-once` now *routes* (the guard
