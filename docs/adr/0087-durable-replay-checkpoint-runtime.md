@@ -82,7 +82,7 @@ mediated internal API (so the agent pod keeps no DB credential).
 | `task_id`, `run_epoch` | the run identity ([ADR-0076](0076-restate-task-lifecycle-workflow.md) idempotency tuple) |
 | `step_name` | `llm_turn:{n}` / `tools:{n}` / `write_tool:{n}:{id}` (the stability-tested contract) |
 | `result` \| `offload_ref` | the journaled result, or a content-hashed pointer for over-cap payloads (the [ADR-0082](0082-restate-durable-agent-runtime.md) offload rule) |
-| `content_hash` | replay verifies it rehydrates the same bytes |
+| `content_hash` | journaled with each result so replay *can* verify rehydration. NB: the check is not yet wired on the replay path, and any check must hash **canonicalized** bytes — `jsonb` normalizes key order and number formatting, so the stored `result::text` is not byte-identical to the journaled input |
 | `created_at` | drives the TTL sweep |
 
 Unique on `(task_id, run_epoch, step_name)` — the replay-idempotent upsert key.

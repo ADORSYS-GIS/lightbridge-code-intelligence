@@ -872,6 +872,7 @@ dependencies = [
  "jsonwebtoken",
  "k8s-openapi",
  "kube",
+ "lci-agent-types",
  "lci-config",
  "metrics",
  "metrics-exporter-prometheus",

@@ -2826,10 +2826,14 @@ pub async fn sweep_terminal_a2a_tasks(
 mod tests {
     use super::*;
     use serde_json::json;
+    // The REAL journaled step-result types (ADR-0087) — used by the durable_step round-trip so the
+    // test proves `from_value::<T>` rehydration through jsonb, not a hand-authored Value.
+    use lci_agent_types::{AssistantTurn, FunctionCallReq, ToolCallReq, ToolOutcome};
 
     // Integration tests: `#[sqlx::test]` provisions a fresh database, runs the migrations, and hands
     // us a pool. Requires a reachable Postgres via `DATABASE_URL` (see `compose.yaml`); skipped when
-    // none is configured (CI builds images but runs no Rust test job today).
+    // none is configured locally. CI runs them against a live Postgres — see
+    // `.github/workflows/control-plane-tests.yml` (`cargo test -p control-plane` with a postgres service).
 
     /// The dedup contract that lets the control plane run multiple replicas: the `delivery_id`
     /// PRIMARY KEY + `ON CONFLICT DO NOTHING` means a replayed GitHub delivery is detected as a
@@ -5321,6 +5325,248 @@ mod tests {
             in_use_commits(&pool, repo_id).await.unwrap(),
             vec!["review-head".to_string()],
             "index task's (NULL) head_sha is not in the keep-set — the gate is its only protection"
+        );
+    }
+
+    // ── ADR-0087 durable-step store: the PRODUCTION journal path ─────────────────────────────────
+    // The resume proof (agent-clients `InMemoryStepStore` tests) never touches Postgres. These tests
+    // exercise the real `ControlPlaneStepStore` backing: the `jsonb` write + `result::text` read
+    // round-trip, the `(task_id, run_epoch, step_name)` keying, and the replay-idempotent upsert.
+
+    /// A realistic `AssistantTurn` (an `llm_turn:{n}` step result) built from the REAL loop type, so
+    /// the round-trip is asserted against exactly what the loop serializes — including the serde
+    /// contract the loop relies on: `ToolCallReq.kind` renames to `"type"` and `extra_content: None`
+    /// is skipped. A hand-authored `Value` would silently drift from this.
+    fn assistant_turn_result() -> AssistantTurn {
+        AssistantTurn {
+            content: Some("Looking at the diff now.".into()),
+            tool_calls: vec![ToolCallReq {
+                id: "call_abc".into(),
+                kind: "function".into(),
+                function: FunctionCallReq {
+                    name: "read_file".into(),
+                    arguments: "{\"path\":\"src/db.rs\"}".into(),
+                },
+                extra_content: None,
+            }],
+        }
+    }
+
+    /// A realistic `tools:{n}` step result: the loop journals `T = Vec<(usize, ToolOutcome)>` (the
+    /// ordered read-batch outcomes). `ToolOutcome` is externally tagged, so this serializes to
+    /// `[[0,{"Continue":"…"}]]` — a shape a hand-written literal is easy to get wrong.
+    fn tool_output_result() -> Vec<(usize, ToolOutcome)> {
+        vec![(0, ToolOutcome::Continue("fn main() {}\n".into()))]
+    }
+
+    /// The gate #363 P1: the entire resume proof runs on `InMemoryStepStore`; this drives the REAL
+    /// Postgres store with the REAL journaled types. For each of `AssistantTurn` (`llm_turn`) and
+    /// `Vec<(usize, ToolOutcome)>` (`tools`): serialize via `to_value` exactly as the loop does, upsert,
+    /// fetch back, and assert BOTH (a) the fetched `Value` semantically equals the journaled `Value`
+    /// (jsonb normalizes whitespace/key order/number formatting, so this is *not* a raw-string check),
+    /// AND (b) `serde_json::from_value::<T>(fetched)` rehydrates to the ORIGINAL typed value — the exact
+    /// call `CheckpointRuntime::step` makes on replay. (b) is the assertion that catches a type which
+    /// survives `Value`-equality but breaks typed rehydration through jsonb.
+    #[sqlx::test]
+    async fn durable_step_round_trips_a_real_step_result_through_jsonb(pool: PgPool) {
+        let task_id = Uuid::new_v4();
+        let run_epoch = 3;
+
+        // ── llm_turn: AssistantTurn ──────────────────────────────────────────────────────────────
+        let turn = assistant_turn_result();
+        let turn_value = serde_json::to_value(&turn).unwrap();
+        upsert_durable_step(
+            &pool,
+            task_id,
+            run_epoch,
+            "llm_turn:0",
+            &serde_json::to_string(&turn_value).unwrap(),
+            "sha256:turn",
+        )
+        .await
+        .expect("upsert the journaled AssistantTurn");
+
+        let fetched = fetch_durable_step(&pool, task_id, run_epoch, "llm_turn:0")
+            .await
+            .expect("fetch the journaled step")
+            .expect("the step was journaled, so it must be found");
+        assert_eq!(
+            fetched.content_hash, "sha256:turn",
+            "the content hash round-trips verbatim"
+        );
+        let fetched_value: serde_json::Value =
+            serde_json::from_str(fetched.result.as_deref().expect("result is set"))
+                .expect("result::text is valid JSON");
+        assert_eq!(
+            fetched_value, turn_value,
+            "(a) the AssistantTurn Value round-trips semantically through jsonb"
+        );
+        let rehydrated: AssistantTurn = serde_json::from_value(fetched_value).expect(
+            "(b) result::text rehydrates into the real AssistantTurn — the step<T> replay call",
+        );
+        assert_eq!(
+            rehydrated, turn,
+            "(b) from_value::<AssistantTurn> yields the original typed value (what CheckpointRuntime::step does)"
+        );
+
+        // ── tools: Vec<(usize, ToolOutcome)> ─────────────────────────────────────────────────────
+        let outputs = tool_output_result();
+        let outputs_value = serde_json::to_value(&outputs).unwrap();
+        upsert_durable_step(
+            &pool,
+            task_id,
+            run_epoch,
+            "tools:0",
+            &serde_json::to_string(&outputs_value).unwrap(),
+            "sha256:tools",
+        )
+        .await
+        .expect("upsert the journaled tool outputs");
+
+        let fetched_tools = fetch_durable_step(&pool, task_id, run_epoch, "tools:0")
+            .await
+            .unwrap()
+            .expect("tools:0 is journaled");
+        let fetched_tools_value: serde_json::Value =
+            serde_json::from_str(fetched_tools.result.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            fetched_tools_value, outputs_value,
+            "(a) the tool-output Vec Value round-trips semantically through jsonb"
+        );
+        let rehydrated_tools: Vec<(usize, ToolOutcome)> = serde_json::from_value(
+            fetched_tools_value,
+        )
+        .expect(
+            "(b) result::text rehydrates into Vec<(usize, ToolOutcome)> — the step<T> replay call",
+        );
+        assert_eq!(
+            rehydrated_tools, outputs,
+            "(b) from_value::<Vec<(usize, ToolOutcome)>> yields the original typed outputs"
+        );
+    }
+
+    /// The `(task_id, run_epoch, step_name)` keying + the replay-idempotent upsert: a wrong tuple
+    /// component finds nothing (the replay gap where the loop continues live), and re-upserting the
+    /// same key overwrites in place rather than duplicating (`ON CONFLICT DO UPDATE`).
+    #[sqlx::test]
+    async fn durable_step_keys_on_the_run_identity_tuple_and_upsert_is_idempotent(pool: PgPool) {
+        let task_id = Uuid::new_v4();
+        let run_epoch = 1;
+
+        let turn = assistant_turn_result();
+        let turn_value = serde_json::to_value(&turn).unwrap();
+        upsert_durable_step(
+            &pool,
+            task_id,
+            run_epoch,
+            "llm_turn:0",
+            &serde_json::to_string(&turn_value).unwrap(),
+            "hash-turn",
+        )
+        .await
+        .unwrap();
+        let tools_value = serde_json::to_value(tool_output_result()).unwrap();
+        upsert_durable_step(
+            &pool,
+            task_id,
+            run_epoch,
+            "tools:0",
+            &serde_json::to_string(&tools_value).unwrap(),
+            "hash-tools",
+        )
+        .await
+        .unwrap();
+
+        // Each step is keyed independently by name.
+        let got_turn = fetch_durable_step(&pool, task_id, run_epoch, "llm_turn:0")
+            .await
+            .unwrap()
+            .expect("llm_turn:0 is journaled");
+        let rehydrated: AssistantTurn =
+            serde_json::from_str(got_turn.result.as_deref().unwrap()).unwrap();
+        assert_eq!(rehydrated, turn, "the right step returns its own result");
+
+        // A wrong tuple component → the replay gap (Ok(None), continue live), not a spurious hit.
+        assert!(
+            fetch_durable_step(&pool, task_id, run_epoch, "llm_turn:99")
+                .await
+                .unwrap()
+                .is_none(),
+            "an un-journaled step name is a gap, not a hit"
+        );
+        assert!(
+            fetch_durable_step(&pool, task_id, run_epoch + 1, "llm_turn:0")
+                .await
+                .unwrap()
+                .is_none(),
+            "a different run_epoch is a different run — no cross-epoch bleed"
+        );
+        assert!(
+            fetch_durable_step(&pool, Uuid::new_v4(), run_epoch, "llm_turn:0")
+                .await
+                .unwrap()
+                .is_none(),
+            "a different task_id sees none of this run's journal"
+        );
+
+        // Re-running the same step overwrites its row (replay-idempotent) rather than duplicating.
+        let revised = json!({ "content": "revised", "tool_calls": [] });
+        upsert_durable_step(
+            &pool,
+            task_id,
+            run_epoch,
+            "llm_turn:0",
+            &serde_json::to_string(&revised).unwrap(),
+            "hash-revised",
+        )
+        .await
+        .unwrap();
+        let after = fetch_durable_step(&pool, task_id, run_epoch, "llm_turn:0")
+            .await
+            .unwrap()
+            .expect("still present after the re-upsert");
+        assert_eq!(
+            after.content_hash, "hash-revised",
+            "the upsert overwrote in place"
+        );
+        let rows: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM durable_step WHERE task_id = $1 AND run_epoch = $2 AND step_name = $3",
+        )
+        .bind(task_id)
+        .bind(run_epoch)
+        .bind("llm_turn:0")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            rows, 1,
+            "ON CONFLICT overwrote the row — it did not duplicate"
+        );
+    }
+
+    /// `durable_step_run_epoch` resolves the run's `run_epoch` from the task row (the server-side
+    /// derivation that keeps the agent from supplying its own epoch — the trust boundary), and returns
+    /// `None` for an unknown task.
+    #[sqlx::test]
+    async fn durable_step_run_epoch_resolves_from_the_task_row(pool: PgPool) {
+        let repo_id = seed(&pool).await;
+        let task_id = create_task(&pool, &pr_task(repo_id, "head1"))
+            .await
+            .unwrap()
+            .expect("the review task");
+
+        let epoch = durable_step_run_epoch(&pool, task_id)
+            .await
+            .unwrap()
+            .expect("a live task resolves its run_epoch");
+        assert_eq!(epoch, 0, "pr_task seeds run_epoch 0");
+
+        assert!(
+            durable_step_run_epoch(&pool, Uuid::new_v4())
+                .await
+                .unwrap()
+                .is_none(),
+            "an unknown task has no run_epoch"
         );
     }
 }
