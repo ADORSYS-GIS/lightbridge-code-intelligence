@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 /// Stored as a `TEXT` column in the database (values: `"github"`, `"gitlab"`). Existing rows default
 /// to `"github"` via the Phase 1 migration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, sqlx::Type)]
+#[serde(rename_all = "lowercase")]
 #[sqlx(type_name = "TEXT", rename_all = "lowercase")]
 pub enum Platform {
     GitHub,
