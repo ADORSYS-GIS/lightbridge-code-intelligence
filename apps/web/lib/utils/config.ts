@@ -9,7 +9,11 @@ export function githubAppInstallUrl(): string {
 
 /** GitLab base URL for repo/target links. Defaults to `https://gitlab.com` (SaaS); self-hosted
  *  deployments set `NEXT_PUBLIC_GITLAB_URL` to their instance origin. `NEXT_PUBLIC_` so it is
- *  inlined into the client bundle — `repoUrl()` is called from client components. */
+ *  inlined into the client bundle — `repoUrl()` is called from client components.
+ *
+ *  Falls back to the SaaS origin on empty or unset; strips trailing slashes so `${base}/owner/repo`
+ *  never double-slashes. */
 export function gitlabBaseUrl(): string {
-  return process.env.NEXT_PUBLIC_GITLAB_URL ?? "https://gitlab.com";
+  const url = process.env.NEXT_PUBLIC_GITLAB_URL || "https://gitlab.com";
+  return url.replace(/\/+$/, "");
 }
