@@ -238,9 +238,77 @@ pub async fn enqueue_failure_notice(
     Ok(inserted)
 }
 
+/// The `pr_open` intent (ADR-0088): everything the egress plane needs to push a branch + open a PR,
+/// with the branch itself **offloaded** — `content_hash` points at the `pr_open_blob` row holding the
+/// `git format-patch` bytes (the offload rule; the intent on the wire carries the key + hash, not the
+/// bytes). The egress plane rehydrates by hash, verifies, pushes the branch, and opens the PR. It never
+/// auto-merges — this proposes.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PrOpenPayload {
+    /// The local branch name the sandbox committed to; the egress plane pushes it under this name.
+    pub branch: String,
+    /// The base ref the PR targets; `None` → the repo default branch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base: Option<String>,
+    pub title: String,
+    pub body: String,
+    /// The content hash keying the offloaded branch patch in `pr_open_blob`.
+    pub content_hash: String,
+}
+
+/// The `pr_open` dedup key — `(task_id, run_epoch)` (ADR-0088 O5). Pure, so the idempotency contract is
+/// unit-tested without a DB: a replay of the terminal `propose_pr` step recomputes the SAME key, so the
+/// outbox `ON CONFLICT DO NOTHING` opens exactly one PR. `run_epoch` is the ADR-0076 run-identity
+/// discriminator, resolved control-plane-side (the agent never knows it — trust boundary).
+#[must_use]
+pub fn pr_open_dedup_key(task_id: Uuid, run_epoch: i32) -> String {
+    format!("{task_id}:{run_epoch}:pr_open")
+}
+
+/// Enqueue the open-mode PR-open intent — dedup-keyed by `(task_id, run_epoch)` so a replayed/at-least-
+/// once `propose_pr` never opens a duplicate PR (ADR-0088 O5). Returns whether a NEW row was inserted
+/// (`false` = an intent with this key already existed → the existing PR proposal stands). Mirrors
+/// [`enqueue_review`]: propagates a serialization failure rather than enqueuing a `Null` payload.
+pub async fn enqueue_pr_open(
+    pool: &PgPool,
+    t: &Target<'_>,
+    task_id: Uuid,
+    run_epoch: i32,
+    payload: &PrOpenPayload,
+) -> anyhow::Result<bool> {
+    let key = pr_open_dedup_key(task_id, run_epoch);
+    let value = serde_json::to_value(payload)?;
+    let inserted = crate::db::enqueue_outbox_post(
+        pool,
+        t.platform,
+        Some(task_id),
+        t.installation_id,
+        t.owner,
+        t.repo,
+        "pr_open",
+        &value,
+        &key,
+    )
+    .await?;
+    t.egress
+        .announce(pool, t.platform, t.installation_id, &key)
+        .await?;
+    Ok(inserted)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ADR-0088 O5: the pr_open dedup key is a pure function of `(task_id, run_epoch)`, so a replayed
+    // propose_pr recomputes the identical key and the outbox `ON CONFLICT` opens exactly one PR.
+    #[test]
+    fn pr_open_dedup_key_is_stable_per_task_and_run_epoch() {
+        let task = Uuid::from_u128(1);
+        assert_eq!(pr_open_dedup_key(task, 0), pr_open_dedup_key(task, 0));
+        assert_ne!(pr_open_dedup_key(task, 0), pr_open_dedup_key(task, 1));
+        assert!(pr_open_dedup_key(task, 3).ends_with(":3:pr_open"));
+    }
 
     // ADR-0068: the reaction payload carries `comment_id` ONLY when the task was @mention-triggered, so
     // the reconciler can route on its presence (comment vs PR/issue body). This is the round-trip the

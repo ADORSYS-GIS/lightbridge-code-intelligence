@@ -2166,6 +2166,41 @@ pub async fn sweep_durable_steps(pool: &PgPool, retention_secs: f64) -> Result<u
     Ok(result.rows_affected())
 }
 
+/// Store one open-mode branch patch in the offload table (ADR-0088 offload rule), keyed by its
+/// content hash. Idempotent (`ON CONFLICT DO NOTHING`), so a replayed `propose_pr` re-stores the same
+/// bytes without duplicating — the outbox `pr_open` intent then carries only the hash, not the patch.
+pub async fn put_pr_open_blob(
+    pool: &PgPool,
+    content_hash: &str,
+    task_id: Uuid,
+    run_epoch: i32,
+    patch: &[u8],
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO pr_open_blob (content_hash, task_id, run_epoch, patch) \
+         VALUES ($1, $2, $3, $4) ON CONFLICT (content_hash) DO NOTHING",
+    )
+    .bind(content_hash)
+    .bind(task_id)
+    .bind(run_epoch)
+    .bind(patch)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Rehydrate an offloaded open-mode branch patch by its content hash (the egress plane reads this
+/// before pushing + verifies the bytes still hash to the key). `None` if the blob was pruned.
+pub async fn get_pr_open_blob(
+    pool: &PgPool,
+    content_hash: &str,
+) -> Result<Option<Vec<u8>>, sqlx::Error> {
+    sqlx::query_scalar("SELECT patch FROM pr_open_blob WHERE content_hash = $1")
+        .bind(content_hash)
+        .fetch_optional(pool)
+        .await
+}
+
 /// Statuses the runner is allowed to report. Transitioning into a terminal one stamps
 /// `completed_at` and releases the lease; `running` (re)stamps `started_at`. Anything else is
 /// rejected by the handler before reaching here.
@@ -3052,6 +3087,81 @@ mod tests {
             claim_outbox_batch(&pool, 10).await.unwrap().is_empty(),
             "a just-failed row is backed off, not immediately re-claimable"
         );
+    }
+
+    /// ADR-0088 merge bar: replaying the terminal `propose_pr` step opens EXACTLY ONE PR intent. The
+    /// dedup key `(task_id, run_epoch)` makes the outbox insert idempotent, and the offloaded branch
+    /// blob is idempotent on its content hash — so an at-least-once/replayed proposal never opens a
+    /// duplicate PR and never duplicates the offloaded patch.
+    #[sqlx::test]
+    async fn pr_open_intent_is_dedup_keyed_by_task_and_run_epoch(pool: PgPool) {
+        let repo_id = seed(&pool).await;
+        let task = create_task(&pool, &pr_task(repo_id, "open"))
+            .await
+            .unwrap()
+            .expect("task");
+        let run_epoch = 0;
+        let key = crate::outbox::pr_open_dedup_key(task, run_epoch);
+        let payload = serde_json::json!({
+            "branch": "open/357", "title": "Add feature", "body": "…", "content_hash": "abc123",
+        });
+
+        // Offload the patch twice (a replay re-stores the same bytes) — idempotent on content hash.
+        put_pr_open_blob(&pool, "abc123", task, run_epoch, b"PATCH-BYTES")
+            .await
+            .unwrap();
+        put_pr_open_blob(&pool, "abc123", task, run_epoch, b"PATCH-BYTES")
+            .await
+            .unwrap();
+        assert_eq!(
+            get_pr_open_blob(&pool, "abc123").await.unwrap().as_deref(),
+            Some(&b"PATCH-BYTES"[..]),
+            "the offloaded branch rehydrates by content hash"
+        );
+
+        // First proposal enqueues the intent; a replay with the SAME (task, run_epoch) key is a no-op.
+        assert!(
+            enqueue_outbox_post(
+                &pool,
+                Platform::GitHub,
+                Some(task),
+                99,
+                "o",
+                "r",
+                "pr_open",
+                &payload,
+                &key,
+            )
+            .await
+            .unwrap(),
+            "first propose_pr enqueues the pr_open intent"
+        );
+        assert!(
+            !enqueue_outbox_post(
+                &pool,
+                Platform::GitHub,
+                Some(task),
+                99,
+                "o",
+                "r",
+                "pr_open",
+                &payload,
+                &key,
+            )
+            .await
+            .unwrap(),
+            "a replayed propose_pr with the same (task, run_epoch) key opens no second PR"
+        );
+
+        // Exactly one pr_open row exists for this task.
+        let count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM outbox WHERE task_id = $1 AND kind = 'pr_open'",
+        )
+        .bind(task)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 1, "replay must open exactly one PR intent");
     }
 
     /// RFC-0005 / ADR-0074 — the `PlatformEgress` virtual object's DB helpers: the status-guarded load,

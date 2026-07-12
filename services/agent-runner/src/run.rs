@@ -224,9 +224,20 @@ async fn run(
     let is_index = match mode {
         Some(Mode::Index) => true,
         Some(Mode::Review) => false,
-        // `Mode::Open` is rejected by the plane guard before `run_once`; treat it defensively as the
-        // inferred default rather than panicking, so a future miswire degrades to today's behaviour.
-        Some(Mode::Open) | None => context.command == "index",
+        // `Mode::Open` (slice 4, ADR-0088) is a *routing*-admitted cell (see `crate::plane`), but its
+        // sandboxed host execution + the ticket→prompt pipeline are **dormant** — they land with the
+        // (unwired) trigger, gated on a security sign-off. Refuse to run rather than silently degrade
+        // to the review/index path: an `open` task must NEVER execute untrusted repo/LLM code outside
+        // the hardened sandbox. The loop assembly + mediated egress + sandbox manifest exist as
+        // dormant machinery (`lci-open-agent`, `outbox::enqueue_pr_open`, the `command == "open"` Job
+        // spec); nothing here drives them yet.
+        Some(Mode::Open) => anyhow::bail!(
+            "open mode is routing-admitted but its run-once host execution is dormant (ADR-0088): \
+             the write-capable loop, mediated PR-open egress, and hardened sandbox manifest exist, \
+             but no ticket pipeline/trigger is wired and this host refuses to run open outside the \
+             sandbox. Activation is gated on a security sign-off."
+        ),
+        None => context.command == "index",
     };
 
     // Gateway attribution headers (epic #89) for per-project token billing — added to the embeddings

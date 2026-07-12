@@ -7,10 +7,17 @@
 //!   [ADR-0004](../../docs/adr/0004-one-k8s-job-per-task.md)) or `serve` (a long-lived Deployment).
 //!
 //! This module encodes the matrix and its **structural** routing rules as data + a [`validate`]
-//! guard, even though `open` (slice 4, [ADR-0088]) and `serve` (slice 5) are not implemented yet:
-//! the guard rejects the not-yet-built cells with a clear reason, and the *permanent* structural rule
-//! (`open` can never run under `serve`) is distinguished from the *temporary* "deferred to a later
-//! slice" rejections so slices 4/5 slot in by deleting a match arm, not rewriting the guard.
+//! guard. `open` (slice 4, [ADR-0088]) now **routes** (`open + run-once` is admitted); `serve` (slice
+//! 5) is still not built. The *permanent* structural rule (`open` can never run under `serve`) is kept
+//! distinct from the *temporary* "deferred to a later slice" rejection so slice 5 slots in by deleting
+//! a match arm, not rewriting the guard.
+//!
+//! Admitting `open + run-once` is a **routing** decision, not an execution one: it says the pair is a
+//! legal cell of the matrix. The dormant machinery it routes to — the write-capable loop assembly
+//! ([`lci-open-agent`](../../../open-agent)), the mediated PR-open egress, and the hardened sandbox Job
+//! spec — lands in this slice too, but no trigger creates an `open` task and the `run-once` host does
+//! not yet drive the open loop (it refuses `Mode::Open` rather than mis-running it — see [`crate::run`]).
+//! Activation is gated on a security sign-off (ADR-0088).
 //!
 //! It carries **no** execution logic — routing an admitted `(mode, host)` pair to the actual work is
 //! the entrypoint's job (`run_once`, `main.rs`/`bin/agent_plane.rs`). Keeping the matrix pure makes it
@@ -64,8 +71,10 @@ impl Host {
 /// - **`open` + `serve` — permanent structural rejection.** `open` executes untrusted + generated
 ///   code; a shared `serve` tenant cannot sandbox arbitrary execution (Linux user namespaces isolate
 ///   *files*, not execution). This cell is *forbidden by construction*, not merely unbuilt.
-/// - **`open` + `run-once` — deferred to slice 4** ([ADR-0088]). The mode enum + gated registry are
-///   scaffolding here; the toolset/sandbox land later.
+/// - **`open` + `run-once` — admitted (slice 4, [ADR-0088]).** `open` routes to `run-once`
+///   *unconditionally* — a security property, not a tunable. The write-capable loop, the mediated
+///   PR-open egress, and the hardened sandbox Job spec are the dormant machinery this admits; no
+///   trigger creates an `open` task yet, so the cell is legal but never exercised in prod.
 /// - **any mode + `serve` — deferred to slice 5.** `run-once` is the default and only host today;
 ///   `serve` re-owns concurrency bounding / stale reclaim / (for execution) sandboxing that k8s Jobs
 ///   give free, so it is opt-in and gated on a measurement.
@@ -79,20 +88,15 @@ pub fn validate(mode: Mode, host: Host) -> Result<(), String> {
              files, not execution (ADR-0085). open is run-once only."
                 .to_string(),
         ),
-        // Temporary — lands in slice 4 (ADR-0088).
-        (Mode::Open, Host::RunOnce) => Err(
-            "open mode is not implemented yet: it arrives in slice 4 (ADR-0088). Only index and \
-             review are wired in this slice."
-                .to_string(),
-        ),
         // Temporary — lands in slice 5.
         (_, Host::Serve) => Err(
             "the serve host is not implemented yet: it arrives in slice 5. index and review run \
              under run-once today (ADR-0085)."
                 .to_string(),
         ),
-        // The two admitted cells for this slice.
-        (Mode::Index | Mode::Review, Host::RunOnce) => Ok(()),
+        // The admitted cells for this slice: index/review/open under run-once. `open` routing is a
+        // security property (ADR-0088: open → run-once, always); its host execution is still dormant.
+        (Mode::Index | Mode::Review | Mode::Open, Host::RunOnce) => Ok(()),
     }
 }
 
@@ -101,9 +105,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn admitted_cells_are_only_index_and_review_run_once() {
+    fn admitted_cells_are_index_review_and_open_run_once() {
         assert!(validate(Mode::Index, Host::RunOnce).is_ok());
         assert!(validate(Mode::Review, Host::RunOnce).is_ok());
+        // Slice 4 (ADR-0088): open now ROUTES under run-once. This is a routing admission — the host
+        // execution stays dormant (see `crate::run`), but the matrix cell is legal.
+        assert!(validate(Mode::Open, Host::RunOnce).is_ok());
     }
 
     #[test]
@@ -116,9 +123,10 @@ mod tests {
     }
 
     #[test]
-    fn open_run_once_is_deferred_to_slice_4() {
-        let err = validate(Mode::Open, Host::RunOnce).expect_err("open is unbuilt this slice");
-        assert!(err.contains("slice 4"), "unexpected reason: {err}");
+    fn open_run_once_is_admitted_in_slice_4() {
+        // The routing cell is legal (ADR-0088: open → run-once, always). Host execution is dormant
+        // and refused separately in `crate::run` — the guard's job is only the mode×host matrix.
+        assert!(validate(Mode::Open, Host::RunOnce).is_ok());
     }
 
     #[test]
@@ -133,12 +141,15 @@ mod tests {
     }
 
     #[test]
-    fn open_serve_and_open_run_once_reject_for_different_reasons() {
-        // The permanent structural rule and the temporary slice-4 gate must not collapse into one
-        // message — slice 4 deletes the run-once arm but the serve arm stays forever.
+    fn open_serve_stays_forbidden_while_open_run_once_is_admitted() {
+        // The permanent structural rule (open+serve forbidden) must NOT relax just because slice 4
+        // admitted open+run-once: the serve arm stays forever, the run-once arm is now legal.
         let serve = validate(Mode::Open, Host::Serve).unwrap_err();
-        let run_once = validate(Mode::Open, Host::RunOnce).unwrap_err();
-        assert_ne!(serve, run_once);
+        assert!(
+            serve.contains("run-once only"),
+            "unexpected reason: {serve}"
+        );
+        assert!(validate(Mode::Open, Host::RunOnce).is_ok());
     }
 
     #[test]

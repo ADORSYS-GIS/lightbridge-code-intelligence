@@ -297,8 +297,45 @@ pub(crate) async fn deliver(
             Ok(posted.id)
         }
         "review" => deliver_review(pool, platform, repo, review, row).await,
+        // ADR-0088 open mode: rehydrate + verify the offloaded branch, but the credentialed push +
+        // PR-open is **deferred, gated on a security sign-off** — so no `open` task is created in prod
+        // and this arm is never reached there. The producer path (offload + dedup'd intent) is real and
+        // tested; activating delivery means adding the forge push/open-PR call to `CodePlatform`.
+        "pr_open" => deliver_pr_open(pool, row).await,
         other => anyhow::bail!("unknown outbox kind {other:?}"),
     }
+}
+
+/// Rehydrate the offloaded open-mode branch (ADR-0088 offload rule) and verify it still hashes to the
+/// intent's key, then **refuse to push** — the credentialed egress (branch push + PR open against the
+/// forge) is not activated in this slice (it needs a `CodePlatform::open_pull_request` and a security
+/// sign-off). No `pr_open` intent is produced in prod (no trigger), so this arm is dormant; if one ever
+/// appears it fails loud (backs off) rather than pushing through an unreviewed path. The rehydrate +
+/// verify here proves the offload contract end-to-end.
+async fn deliver_pr_open(pool: &PgPool, row: &crate::db::OutboxRow) -> anyhow::Result<Option<i64>> {
+    use sha2::{Digest, Sha256};
+    let payload: crate::outbox::PrOpenPayload = serde_json::from_value(row.payload.clone())?;
+    let patch = crate::db::get_pr_open_blob(pool, &payload.content_hash)
+        .await?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "pr_open blob {} was pruned before delivery",
+                payload.content_hash
+            )
+        })?;
+    let actual = hex::encode(Sha256::digest(&patch));
+    anyhow::ensure!(
+        actual == payload.content_hash,
+        "pr_open blob hash mismatch (offload corruption): expected {}, got {actual}",
+        payload.content_hash
+    );
+    anyhow::bail!(
+        "open-mode pr_open egress is not activated (ADR-0088): the branch rehydrated + verified, but \
+         the credentialed push + PR-open is gated on a security sign-off. Branch {:?} ({} patch bytes) \
+         NOT pushed.",
+        payload.branch,
+        patch.len()
+    )
 }
 
 /// Post the grouped review and its success side-effects (persist the copy, fetch inline ids, apply

@@ -404,6 +404,14 @@ fn app(state: AppState) -> Router {
             "/internal/tasks/{id}/review/finalize",
             post(internal::finalize_review),
         )
+        // ADR-0088 open mode: the sandboxed open agent proposes a PR (branch + metadata) via this
+        // mediated endpoint; the control plane offloads the branch and enqueues a dedup'd `pr_open`
+        // intent for the egress plane to push. A branch patch can be large, so raise the body limit.
+        // DORMANT: no trigger creates an open task, so nothing calls this in prod yet.
+        .route(
+            "/internal/tasks/{id}/propose-pr",
+            post(internal::propose_pr).layer(DefaultBodyLimit::max(32 * 1024 * 1024)),
+        )
         .layer(axum::middleware::from_fn(track_http_metrics))
         .with_state(state)
 }
