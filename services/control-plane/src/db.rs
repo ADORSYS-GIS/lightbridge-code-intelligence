@@ -1158,6 +1158,7 @@ pub struct TaskRow {
     pub repo_owner: Option<String>,
     pub repo_name: Option<String>,
     pub repo_default_branch: Option<String>,
+    pub repo_platform: Option<Platform>,
     /// The Kubernetes Job name (set once dispatched), so the console can stream the run's logs. `None`
     /// before dispatch or after the Job is reaped/TTL'd. Already selected by `TASK_SELECT` (`t.*`).
     pub job_name: Option<String>,
@@ -1171,7 +1172,7 @@ pub struct TaskRow {
 /// `SELECT` projection shared by the list and detail queries: every `tasks` column plus the joined
 /// repository identity, aliased to the `repo_*` fields of [`TaskRow`].
 const TASK_SELECT: &str = "SELECT t.*, r.owner AS repo_owner, r.name AS repo_name, \
-     r.default_branch AS repo_default_branch \
+     r.default_branch AS repo_default_branch, r.platform AS repo_platform \
      FROM tasks t LEFT JOIN repositories r ON r.id = t.repository_id";
 
 /// Fields needed to create a task from a webhook event.

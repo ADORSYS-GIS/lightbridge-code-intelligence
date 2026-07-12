@@ -3,6 +3,8 @@
  * plane's `/tasks` payload (`TaskRow` in `services/control-plane/src/db.rs`). Pure + Edge-safe.
  */
 
+import { gitlabBaseUrl } from "@/lib/utils/config";
+
 /** One task run, as returned by `GET /tasks` and `GET /tasks/{id}`. */
 export interface Task {
   id: string;
@@ -23,6 +25,7 @@ export interface Task {
   repo_owner: string | null;
   repo_name: string | null;
   repo_default_branch: string | null;
+  repo_platform: "github" | "gitlab" | null;
   /** The dispatched Kubernetes Job name, used to stream the run's logs. `null` before dispatch or
    * after the Job is cleaned up. */
   job_name: string | null;
@@ -99,22 +102,31 @@ export function repoLabel(task: Task): string {
   return `repo #${task.repository_id}`;
 }
 
-/** GitHub URL of the task's repository, or `null` when the repo identity join came back empty. */
+/** Platform-specific URL of the task's repository, or `null` when the repo identity join came back empty. */
 export function repoUrl(task: Task): string | null {
   if (!task.repo_owner || !task.repo_name) return null;
-  return `https://github.com/${task.repo_owner}/${task.repo_name}`;
+  switch (task.repo_platform) {
+    case "gitlab":
+      return `${gitlabBaseUrl()}/${task.repo_owner}/${task.repo_name}`;
+    default:
+      return `https://github.com/${task.repo_owner}/${task.repo_name}`;
+  }
 }
 
-/** GitHub URL of the run's target — the PR or issue — for a deep link; `null` when not applicable
+/** Platform-specific URL of the run's target — the PR or MR or issue — for a deep link; `null` when not applicable
  * (e.g. a `repository` index task, which has no PR/issue) or the repo identity is missing. */
 export function targetUrl(task: Task): string | null {
   const base = repoUrl(task);
   if (!base) return null;
   switch (task.target_type) {
     case "pull_request":
-      return `${base}/pull/${task.target_id}`;
+      return task.repo_platform === "gitlab"
+        ? `${base}/-/merge_requests/${task.target_id}`
+        : `${base}/pull/${task.target_id}`;
     case "issue":
-      return `${base}/issues/${task.target_id}`;
+      return task.repo_platform === "gitlab"
+        ? `${base}/-/issues/${task.target_id}`
+        : `${base}/issues/${task.target_id}`;
     default:
       return null;
   }
