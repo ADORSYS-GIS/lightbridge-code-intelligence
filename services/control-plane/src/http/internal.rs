@@ -1203,7 +1203,10 @@ pub async fn add_review_reply(
         return (StatusCode::SERVICE_UNAVAILABLE, "no database").into_response();
     };
     let run_epoch = match crate::db::durable_step_run_epoch(pool, id).await {
-        Ok(epoch) => epoch,
+        Ok(Some(epoch)) => Some(epoch),
+        // Task not found (e.g. purged mid-run): 404 like the sibling endpoints, rather than appending
+        // an orphaned comment row for a non-existent task (gemini review on #370).
+        Ok(None) => return (StatusCode::NOT_FOUND, "task not found").into_response(),
         Err(error) => {
             tracing::warn!(%error, task_id = %id, "resolving run_epoch for comment dedup failed; appending without a dedup key");
             None
