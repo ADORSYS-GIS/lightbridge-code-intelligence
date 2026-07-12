@@ -8,9 +8,14 @@
 //! `graph_get_callers` retrieval tools are unchanged behind the seam.
 //!
 //! Slice 1 resolves **Rust** (ADR-0086 "Rust language first"). Relations emitted:
-//! - `contains` — file → top-level def, and container def (impl/mod/struct/trait) → nested def.
+//! - `contains` — file → top-level def, and container def (mod/struct/trait/enum) → nested def.
+//! - `method` — a type container (impl/trait/struct/enum/class) → a callable it defines. This is a
+//!   specialisation of `contains` kept separate for parity with Graphify (which emits `method`).
 //! - `calls` — caller def → callee def, with **cross-file** resolution (a call in file A resolved to a
 //!   definition in file B). `graph_get_callers` traverses this relation, so the name must match.
+//!
+//! Line numbers are **1-based** and callable labels carry a `()` suffix (`add` → `add()`), both for
+//! parity with the Graphify `graph.json` this crate is replacing.
 
 use std::collections::HashMap;
 
@@ -44,17 +49,36 @@ pub struct Graph {
     pub edges: Vec<GraphEdge>,
 }
 
-/// The per-file structural facts: the file's nodes (file node + defs), its intra-file `contains`
-/// edges, and the unresolved call sites (caller node_id + callee name) for the cross-file pass.
+/// The per-file structural facts: the file's nodes (file node + defs), its intra-file `contains` /
+/// `method` edges, and the unresolved call sites for the cross-file pass.
 #[derive(Debug, Default)]
 pub struct FileSymbols {
     nodes: Vec<GraphNode>,
     contains: Vec<GraphEdge>,
-    /// `(caller_node_id, callee_name)` — resolved to `calls` edges once every file is known.
-    calls: Vec<(String, String)>,
-    /// Callable defs (functions/methods) in this file, `name → node_id`, for same-file-first
-    /// resolution.
-    callables: Vec<(String, String)>,
+    /// Call sites attributed to their enclosing caller, resolved to `calls` edges once every file is
+    /// known.
+    calls: Vec<CallSite>,
+    /// Callable defs (functions/methods) in this file, for same-file-first resolution.
+    callables: Vec<Callable>,
+}
+
+/// A callable definition (`function`/`method`) recorded for call resolution.
+#[derive(Debug, Clone)]
+struct Callable {
+    name: String,
+    node_id: String,
+    /// Enclosing `impl`/`trait` type name (`impl S` / `impl T for S` → `S`), used **only** as a
+    /// tiebreaker to disambiguate several same-named callables. `None` for free functions.
+    scope: Option<String>,
+}
+
+/// An unresolved call site: the enclosing caller def id, the bare callee name, and — when the call
+/// is a qualified path (`A::new`) — the qualifier segment, used only to break same-name ambiguity.
+#[derive(Debug, Clone)]
+struct CallSite {
+    caller: String,
+    name: String,
+    qualifier: Option<String>,
 }
 
 /// Extract the structural facts for one **pre-parsed** file. `language` gates which languages produce
@@ -66,12 +90,13 @@ pub fn extract_file(tree: &Tree, source_file: &str, source: &str, language: &str
     if language != "rust" {
         return facts;
     }
-    // The file node: id = the path, label = the file name. Top-level defs are `contains`-ed by it.
+    // The file node: id = the path, label = the file name, line 1 (1-based, matching Graphify's `L1`
+    // file node). Top-level defs are `contains`-ed by it.
     facts.nodes.push(GraphNode {
         node_id: source_file.to_string(),
         label: file_label(source_file),
         source_file: source_file.to_string(),
-        start_line: 0,
+        start_line: 1,
     });
 
     let bytes = source.as_bytes();
@@ -79,83 +104,186 @@ pub fn extract_file(tree: &Tree, source_file: &str, source: &str, language: &str
     // Stack of enclosing definition node ids (innermost last) for `contains` parenting + attributing
     // a call site to the definition it sits inside.
     let mut stack: Vec<String> = Vec::new();
-    walk(&root, bytes, source_file, &mut stack, &mut facts);
+    walk(
+        &root,
+        bytes,
+        source_file,
+        &mut stack,
+        None,
+        None,
+        &mut facts,
+    );
     facts
 }
 
-/// DFS that, in one pass, emits def nodes + `contains` edges and records call sites attributed to the
-/// innermost enclosing def.
+/// DFS that, in one pass, emits def nodes + `contains`/`method` edges and records call sites
+/// attributed to the innermost enclosing def. `scope` is the nearest enclosing type name (for
+/// same-name method disambiguation); `enclosing_kind` is the nearest enclosing def kind (to decide
+/// `contains` vs `method`).
 fn walk(
     node: &Node<'_>,
     bytes: &[u8],
     source_file: &str,
     stack: &mut Vec<String>,
+    scope: Option<&str>,
+    enclosing_kind: Option<&str>,
     facts: &mut FileSymbols,
 ) {
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         if let Some((kind, name)) = interesting_node(&child, bytes) {
-            let start_line = child.start_position().row as i64;
+            // 1-based line (Graphify parity).
+            let start_line = child.start_position().row as i64 + 1;
             let node_id = def_node_id(source_file, start_line, kind, name.as_deref());
             let parent_id = stack
                 .last()
                 .cloned()
                 .unwrap_or_else(|| source_file.to_string());
+            let is_callable = kind == "function" || kind == "method";
+            // A callable directly inside a type container is a *method* (Graphify emits `method`);
+            // everything else nests via `contains`.
+            let relation = if is_callable
+                && matches!(
+                    enclosing_kind,
+                    Some("impl" | "trait" | "struct" | "enum" | "class")
+                ) {
+                "method"
+            } else {
+                "contains"
+            };
             facts.contains.push(GraphEdge {
                 source: parent_id,
                 target: node_id.clone(),
-                relation: "contains".to_string(),
+                relation: relation.to_string(),
             });
+            // Label parity with Graphify: callables carry a `()` suffix (`add` → `add()`).
+            let label = match name.clone() {
+                Some(n) if is_callable => format!("{n}()"),
+                Some(n) => n,
+                None => kind.to_string(),
+            };
             facts.nodes.push(GraphNode {
                 node_id: node_id.clone(),
-                label: name.clone().unwrap_or_else(|| kind.to_string()),
+                label,
                 source_file: source_file.to_string(),
                 start_line,
             });
-            // Functions/methods are callable — record for cross-file resolution.
-            if (kind == "function" || kind == "method")
-                && let Some(n) = name.clone()
-            {
-                facts.callables.push((n, node_id.clone()));
+            // Functions/methods are callable — record for resolution, tagged with their type scope.
+            if is_callable && let Some(n) = name.clone() {
+                facts.callables.push(Callable {
+                    name: n,
+                    node_id: node_id.clone(),
+                    scope: scope.map(str::to_string),
+                });
             }
+            // The type scope introduced for this def's children (qualifies nested methods).
+            let child_scope: Option<String> = match kind {
+                "impl" => impl_type_name(&child, bytes),
+                "trait" | "struct" | "enum" | "class" => name.clone(),
+                _ => None,
+            };
             stack.push(node_id);
-            walk(&child, bytes, source_file, stack, facts);
+            walk(
+                &child,
+                bytes,
+                source_file,
+                stack,
+                child_scope.as_deref(),
+                Some(kind),
+                facts,
+            );
             stack.pop();
         } else {
             if child.kind() == "call_expression"
                 && let Some(caller) = stack.last()
-                && let Some(callee) = callee_name(&child, bytes)
+                && let Some(callee) = callee_ref_of(&child, bytes)
             {
-                facts.calls.push((caller.clone(), callee));
+                facts.calls.push(CallSite {
+                    caller: caller.clone(),
+                    name: callee.name,
+                    qualifier: callee.qualifier,
+                });
             }
-            walk(&child, bytes, source_file, stack, facts);
+            walk(
+                &child,
+                bytes,
+                source_file,
+                stack,
+                scope,
+                enclosing_kind,
+                facts,
+            );
         }
     }
 }
 
-/// The name being called in a Rust `call_expression`, if we can name it. Handles free calls
-/// (`foo()`), paths (`a::b::foo()` → `foo`), method calls (`x.foo()` → `foo`), and turbofish
-/// (`foo::<T>()`).
-fn callee_name(call: &Node<'_>, bytes: &[u8]) -> Option<String> {
-    let func = call.child_by_field_name("function")?;
-    name_of(&func, bytes)
+/// The callee of a Rust `call_expression`: its bare name plus, for a qualified path, the qualifier
+/// segment. `A::new()` → `{name: "new", qualifier: Some("A")}`; `a::b::foo()` → `{"foo", Some("b")}`;
+/// `foo()` / `x.foo()` → no qualifier (a method receiver's type is not known without inference).
+struct CalleeRef {
+    name: String,
+    qualifier: Option<String>,
 }
 
-fn name_of(node: &Node<'_>, bytes: &[u8]) -> Option<String> {
+fn callee_ref_of(call: &Node<'_>, bytes: &[u8]) -> Option<CalleeRef> {
+    let func = call.child_by_field_name("function")?;
+    callee_ref(&func, bytes)
+}
+
+fn callee_ref(node: &Node<'_>, bytes: &[u8]) -> Option<CalleeRef> {
     match node.kind() {
-        "identifier" | "field_identifier" | "type_identifier" => text(node, bytes),
-        // `a::b::foo` — the callable name is the final segment.
-        "scoped_identifier" => node
-            .child_by_field_name("name")
-            .and_then(|n| text(&n, bytes)),
-        // `x.foo` — the method name is the `field`.
+        "identifier" | "field_identifier" | "type_identifier" => Some(CalleeRef {
+            name: text(node, bytes)?,
+            qualifier: None,
+        }),
+        // `a::b::foo` — callable is the final `name`; qualifier is the segment before it (`b`).
+        "scoped_identifier" => {
+            let name = node
+                .child_by_field_name("name")
+                .and_then(|n| text(&n, bytes))?;
+            let qualifier = node
+                .child_by_field_name("path")
+                .and_then(|p| path_tail(&p, bytes));
+            Some(CalleeRef { name, qualifier })
+        }
+        // `x.foo` — the method name is the `field`; the receiver type is unknown, so no qualifier.
         "field_expression" => node
             .child_by_field_name("field")
-            .and_then(|n| name_of(&n, bytes)),
+            .and_then(|n| callee_ref(&n, bytes)),
         // `foo::<T>` — the callable is under the `function` field.
         "generic_function" => node
             .child_by_field_name("function")
-            .and_then(|n| name_of(&n, bytes)),
+            .and_then(|n| callee_ref(&n, bytes)),
+        _ => None,
+    }
+}
+
+/// The last segment of a path node — the receiver/namespace qualifier (`A` in `A`, `b` in `a::b`).
+fn path_tail(node: &Node<'_>, bytes: &[u8]) -> Option<String> {
+    match node.kind() {
+        "scoped_identifier" => node
+            .child_by_field_name("name")
+            .and_then(|n| text(&n, bytes)),
+        _ => text(node, bytes),
+    }
+}
+
+/// The implementing type of an `impl_item` (`impl S` / `impl T for S` / `impl Vec<T>` → `S` / `Vec`),
+/// used to scope the methods it contains for same-name disambiguation.
+fn impl_type_name(node: &Node<'_>, bytes: &[u8]) -> Option<String> {
+    let ty = node.child_by_field_name("type")?;
+    type_head_name(&ty, bytes)
+}
+
+fn type_head_name(node: &Node<'_>, bytes: &[u8]) -> Option<String> {
+    match node.kind() {
+        "type_identifier" => text(node, bytes),
+        "generic_type" => node
+            .child_by_field_name("type")
+            .and_then(|n| type_head_name(&n, bytes)),
+        "scoped_type_identifier" => node
+            .child_by_field_name("name")
+            .and_then(|n| text(&n, bytes)),
         _ => None,
     }
 }
@@ -181,17 +309,59 @@ fn file_label(source_file: &str) -> String {
         .to_string()
 }
 
+/// Outcome of resolving one call against a candidate set.
+enum Pick<'a> {
+    /// Exactly one definition matched — emit the edge.
+    One(&'a str),
+    /// Several same-named defs and no qualifier singles one out — drop and count (never fan out).
+    Ambiguous,
+    /// Nothing matched here — try the next table (or count as unresolved).
+    None,
+}
+
+/// Resolve a call against `candidates` (all defs sharing the callee's bare name). A single candidate
+/// resolves unless a **type** qualifier positively contradicts it (a *module* qualifier — the
+/// candidate has no type scope — still matches, so `math::add` resolves to a free `add`). Several
+/// candidates are [`Pick::Ambiguous`] unless the qualifier singles exactly one out — we never emit an
+/// edge to every same-named def (the same-file fan-out bug).
+fn pick<'a>(candidates: Option<&[&'a Callable]>, qualifier: Option<&str>) -> Pick<'a> {
+    let candidates = match candidates {
+        Some(c) if !c.is_empty() => c,
+        _ => return Pick::None,
+    };
+    if let [only] = candidates {
+        if let (Some(q), Some(scope)) = (qualifier, only.scope.as_deref())
+            && q != scope
+        {
+            return Pick::None;
+        }
+        return Pick::One(only.node_id.as_str());
+    }
+    // Genuine same-name ambiguity: a type qualifier is the only thing that can break it.
+    if let Some(q) = qualifier {
+        let mut narrowed = candidates.iter().filter(|c| c.scope.as_deref() == Some(q));
+        if let Some(first) = narrowed.next()
+            && narrowed.next().is_none()
+        {
+            return Pick::One(first.node_id.as_str());
+        }
+    }
+    Pick::Ambiguous
+}
+
 /// Resolve every file's call sites into `calls` edges with cross-file resolution, and return the
 /// canonicalised whole-repo [`Graph`]. Resolution policy (precision-favouring, ADR-0086 R5):
-/// same-file definitions win; otherwise a **unique** global definition of that name resolves;
-/// ambiguous (>1 global) or unknown (0) names are dropped and counted, not guessed.
+/// same-file definitions win; otherwise the global table is consulted. In **both** tables a call
+/// resolves only to a **single** matching definition — a bare name matching several same-named defs
+/// is **dropped and counted, not fanned out** to every candidate; a path qualifier (`A::new`) is used
+/// solely as a tiebreaker to single out the right one when there is genuine ambiguity.
 #[must_use]
 pub fn resolve(files: Vec<FileSymbols>) -> Graph {
-    // Global callable table: name → node_ids across all files.
-    let mut global: HashMap<String, Vec<String>> = HashMap::new();
+    // Global callable table: name → all callables across files (for cross-file resolution).
+    let mut global: HashMap<&str, Vec<&Callable>> = HashMap::new();
     for f in &files {
-        for (name, id) in &f.callables {
-            global.entry(name.clone()).or_default().push(id.clone());
+        for c in &f.callables {
+            global.entry(c.name.as_str()).or_default().push(c);
         }
     }
 
@@ -205,31 +375,38 @@ pub fn resolve(files: Vec<FileSymbols>) -> Graph {
         edges.extend(f.contains.iter().cloned());
 
         // Per-file callable table for same-file-first resolution.
-        let mut local: HashMap<&str, Vec<&str>> = HashMap::new();
-        for (name, id) in &f.callables {
-            local.entry(name.as_str()).or_default().push(id.as_str());
+        let mut local: HashMap<&str, Vec<&Callable>> = HashMap::new();
+        for c in &f.callables {
+            local.entry(c.name.as_str()).or_default().push(c);
         }
 
-        for (caller, callee) in &f.calls {
-            let targets: Vec<String> = if let Some(local_ids) = local.get(callee.as_str()) {
-                // Same-file definition(s) win.
-                local_ids.iter().map(|s| (*s).to_string()).collect()
-            } else {
-                match global.get(callee).map(Vec::as_slice) {
-                    Some([only]) => vec![only.clone()],
-                    Some(many) if many.len() > 1 => {
-                        ambiguous += 1;
-                        Vec::new()
-                    }
-                    _ => {
-                        unresolved += 1;
-                        Vec::new()
+        for call in &f.calls {
+            let qualifier = call.qualifier.as_deref();
+            // Same-file definitions win; fall through to the global table only when the local table
+            // offers nothing (or the qualifier rules the sole local candidate out).
+            let target = match pick(local.get(call.name.as_str()).map(Vec::as_slice), qualifier) {
+                Pick::One(id) => Some(id.to_string()),
+                Pick::Ambiguous => {
+                    ambiguous += 1;
+                    None
+                }
+                Pick::None => {
+                    match pick(global.get(call.name.as_str()).map(Vec::as_slice), qualifier) {
+                        Pick::One(id) => Some(id.to_string()),
+                        Pick::Ambiguous => {
+                            ambiguous += 1;
+                            None
+                        }
+                        Pick::None => {
+                            unresolved += 1;
+                            None
+                        }
                     }
                 }
             };
-            for target in targets {
+            if let Some(target) = target {
                 edges.push(GraphEdge {
-                    source: caller.clone(),
+                    source: call.caller.clone(),
                     target,
                     relation: "calls".to_string(),
                 });
@@ -278,7 +455,11 @@ mod tests {
                 .iter()
                 .any(|n| n.node_id == "src/math.rs" && n.label == "math.rs")
         );
-        let add = g.nodes.iter().find(|n| n.label == "add").expect("add node");
+        let add = g
+            .nodes
+            .iter()
+            .find(|n| n.label == "add()")
+            .expect("add node");
         assert_eq!(add.source_file, "src/math.rs");
         assert!(
             g.edges.iter().any(|e| e.relation == "contains"
@@ -292,8 +473,8 @@ mod tests {
     fn intra_file_call_edge_is_built() {
         let src = "fn helper() {}\nfn caller() { helper(); }\n";
         let g = graph_of(&[("src/a.rs", src)]);
-        let helper = g.nodes.iter().find(|n| n.label == "helper").unwrap();
-        let caller = g.nodes.iter().find(|n| n.label == "caller").unwrap();
+        let helper = g.nodes.iter().find(|n| n.label == "helper()").unwrap();
+        let caller = g.nodes.iter().find(|n| n.label == "caller()").unwrap();
         assert!(
             g.edges.iter().any(|e| e.relation == "calls"
                 && e.source == caller.node_id
@@ -309,8 +490,8 @@ mod tests {
         let a = ("src/a.rs", "fn caller() { target(); }\n");
         let b = ("src/b.rs", "fn target() {}\n");
         let g = graph_of(&[a, b]);
-        let target = g.nodes.iter().find(|n| n.label == "target").unwrap();
-        let caller = g.nodes.iter().find(|n| n.label == "caller").unwrap();
+        let target = g.nodes.iter().find(|n| n.label == "target()").unwrap();
+        let caller = g.nodes.iter().find(|n| n.label == "caller()").unwrap();
         assert_eq!(target.source_file, "src/b.rs");
         assert_eq!(caller.source_file, "src/a.rs");
         assert!(
@@ -326,8 +507,8 @@ mod tests {
     fn method_call_resolves_to_method_definition() {
         let src = "struct S;\nimpl S { fn run(&self) {} }\nfn go(s: &S) { s.run(); }\n";
         let g = graph_of(&[("src/s.rs", src)]);
-        let run = g.nodes.iter().find(|n| n.label == "run").unwrap();
-        let go = g.nodes.iter().find(|n| n.label == "go").unwrap();
+        let run = g.nodes.iter().find(|n| n.label == "run()").unwrap();
+        let go = g.nodes.iter().find(|n| n.label == "go()").unwrap();
         assert!(
             g.edges.iter().any(|e| e.relation == "calls"
                 && e.source == go.node_id
@@ -351,6 +532,131 @@ mod tests {
             "ambiguous name must not produce a guessed calls edge, got {:?}",
             g.edges
         );
+    }
+
+    #[test]
+    fn method_definition_emits_a_method_edge_not_contains() {
+        // Parity with Graphify: a callable inside a type container is joined by `method`, not
+        // `contains`.
+        let src = "struct S;\nimpl S { fn run(&self) {} }\n";
+        let g = graph_of(&[("src/s.rs", src)]);
+        let run = g.nodes.iter().find(|n| n.label == "run()").unwrap();
+        assert!(
+            g.edges
+                .iter()
+                .any(|e| e.relation == "method" && e.target == run.node_id),
+            "S::run must be reached by a `method` edge; edges = {:?}",
+            g.edges
+        );
+        assert!(
+            !g.edges
+                .iter()
+                .any(|e| e.relation == "contains" && e.target == run.node_id),
+            "S::run must NOT also be a `contains` target; edges = {:?}",
+            g.edges
+        );
+    }
+
+    #[test]
+    fn labels_and_lines_match_graphify_shape() {
+        // 1-based lines + `()` on callables (Graphify parity).
+        let g = graph_of(&[("src/m.rs", "\nfn add() {}\n")]); // `add` on source line 2
+        let add = g.nodes.iter().find(|n| n.label == "add()").unwrap();
+        assert_eq!(add.start_line, 2, "1-based start_line");
+        let file = g.nodes.iter().find(|n| n.node_id == "src/m.rs").unwrap();
+        assert_eq!(file.start_line, 1, "file node is line 1 like Graphify's L1");
+    }
+
+    #[test]
+    fn same_file_qualified_call_hits_the_right_constructor() {
+        // Two impls in one file both define `new`. `A::new()` must resolve to A's `new` only — the
+        // old same-file branch fanned out to BOTH (the bug this fixes).
+        let src = "\
+struct A;
+struct B;
+impl A { fn new() -> A { A } }
+impl B { fn new() -> B { B } }
+fn make() { let _ = A::new(); }
+";
+        let g = graph_of(&[("src/lib.rs", src)]);
+        let make = g.nodes.iter().find(|n| n.label == "make()").unwrap();
+        // `impl A { fn new ... }` are one source line: A::new is line 3, B::new line 4.
+        let a_new = g
+            .nodes
+            .iter()
+            .find(|n| n.label == "new()" && n.start_line == 3)
+            .expect("A::new at line 3");
+        let b_new = g
+            .nodes
+            .iter()
+            .find(|n| n.label == "new()" && n.start_line == 4)
+            .expect("B::new at line 4");
+        let calls: Vec<_> = g
+            .edges
+            .iter()
+            .filter(|e| e.relation == "calls" && e.source == make.node_id)
+            .collect();
+        assert_eq!(
+            calls.len(),
+            1,
+            "exactly one calls edge (no fan-out); got {calls:?}"
+        );
+        assert_eq!(calls[0].target, a_new.node_id, "must resolve to A::new");
+        assert_ne!(calls[0].target, b_new.node_id, "must NOT also hit B::new");
+    }
+
+    #[test]
+    fn same_file_bare_duplicate_call_is_dropped_not_fanned_out() {
+        // `default` on two impls; a *bare* `default()` can't be attributed → dropped, not one edge
+        // to each definition.
+        let src = "\
+struct A;
+struct B;
+impl A { fn default() -> A { A } }
+impl B { fn default() -> B { B } }
+fn make() { let _ = default(); }
+";
+        let g = graph_of(&[("src/lib.rs", src)]);
+        assert!(
+            !g.edges.iter().any(|e| e.relation == "calls"),
+            "ambiguous bare call must be dropped, not fanned out; edges = {:?}",
+            g.edges
+        );
+    }
+
+    #[test]
+    fn qualified_call_disambiguates_from_and_build_across_impls() {
+        // A mix of `from`/`build` constructors on colliding types; each qualified call lands on its
+        // own type's method and nothing else.
+        let src = "\
+struct Meters;
+struct Feet;
+impl Meters { fn from(v: i32) -> Meters { Meters } fn build() -> Meters { Meters } }
+impl Feet { fn from(v: i32) -> Feet { Feet } fn build() -> Feet { Feet } }
+fn go() { let _ = Feet::from(3); let _ = Meters::build(); }
+";
+        let g = graph_of(&[("src/u.rs", src)]);
+        let go = g.nodes.iter().find(|n| n.label == "go()").unwrap();
+        let calls: Vec<_> = g
+            .edges
+            .iter()
+            .filter(|e| e.relation == "calls" && e.source == go.node_id)
+            .collect();
+        assert_eq!(calls.len(), 2, "two resolved edges; got {calls:?}");
+        // `Feet::from` and `Meters::build` are the only correct targets.
+        // `impl Meters {...}` is line 3, `impl Feet {...}` line 4 (each impl + its methods one line).
+        let feet_from = g
+            .nodes
+            .iter()
+            .find(|n| n.label == "from()" && n.start_line == 4)
+            .expect("Feet::from at line 4");
+        let meters_build = g
+            .nodes
+            .iter()
+            .find(|n| n.label == "build()" && n.start_line == 3)
+            .expect("Meters::build at line 3");
+        assert!(calls.iter().any(|e| e.target == feet_from.node_id));
+        assert!(calls.iter().any(|e| e.target == meters_build.node_id));
     }
 
     #[test]

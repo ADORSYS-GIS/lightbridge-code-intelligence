@@ -2768,6 +2768,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bon",
+ "flate2",
  "ignore",
  "lopdf",
  "pdf-extract",

@@ -4,84 +4,84 @@
       "node_id": "src/main.rs",
       "label": "main.rs",
       "source_file": "src/main.rs",
-      "start_line": 0
+      "start_line": 1
     },
     {
-      "node_id": "src/main.rs#0:math",
+      "node_id": "src/main.rs#1:math",
       "label": "math",
       "source_file": "src/main.rs",
-      "start_line": 0
+      "start_line": 1
     },
     {
-      "node_id": "src/main.rs#2:main",
-      "label": "main",
+      "node_id": "src/main.rs#3:main",
+      "label": "main()",
       "source_file": "src/main.rs",
-      "start_line": 2
+      "start_line": 3
     },
     {
       "node_id": "src/math.rs",
       "label": "math.rs",
       "source_file": "src/math.rs",
-      "start_line": 0
-    },
-    {
-      "node_id": "src/math.rs#10:log",
-      "label": "log",
-      "source_file": "src/math.rs",
-      "start_line": 10
-    },
-    {
-      "node_id": "src/math.rs#1:add",
-      "label": "add",
-      "source_file": "src/math.rs",
       "start_line": 1
     },
     {
-      "node_id": "src/math.rs#6:print_result",
-      "label": "print_result",
+      "node_id": "src/math.rs#11:log",
+      "label": "log()",
       "source_file": "src/math.rs",
-      "start_line": 6
+      "start_line": 11
+    },
+    {
+      "node_id": "src/math.rs#2:add",
+      "label": "add()",
+      "source_file": "src/math.rs",
+      "start_line": 2
+    },
+    {
+      "node_id": "src/math.rs#7:print_result",
+      "label": "print_result()",
+      "source_file": "src/math.rs",
+      "start_line": 7
     }
   ],
   "edges": [
     {
       "source": "src/main.rs",
-      "target": "src/main.rs#0:math",
+      "target": "src/main.rs#1:math",
       "relation": "contains"
     },
     {
       "source": "src/main.rs",
-      "target": "src/main.rs#2:main",
+      "target": "src/main.rs#3:main",
       "relation": "contains"
     },
     {
-      "source": "src/main.rs#2:main",
-      "target": "src/math.rs#1:add",
+      "source": "src/main.rs#3:main",
+      "target": "src/math.rs#2:add",
       "relation": "calls"
     },
     {
-      "source": "src/main.rs#2:main",
-      "target": "src/math.rs#6:print_result",
+      "source": "src/main.rs#3:main",
+      "target": "src/math.rs#7:print_result",
       "relation": "calls"
     },
     {
       "source": "src/math.rs",
-      "target": "src/math.rs#10:log",
+      "target": "src/math.rs#11:log",
       "relation": "contains"
     },
     {
       "source": "src/math.rs",
-      "target": "src/math.rs#1:add",
+      "target": "src/math.rs#2:add",
       "relation": "contains"
     },
     {
       "source": "src/math.rs",
-      "target": "src/math.rs#6:print_result",
+      "target": "src/math.rs#7:print_result",
       "relation": "contains"
     },
     {
-      "source": "src/math.rs#6:print_result",
-      "target": "src/math.rs#10:log",
+      "source": "src/math.rs#7:print_result",
+      "target": "src/math.rs#11:log",
       "relation": "calls"
     }
   ]
