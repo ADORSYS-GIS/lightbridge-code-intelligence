@@ -4,6 +4,9 @@
 //! internal API — the runner has no direct DB access). See docs/indexing-and-storage.md.
 
 pub mod chunker;
+// In-house structural graph (ADR-0086), behind the `LCI_CODEGRAPH_GRAPH` flag. Additive: `graph`
+// (Graphify) stays the default until the parity cutover.
+pub mod codegraph_graph;
 pub mod graph;
 pub mod language;
 
