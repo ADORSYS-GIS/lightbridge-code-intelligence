@@ -36,6 +36,7 @@ jobs:
     runs-on: [self-hosted, vymalo-vps]
     container: debian:bookworm-slim
     steps:
+      - uses: actions/checkout@v4
       - name: inside container
         run: |
           echo "=== CONTAINER JOB RAN ==="
@@ -58,6 +59,7 @@ jobs:
           --health-timeout 5s
           --health-retries 10
     steps:
+      - uses: actions/checkout@v4
       - name: reach postgres service by name
         run: |
           apt-get update && apt-get install -y --no-install-recommends postgresql-client >/dev/null 2>&1 || echo "apt failed"
