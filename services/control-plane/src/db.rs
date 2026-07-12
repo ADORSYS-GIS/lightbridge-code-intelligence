@@ -1711,7 +1711,7 @@ pub async fn list_tasks(pool: &PgPool, limit: i64) -> Result<Vec<TaskRow>, sqlx:
         "SELECT t.*, r.owner AS repo_owner, r.name AS repo_name, \
          r.default_branch AS repo_default_branch \
          FROM tasks t LEFT JOIN repositories r ON r.id = t.repository_id \
-         ORDER BY t.id DESC LIMIT $1",
+         ORDER BY t.created_at DESC, t.id DESC LIMIT $1",
     )
     .bind(limit)
     .fetch_all(pool)
@@ -3867,6 +3867,72 @@ mod tests {
         let idle_row = repos.iter().find(|r| r.id == idle).unwrap();
         assert_eq!(idle_row.task_count, 0);
         assert!(idle_row.last_task_at.is_none());
+    }
+
+    /// `list_tasks` is the dashboard/TUI run list and must return most-recent-first. `tasks.id` is a
+    /// random UUIDv4, so ordering by it is effectively random — this guards against regressing to an
+    /// id-based ORDER BY (which hid recent runs entirely once older rows crowded the LIMIT window).
+    #[sqlx::test]
+    async fn list_tasks_returns_most_recent_first(pool: PgPool) {
+        let repo = upsert_repository(&pool, Platform::GitHub, 9, "vymalo", "runs", "main", None)
+            .await
+            .unwrap();
+
+        // Create three tasks, then stamp deterministic, distinct created_at values so the expected
+        // order is unambiguous and independent of the (random) UUIDs.
+        let mut ids = Vec::new();
+        for (n, delivery) in ["r-1", "r-2", "r-3"].iter().enumerate() {
+            record_delivery(
+                &pool,
+                Platform::GitHub,
+                delivery,
+                "pull_request",
+                &json!({}),
+            )
+            .await
+            .unwrap();
+            let id = create_task(
+                &pool,
+                &NewTask {
+                    repository_id: repo,
+                    installation_id: 7,
+                    webhook_delivery_id: (*delivery).to_string(),
+                    target_type: "pull_request".to_string(),
+                    target_id: n as i64,
+                    command_text: "review".to_string(),
+                    base_sha: None,
+                    head_sha: None,
+                    run_epoch: 0,
+                    tier: "deep".to_string(),
+                    trigger_comment_id: None,
+                },
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            ids.push(id);
+        }
+        let (oldest, middle, newest) = (ids[0], ids[1], ids[2]);
+
+        // Insertion order is NOT recency order: make the first-inserted the newest.
+        for (id, hours_ago) in [(newest, 1_i32), (middle, 2), (oldest, 3)] {
+            sqlx::query(
+                "UPDATE tasks SET created_at = now() - ($2 * interval '1 hour') WHERE id = $1",
+            )
+            .bind(id)
+            .bind(hours_ago)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let tasks = list_tasks(&pool, 100).await.unwrap();
+        let order: Vec<Uuid> = tasks.iter().map(|t| t.id).collect();
+        assert_eq!(
+            order,
+            vec![newest, middle, oldest],
+            "list_tasks must return most-recent-first by created_at"
+        );
     }
 
     /// The approval gate (Epic #75): new repos are pending; register_pending is insert-only;
