@@ -94,7 +94,10 @@ Unique on `(task_id, run_epoch, step_name)` — the replay-idempotent upsert key
 - **TTL sweep:** the `replay` role periodically deletes rows older than a **configurable retention**
   (`DURABLE_STEP_RETENTION`, default e.g. 6 h), **success or failure** — the backstop for abandoned,
   failed, or cancelled runs, mirroring the outbox prune and the k8s Job `ttlSecondsAfterFinished` it
-  functionally replaces for the loop.
+  functionally replaces for the loop. **The retention MUST be validated `> 0` at load** (reject/clamp a
+  zero or negative value): a misconfigured `0` would make the age cutoff `now()` and sweep *every*
+  in-flight run's state, silently disabling resume — a config footgun the loader guards against, not a
+  runtime surprise.
 
 ### Idempotency of side-effectful steps (the at-least-once seam)
 

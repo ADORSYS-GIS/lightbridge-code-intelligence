@@ -167,8 +167,10 @@ call is the terminal `propose_pr`):
 
 - **`read_file`, `grep`, `find_files`** — read-only navigation of the checkout (shared with
   `review`).
-- **`apply_patch` / `edit_file`** — writes, **only inside the sandbox workdir**. The tool rejects
-  any path that escapes the checkout root; the read-only root FS is the backstop if it doesn't.
+- **`apply_patch` / `edit_file`** — writes, **only inside the sandbox workdir**. The tool
+  **canonicalizes** each target path and rejects any that escapes the checkout root — including `..`
+  traversal and **symlinks that point outside** the workdir (the classic bypass of a naive prefix
+  check); the read-only root FS is the backstop if the check is ever wrong.
 - **`run_command`** — a **sandboxed** build/test/tooling runner. It executes inside the same pod,
   under the same seccomp/non-root/egress-restricted posture, bounded by the per-command and
   wall-clock budgets. This is the tool that runs untrusted code; the sandbox *is* its safety.
