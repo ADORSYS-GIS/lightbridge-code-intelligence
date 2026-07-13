@@ -3644,11 +3644,17 @@ mod tests {
 
         // list_tasks must decode repo_platform correctly
         let tasks = list_tasks(&pool, 10).await.unwrap();
-        let task = tasks.iter().find(|t| t.id == task_id).expect("task in list");
+        let task = tasks
+            .iter()
+            .find(|t| t.id == task_id)
+            .expect("task in list");
         assert_eq!(task.repo_platform, Some(Platform::GitHub));
 
         // get_task must decode repo_platform correctly
-        let fetched = get_task(&pool, task_id).await.unwrap().expect("task exists");
+        let fetched = get_task(&pool, task_id)
+            .await
+            .unwrap()
+            .expect("task exists");
         assert_eq!(fetched.repo_platform, Some(Platform::GitHub));
     }
 
