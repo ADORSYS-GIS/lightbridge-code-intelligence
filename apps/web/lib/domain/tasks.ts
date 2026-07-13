@@ -3,8 +3,6 @@
  * plane's `/tasks` payload (`TaskRow` in `services/control-plane/src/db.rs`). Pure + Edge-safe.
  */
 
-import { gitlabBaseUrl } from "@/lib/utils/config";
-
 /** One task run, as returned by `GET /tasks` and `GET /tasks/{id}`. */
 export interface Task {
   id: string;
@@ -13,6 +11,7 @@ export interface Task {
   /** `null` for admin-initiated tasks (e.g. index-on-approve) that had no originating webhook. */
   webhook_delivery_id: string | null;
   target_type: string;
+  /** For GitHub, the PR or issue number. For GitLab, the project-scoped `iid` (not the global id), required for deep-linking. */
   target_id: number;
   command_text: string;
   base_sha: string | null;
@@ -103,11 +102,11 @@ export function repoLabel(task: Task): string {
 }
 
 /** Platform-specific URL of the task's repository, or `null` when the repo identity join came back empty. */
-export function repoUrl(task: Task): string | null {
+export function repoUrl(task: Task, gitlabBaseUrl: string): string | null {
   if (!task.repo_owner || !task.repo_name) return null;
   switch (task.repo_platform) {
     case "gitlab":
-      return `${gitlabBaseUrl()}/${task.repo_owner}/${task.repo_name}`;
+      return `${gitlabBaseUrl}/${task.repo_owner}/${task.repo_name}`;
     default:
       return `https://github.com/${task.repo_owner}/${task.repo_name}`;
   }
@@ -115,8 +114,8 @@ export function repoUrl(task: Task): string | null {
 
 /** Platform-specific URL of the run's target — the PR or MR or issue — for a deep link; `null` when not applicable
  * (e.g. a `repository` index task, which has no PR/issue) or the repo identity is missing. */
-export function targetUrl(task: Task): string | null {
-  const base = repoUrl(task);
+export function targetUrl(task: Task, gitlabBaseUrl: string): string | null {
+  const base = repoUrl(task, gitlabBaseUrl);
   if (!base) return null;
   switch (task.target_type) {
     case "pull_request":

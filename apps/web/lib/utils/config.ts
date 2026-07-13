@@ -7,13 +7,13 @@ export function githubAppInstallUrl(): string {
   return process.env.GITHUB_APP_INSTALL_URL ?? "https://github.com/apps/lightbridge-assistant";
 }
 
-/** GitLab base URL for repo/target links. Defaults to `https://gitlab.com` (SaaS); self-hosted
- *  deployments set `NEXT_PUBLIC_GITLAB_URL` to their instance origin. `NEXT_PUBLIC_` so it is
- *  inlined into the client bundle — `repoUrl()` is called from client components.
- *
- *  Falls back to the SaaS origin on empty or unset; strips trailing slashes so `${base}/owner/repo`
- *  never double-slashes. */
+/**
+ * GitLab base URL for repo/target links. Read server-side at runtime from `GITLAB_URL`
+ * (non-prefixed, follows `GITHUB_APP_INSTALL_URL` convention); unset or empty falls back to
+ * `https://gitlab.com` (SaaS). Strips trailing slashes so `${base}/owner/repo` never double-slashes.
+ * Read in Server Components only.
+ */
 export function gitlabBaseUrl(): string {
-  const url = process.env.NEXT_PUBLIC_GITLAB_URL || "https://gitlab.com";
+  const url = process.env.GITLAB_URL || "https://gitlab.com";
   return url.replace(/\/+$/, "");
 }

@@ -4,7 +4,6 @@
  */
 
 import type { StatusVariant } from "@/lib/domain/tasks";
-import { gitlabBaseUrl } from "@/lib/utils/config";
 
 /** A connected repository plus its run-activity summary. */
 export interface Repository {
@@ -30,10 +29,10 @@ export function repoSlug(repo: Repository): string {
 }
 
 /** Platform-specific URL of the repository. */
-export function repoUrl(repo: Repository): string {
+export function repoUrl(repo: Repository, gitlabBaseUrl: string): string {
   switch (repo.platform) {
     case "gitlab":
-      return `${gitlabBaseUrl()}/${repo.owner}/${repo.name}`;
+      return `${gitlabBaseUrl}/${repo.owner}/${repo.name}`;
     default:
       return `https://github.com/${repo.owner}/${repo.name}`;
   }

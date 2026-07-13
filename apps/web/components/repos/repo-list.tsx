@@ -15,8 +15,9 @@ const PAGE_SIZE = 12;
 
 /** Connected repositories as cards with a search box + pagination (ADR-0024, daisyUI in ADR-0027).
  * Search + page live in the URL via nuqs; filtering/paging is client-side over the fetched list.
- * `now` is server-passed so relative times don't drift on hydration. */
-export function RepoList({ repos, now }: { repos: Repository[]; now: number }) {
+ * `now` is server-passed so relative times don't drift on hydration.
+ * `gitlabBaseUrl` is passed from the Server Component for self-hosted GitLab links. */
+export function RepoList({ repos, now, gitlabBaseUrl }: { repos: Repository[]; now: number; gitlabBaseUrl: string }) {
   const [query, setQuery] = useQueryState("q", { defaultValue: "", clearOnDefault: true });
   const [page, setPage] = useQueryState("page", parseAsInteger.withDefault(0));
 
@@ -45,7 +46,7 @@ export function RepoList({ repos, now }: { repos: Repository[]; now: number }) {
       ) : (
         <div className="grid gap-3 sm:grid-cols-2">
           {rows.map((repo) => (
-            <RepoCard key={repo.id} repo={repo} now={now} />
+            <RepoCard key={repo.id} repo={repo} now={now} gitlabBaseUrl={gitlabBaseUrl} />
           ))}
         </div>
       )}
@@ -63,7 +64,7 @@ export function RepoList({ repos, now }: { repos: Repository[]; now: number }) {
   );
 }
 
-function RepoCard({ repo, now }: { repo: Repository; now: number }) {
+function RepoCard({ repo, now, gitlabBaseUrl }: { repo: Repository; now: number; gitlabBaseUrl: string }) {
   const approval = approvalVisual(repo);
   return (
     <Card>
@@ -87,7 +88,7 @@ function RepoCard({ repo, now }: { repo: Repository; now: number }) {
         {/* Index health (graph + vector freshness, ADR-0016) lands with the indexer — honest for now. */}
         <span className="text-base-content/60">Not indexed yet</span>
         <a
-          href={repoUrl(repo)}
+          href={repoUrl(repo, gitlabBaseUrl)}
           target="_blank"
           rel="noopener noreferrer"
           className="inline-flex items-center gap-1 text-primary transition-colors hover:underline"

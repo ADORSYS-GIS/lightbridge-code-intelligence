@@ -21,6 +21,7 @@ import {
 } from "@/lib/domain/tasks";
 import { hasPermission } from "@/lib/server/admin";
 import { getReview, getTask } from "@/lib/server/api";
+import { gitlabBaseUrl } from "@/lib/utils/config";
 import { cancelRunAction } from "./actions";
 
 export const dynamic = "force-dynamic";
@@ -114,9 +115,9 @@ export default async function RunDetail({ params }: { params: Promise<{ id: stri
         </CardHeader>
         <CardBody>
           <dl className="grid grid-cols-1 gap-x-8 gap-y-3 sm:grid-cols-2">
-            <Field label="Repository" value={repoLabel(task)} href={repoUrl(task)} />
+            <Field label="Repository" value={repoLabel(task)} href={repoUrl(task, gitlabBaseUrl())} />
             <Field label="Branch" value={task.repo_default_branch ?? "—"} />
-            <Field label="Trigger" value={triggerLabel(task)} href={targetUrl(task)} />
+            <Field label="Trigger" value={triggerLabel(task)} href={targetUrl(task, gitlabBaseUrl())} />
             <Field label="Delivery" value={task.webhook_delivery_id ?? "—"} mono />
             <Field label="Base SHA" value={shortSha(task.base_sha) ?? "—"} mono />
             <Field label="Head SHA" value={shortSha(task.head_sha) ?? "—"} mono />

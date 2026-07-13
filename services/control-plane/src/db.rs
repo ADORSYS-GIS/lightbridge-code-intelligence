@@ -1183,13 +1183,6 @@ pub struct TaskRow {
     pub error_detail: Option<String>,
 }
 
-/// `SELECT` projection shared by the list and detail queries: every `tasks` column plus the joined
-/// repository identity, aliased to the `repo_*` fields of [`TaskRow`].
-const TASK_SELECT: &str = "SELECT t.*, r.owner AS repo_owner, r.name AS repo_name, \
-     r.default_branch AS repo_default_branch, r.platform AS repo_platform \
-     FROM tasks t LEFT JOIN repositories r ON r.id = t.repository_id";
-
-
 /// Fields needed to create a task from a webhook event.
 pub struct NewTask {
     pub repository_id: i64,
@@ -1717,7 +1710,7 @@ pub async fn renew_lease(pool: &PgPool, id: Uuid, lease: Duration) -> Result<boo
 pub async fn list_tasks(pool: &PgPool, limit: i64) -> Result<Vec<TaskRow>, sqlx::Error> {
     sqlx::query_as::<_, TaskRow>(
         "SELECT t.*, r.owner AS repo_owner, r.name AS repo_name, \
-         r.default_branch AS repo_default_branch \
+         r.default_branch AS repo_default_branch, r.platform AS repo_platform \
          FROM tasks t LEFT JOIN repositories r ON r.id = t.repository_id \
          ORDER BY t.id DESC LIMIT $1",
     )
@@ -1730,7 +1723,7 @@ pub async fn list_tasks(pool: &PgPool, limit: i64) -> Result<Vec<TaskRow>, sqlx:
 pub async fn get_task(pool: &PgPool, id: Uuid) -> Result<Option<TaskRow>, sqlx::Error> {
     sqlx::query_as::<_, TaskRow>(
         "SELECT t.*, r.owner AS repo_owner, r.name AS repo_name, \
-         r.default_branch AS repo_default_branch \
+         r.default_branch AS repo_default_branch, r.platform AS repo_platform \
          FROM tasks t LEFT JOIN repositories r ON r.id = t.repository_id \
          WHERE t.id = $1",
     )
@@ -3635,6 +3628,28 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(count, 2);
+    }
+
+    /// Regression guard: `list_tasks` and `get_task` must include `r.platform AS repo_platform` in
+    /// their SELECT projection, otherwise `TaskRow::repo_platform` fails with `ColumnNotFound` at
+    /// decode time (sqlx::FromRow needs the column even for `Option<T>`).
+    #[sqlx::test]
+    async fn task_queries_include_repo_platform(pool: PgPool) {
+        let repo_id = seed(&pool).await;
+
+        let task_id = create_task(&pool, &pr_task(repo_id, "head"))
+            .await
+            .unwrap()
+            .expect("task created");
+
+        // list_tasks must decode repo_platform correctly
+        let tasks = list_tasks(&pool, 10).await.unwrap();
+        let task = tasks.iter().find(|t| t.id == task_id).expect("task in list");
+        assert_eq!(task.repo_platform, Some(Platform::GitHub));
+
+        // get_task must decode repo_platform correctly
+        let fetched = get_task(&pool, task_id).await.unwrap().expect("task exists");
+        assert_eq!(fetched.repo_platform, Some(Platform::GitHub));
     }
 
     /// An explicit `@mention` command (`create_explicit_task`) must ALWAYS land a row — never be

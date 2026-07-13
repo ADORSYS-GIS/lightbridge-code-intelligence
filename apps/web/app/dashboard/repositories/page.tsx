@@ -3,7 +3,7 @@ import { buttonClass } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { ApiErrorLine, EmptyState } from "@/components/ui/states";
 import { listRepositories } from "@/lib/server/api";
-import { githubAppInstallUrl } from "@/lib/utils/config";
+import { githubAppInstallUrl, gitlabBaseUrl } from "@/lib/utils/config";
 
 export const dynamic = "force-dynamic";
 
@@ -42,7 +42,7 @@ export default async function Repositories() {
           pull request).
         </EmptyState>
       ) : (
-        <RepoList repos={result.data} now={now} />
+        <RepoList repos={result.data} now={now} gitlabBaseUrl={gitlabBaseUrl()} />
       )}
     </div>
   );
