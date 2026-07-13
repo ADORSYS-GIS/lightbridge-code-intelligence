@@ -11,8 +11,13 @@ pub fn ts_language(lang: &str) -> Option<Language> {
     match lang {
         "rust" => Some(tree_sitter_rust::LANGUAGE.into()),
         "typescript" => Some(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
+        // `.tsx` needs the dedicated TSX grammar: the plain TypeScript grammar does NOT parse JSX and
+        // would litter tsx files with error nodes, degrading both chunking and graph extraction.
+        "tsx" => Some(tree_sitter_typescript::LANGUAGE_TSX.into()),
+        // The JavaScript grammar already parses JSX, so `.jsx`/`.js` share it.
         "javascript" => Some(tree_sitter_javascript::LANGUAGE.into()),
         "python" => Some(tree_sitter_python::LANGUAGE.into()),
+        "java" => Some(tree_sitter_java::LANGUAGE.into()),
         _ => None,
     }
 }

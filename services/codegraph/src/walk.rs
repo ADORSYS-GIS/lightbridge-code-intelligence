@@ -30,7 +30,7 @@ pub struct WalkOptions {
     /// what makes the operator layer *compose with* rather than *replace* the repo ignores.
     #[builder(default = true)]
     pub respect_gitignore: bool,
-    /// Build the in-house structural graph (Rust only in slice 1). Default `false` so the crate is
+    /// Build the in-house structural graph (Rust, Python, TS/JS+TSX, Java). Default `false` so the crate is
     /// behavior-neutral until a host opts in (ADR-0086 migration shape).
     #[builder(default = false)]
     pub build_graph: bool,
@@ -275,6 +275,47 @@ mod tests {
         assert!(
             out.stats.paths_ignored >= 1,
             "at least the target/ dir was pruned"
+        );
+    }
+
+    #[test]
+    fn walk_builds_cross_file_graph_for_python_and_ts() {
+        // Proves the full walk path — extension detection, `has_graph` gating, the parse-once branch —
+        // wires up for the new languages, not just the direct `extract_file` unit tests.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(root, "svc/a.py", "def caller():\n    target()\n");
+        write(root, "svc/b.py", "def target():\n    pass\n");
+        write(
+            root,
+            "web/a.ts",
+            "import { help } from './b';\nfunction run() { help(); }\n",
+        );
+        write(root, "web/b.ts", "export function help() {}\n");
+
+        let options = WalkOptions::builder().build_graph(true).build();
+        let out = walk_checkout(root, &options).unwrap();
+
+        let cross_file = |lang_dir: &str| {
+            out.graph.edges.iter().any(|e| {
+                e.relation == "calls"
+                    && out
+                        .graph
+                        .nodes
+                        .iter()
+                        .find(|n| n.node_id == e.source)
+                        .is_some_and(|n| n.source_file.starts_with(lang_dir))
+            })
+        };
+        assert!(
+            cross_file("svc/"),
+            "python cross-file call edge; edges = {:?}",
+            out.graph.edges
+        );
+        assert!(
+            cross_file("web/"),
+            "ts cross-file call edge; edges = {:?}",
+            out.graph.edges
         );
     }
 

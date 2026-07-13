@@ -27,6 +27,9 @@ tree-sitter-rust.workspace = true
 tree-sitter-javascript.workspace = true
 tree-sitter-typescript.workspace = true
 tree-sitter-python.workspace = true
+# Java grammar (ADR-0086 language expansion): the org ships Java backends (webank). Same tree-sitter
+# ABI as the other grammars; adds no C-runtime beyond the shared `cc` build path already in use.
+tree-sitter-java.workspace = true
 # Configurable ignore-list that composes with the repo `.gitignore` (ADR-0086 §4 / R3).
 ignore.workspace = true
 # Bounded PDF text extraction over untrusted repo input (ADR-0086 §3 / R2).

@@ -14,7 +14,8 @@
 //! - [`ignore_list`] — gitignore-style, operator-configurable ignore layer that **composes with** the
 //!   repo `.gitignore`, replacing the old hardcoded dir set.
 //! - [`pdf`] — bounded PDF text extraction (byte-capped before parse, panic-caught).
-//! - [`graph`] — the structural call/reference graph with **cross-file resolution for Rust**.
+//! - [`graph`] — the structural call/reference graph with **cross-file resolution** for Rust, Python,
+//!   TypeScript/JavaScript (incl. TSX/JSX), and Java.
 //! - [`walk`] — the one-pass walk producing chunks + graph, honouring both ignore layers.
 //! - a parity-harness scaffold (`tests/parity.rs`) that snapshots the graph against a golden.
 
@@ -23,6 +24,7 @@ pub mod graph;
 pub mod ignore_list;
 pub mod language;
 pub mod pdf;
+pub mod tags;
 pub mod ts;
 pub mod tuning;
 pub mod walk;
