@@ -131,11 +131,13 @@ export function targetUrl(task: Task, gitlabBaseUrl: string): string | null {
   }
 }
 
-/** What triggered the run, e.g. `review · PR #123`. */
+/** What triggered the run, e.g. `review · PR #123` (GitHub) or `review · MR #15` (GitLab). */
 export function triggerLabel(task: Task): string {
   const target =
     task.target_type === "pull_request"
-      ? `PR #${task.target_id}`
+      ? task.repo_platform === "gitlab"
+        ? `MR #${task.target_id}`
+        : `PR #${task.target_id}`
       : `${task.target_type} #${task.target_id}`;
   return `${task.command_text} · ${target}`;
 }
