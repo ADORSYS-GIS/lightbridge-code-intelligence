@@ -140,8 +140,8 @@ same pinned rules ⇒ same findings, every run, at CPU cost with no tokens.
 Implementation in `services/agent-runner/src/sast/mod.rs`:
 
 - **opengrep** (the LGPL fork of Semgrep CE) runs **in the runner** as a best-effort, non-fatal
-  subprocess — the same pattern as Graphify. A missing binary, scan error, or timeout logs and
-  continues; it never fails a review.
+  subprocess — the same best-effort pattern as the structural-graph step. A missing binary, scan error,
+  or timeout logs and continues; it never fails a review.
 - **Scoped to the PR's changed files** (filtered to paths that still exist on disk), so findings land
   on the change rather than dumping every pre-existing repo finding into the out-of-scope section.
   The ruleset is **language-scoped** to the changed files (plus `generic` for secrets) as a perf

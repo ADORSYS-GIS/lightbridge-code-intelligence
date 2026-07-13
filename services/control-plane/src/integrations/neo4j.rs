@@ -1,20 +1,21 @@
-//! Neo4j (Bolt) persistence for the structural code graph (ADR-0019).
+//! Neo4j (Bolt) persistence for the structural code graph (ADR-0086; formerly ADR-0019).
 //!
-//! The agent runner spawns Graphify to produce a `graph.json` (symbols + `contains`/`method`/`calls`
-//! edges) and POSTs it to the internal API; this module writes it to Neo4j. The control plane owns
-//! the Neo4j credentials so the untrusted per-task Job never holds them (trust boundary, ADR-0002) —
-//! the same reason chunk ingestion routes through the control plane rather than direct DB access.
+//! The agent runner builds the structural graph in-process with `lci-codegraph` (symbols +
+//! `contains`/`method`/`calls` edges) and POSTs nodes+edges to the internal API; this module writes
+//! them to Neo4j. The control plane owns the Neo4j credentials so the untrusted per-task Job never
+//! holds them (trust boundary, ADR-0002) — the same reason chunk ingestion routes through the control
+//! plane rather than direct DB access.
 
 use neo4rs::{Graph, query};
 use serde::Serialize;
 
-/// One graph node submitted by the runner (mirrors a Graphify `graph.json` node).
+/// One graph node submitted by the runner (from `lci-codegraph`).
 #[derive(Debug, Clone)]
 pub struct GraphNode {
     pub node_id: String,
     pub label: String,
     pub source_file: String,
-    /// 1-based start line (Graphify emits `"L42"`; the runner parses the integer).
+    /// 1-based start line (as emitted by `lci-codegraph`).
     pub start_line: i64,
 }
 

@@ -332,7 +332,7 @@ fn app(state: AppState) -> Router {
             "/internal/tasks/{id}/chunks",
             post(internal::ingest_chunks).layer(DefaultBodyLimit::max(16 * 1024 * 1024)),
         )
-        // The structural graph (Graphify → Neo4j, ADR-0019). A whole-repo graph.json can be large,
+        // The structural graph (lci-codegraph → Neo4j, ADR-0086). A whole-repo graph can be large,
         // so raise the body limit here too.
         .route(
             "/internal/tasks/{id}/graph",

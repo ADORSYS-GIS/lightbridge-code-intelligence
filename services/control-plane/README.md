@@ -37,8 +37,8 @@ cargo run -p control-plane reconciler   # reconciler (GitHub egress + feedback p
 - **Postgres (+pgvector)** — the work queue, repositories, reviews, and the `code_chunks` semantic index.
   Schema via hand-written SQLx migrations (cratestack deferred,
   [ADR-0005](../../docs/adr/0005-cratestack-schema-first-control-plane.md)).
-- **Neo4j** — the structural graph (the control plane writes;
-  [ADR-0019](../../docs/adr/0019-graphify-cli-structural-graph.md)).
+- **Neo4j** — the structural graph (the control plane writes; built in-process by the runner's
+  **lci-codegraph** crate, [ADR-0086](../../docs/adr/0086-in-house-code-graph-crate.md)).
 - **GitHub** — webhooks in; minted installation tokens used by runners to clone; all write-back
   (validated reviews, replies, reactions, notices) flows **out through the `reconciler`'s
   `github_outbox`** — one writer ([ADR-0022](../../docs/adr/0022-review-writeback-control-plane.md) →

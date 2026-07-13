@@ -158,11 +158,12 @@ pub struct AgentSection {
     /// The agent-runner container image. Acts as the shared fallback when a per-kind override below
     /// is unset.
     pub runner_image: Option<String>,
-    /// Per-kind override for **index** Jobs (`command_text == "index"`) — the full image that
-    /// bundles Python + Graphify for structural-graph extraction. Falls back to `runner_image`.
+    /// Per-kind override for **index** Jobs (`command_text == "index"`). Falls back to `runner_image`.
+    /// Since Graphify was retired (ADR-0086) the index and review images share one lean runtime, but
+    /// the override stays so operators can still pin the two Job kinds to different tags if needed.
     pub indexer_runner_image: Option<String>,
-    /// Per-kind override for **review** Jobs (everything else) — the leaner image without the
-    /// Python/Graphify venv (the review path never spawns Graphify). Falls back to `runner_image`.
+    /// Per-kind override for **review** Jobs (everything else). Falls back to `runner_image`. Same
+    /// lean runtime as the index image now that Graphify is gone (ADR-0086); override kept for pinning.
     pub review_runner_image: Option<String>,
     pub service_account: Option<String>,
     pub control_plane_url: Option<String>,
@@ -183,7 +184,7 @@ pub struct AgentSection {
     /// shared fallback when a per-kind override below is unset.
     pub resources: Option<serde_json::Value>,
     /// Per-kind override for **index** Jobs (`command_text == "index"`) — the heavy path (full
-    /// tree-sitter parse + embeddings + Graphify), wants more CPU/RAM. Falls back to `resources`.
+    /// tree-sitter parse + embeddings + in-process lci-codegraph), wants more CPU/RAM. Falls back to `resources`.
     pub indexer_resources: Option<serde_json::Value>,
     /// Per-kind override for **review** Jobs (everything else) — read-mostly (reuses the indexed
     /// snapshot, ADR-0050; LLM/network-bound), so it can run leaner. Falls back to `resources`.

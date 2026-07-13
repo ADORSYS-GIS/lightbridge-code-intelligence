@@ -1,7 +1,7 @@
 # ADR-0010: Graphify + tree-sitter as the indexing baseline
 
-- **Status:** Accepted
-- **Date:** 2026-06-18
+- **Status:** Accepted — but the **Graphify (structural-graph) half is Superseded by [ADR-0086](0086-in-house-code-graph-crate.md)**. The tree-sitter semantic-chunking half stands; the structural graph is now built in-process by the in-house `lci-codegraph` crate (Graphify removed).
+- **Date:** 2026-06-18 (graph half superseded 2026-07-13)
 
 ## Context and Problem Statement
 

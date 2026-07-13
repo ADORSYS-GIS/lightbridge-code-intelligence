@@ -9,19 +9,19 @@ submits everything over the internal API).
 > pgvector answers "what reads like this" (cosine-nearest chunks). They are complementary, not
 > interchangeable — see [ADR-0003](adr/0003-dual-retrieval-neo4j-pgvector.md).
 
-> **Migrating toward v2 ([RFC-0007](rfc/0007-control-plane-v2-planes.md)) — partial, in progress.**
-> The in-house Rust crate `lci-codegraph` ([ADR-0086](adr/0086-in-house-code-graph-crate.md)) that
-> will replace the Python **Graphify** tool now exists (RFC-0007 slice 1, `#354`): it owns chunking, a
-> configurable **ignore-list** (gitignore-style globs that compose with the repo's `.gitignore`),
-> bounded **PDF text extraction**, and a structurally-resolved call/reference **graph with cross-file
-> resolution for Rust** — over one tree-sitter parse, no Python. **Graphify is still the default graph
-> extractor.** The crate is wired into the runner behind a default-off flag (`LCI_CODEGRAPH_GRAPH`)
-> and, when set, produces the Rust graph in-house; all other languages stay on Graphify until they
-> reach parity (golden + side-by-side `graph.json` diff). It emits the **same**
-> `GraphNodePayload`/`GraphEdgePayload` shape, so the two datastores, the internal-API boundary, and
-> the retrieval tools described here are unchanged. Only once every actively-indexed language is at
-> parity do Graphify, the Python runtime, and the ~4 Gi index Job get retired; indexing then becomes
-> the `index` **mode** of the `agent-plane` ([ADR-0085](adr/0085-agent-execution-plane.md)).
+> **In-house structural graph ([ADR-0086](adr/0086-in-house-code-graph-crate.md)) — the Python
+> Graphify CLI has been retired.** The structural graph is now built **in-process** by the Rust crate
+> `lci-codegraph`: it owns chunking, a configurable **ignore-list** (gitignore-style globs that compose
+> with the repo's `.gitignore`), bounded **PDF text extraction**, and a structurally-resolved
+> call/reference **graph with cross-file resolution for Rust** — all over one tree-sitter parse, no
+> Python, no subprocess. It emits the **same** `GraphNodePayload`/`GraphEdgePayload` shape Graphify's
+> `graph.json` parse used to, so the two datastores, the internal-API boundary, and the retrieval tools
+> described here are unchanged. There is **no flag and no fallback** — `lci-codegraph` is the sole graph
+> engine. Retiring Graphify removed the Python runtime and collapsed the ~4 Gi index-Job / #207 image
+> split, so the `index` and `review` images are now one lean runtime; indexing becomes the `index`
+> **mode** of the `agent-plane` ([ADR-0085](adr/0085-agent-execution-plane.md)). Languages without a
+> graph extractor yet get no structural facts, but the windowed-text fallback keeps them semantically
+> searchable.
 
 ## Who builds what
 
@@ -31,8 +31,8 @@ flowchart LR
     A[Clone checkout] --> B[Walk files]
     B --> C[Tree-sitter chunker]
     C --> D[Embeddings client]
-    A --> G[graphify update --no-cluster]
-    G --> H[graph.json → code nodes/edges]
+    A --> G[lci-codegraph walk<br/>in-process, tree-sitter]
+    G --> H[nodes/edges]
   end
   D -- submit_chunks --> CP[(Control plane API)]
   H -- submit_graph --> CP
@@ -45,14 +45,13 @@ Two independent indexers run in the same task:
 - **Semantic** — our own tree-sitter chunker embeds each chunk and submits batches to the control
   plane, which upserts `code_chunks` rows (pgvector). Code: `services/agent-runner/src/indexer/mod.rs`,
   `services/agent-runner/src/indexer/chunker.rs`, `services/agent-clients/src/embeddings.rs`.
-- **Structural** — Graphify (a bundled multi-grammar AST→graph extractor) emits `graph.json`; the
-  runner keeps only the **code** nodes/edges and submits them; the control plane writes Neo4j. Code:
-  `services/agent-runner/src/indexer/graph.rs`, `services/control-plane/src/integrations/neo4j.rs`.
-  With `LCI_CODEGRAPH_GRAPH` set, the runner instead builds the **Rust** graph in-house via
-  `lci-codegraph` and submits the identical payload shape (ADR-0086, migration in progress):
-  `services/agent-runner/src/indexer/codegraph_graph.rs`, `services/codegraph/`.
+- **Structural** — the in-house `lci-codegraph` crate walks the same checkout (in-process, tree-sitter)
+  and produces symbol nodes + `contains`/`method`/`calls` edges; the runner submits them and the
+  control plane writes Neo4j. Code: `services/agent-runner/src/indexer/graph.rs` (the host that calls
+  the crate), `services/codegraph/`, `services/control-plane/src/integrations/neo4j.rs`. This replaced
+  the Python Graphify CLI (ADR-0086); there is no flag and no fallback.
 
-The structural pass is **best-effort**: it runs after the semantic pass, and a Graphify failure (or
+The structural pass is **best-effort**: it runs after the semantic pass, and a graph failure (or
 an unconfigured graph store returning 503) is logged, not fatal — the task still succeeds with a
 populated pgvector index (`services/agent-runner/src/main.rs`).
 
@@ -184,21 +183,20 @@ The pgvector column is fixed-width, so changing the embedding model's dimension 
 
 ## Structural index (Neo4j)
 
-### Extraction — `graph.rs`
+### Extraction — `graph.rs` + the `lci-codegraph` crate
 
-Graphify is bundled into the runner image and spawned as **`graphify update <checkout> --no-cluster`**
-— the AST-only, no-LLM path. (Not `graphify extract`, which runs a semantic-LLM pass over docs and
-exits non-zero without an API key on any repo with markdown.) Provider API-key envs are stripped so a
-stray key can't change behaviour or trigger paid calls. Output is forced to a private dir outside the
-checkout via an **absolute** `GRAPHIFY_OUT` (a relative value would make Graphify write under the
-checkout while the runner reads the sibling dir → graph silently skipped), keeping a repo's own
-committed `graphify-out/graph.json` from being merged into ours.
+The structural graph is built **in-process** by the `lci-codegraph` crate (ADR-0086), which walks the
+checkout over one tree-sitter parse — no subprocess, no Python, no `graph.json` on disk. The runner's
+`indexer/graph.rs` is a thin host: it calls `lci_codegraph::walk_checkout_from_env(&checkout, /* build_graph */ true)`
+on a blocking thread and maps the crate's `Graph` onto the internal-API `GraphNodePayload`/`GraphEdgePayload`.
 
-The runner parses `graph.json` and keeps only **code** nodes — `file_type == "code"` and a
-`source_file` present — dropping document/heading (markdown) and synthetic nodes. Edges (read from
-`links`, with an `edges` alias for older output) are kept only when **both** endpoints survive the
-code filter. Graphify encodes lines as `"L42"`, parsed to a 1-based integer. Graphify has no
-embeddings; the semantic path stays entirely with our own chunker.
+The crate emits symbol nodes (functions, methods, types, modules) with 1-based start lines and a `()`
+suffix on callables, plus `contains` / `method` / `calls` edges, with **cross-file symbol resolution
+for Rust** (a reference in file A resolved to a definition in file B). Languages without a graph
+extractor yet contribute no structural facts (they stay covered by the semantic chunker). The
+extractor has no embeddings; the semantic path stays entirely with our own chunker. An
+operator-configurable, gitignore-style **ignore-list** (`LCI_CODEGRAPH_IGNORE_GLOBS`, composed with the
+repo `.gitignore`) and the `INDEX_*` tuning knobs govern the walk.
 
 ### Storage — `:Symbol` graph (`services/control-plane/src/integrations/neo4j.rs`)
 

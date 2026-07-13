@@ -89,17 +89,17 @@ PR `closed` **cancels** the PR's active tasks; a repo removed/denied **purges** 
 ## Distinct image + resources per kind
 
 The dispatcher picks the container image and resource block by `command_text`
-(`k8s.rs::image_for` / `resources_for`): **index** jobs run the *full* image (Python + Graphify, more
-CPU/RAM — full tree-sitter parse + embeddings + structural graph); **review** jobs run a *leaner*
-image and lighter resources (LLM/network-bound, reuse the latest snapshot). Each falls back to the
-shared image/resources when its override is unset, so a chart that sets only `runner_image` keeps the
-single-image behaviour.
+(`k8s.rs::image_for` / `resources_for`): **index** jobs want more CPU/RAM (full tree-sitter parse +
+embeddings + the in-process structural graph); **review** jobs run lighter resources (LLM/network-bound,
+reuse the latest snapshot). Since Graphify was retired (ADR-0086) both kinds share one lean runtime
+image, but the per-kind image/resource overrides remain; each falls back to the shared image/resources
+when its override is unset, so a chart that sets only `runner_image` keeps single-image behaviour.
 
 > Cold-repo caveat: [ADR-0050](adr/0050-retrieval-pins-to-latest-indexed-snapshot.md) only makes
 > **warm** reviews reuse the snapshot. A review of a repo that has never been indexed still
-> self-indexes on the leaner image (the structural-graph step is best-effort and skips when Graphify
-> is absent). In practice the approval-time index task indexes a repo before any review runs, so
-> reviews are normally warm. Removing the residual cold self-index path is a later
+> self-indexes — the structural-graph step is now in-process (`lci-codegraph`) and best-effort, so it
+> runs inline and just logs on failure. In practice the approval-time index task indexes a repo before
+> any review runs, so reviews are normally warm. Removing the residual cold self-index path is a later
 > runner-differentiation slice.
 
 ## The `open` mode (dormant, ADR-0088)

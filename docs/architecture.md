@@ -79,7 +79,7 @@ flowchart TD
   DISP -->|one Job per task| JOB
 
   subgraph JOB[agent-runner Job — lightbridge-agents ns]
-    CLONE[clone @ commit] --> IDX[index:<br/>tree-sitter→pgvector,<br/>graphify→Neo4j]
+    CLONE[clone @ commit] --> IDX[index:<br/>tree-sitter→pgvector,<br/>lci-codegraph→Neo4j]
     IDX --> SAST[SAST: opengrep over diff]
     SAST --> AGENT[native review agent loop]
   end
@@ -160,8 +160,9 @@ on a `dedup_key`; the reconciler just ships the bytes. This is the single PR out
   internal gateway (**eaig**), model `qwen3-embedding-8b` at **4096 dims** with **no ANN index**
   ([ADR-0018](adr/0018-openai-compatible-embeddings.md)); the control plane reconciles the configured
   dimension against the live column at startup (`db::reconcile_embedding_dimension`).
-- **Neo4j** — the structural code graph built by graphify/tree-sitter
-  ([ADR-0010](adr/0010-graphify-treesitter-indexing-baseline.md),
+- **Neo4j** — the structural code graph built in-process by the `lci-codegraph` crate (tree-sitter)
+  ([ADR-0086](adr/0086-in-house-code-graph-crate.md), superseding the Graphify path of
+  [ADR-0010](adr/0010-graphify-treesitter-indexing-baseline.md) /
   [ADR-0019](adr/0019-graphify-cli-structural-graph.md)). The untrusted Job never holds Neo4j creds; it
   POSTs the graph through the internal API and queries it via `/graph/query`.
 

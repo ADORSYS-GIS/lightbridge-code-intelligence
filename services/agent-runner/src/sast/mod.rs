@@ -2,8 +2,8 @@
 //!
 //! opengrep is the LGPL fork of Semgrep CE — a rules engine that finds known-bad code patterns
 //! **deterministically** (same code + rules ⇒ same findings, every run, no LLM, no tokens). We run it
-//! the same way we run Graphify (`indexer::graph`): a best-effort subprocess over the checkout whose
-//! failure is logged, never fatal. Unlike the review agent, SAST is a *deterministic* finding source —
+//! as a best-effort subprocess over the checkout whose failure is logged, never fatal (the same
+//! best-effort contract as the structural-graph step). Unlike the review agent, SAST is a *deterministic* finding source —
 //! its findings are posted on their own merit and are **not** gated by the LLM (ADR-0061). They flow
 //! through the existing mediated-write buffer (`add_review_comment`), so the control plane validates,
 //! scopes, renders, and posts them as part of the one grouped review (ADR-0037/0059) — no second poster.
@@ -250,9 +250,8 @@ pub fn digest(findings: &[SastFinding]) -> Option<String> {
 
 /// Spawn `opengrep scan` over the targets and return the SARIF it writes. Output goes to a private file
 /// in the **system temp dir** (outside the checkout, so a repo can't plant or clobber it). We use
-/// temp_dir rather than the checkout's parent: opengrep takes an *absolute* `--sarif-output`, so — unlike
-/// Graphify, whose `GRAPHIFY_OUT` must sit beside the watch path — there's no reason to depend on the
-/// workdir layout, and `/tmp` is always writable by the non-root runner user.
+/// temp_dir rather than the checkout's parent: opengrep takes an *absolute* `--sarif-output`, so there's
+/// no reason to depend on the workdir layout, and `/tmp` is always writable by the non-root runner user.
 /// A non-zero exit is NOT by itself an error — opengrep exits non-zero when it finds matches; we treat
 /// "the SARIF file exists and parses" as success and only bail when the file never appeared.
 async fn run_opengrep(

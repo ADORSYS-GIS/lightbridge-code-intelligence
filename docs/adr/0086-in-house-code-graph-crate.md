@@ -1,8 +1,9 @@
 # ADR-0086: In-house code-graph crate — retire Graphify
 
-- **Status:** Proposed
-- **Date:** 2026-07-12
+- **Status:** Accepted — Implemented (Graphify fully removed; `lci-codegraph` is the sole graph engine)
+- **Date:** 2026-07-12 (implemented 2026-07-13)
 - **Deciders:** @stephane-segning
+- **Supersedes:** [ADR-0019](0019-graphify-cli-structural-graph.md); the graph half of [ADR-0010](0010-graphify-treesitter-indexing-baseline.md)
 
 ## Context and Problem Statement
 

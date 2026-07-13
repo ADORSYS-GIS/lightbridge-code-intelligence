@@ -1,21 +1,28 @@
-//! Structural code graph (ADR-0086 §1). Built directly on tree-sitter — the same grammars and the
-//! same `interesting_node` symbol set the chunker uses — as **edges on top of the per-file symbols**.
+//! Structural code graph (ADR-0086 §1). Built directly on tree-sitter — the same grammars the chunker
+//! uses — as **edges on top of the per-file symbols** (definitions + their call sites).
 //!
-//! Output is payload-compatible with the current Graphify `graph.json` parse: [`GraphNode`] mirrors
+//! Output is payload-compatible with the graph payload the retired Graphify `graph.json` parse
+//! produced (schema history, ADR-0019 → ADR-0086): [`GraphNode`] mirrors
 //! `agent-clients::GraphNodePayload` (`node_id`, `label`, `source_file`, `start_line`) and
 //! [`GraphEdge`] mirrors `GraphEdgePayload` (`source`, `target`, `relation`). The control plane's
 //! generic `:Symbol` + `[:REL {relation}]` Neo4j write and the `graph_find_symbol` /
 //! `graph_get_callers` retrieval tools are unchanged behind the seam.
 //!
-//! Slice 1 resolves **Rust** (ADR-0086 "Rust language first"). Relations emitted:
-//! - `contains` — file → top-level def, and container def (mod/struct/trait/enum) → nested def.
-//! - `method` — a type container (impl/trait/struct/enum/class) → a callable it defines. This is a
-//!   specialisation of `contains` kept separate for parity with Graphify (which emits `method`).
+//! Languages with a real extractor today: **Rust** (ADR-0086 "Rust language first"), **Python**,
+//! **TypeScript/JavaScript** (incl. JSX/TSX), and **Java**. Every language emits the SAME node/edge
+//! vocabulary — the cross-file resolver ([`resolve`]/[`pick`]) is language-agnostic and shared
+//! verbatim. Definitions and call references are identified by each grammar's bundled `tags.scm`
+//! query ([`crate::tags`]); Rust keeps its own node-kind extractor for a byte-stable golden. See
+//! [`Classifier`]. Relations emitted:
+//! - `contains` — file → top-level def, and container def (mod/struct/trait/enum/class) → nested def.
+//! - `method` — a type container (impl/trait/struct/enum/class/interface) → a callable it defines.
+//!   This is a specialisation of `contains` kept separate for parity with Graphify (which emits
+//!   `method`).
 //! - `calls` — caller def → callee def, with **cross-file** resolution (a call in file A resolved to a
 //!   definition in file B). `graph_get_callers` traverses this relation, so the name must match.
 //!
 //! Line numbers are **1-based** and callable labels carry a `()` suffix (`add` → `add()`), both for
-//! parity with the Graphify `graph.json` this crate is replacing.
+//! parity with the Graphify `graph.json` schema this crate replaced.
 
 use std::collections::HashMap;
 
@@ -23,6 +30,7 @@ use serde::Serialize;
 use tree_sitter::{Node, Tree};
 
 use crate::chunk::interesting_node;
+use crate::tags;
 
 /// One graph node. Field set mirrors `agent-clients::GraphNodePayload` exactly.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -67,13 +75,15 @@ pub struct FileSymbols {
 struct Callable {
     name: String,
     node_id: String,
-    /// Enclosing `impl`/`trait` type name (`impl S` / `impl T for S` → `S`), used **only** as a
-    /// tiebreaker to disambiguate several same-named callables. `None` for free functions.
+    /// Enclosing type/class name (Rust `impl S` → `S`; a Python/TS/Java `class C` → `C`), used
+    /// **only** as a tiebreaker to disambiguate several same-named callables. `None` for free
+    /// functions.
     scope: Option<String>,
 }
 
-/// An unresolved call site: the enclosing caller def id, the bare callee name, and — when the call
-/// is a qualified path (`A::new`) — the qualifier segment, used only to break same-name ambiguity.
+/// An unresolved call site: the enclosing caller def id, the bare callee name, and — when the call is
+/// qualified by a receiver/path (`A::new`, `Foo.bar`) — that qualifier, used only to break same-name
+/// ambiguity.
 #[derive(Debug, Clone)]
 struct CallSite {
     caller: String,
@@ -82,16 +92,27 @@ struct CallSite {
 }
 
 /// Extract the structural facts for one **pre-parsed** file. `language` gates which languages produce
-/// a graph (Rust only in slice 1); an unsupported language yields empty facts (Graphify still covers
-/// it). `source_file` is the repo-relative, forward-slashed path used as the file node id.
+/// a graph (Rust, or any language [`crate::tags::extract`] handles); an unsupported language yields
+/// empty facts (no structural graph — semantic search still covers it). `source_file` is the
+/// repo-relative, forward-slashed path used as the file node id.
 #[must_use]
 pub fn extract_file(tree: &Tree, source_file: &str, source: &str, language: &str) -> FileSymbols {
     let mut facts = FileSymbols::default();
-    if language != "rust" {
+    // The definition/call *classifier*: Rust keeps its own node-kind extractor (byte-stable golden);
+    // every other language identifies defs + calls via the grammar's bundled `tags.scm` query. The
+    // `tagged` binding owns the query result the `Classifier::Tagged` variant borrows for the walk.
+    let tagged;
+    let classifier = if language == "rust" {
+        Classifier::Rust
+    } else if let Some(symbols) = tags::extract(language, tree, source) {
+        tagged = symbols;
+        Classifier::Tagged(&tagged)
+    } else {
         return facts;
-    }
+    };
+
     // The file node: id = the path, label = the file name, line 1 (1-based, matching Graphify's `L1`
-    // file node). Top-level defs are `contains`-ed by it.
+    // file node). Top-level defs are `contains`-ed by it. For Python/JS the file *is* the module unit.
     facts.nodes.push(GraphNode {
         node_id: source_file.to_string(),
         label: file_label(source_file),
@@ -105,6 +126,7 @@ pub fn extract_file(tree: &Tree, source_file: &str, source: &str, language: &str
     // a call site to the definition it sits inside.
     let mut stack: Vec<String> = Vec::new();
     walk(
+        classifier,
         &root,
         bytes,
         source_file,
@@ -120,7 +142,9 @@ pub fn extract_file(tree: &Tree, source_file: &str, source: &str, language: &str
 /// attributed to the innermost enclosing def. `scope` is the nearest enclosing type name (for
 /// same-name method disambiguation); `enclosing_kind` is the nearest enclosing def kind (to decide
 /// `contains` vs `method`).
+#[allow(clippy::too_many_arguments)]
 fn walk(
+    classifier: Classifier<'_>,
     node: &Node<'_>,
     bytes: &[u8],
     source_file: &str,
@@ -131,7 +155,7 @@ fn walk(
 ) {
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        if let Some((kind, name)) = interesting_node(&child, bytes) {
+        if let Some((kind, name)) = classifier.classify(&child, bytes) {
             // 1-based line (Graphify parity).
             let start_line = child.start_position().row as i64 + 1;
             let node_id = def_node_id(source_file, start_line, kind, name.as_deref());
@@ -142,11 +166,7 @@ fn walk(
             let is_callable = kind == "function" || kind == "method";
             // A callable directly inside a type container is a *method* (Graphify emits `method`);
             // everything else nests via `contains`.
-            let relation = if is_callable
-                && matches!(
-                    enclosing_kind,
-                    Some("impl" | "trait" | "struct" | "enum" | "class")
-                ) {
+            let relation = if is_callable && is_type_container(enclosing_kind) {
                 "method"
             } else {
                 "contains"
@@ -177,13 +197,11 @@ fn walk(
                 });
             }
             // The type scope introduced for this def's children (qualifies nested methods).
-            let child_scope: Option<String> = match kind {
-                "impl" => impl_type_name(&child, bytes),
-                "trait" | "struct" | "enum" | "class" => name.clone(),
-                _ => None,
-            };
+            let child_scope: Option<String> =
+                classifier.container_scope(&child, kind, name.as_deref(), bytes);
             stack.push(node_id);
             walk(
+                classifier,
                 &child,
                 bytes,
                 source_file,
@@ -194,9 +212,8 @@ fn walk(
             );
             stack.pop();
         } else {
-            if child.kind() == "call_expression"
-                && let Some(caller) = stack.last()
-                && let Some(callee) = callee_ref_of(&child, bytes)
+            if let Some(caller) = stack.last()
+                && let Some(callee) = classifier.call_site(&child, bytes)
             {
                 facts.calls.push(CallSite {
                     caller: caller.clone(),
@@ -205,6 +222,7 @@ fn walk(
                 });
             }
             walk(
+                classifier,
                 &child,
                 bytes,
                 source_file,
@@ -214,6 +232,113 @@ fn walk(
                 facts,
             );
         }
+    }
+}
+
+/// True when a callable directly inside a def of this kind is a *method* (joined by a `method` edge)
+/// rather than a plain nested `contains`. Type containers across languages: Rust `impl`/`trait`/
+/// `struct`/`enum`, and the `class`/`interface`/`enum` of Python, TS/JS, and Java.
+fn is_type_container(kind: Option<&str>) -> bool {
+    matches!(
+        kind,
+        Some("impl" | "trait" | "struct" | "enum" | "class" | "interface")
+    )
+}
+
+/// The definition/call *classifier* the shared walk consults. Two sources, one uniform result.
+/// **Rust** keeps its own tree-sitter node-kind extractor (the chunker's `interesting_node` plus the
+/// Rust `call_expression` navigation) so chunk and graph symbols stay in lock-step and the committed
+/// golden is byte-stable. **Every other language** is classified by the grammar's bundled `tags.scm`
+/// query ([`crate::tags`]). Everything downstream is identical regardless of source — the
+/// `contains`/`method` edge choice, the type-scope threading, and the cross-file [`resolve`]/[`pick`]
+/// resolver — so a call site's qualifier is always tree-derived (tags omit it).
+#[derive(Clone, Copy)]
+enum Classifier<'a> {
+    Rust,
+    Tagged(&'a tags::TaggedSymbols),
+}
+
+impl Classifier<'_> {
+    /// Classify a node as a graph definition: `(kind, name)` for functions/methods/classes/containers,
+    /// or `None` otherwise. `kind` drives callable-ness (`function`/`method`) and the type scope.
+    fn classify(self, node: &Node<'_>, bytes: &[u8]) -> Option<(&'static str, Option<String>)> {
+        match self {
+            Classifier::Rust => interesting_node(node, bytes),
+            Classifier::Tagged(tags) => tags
+                .defs
+                .get(&node.id())
+                .map(|def| (def.kind, def.name.clone())),
+        }
+    }
+
+    /// The type name a container def introduces for its children — used only to disambiguate several
+    /// same-named callables (e.g. two classes each with `run`). `None` for non-containers.
+    fn container_scope(
+        self,
+        node: &Node<'_>,
+        kind: &str,
+        name: Option<&str>,
+        bytes: &[u8],
+    ) -> Option<String> {
+        match self {
+            Classifier::Rust => match kind {
+                // `impl S` / `impl T for S` — the implementing type is the scope, not the trait.
+                "impl" => impl_type_name(node, bytes),
+                "trait" | "struct" | "enum" | "class" => name.map(str::to_string),
+                _ => None,
+            },
+            // Tagged languages: a class/interface/enum scopes the methods it contains by its own name.
+            Classifier::Tagged(_) => match kind {
+                "class" | "interface" | "enum" => name.map(str::to_string),
+                _ => None,
+            },
+        }
+    }
+
+    /// If `node` is a call site, return its callee reference (bare name + an optional type qualifier
+    /// used solely as an ambiguity tiebreaker). For Rust this is the `call_expression` navigation; for
+    /// tagged languages the node is the callee **name node** the query captured, and the qualifier is
+    /// recovered from that node's receiver in the tree (tags drop it).
+    fn call_site(self, node: &Node<'_>, bytes: &[u8]) -> Option<CalleeRef> {
+        match self {
+            Classifier::Rust => (node.kind() == "call_expression")
+                .then(|| callee_ref_of(node, bytes))
+                .flatten(),
+            Classifier::Tagged(tags) => tags.calls.get(&node.id()).map(|name| CalleeRef {
+                name: name.clone(),
+                qualifier: qualifier_from_callee_node(node, bytes),
+            }),
+        }
+    }
+}
+
+/// The qualifier for a tags-captured callee name node: its receiver, when the name is the property of
+/// a member access (`Foo.bar()` → `Foo`; Python `obj.m()` / Java `Obj.m()`). A bare call
+/// (`function`-field identifier) or a `self`/`this`/`cls`/`super` receiver yields no qualifier — the
+/// call resolves on the bare name (single hit) or is dropped as ambiguous, never mis-attributed.
+fn qualifier_from_callee_node(name_node: &Node<'_>, bytes: &[u8]) -> Option<String> {
+    let parent = name_node.parent()?;
+    match parent.kind() {
+        // JS/TS `obj.foo()`, Python `obj.foo()`, Java `obj.foo()` — the receiver is the `object` field.
+        "member_expression" | "attribute" | "method_invocation" => parent
+            .child_by_field_name("object")
+            .and_then(|object| receiver_qualifier(&object, bytes)),
+        _ => None,
+    }
+}
+
+/// A receiver object as a qualifier, iff it is a plain identifier that could name a *type* (`Foo` in
+/// `Foo.bar()`). Implicit-`self` receivers (`self`/`cls`/`this`/`super`) carry no type information, so
+/// they yield no qualifier — the call resolves on the bare method name (single hit) or is dropped as
+/// ambiguous, never mis-attributed by a bogus `self` qualifier.
+fn receiver_qualifier(object: &Node<'_>, bytes: &[u8]) -> Option<String> {
+    if object.kind() != "identifier" {
+        return None;
+    }
+    let name = text(object, bytes)?;
+    match name.as_str() {
+        "self" | "cls" | "this" | "super" => None,
+        _ => Some(name),
     }
 }
 
@@ -440,15 +565,36 @@ mod tests {
     use super::*;
     use crate::ts;
 
-    fn graph_of(files: &[(&str, &str)]) -> Graph {
+    fn graph_of_lang(language: &str, files: &[(&str, &str)]) -> Graph {
         let facts: Vec<FileSymbols> = files
             .iter()
             .map(|(path, src)| {
-                let tree = ts::parse(src, "rust").expect("rust parses");
-                extract_file(&tree, path, src, "rust")
+                let tree = ts::parse(src, language).expect("source parses");
+                extract_file(&tree, path, src, language)
             })
             .collect();
         resolve(facts)
+    }
+
+    fn graph_of(files: &[(&str, &str)]) -> Graph {
+        graph_of_lang("rust", files)
+    }
+
+    /// Find the single node with `label`, panicking with the graph on failure (test ergonomics).
+    fn node<'a>(g: &'a Graph, label: &str) -> &'a GraphNode {
+        g.nodes
+            .iter()
+            .find(|n| n.label == label)
+            .unwrap_or_else(|| panic!("no node labelled {label:?}; nodes = {:?}", g.nodes))
+    }
+
+    /// True iff a `calls` edge `caller → callee` (by label) exists.
+    fn has_call(g: &Graph, caller: &str, callee: &str) -> bool {
+        let src = node(g, caller).node_id.as_str();
+        let dst = node(g, callee).node_id.as_str();
+        g.edges
+            .iter()
+            .any(|e| e.relation == "calls" && e.source == src && e.target == dst)
     }
 
     #[test]
@@ -718,5 +864,350 @@ fn go() { let _ = Feet::from(3); let _ = Meters::build(); }
         let g1 = graph_of(files);
         let g2 = graph_of(files);
         assert_eq!(g1, g2, "resolve must be order-independent + canonical");
+    }
+
+    // ── Python ──────────────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn python_free_function_contains_and_intra_file_call() {
+        let src = "def helper():\n    pass\n\ndef caller():\n    helper()\n";
+        let g = graph_of_lang("python", &[("app/util.py", src)]);
+        let file = node(&g, "util.py");
+        assert_eq!(file.node_id, "app/util.py");
+        let helper = node(&g, "helper()");
+        assert_eq!(helper.start_line, 1, "1-based def line");
+        assert!(
+            g.edges.iter().any(|e| e.relation == "contains"
+                && e.source == "app/util.py"
+                && e.target == helper.node_id),
+            "file → helper contains edge; edges = {:?}",
+            g.edges
+        );
+        assert!(has_call(&g, "caller()", "helper()"), "caller → helper");
+    }
+
+    #[test]
+    fn python_class_method_emits_method_edge_and_self_call_resolves() {
+        // A class with two methods; `describe` calls `self.area()`. `area` is a `method` edge off the
+        // class node, and the self-call resolves to the single `area` despite the `self` receiver.
+        let src = "\
+class Circle:
+    def area(self):
+        return 3.14
+
+    def describe(self):
+        return self.area()
+";
+        let g = graph_of_lang("python", &[("shapes.py", src)]);
+        let class = node(&g, "Circle");
+        let area = node(&g, "area()");
+        assert!(
+            g.edges.iter().any(|e| e.relation == "method"
+                && e.source == class.node_id
+                && e.target == area.node_id),
+            "Circle → area must be a `method` edge; edges = {:?}",
+            g.edges
+        );
+        assert!(
+            !g.edges
+                .iter()
+                .any(|e| e.relation == "contains" && e.target == area.node_id),
+            "a method must not also be a `contains` target"
+        );
+        assert!(
+            has_call(&g, "describe()", "area()"),
+            "self.area() must resolve to Circle.area; edges = {:?}",
+            g.edges
+        );
+    }
+
+    #[test]
+    fn python_cross_file_call_resolves() {
+        let a = ("pkg/a.py", "def caller():\n    target()\n");
+        let b = ("pkg/b.py", "def target():\n    pass\n");
+        let g = graph_of_lang("python", &[a, b]);
+        assert_eq!(node(&g, "target()").source_file, "pkg/b.py");
+        assert!(
+            has_call(&g, "caller()", "target()"),
+            "cross-file caller → target"
+        );
+    }
+
+    #[test]
+    fn python_colliding_method_names_qualified_resolves_bare_dropped() {
+        // Two classes each define `new`; `Circle.new()` resolves to Circle's only, a bare `new()`
+        // is ambiguous and dropped (never fanned out to both).
+        let src = "\
+class Circle:
+    def new(self):
+        return self
+
+class Square:
+    def new(self):
+        return self
+
+def build():
+    return Circle.new()
+
+def build_bare():
+    return new()
+";
+        let g = graph_of_lang("python", &[("shapes.py", src)]);
+        let circle_new = g
+            .nodes
+            .iter()
+            .find(|n| n.label == "new()" && n.start_line == 2)
+            .expect("Circle.new at line 2");
+        let build_calls: Vec<_> = g
+            .edges
+            .iter()
+            .filter(|e| e.relation == "calls" && e.source == node(&g, "build()").node_id)
+            .collect();
+        assert_eq!(
+            build_calls.len(),
+            1,
+            "one qualified edge; got {build_calls:?}"
+        );
+        assert_eq!(
+            build_calls[0].target, circle_new.node_id,
+            "→ Circle.new only"
+        );
+        assert!(
+            !g.edges
+                .iter()
+                .any(|e| e.relation == "calls" && e.source == node(&g, "build_bare()").node_id),
+            "bare ambiguous new() must be dropped; edges = {:?}",
+            g.edges
+        );
+    }
+
+    #[test]
+    fn python_decorated_def_is_named_not_wrapped() {
+        // `@decorator` must not spawn an anonymous wrapper node — the def keeps its real name/line.
+        let src = "import functools\n\n@functools.cache\ndef cached():\n    return 1\n";
+        let g = graph_of_lang("python", &[("m.py", src)]);
+        let cached = node(&g, "cached()");
+        assert_eq!(cached.start_line, 4, "def line, not the decorator line");
+        assert!(
+            g.edges.iter().any(|e| e.relation == "contains"
+                && e.source == "m.py"
+                && e.target == cached.node_id),
+            "decorated def is contained by the file directly (no wrapper); edges = {:?}",
+            g.edges
+        );
+        assert!(
+            !g.nodes.iter().any(|n| n.label == "function"),
+            "no anonymous `function` wrapper node; nodes = {:?}",
+            g.nodes
+        );
+    }
+
+    // ── TypeScript / JavaScript ─────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn ts_function_declaration_and_call() {
+        let src = "function helper() {}\nfunction caller() { helper(); }\n";
+        let g = graph_of_lang("typescript", &[("src/a.ts", src)]);
+        assert!(has_call(&g, "caller()", "helper()"), "caller → helper");
+    }
+
+    #[test]
+    fn ts_named_arrow_const_is_a_callable() {
+        // The dominant modern form: `const helper = () => {}`. It must be a named, callable def.
+        let src = "const helper = () => {};\nfunction caller() { helper(); }\n";
+        let g = graph_of_lang("typescript", &[("src/a.ts", src)]);
+        let helper = node(&g, "helper()");
+        assert!(
+            g.edges.iter().any(|e| e.relation == "contains"
+                && e.source == "src/a.ts"
+                && e.target == helper.node_id),
+            "file → const-arrow helper; edges = {:?}",
+            g.edges
+        );
+        assert!(
+            has_call(&g, "caller()", "helper()"),
+            "caller → const-arrow helper"
+        );
+    }
+
+    #[test]
+    fn ts_class_method_edge_and_this_call() {
+        let src = "\
+class Service {
+  run() {}
+  go() { this.run(); }
+}
+";
+        let g = graph_of_lang("typescript", &[("src/s.ts", src)]);
+        let class = node(&g, "Service");
+        let run = node(&g, "run()");
+        assert!(
+            g.edges.iter().any(|e| e.relation == "method"
+                && e.source == class.node_id
+                && e.target == run.node_id),
+            "Service → run `method` edge; edges = {:?}",
+            g.edges
+        );
+        assert!(
+            has_call(&g, "go()", "run()"),
+            "this.run() resolves to Service.run"
+        );
+    }
+
+    #[test]
+    fn ts_cross_file_call_resolves() {
+        let a = (
+            "src/a.ts",
+            "import { target } from './b';\nfunction caller() { target(); }\n",
+        );
+        let b = ("src/b.ts", "export function target() {}\n");
+        let g = graph_of_lang("typescript", &[a, b]);
+        assert_eq!(node(&g, "target()").source_file, "src/b.ts");
+        assert!(
+            has_call(&g, "caller()", "target()"),
+            "cross-file caller → target"
+        );
+    }
+
+    #[test]
+    fn ts_colliding_methods_qualified_resolves_bare_dropped() {
+        let src = "\
+class Circle { make() { return this; } }
+class Square { make() { return this; } }
+function build() { return Circle.make(); }
+function buildBare(m) { return make(); }
+";
+        let g = graph_of_lang("typescript", &[("src/shapes.ts", src)]);
+        let circle_make = g
+            .nodes
+            .iter()
+            .find(|n| n.label == "make()" && n.start_line == 1)
+            .expect("Circle.make at line 1");
+        let build_calls: Vec<_> = g
+            .edges
+            .iter()
+            .filter(|e| e.relation == "calls" && e.source == node(&g, "build()").node_id)
+            .collect();
+        assert_eq!(
+            build_calls.len(),
+            1,
+            "one qualified edge; got {build_calls:?}"
+        );
+        assert_eq!(
+            build_calls[0].target, circle_make.node_id,
+            "→ Circle.make only"
+        );
+        assert!(
+            !g.edges
+                .iter()
+                .any(|e| e.relation == "calls" && e.source == node(&g, "buildBare()").node_id),
+            "bare ambiguous make() must be dropped; edges = {:?}",
+            g.edges
+        );
+    }
+
+    #[test]
+    fn tsx_component_uses_the_jsx_grammar() {
+        // A `.tsx` component returning JSX must parse via the TSX grammar (the plain TS grammar chokes
+        // on JSX). Assert the component + a hook call resolve, proving the JSX body didn't wreck the
+        // parse.
+        let src = "\
+function useThing() { return 1; }
+export const Widget = () => {
+  const n = useThing();
+  return <div>{n}</div>;
+};
+";
+        let g = graph_of_lang("tsx", &[("src/Widget.tsx", src)]);
+        assert!(
+            has_call(&g, "Widget()", "useThing()"),
+            "Widget → useThing across a JSX body; edges = {:?}",
+            g.edges
+        );
+    }
+
+    #[test]
+    fn javascript_jsx_arrow_component_is_extracted() {
+        // JSX in a `.jsx`/`.js` file must still parse + yield the named component and its call.
+        let src = "\
+const Button = () => { return null; };
+function App() { return Button(); }
+";
+        let g = graph_of_lang("javascript", &[("src/app.jsx", src)]);
+        assert!(
+            has_call(&g, "App()", "Button()"),
+            "App → Button; edges = {:?}",
+            g.edges
+        );
+    }
+
+    // ── Java (stretch) ──────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn java_class_method_edge_and_this_call() {
+        let src = "\
+class Greeter {
+    String hello() { return \"hi\"; }
+    String greet() { return this.hello(); }
+}
+";
+        let g = graph_of_lang("java", &[("Greeter.java", src)]);
+        let class = node(&g, "Greeter");
+        let hello = node(&g, "hello()");
+        assert!(
+            g.edges.iter().any(|e| e.relation == "method"
+                && e.source == class.node_id
+                && e.target == hello.node_id),
+            "Greeter → hello `method` edge; edges = {:?}",
+            g.edges
+        );
+        assert!(
+            has_call(&g, "greet()", "hello()"),
+            "this.hello() → Greeter.hello"
+        );
+    }
+
+    #[test]
+    fn java_cross_file_qualified_static_call_resolves() {
+        let a = (
+            "Caller.java",
+            "class Caller { void run() { Helper.help(); } }\n",
+        );
+        let b = ("Helper.java", "class Helper { static void help() {} }\n");
+        let g = graph_of_lang("java", &[a, b]);
+        assert_eq!(node(&g, "help()").source_file, "Helper.java");
+        assert!(
+            has_call(&g, "run()", "help()"),
+            "Helper.help() resolves cross-file"
+        );
+    }
+
+    #[test]
+    fn java_colliding_methods_qualified_resolves() {
+        let src = "\
+class Circle { Circle make() { return this; } }
+class Square { Square make() { return this; } }
+class Builder { Object build() { return Circle.make(); } }
+";
+        let g = graph_of_lang("java", &[("Shapes.java", src)]);
+        let circle_make = g
+            .nodes
+            .iter()
+            .find(|n| n.label == "make()" && n.start_line == 1)
+            .expect("Circle.make at line 1");
+        let build_calls: Vec<_> = g
+            .edges
+            .iter()
+            .filter(|e| e.relation == "calls" && e.source == node(&g, "build()").node_id)
+            .collect();
+        assert_eq!(
+            build_calls.len(),
+            1,
+            "one qualified edge; got {build_calls:?}"
+        );
+        assert_eq!(
+            build_calls[0].target, circle_make.node_id,
+            "→ Circle.make only"
+        );
     }
 }

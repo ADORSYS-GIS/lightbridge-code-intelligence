@@ -680,7 +680,7 @@ pub async fn ingest_chunks(
     }
 }
 
-/// One structural-graph node submitted by the runner (a Graphify `graph.json` node).
+/// One structural-graph node submitted by the runner (from `lci-codegraph`).
 #[derive(Debug, Deserialize)]
 pub struct GraphNodeInput {
     pub node_id: String,
@@ -705,10 +705,10 @@ pub struct GraphBatch {
     pub edges: Vec<GraphEdgeInput>,
 }
 
-/// `POST /internal/tasks/{id}/graph` — ingest the structural code graph (Graphify → Neo4j, ADR-0019).
+/// `POST /internal/tasks/{id}/graph` — ingest the structural code graph (lci-codegraph → Neo4j, ADR-0086).
 ///
-/// The runner spawns Graphify, reads its `graph.json`, and POSTs nodes+edges here; the control plane
-/// writes them to Neo4j. `repository_id` is read from the DB, not trusted from the caller (ADR-0002).
+/// The runner builds the graph in-process with `lci-codegraph` and POSTs nodes+edges here; the control
+/// plane writes them to Neo4j. `repository_id` is read from the DB, not trusted from the caller (ADR-0002).
 pub async fn ingest_graph(
     _auth: RunnerAuth,
     State(state): State<AppState>,

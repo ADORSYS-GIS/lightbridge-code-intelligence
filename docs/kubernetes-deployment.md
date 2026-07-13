@@ -132,17 +132,19 @@ The Job carries the task context and callback wiring as env (`job_manifest`):
 
 ### Image selection (`image_for`)
 
-The dispatcher picks the image per task kind:
+The dispatcher picks the image per task kind. Since Graphify was retired ([ADR-0086](adr/0086-in-house-code-graph-crate.md))
+both kinds share **one lean runtime image** (structural-graph extraction is now in-process via the
+`lci-codegraph` crate — no Python/Graphify venv), but the per-kind overrides remain so operators can
+still pin the kinds to different tags:
 
-- **`command_text == "index"`** → the **full** image (`indexer_runner_image`, falls back to
-  `runner_image`) — bundles Python + Graphify for structural-graph extraction.
-- **everything else (review/ask)** → the **leaner** image (`review_runner_image`, falls back to
-  `runner_image`) — no Graphify venv; the review path is LLM/network-bound and reuses the indexed
-  snapshot ([ADR-0050](adr/0050-retrieval-pins-to-latest-indexed-snapshot.md)).
+- **`command_text == "index"`** → `indexer_runner_image`, falls back to `runner_image` — the heavier
+  path (full tree-sitter parse + embeddings + structural graph), typically more CPU/RAM.
+- **everything else (review/ask)** → `review_runner_image`, falls back to `runner_image` — LLM/network-
+  bound and reuses the indexed snapshot ([ADR-0050](adr/0050-retrieval-pins-to-latest-indexed-snapshot.md)).
 
 A chart that sets only `runner_image` keeps single-image behaviour. (Caveat in the code: a *cold-repo*
-review still self-indexes; on the lean image Graphify is best-effort/non-fatal, so a cold review
-builds the pgvector index and defers the graph to the next `index` task.)
+review still self-indexes; the structural-graph step is in-process and best-effort/non-fatal, so a cold
+review builds the pgvector index and the graph inline.)
 
 ### Resources (`resources_for`)
 

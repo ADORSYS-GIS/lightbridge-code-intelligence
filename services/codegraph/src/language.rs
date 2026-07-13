@@ -13,7 +13,8 @@ use std::path::Path;
 pub fn from_path(path: &Path) -> Option<&'static str> {
     match path.extension().and_then(|e| e.to_str()) {
         Some("rs") => Some("rust"),
-        Some("ts" | "tsx") => Some("typescript"),
+        Some("ts") => Some("typescript"),
+        Some("tsx") => Some("tsx"),
         Some("js" | "jsx" | "mjs" | "cjs") => Some("javascript"),
         Some("py") => Some("python"),
         Some("go") => Some("go"),
@@ -28,15 +29,24 @@ pub fn from_path(path: &Path) -> Option<&'static str> {
 /// True for languages we have a tree-sitter grammar for (structured chunking available).
 #[must_use]
 pub fn has_grammar(language: &str) -> bool {
-    matches!(language, "rust" | "typescript" | "javascript" | "python")
+    matches!(
+        language,
+        "rust" | "typescript" | "tsx" | "javascript" | "python" | "java"
+    )
 }
 
-/// True for languages the structural **graph** builder resolves today. Slice 1 ships Rust only
-/// (ADR-0086: "Rust language first"); other languages keep Graphify for the graph and the
-/// windowed-text fallback keeps them semantically searchable.
+/// True for languages the structural **graph** builder has a real extractor for today: Rust
+/// (ADR-0086 "Rust language first"), Python, TypeScript/JavaScript (incl. TSX), and Java. This list
+/// MUST stay in lock-step with the graph classifier — Rust's own extractor plus every language
+/// [`crate::tags::extract`] handles — or a language here without an extractor there would silently
+/// emit an empty graph. Languages absent here still get chunked and stay semantically searchable via
+/// the windowed-text fallback.
 #[must_use]
 pub fn has_graph(language: &str) -> bool {
-    matches!(language, "rust")
+    matches!(
+        language,
+        "rust" | "python" | "typescript" | "tsx" | "javascript" | "java"
+    )
 }
 
 /// True when a path is a PDF (case-insensitive `.pdf`). PDFs take the bounded extraction path, not
@@ -56,6 +66,9 @@ mod tests {
     #[test]
     fn detects_rust_and_text() {
         assert_eq!(from_path(Path::new("a/b.rs")), Some("rust"));
+        // `.tsx` gets its own language so it routes to the JSX-aware TSX grammar, not plain TS.
+        assert_eq!(from_path(Path::new("src/App.tsx")), Some("tsx"));
+        assert_eq!(from_path(Path::new("src/api.ts")), Some("typescript"));
         assert_eq!(from_path(Path::new("README.md")), Some("text"));
         assert_eq!(from_path(Path::new("image.png")), None);
         assert_eq!(
@@ -66,10 +79,17 @@ mod tests {
     }
 
     #[test]
-    fn graph_is_rust_only_in_slice_1() {
+    fn graph_covers_rust_python_and_ts_js() {
         assert!(has_graph("rust"));
-        assert!(!has_graph("python"));
-        assert!(!has_graph("typescript"));
+        assert!(has_graph("python"));
+        assert!(has_graph("typescript"));
+        assert!(has_graph("javascript"));
+        assert!(has_graph("tsx"));
+        assert!(has_graph("java"));
+        // A language we chunk but have no graph extractor for must NOT claim graph support.
+        assert!(!has_graph("go"));
+        assert!(!has_graph("c"));
+        assert!(!has_graph("text"));
     }
 
     #[test]
