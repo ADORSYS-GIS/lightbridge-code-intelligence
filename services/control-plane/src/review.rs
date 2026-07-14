@@ -66,12 +66,11 @@ impl Finding {
     /// `severity` (error/critical→P0, warning→P1, else→P2), else `P2`.
     pub fn priority(&self) -> &str {
         if let Some(p) = self.priority.as_deref().map(str::trim) {
-            if p.eq_ignore_ascii_case("P0") {
-                return "P0";
-            } else if p.eq_ignore_ascii_case("P1") {
-                return "P1";
-            } else if p.eq_ignore_ascii_case("P2") {
-                return "P2";
+            match p {
+                p if p.eq_ignore_ascii_case("P0") => return "P0",
+                p if p.eq_ignore_ascii_case("P1") => return "P1",
+                p if p.eq_ignore_ascii_case("P2") => return "P2",
+                _ => {}
             }
         }
         match self.severity.as_deref().map(str::trim) {
