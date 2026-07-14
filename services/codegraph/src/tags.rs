@@ -16,9 +16,10 @@
 //! The JavaScript query compiles and matches against both the TS and TSX grammars.
 
 use std::collections::HashMap;
-use std::sync::OnceLock;
 
-use tree_sitter::{Language, Node, Query, QueryCursor, StreamingIterator, Tree};
+use tree_sitter::{Node, QueryCursor, StreamingIterator, Tree};
+
+use crate::lang::{self, GraphStrategy};
 
 /// One tagged definition: the graph node kind (normalised across languages) and its symbol name.
 #[derive(Debug, Clone)]
@@ -39,10 +40,16 @@ pub struct TaggedSymbols {
 }
 
 /// Run the bundled tags query for `language` over a pre-parsed `tree`. Returns `None` for languages
-/// with no tags pipeline (Rust keeps its own extractor to hold the byte-stable golden).
+/// with no tags pipeline (Rust keeps its own extractor to hold the byte-stable golden; an unknown
+/// language has no grammar). The compiled query is owned + cached by the language's
+/// [`crate::lang::LanguageSupport`] impl ([`GraphStrategy::Tags`]), so there is no per-language
+/// `match` here.
 #[must_use]
 pub fn extract(language: &str, tree: &Tree, source: &str) -> Option<TaggedSymbols> {
-    let query = query_for(language)?;
+    let query = match lang::by_id(language)?.graph_strategy()? {
+        GraphStrategy::Tags(query) => query,
+        GraphStrategy::RustNative => return None,
+    };
     let names = query.capture_names();
     let mut out = TaggedSymbols::default();
     let mut cursor = QueryCursor::new();
@@ -101,74 +108,19 @@ fn node_text(node: &Node<'_>, source: &str) -> Option<String> {
     source.get(node.byte_range()).map(str::to_string)
 }
 
-/// The compiled (and cached) tags query for a language. `typescript`/`tsx` compose the JavaScript
-/// query (concrete constructs) with the TypeScript query (signatures/interface/module).
-fn query_for(language: &str) -> Option<&'static Query> {
-    fn cached(cell: &'static OnceLock<Query>, language: Language, source: &str) -> &'static Query {
-        cell.get_or_init(|| {
-            Query::new(&language, source).expect("bundled grammar tags.scm query compiles")
-        })
-    }
-
-    static PYTHON: OnceLock<Query> = OnceLock::new();
-    static JAVASCRIPT: OnceLock<Query> = OnceLock::new();
-    static TYPESCRIPT: OnceLock<Query> = OnceLock::new();
-    static TSX: OnceLock<Query> = OnceLock::new();
-    static JAVA: OnceLock<Query> = OnceLock::new();
-
-    match language {
-        "python" => Some(cached(
-            &PYTHON,
-            tree_sitter_python::LANGUAGE.into(),
-            tree_sitter_python::TAGS_QUERY,
-        )),
-        "javascript" => Some(cached(
-            &JAVASCRIPT,
-            tree_sitter_javascript::LANGUAGE.into(),
-            tree_sitter_javascript::TAGS_QUERY,
-        )),
-        "typescript" => Some(cached(
-            &TYPESCRIPT,
-            tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
-            &typescript_tags(),
-        )),
-        "tsx" => Some(cached(
-            &TSX,
-            tree_sitter_typescript::LANGUAGE_TSX.into(),
-            &typescript_tags(),
-        )),
-        "java" => Some(cached(
-            &JAVA,
-            tree_sitter_java::LANGUAGE.into(),
-            tree_sitter_java::TAGS_QUERY,
-        )),
-        _ => None,
-    }
-}
-
-/// The TypeScript/TSX tags query: the JavaScript query (concrete class/function/method/call — the TS
-/// grammar is a JS superset, so these node patterns match) composed with the TS-specific query.
-fn typescript_tags() -> String {
-    format!(
-        "{}\n{}",
-        tree_sitter_javascript::TAGS_QUERY,
-        tree_sitter_typescript::TAGS_QUERY
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ts;
+    use crate::lang;
 
     fn tagged(language: &str, code: &str) -> TaggedSymbols {
-        let tree = ts::parse(code, language).expect("parses");
+        let tree = lang::parse(code, language).expect("parses");
         extract(language, &tree, code).expect("has a tags pipeline")
     }
 
     #[test]
     fn rust_has_no_tags_pipeline() {
-        let tree = ts::parse("fn a() {}\n", "rust").unwrap();
+        let tree = lang::parse("fn a() {}\n", "rust").unwrap();
         assert!(extract("rust", &tree, "fn a() {}\n").is_none());
     }
 
