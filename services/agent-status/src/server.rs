@@ -14,15 +14,17 @@
 //! the loop behaves identically.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::str::FromStr;
 use std::sync::Arc;
 
 use axum::extract::State;
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 
 use crate::StatusHandle;
+use crate::auth::authorized;
 
 /// Default TCP port for the status server when `LCI_STATUS_PORT` is unset. Chosen away from the app's
 /// data ports; a NetworkPolicy/Service to actually reach it is deploy-side and out of scope here.
@@ -54,14 +56,8 @@ impl StatusServerConfig {
         if !truthy(std::env::var("LCI_STATUS_API").ok().as_deref()) {
             return None;
         }
-        let port = std::env::var("LCI_STATUS_PORT")
-            .ok()
-            .and_then(|raw| raw.trim().parse::<u16>().ok())
-            .unwrap_or(DEFAULT_STATUS_PORT);
-        let bind_addr = std::env::var("LCI_STATUS_BIND")
-            .ok()
-            .and_then(|raw| raw.trim().parse::<IpAddr>().ok())
-            .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+        let port = env_parsed("LCI_STATUS_PORT", DEFAULT_STATUS_PORT);
+        let bind_addr = env_parsed("LCI_STATUS_BIND", IpAddr::V4(Ipv4Addr::UNSPECIFIED));
         let bearer_token = std::env::var("LCI_STATUS_TOKEN")
             .ok()
             .map(|raw| raw.trim().to_string())
@@ -87,6 +83,18 @@ fn truthy(value: Option<&str>) -> bool {
         value.map(|raw| raw.trim().to_ascii_lowercase()).as_deref(),
         Some("1" | "true" | "yes")
     )
+}
+
+/// Read `key` from the environment and parse it as `T`, falling back to `default` when the var is
+/// unset, empty, or fails to parse. Shared by the `port` and `bind_addr` fields of [`from_env`], which
+/// differ only in which type they parse.
+///
+/// [`from_env`]: StatusServerConfig::from_env
+fn env_parsed<T: FromStr>(key: &str, default: T) -> T {
+    std::env::var(key)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<T>().ok())
+        .unwrap_or(default)
 }
 
 /// Shared axum state: the projection handle + the bearer token `GET /status` requires.
@@ -142,35 +150,11 @@ async fn health_handler() -> Response {
     Json(serde_json::json!({ "ok": true })).into_response()
 }
 
-/// Whether the request carries `Authorization: Bearer <token>` matching the configured token.
-fn authorized(headers: &HeaderMap, expected: &str) -> bool {
-    headers
-        .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .map(str::trim)
-        .is_some_and(|presented| constant_time_eq(presented.as_bytes(), expected.as_bytes()))
-}
-
-/// Constant-time bearer-token comparison. A plain `==` on `&str` short-circuits on the first
-/// differing byte, and even `subtle`'s `ConstantTimeEq` needs equal-length inputs — guarding the
-/// length with `presented.len() == expected.len()` short-circuits on a mismatch and thereby leaks the
-/// secret's *length* to a timing attacker. Instead hash both sides to a fixed 32-byte SHA-256 digest
-/// (always equal-length, so no length branch) and `ct_eq` the digests. Byte-for-byte constant time
-/// regardless of the presented token's length; a collision would require breaking SHA-256.
-fn constant_time_eq(presented: &[u8], expected: &[u8]) -> bool {
-    use sha2::{Digest, Sha256};
-    use subtle::ConstantTimeEq as _;
-    let presented = Sha256::digest(presented);
-    let expected = Sha256::digest(expected);
-    presented.ct_eq(&expected).into()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use axum::body::Body;
-    use axum::http::Request;
+    use axum::http::{Request, header};
     use tower::ServiceExt; // oneshot
     use uuid::Uuid;
 

@@ -28,6 +28,7 @@ use lci_agent_loop::{TranscriptEvent, TranscriptSink};
 use serde::Serialize;
 use uuid::Uuid;
 
+mod auth;
 pub mod server;
 
 pub use server::{StatusServerConfig, serve, spawn};
