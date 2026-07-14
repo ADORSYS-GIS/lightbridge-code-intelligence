@@ -169,11 +169,12 @@ wouldn't explain all 7 being zero, only possibly the last).
 `reasoning_content` deltas are present, off the real wire, for every faithful reconstruction of
 production's actual size/tool-count/turn-depth, including well past where the hypothesis predicted
 suppression. This rules out a structural, request-shape-driven code defect in
-`stream.rs::StreamDelta`/`collect_stream` or `transcript.rs`'s `reasoning_chars` line — both remain
-verified correct, now under realistic load as well as #247's isolated probes. PR #409's specific
-7-turn zero streak remains **unexplained** but, given it could not be reproduced despite deliberately
-exceeding its own request's scale on every axis, is most plausibly a **one-off gateway/provider-side
-anomaly** (transient backend routing or degraded behavior at that moment) rather than a recurring
+`stream.rs::StreamDelta`/`collect_stream` or `agent-runner/src/review/transcript.rs`'s
+`reasoning_chars` line — both remain verified correct, now under realistic load as well as #247's
+isolated probes. PR #409's specific 7-turn zero streak remains **unexplained** but, given it could
+not be reproduced despite deliberately exceeding its own request's scale on every axis, is most
+plausibly a **one-off gateway/provider-side anomaly** (transient backend routing or degraded
+behavior at that moment) rather than a recurring
 systemic bug — there is nothing here to fix. Since the original raw wire data for that specific
 incident was never captured (only the aggregate `reasoning_chars: 0` log line survived), a recurrence
 today would be equally undiagnosable;
