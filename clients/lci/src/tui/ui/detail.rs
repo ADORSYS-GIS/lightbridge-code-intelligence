@@ -192,7 +192,7 @@ fn detail_live_badge(d: &DetailState, theme: &Theme) -> Vec<Span<'static>> {
     };
     vec![
         Span::styled("● ", Style::default().fg(color)),
-        Span::styled(label.to_string(), Style::default().fg(color)),
+        Span::styled(label, Style::default().fg(color)),
     ]
 }
 
