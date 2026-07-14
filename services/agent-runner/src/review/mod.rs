@@ -44,11 +44,13 @@ use lci_agent_status::StatusHandle;
 use lci_agent_step::Passthrough;
 use lci_agent_tools::{RuntimeCaps, ToolCx, TurnFilter};
 use lci_review_agent::flows::{self, ReviewRunParams};
+use lci_review_agent::policies::SastLead;
 use lci_review_agent::prompt::{self, PrDiffRef, PromptConfig};
 use lci_review_agent::tools::{ADD_REVIEW_COMMENT, tool_registry};
 
 use crate::bootstrap::config::ReviewConfig;
 use crate::clone::PrDiff;
+use crate::sast::SastFinding;
 
 /// How the agent loop ended (#137). Distinct from `Err`, which is reserved for a transport/loop failure
 /// where the gateway was unreachable and nothing useful happened. The caller maps these to a visible
@@ -114,6 +116,10 @@ pub async fn run_native_agent(
     prior_reviews: Option<&str>,
     repo_memory: Option<&str>,
     sast_digest: Option<&str>,
+    // The SAST findings the digest above summarizes, kept structured so the SAST anchor gate (#305)
+    // can reject a triage verdict anchored to a line opengrep never flagged. Empty when SAST is off or
+    // found nothing — the gate is then a no-op.
+    sast_findings: &[SastFinding],
     attribution: &[(String, String)],
     client: &ControlPlaneClient,
     embedder: &EmbeddingsClient,
@@ -211,6 +217,14 @@ pub async fn run_native_agent(
         fast: review.fast,
         diff_present,
         diff_files: diff.map(|pr| pr.files.clone()).unwrap_or_default(),
+        sast_leads: sast_findings
+            .iter()
+            .map(|f| SastLead {
+                file: f.file.clone(),
+                line: f.line,
+                rule_id: f.rule_id.clone(),
+            })
+            .collect(),
     };
     let workspace = flows::eager_workspace(checkout_root.to_path_buf());
     let cx = ToolCx {

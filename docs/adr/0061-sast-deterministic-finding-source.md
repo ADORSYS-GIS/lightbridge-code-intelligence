@@ -79,15 +79,44 @@ ever *gating* them.**
   source-filtering and analytics, instead of the title marker) are noted follow-ups — neither is needed
   for the value v1 delivers.
 
+## Amendment — 2026-07-14 (Accepted, as implemented): triage verdicts must anchor to the real line
+
+The Phase 2 digest (item 5 above) told the agent it *may* investigate a lead further — confirm
+exploitability, trace a tainted input, or note a false positive — but never required it to actually
+**read the flagged line** before doing so. That gap surfaced in production
+(ADORSYS-GIS/webank-mobile#145, run `e82f7c4b-50ec-4bc4-942f-48cfc404b603`): opengrep deterministically
+flagged `.env.fullstack:216` (a real MTN Mobile Money API key), but the agent posted a P2 "false
+positive" note anchored at `.env.fullstack:60` — an unrelated dev-DB-password line it never verified
+against the actual finding. The review ended up with a P1 opengrep badge *and* a contradictory P2 note
+about the wrong credential, and the one secret that warranted a human look was never evaluated. This is
+issue [#305](https://github.com/vymalo/lightbridge-code-intelligence/issues/305).
+
+Two changes ship together, mirroring [ADR-0043](0043-review-finding-verification.md)'s
+evidence-citation + refute-pass shape (a prompt instruction alone is not a guarantee):
+
+- **Prompt (`sast::digest`).** The digest now explicitly requires calling `read_file` on the EXACT
+  flagged line before any confirm/refute verdict, quoting its real content into `evidence`, and never
+  reasoning about a nearby or similar-looking line.
+- **Code gate (`SastAnchorGate`, `review-agent`).** A new one-shot `TurnPolicy` (same shape as
+  [`RefuteGate`](0043-review-finding-verification.md)) rejects a `finish` while an `add_review_comment`
+  claims a SAST verdict — "false positive" wording, or a cited opengrep rule id — anchored to a
+  `(file, line)` that isn't one opengrep actually flagged in that file, and names the real coordinate in
+  the bounce. It is a narrow, coordinate-based check (not free-text NLP): a legitimate deepen-the-lead
+  comment on a genuinely different line (e.g. a taint source) that doesn't claim "false positive" or cite
+  the rule id is never caught. Disabled in the FAST tier, which never offers `read_file` in the first
+  place. This does not change the byte-frozen golden traces (no SAST leads there → the gate is a no-op).
+
 ## References
 
 - [ADR-0037](0037-agent-acts-via-mediated-tools.md) — mediated write actions + buffer/flush-on-finalize
   (the channel SAST findings ride).
+- [ADR-0043](0043-review-finding-verification.md) — evidence citation + the one-shot refute-pass pattern
+  the 2026-07-14 amendment's `SastAnchorGate` mirrors.
 - [ADR-0056](0056-control-plane-owns-the-posted-output.md) — the control plane is the single policy
   owner of PR output (why reviewdog is rejected for the product pipeline).
 - [ADR-0059](0059-reconciler-owns-all-github-egress.md) — the egress outbox (downstream of where SAST
   hooks in; untouched).
 - [ADR-0019](0019-graphify-cli-structural-graph.md) — the Graphify subprocess pattern opengrep mirrors.
 - [opengrep](https://github.com/opengrep/opengrep) · [reviewdog](https://github.com/reviewdog/reviewdog).
-</content>
-</invoke>
+- Issue [#305](https://github.com/vymalo/lightbridge-code-intelligence/issues/305) — the triage-anchoring
+  incident this amendment fixes.

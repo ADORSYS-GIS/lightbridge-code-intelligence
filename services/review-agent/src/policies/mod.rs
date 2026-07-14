@@ -3,9 +3,10 @@
 //! Each submodule owns one independent [`TurnPolicy`](lci_agent_loop::TurnPolicy): [`fast_tier`] narrows
 //! the FAST tier's offered tools, [`coverage`] bounces a premature `finish` until the changed files were
 //! actually engaged (or discloses what wasn't), [`scratchpad`] breaks a same-line `add_review_comment`
-//! loop, [`refute`] makes the model re-verify its own P0/P1 findings before finishing, and
-//! [`finding_nudge`] steers the model toward `finish` once it has recorded something. This file only
-//! holds the helpers shared across them and the flat re-exports the host (`crate::flows`) consumes.
+//! loop, [`refute`] makes the model re-verify its own P0/P1 findings before finishing, [`sast_anchor`]
+//! rejects a SAST triage verdict anchored to a line opengrep never flagged, and [`finding_nudge`] steers
+//! the model toward `finish` once it has recorded something. This file only holds the helpers shared
+//! across them and the flat re-exports the host (`crate::flows`) consumes.
 
 use lci_agent_tools::DispatchRefusal;
 use lci_agent_types::ToolOutcome;
@@ -16,6 +17,7 @@ mod coverage;
 mod fast_tier;
 mod finding_nudge;
 mod refute;
+mod sast_anchor;
 mod scratchpad;
 
 #[cfg(test)]
@@ -25,6 +27,7 @@ pub use coverage::{CoverageGate, CoverageState};
 pub use fast_tier::FastTierGuard;
 pub use finding_nudge::FindingFinishNudge;
 pub use refute::RefuteGate;
+pub use sast_anchor::{SastAnchorGate, SastLead};
 pub use scratchpad::ScratchpadLoopGuard;
 
 /// Pull a string field out of a tool call's raw JSON `arguments`. `None` on malformed JSON, a missing
@@ -36,6 +39,15 @@ fn arg_field(arguments: &str, key: &str) -> Option<String> {
         .get(key)?
         .as_str()
         .map(str::to_string)
+}
+
+/// Pull an integer field out of a tool call's raw JSON `arguments` (e.g. `add_review_comment`'s `line`).
+/// Same "couldn't identify the target" contract as [`arg_field`].
+fn arg_field_i64(arguments: &str, key: &str) -> Option<i64> {
+    serde_json::from_str::<serde_json::Value>(arguments)
+        .ok()?
+        .get(key)?
+        .as_i64()
 }
 
 /// Normalize a model-supplied repo path so the same file can't dodge coverage/loop tracking by varying
