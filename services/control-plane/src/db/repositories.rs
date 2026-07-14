@@ -46,7 +46,10 @@ pub async fn upsert_repository(
 
 /// A connected repository for the dashboard's Repositories view (ADR-0016), with a small activity
 /// summary (run count + most-recent run) derived from `tasks`. RepoIndex health is not joined yet —
-/// the indexer that populates `repo_index` is a later step in the Code product epic.
+/// `repo_index` has no writer today (snapshot readiness is tracked via `code_chunks` /
+/// `latest_indexed_commit`, ADR-0050); it is intentionally reserved for the `ready`-row-per-commit
+/// gate described in [ADR-0055](../../../../docs/adr/0055-review-waits-for-index-readiness.md)'s
+/// "Failed/partial index" follow-up (RFC-0002), not dead schema (#245).
 #[derive(Debug, Serialize, sqlx::FromRow)]
 pub struct RepositoryRow {
     pub id: i64,
