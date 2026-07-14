@@ -77,9 +77,18 @@ Chosen option: **A** — symbol-level embeddings on `:Symbol`, plus a Neo4j cosi
   qwen3-embedding-8b eaig path and batch machinery it already uses for chunks (the
   `INDEX_EMBED_BATCH_SIZE` tunable and the 4096-dim guard apply unchanged). The control plane writes it
   onto the node in the existing `MERGE (:Symbol …)` upsert.
+- **The write batches via `UNWIND` from day one, not as a later optimization.** A 4096-dim `float`
+  array is a large per-row payload; upserting one `:Symbol` per statement (as the pre-embedding
+  `upsert_graph` does today) would be a real latency/throughput regression once every node carries a
+  vector. `upsert_graph` ([`integrations/neo4j.rs`](../../services/control-plane/src/integrations/neo4j.rs))
+  takes an `UNWIND $rows AS row MERGE (s:Symbol {…}) SET s.embedding = row.embedding` shape, batched at
+  the same `INDEX_EMBED_BATCH_SIZE` the embedder already chunks at — one round trip per batch, not per
+  symbol.
 - The control plane creates the Neo4j vector index idempotently at bootstrap / first index:
-  `CREATE VECTOR INDEX symbol_embedding IF NOT EXISTS FOR (s:Symbol) ON (s.embedding)
-  OPTIONS {indexConfig: {\`vector.dimensions\`: 4096, \`vector.similarity_function\`: 'cosine'}}`.
+  ```cypher
+  CREATE VECTOR INDEX symbol_embedding IF NOT EXISTS FOR (s:Symbol) ON (s.embedding)
+  OPTIONS {indexConfig: {`vector.dimensions`: 4096, `vector.similarity_function`: 'cosine'}}
+  ```
 - pgvector's `code_chunks` exact chunk search is **unchanged**. ADR-0003 is amended, not superseded:
   Neo4j now carries *structure + symbol-level semantics*; pgvector carries *chunk-level semantics*.
 - The tools that consume this land in a companion decision, [ADR-0090](0090-hybrid-retrieval-tools.md).

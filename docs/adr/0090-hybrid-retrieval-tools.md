@@ -49,10 +49,18 @@ are removed.
   edge filter: `calls`/`method`/`contains`), and an `exact` flag/behaviour that also unions **exact
   `:Symbol.label` name matches** into the result and ranks them first. Flow: runner embeds `query` →
   `POST /internal/tasks/{id}/graph_search {vector, k, expand_hops, relation, exact_terms}` →
-  control-plane runs `db.index.vector.queryNodes('symbol_embedding', k, $vec)`, unions exact-name
-  matches, and (if `expand_hops>0`) traverses the neighborhood → returns symbols
-  `{node_id, label, source_file, start_line, score}` plus the expanded edges. One tool, both recall
-  modes (semantic + exact) + optional structure.
+  control-plane runs the Neo4j 5 `CALL` form for vector-index reads:
+  ```cypher
+  CALL db.index.vector.queryNodes('symbol_embedding', $k, $vec) YIELD node, score
+  ```
+  unions exact-name matches, and (if `expand_hops>0`) traverses the neighborhood → returns symbols
+  `{node_id, label, source_file, start_line, score}` plus the expanded edges (exact response schema in
+  Decision Outcome below). One tool, both recall modes (semantic + exact) + optional structure.
+  `exact_terms` are **not** free-text-extracted by the runner — the caller passes the literal symbol
+  name(s) it already knows (e.g. from a prior tool result or the diff under review) alongside the
+  natural-language `query`; the control plane matches those verbatim against `:Symbol.label`. No
+  keyword/NLP extraction step exists on either side — if the model only has a natural-language query
+  and no known symbol name, it omits `exact_terms` and gets the vector-only result.
 - **Two tools (a pure `graph_vector_search` and a separate `graph_expand`).** More composable but
   reintroduces the multi-turn stitch this ADR exists to remove. Rejected — the point is the single
   call.
@@ -74,6 +82,22 @@ Add **`lightbridge_graph_semantic_search`** — a single control-plane-mediated 
   tier gets it by default; fast tier opts in by config.
 - Ships **after / with** [ADR-0089](0089-embeddings-on-the-code-graph.md) (needs the symbol embeddings
   + vector index to exist).
+- **Response schema** (the runner↔control-plane contract; `edges`/`expand_hops` are omitted from the
+  JSON entirely when `expand_hops` is `0`, not returned empty):
+  ```json
+  {
+    "nodes": [
+      { "node_id": "string", "label": "string", "source_file": "string", "start_line": 0, "score": 0.0, "match": "vector | exact" }
+    ],
+    "edges": [
+      { "source": "string", "target": "string", "relation": "contains | method | calls" }
+    ]
+  }
+  ```
+  `score` is the cosine similarity for `match: "vector"` hits and `1.0` for `match: "exact"` hits (so
+  exact matches always rank first under a descending sort, matching the "ranks them first" driver
+  above without a separate ranking pass). `edges` covers only the `expand_hops`-reachable neighborhood
+  of the returned `nodes`, not the whole graph.
 
 ### Consequences
 
