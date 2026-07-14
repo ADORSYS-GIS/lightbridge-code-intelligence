@@ -3,13 +3,13 @@
 use std::borrow::Cow;
 use std::fmt;
 
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Serialize};
 
 /// A stable name for a journaled agent step.
 ///
 /// Completed workflow journals persist these values, so existing names must never be renamed or
 /// reformatted in a patch release. Add new names instead.
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct StepName(Cow<'static, str>);
 
@@ -18,15 +18,6 @@ impl StepName {
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
-    }
-}
-
-impl<'de> Deserialize<'de> for StepName {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        String::deserialize(deserializer).map(Self::from)
     }
 }
 
