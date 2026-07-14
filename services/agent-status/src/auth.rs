@@ -7,7 +7,14 @@
 use axum::http::{HeaderMap, header};
 
 /// Whether the request carries `Authorization: Bearer <token>` matching the configured token.
+///
+/// Fails closed on a blank `expected`: an unset/misconfigured token must never be satisfiable by a
+/// caller presenting an empty `Bearer` token (`Authorization: Bearer `, trimmed to `""`), which the
+/// constant-time comparison below would otherwise treat as a valid match.
 pub(crate) fn authorized(headers: &HeaderMap, expected: &str) -> bool {
+    if expected.is_empty() {
+        return false;
+    }
     headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
@@ -28,4 +35,43 @@ fn constant_time_eq(presented: &[u8], expected: &[u8]) -> bool {
     let presented = Sha256::digest(presented);
     let expected = Sha256::digest(expected);
     presented.ct_eq(&expected).into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::authorized;
+    use axum::http::{HeaderMap, HeaderValue, header};
+
+    fn headers_with_bearer(token: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+        );
+        headers
+    }
+
+    #[test]
+    fn blank_expected_token_never_authorizes_even_an_empty_bearer_token() {
+        // A blank `expected` (unset/misconfigured secret) must fail closed, not treat an empty
+        // `Authorization: Bearer ` as a match — the regression this test guards against.
+        assert!(!authorized(&headers_with_bearer(""), ""));
+        assert!(!authorized(&headers_with_bearer("anything"), ""));
+        assert!(!authorized(&HeaderMap::new(), ""));
+    }
+
+    #[test]
+    fn matching_bearer_token_authorizes() {
+        assert!(authorized(&headers_with_bearer("secret"), "secret"));
+    }
+
+    #[test]
+    fn mismatched_bearer_token_does_not_authorize() {
+        assert!(!authorized(&headers_with_bearer("wrong"), "secret"));
+    }
+
+    #[test]
+    fn missing_authorization_header_does_not_authorize() {
+        assert!(!authorized(&HeaderMap::new(), "secret"));
+    }
 }
