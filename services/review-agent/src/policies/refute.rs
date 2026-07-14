@@ -58,6 +58,11 @@ fn is_absence_claim(text: &str) -> bool {
     ABSENCE_MARKERS.iter().any(|marker| lower.contains(marker))
 }
 
+/// Cap on the already-engaged files named in the directive — a long deep-tier run can have engaged
+/// dozens of files, and listing all of them would bloat the nudge for no benefit. Mirrors
+/// `CoverageGate`'s `COVERAGE_MAX_LISTED`.
+const ENGAGED_MAX_LISTED: usize = 15;
+
 #[derive(Clone)]
 struct Finding {
     file: String,
@@ -83,7 +88,17 @@ fn absence_directive(findings: &[&Finding], engaged: &BTreeSet<String>) -> Strin
     let already_read = if engaged.is_empty() {
         "(no files read yet)".to_string()
     } else {
-        engaged.iter().cloned().collect::<Vec<_>>().join(", ")
+        let listed: Vec<&str> = engaged
+            .iter()
+            .map(String::as_str)
+            .take(ENGAGED_MAX_LISTED)
+            .collect();
+        let more = engaged.len() - listed.len();
+        let mut rendered = listed.join(", ");
+        if more > 0 {
+            rendered.push_str(&format!(", … and {more} more"));
+        }
+        rendered
     };
     format!(
         "\n\nThe following finding(s) claim something is never sent/set/present:\n{cited}\n\nThis bug class is almost always disproven by a file you have NOT opened — a transport interceptor, \
@@ -298,6 +313,44 @@ mod tests {
         assert!(nudge.contains("bff/cmd/server/main.go:580"));
         assert!(nudge.contains("transport interceptor"));
         assert!(nudge.contains("bff/cmd/server/main.go"));
+    }
+
+    /// The engaged-files list in the outward-search directive is capped (mirrors `CoverageGate`'s
+    /// `COVERAGE_MAX_LISTED`) so a long deep-tier run doesn't bloat the nudge with dozens of paths.
+    #[test]
+    fn absence_directive_caps_the_engaged_files_list() {
+        let mut gate = RefuteGate::new(false);
+        for i in 0..20 {
+            gate.after_turn_actions(
+                &state(0),
+                &TurnOutcome {
+                    assistant: ChatMessage::user(""),
+                    results: vec![call(
+                        READ_FILE,
+                        &format!(r#"{{"path":"file{i}.rs"}}"#),
+                        ToolOutcome::Continue("source".into()),
+                    )],
+                    finish_requested: false,
+                    abort_reason: None,
+                },
+            );
+        }
+        gate.after_turn_actions(
+            &state(1),
+            &finding_turn(
+                r#"{"priority":"P1","file":"a.rs","line":2,"title":"header never sent","body":"","evidence":""}"#,
+            ),
+        );
+        let actions = gate.after_turn_actions(&state(2), &finish_turn());
+        let nudge = actions
+            .iter()
+            .find_map(|action| match action {
+                PolicyAction::RejectFinish(Nudge(text)) => Some(text.clone()),
+                _ => None,
+            })
+            .expect("expected a RejectFinish nudge");
+        assert!(nudge.contains("… and"));
+        assert!(nudge.contains("more"));
     }
 
     /// A finding with no absence-marker language gets only the generic re-verify nudge — the outward-
