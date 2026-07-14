@@ -314,7 +314,7 @@ pub async fn claim_next_task(
          WHERE id = ( \
            SELECT id FROM tasks \
            WHERE status = 'queued' AND run_after <= now() \
-           ORDER BY priority DESC, created_at \
+           ORDER BY priority DESC, created_at, id \
            FOR UPDATE SKIP LOCKED \
            LIMIT 1 \
          ) \
@@ -376,7 +376,7 @@ pub async fn list_reapable_tasks(
     sqlx::query_as::<_, ReapableTask>(
         "SELECT id, job_name, attempts FROM tasks \
          WHERE status IN ('running', 'posting_result') AND lease_expires_at < now() \
-         ORDER BY started_at NULLS FIRST \
+         ORDER BY started_at NULLS FIRST, id \
          LIMIT $1",
     )
     .bind(limit)

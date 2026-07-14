@@ -48,7 +48,9 @@ pub async fn delete_code_chunks_for_repo(
 }
 
 /// Delete a repository's indexing-state rows (`repo_index`) — completes the purge bookkeeping so a
-/// later re-add reindexes from scratch.
+/// later re-add reindexes from scratch. `repo_index` has no writer yet (#245): this delete (and the
+/// `EXISTS` check in [`list_disabled_repos_needing_purge`]) is forward-compatible cleanup for the
+/// `ready`-row-per-commit write path reserved by ADR-0055 / RFC-0002, not dead-table churn.
 pub async fn delete_repo_index_rows(pool: &PgPool, repository_id: i64) -> Result<u64, sqlx::Error> {
     let result = sqlx::query("DELETE FROM repo_index WHERE repository_id = $1")
         .bind(repository_id)

@@ -17,8 +17,8 @@ use lci_agent_step::StepRuntime;
 use lci_agent_tools::{ToolCx, ToolRegistry, TurnFilter};
 
 use crate::policies::{
-    CoverageGate, FastTierGuard, FindingFinishNudge, RefuteGate, ScratchpadLoopGuard,
-    render_fast_refusal,
+    CoverageGate, FastTierGuard, FindingFinishNudge, RefuteGate, SastAnchorGate, SastLeadSink,
+    ScratchpadLoopGuard, render_fast_refusal,
 };
 pub use crate::tools::EagerWorkspace;
 use crate::tools::{RETRACT_FINDING, tool_defs};
@@ -60,6 +60,10 @@ pub struct ReviewRunParams {
     pub diff_present: bool,
     /// The changed-file set the coverage gate tracks engagement against.
     pub diff_files: Vec<String>,
+    /// The shared feed the `run_sast` tool pushes opengrep leads into as it scans (ADR-0073), so
+    /// [`SastAnchorGate`] can reject a triage verdict anchored to a different line (#305). Starts empty
+    /// and may never fill — SAST off, no diff, or the agent simply never calls the tool.
+    pub sast_leads: SastLeadSink,
 }
 
 /// Build a [`Workspace`](lci_agent_tools::Workspace) over an already-materialized checkout root, for
@@ -125,7 +129,7 @@ where
 
     // Policy order is a behavioural contract (registration order = evaluation order in the engine):
     // context trim → wind-down → read budgets → turn budget → fast guard → scratchpad guard → coverage
-    // gate → refute gate → finding-finish nudge.
+    // gate → refute gate → SAST anchor gate → finding-finish nudge.
     let policies: Vec<Box<dyn TurnPolicy>> = vec![
         Box::new(ContextWindowTrim::new(params.context_window)),
         Box::new(
@@ -141,6 +145,7 @@ where
         Box::new(ScratchpadLoopGuard::new()),
         Box::new(coverage),
         Box::new(RefuteGate::new(params.fast)),
+        Box::new(SastAnchorGate::new(params.sast_leads, params.fast)),
         Box::new(FindingFinishNudge::new(params.fast)),
     ];
 
@@ -181,7 +186,7 @@ where
 mod tests {
     use super::*;
 
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     use lci_agent_clients::{ControlPlaneClient, EmbeddingsClient};
     use lci_agent_loop::{ChatMessage, RequestOptions};
@@ -231,6 +236,7 @@ mod tests {
             Arc::new(embedder),
             [],
             RuntimeCaps::default(),
+            None,
         )
         .unwrap();
         let workspace = eager_workspace(checkout.path().to_path_buf());
@@ -264,6 +270,7 @@ mod tests {
             } else {
                 Vec::new()
             },
+            sast_leads: Arc::new(Mutex::new(Vec::new())),
         };
         run_review(
             Passthrough,

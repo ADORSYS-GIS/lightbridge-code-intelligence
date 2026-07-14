@@ -1,21 +1,26 @@
-//! SAST (static application security testing) via opengrep (ADR-0061).
+//! SAST (static application security testing) via opengrep (ADR-0061), invoked as the `run_sast` agent
+//! tool (ADR-0073).
 //!
 //! opengrep is the LGPL fork of Semgrep CE — a rules engine that finds known-bad code patterns
 //! **deterministically** (same code + rules ⇒ same findings, every run, no LLM, no tokens). We run it
 //! as a best-effort subprocess over the checkout whose failure is logged, never fatal (the same
-//! best-effort contract as the structural-graph step). Unlike the review agent, SAST is a *deterministic* finding source —
-//! its findings are posted on their own merit and are **not** gated by the LLM (ADR-0061). They flow
-//! through the existing mediated-write buffer (`add_review_comment`), so the control plane validates,
-//! scopes, renders, and posts them as part of the one grouped review (ADR-0037/0059) — no second poster.
+//! best-effort contract as the structural-graph step). SAST findings are posted on their own merit and
+//! are **not** gated by the LLM's judgment (ADR-0061) — the LLM only decides *whether and when* to call
+//! `scan` (ADR-0073), not what happens to what it returns. They flow through the existing mediated-write
+//! buffer (`add_review_comment`), so the control plane validates, scopes, renders, and posts them as part
+//! of the one grouped review (ADR-0037/0059) — no second poster.
 //!
-//! Scope: we point opengrep only at the PR's **changed files**, so a review surfaces findings on the
-//! change rather than dumping every pre-existing repo finding into the out-of-scope section.
+//! Scope: point opengrep only at the PR's **changed files**, so a review surfaces findings on the change
+//! rather than dumping every pre-existing repo finding into the out-of-scope section.
 //!
-//! Split by concern (quality pass, no behaviour change): [`finding`] ([`SastFinding`] + its comment
-//! rendering), [`rules`] (language-scoping the ruleset to the changed files), [`process`] (spawning the
-//! `opengrep` subprocess + path safety), and [`sarif`] (parsing its SARIF output). This module keeps
-//! only the public orchestration: [`scan`], [`buffer`], [`digest`].
+//! Split by concern (quality pass, no behaviour change from the original `agent-runner` module):
+//! [`config`] ([`SastConfig`], the value type — resolving it from env/file config stays a bootstrap
+//! concern in `agent-runner`), [`finding`] ([`SastFinding`] + its comment rendering), [`rules`]
+//! (language-scoping the ruleset to the changed files), [`process`] (spawning the `opengrep` subprocess +
+//! path safety), and [`sarif`] (parsing its SARIF output). This crate root keeps only the public
+//! orchestration: [`scan`], [`buffer`], [`digest`].
 
+mod config;
 mod finding;
 mod process;
 mod rules;
@@ -25,10 +30,10 @@ use std::path::{Path, PathBuf};
 
 use uuid::Uuid;
 
+pub use config::SastConfig;
 pub use finding::SastFinding;
 use process::is_safe_relative;
 
-use crate::bootstrap::config::SastConfig;
 use lci_agent_clients::ControlPlaneClient;
 
 /// Run opengrep over the PR's changed files and return the normalized findings. Best-effort: any failure
@@ -120,10 +125,20 @@ pub async fn buffer(client: &ControlPlaneClient, task_id: Uuid, findings: &[Sast
     }
 }
 
-/// A compact, untrusted digest of the SAST findings for injection into the review agent's prompt
-/// (ADR-0061 Phase 2): the agent is made *aware* of what opengrep already flagged so it doesn't
-/// redundantly re-report those lines and can choose to *deepen* a lead. It does NOT gate posting —
-/// these findings are buffered and posted regardless of what the agent does. `None` when empty.
+/// A compact, untrusted digest of the SAST findings, returned as the `run_sast` tool's result (ADR-0073;
+/// previously a static prompt block, ADR-0061 Phase 2): the agent is made *aware* of what opengrep
+/// already flagged so it doesn't redundantly re-report those lines and can choose to *deepen* a lead. It
+/// does NOT gate posting — these findings are buffered and posted regardless of what the agent does.
+/// `None` when empty.
+///
+/// The anchoring paragraph below exists because of a production incident
+/// (ADORSYS-GIS/webank-mobile#145, run `e82f7c4b-50ec-4bc4-942f-48cfc404b603`): opengrep flagged
+/// `.env.fullstack:216` (a real API key), but the agent triaged a DIFFERENT, unrelated line in the same
+/// file — never reading the actual flagged line — and confidently declared it a false positive while
+/// the real secret went unevaluated. `review-agent`'s `SastAnchorGate` (issue #305) enforces the same
+/// rule in code (rejecting a "false positive"/rule-id verdict recorded on the wrong line before
+/// `finish`); this instruction is the first line of defense so the model gets it right without needing
+/// the bounce.
 pub fn digest(findings: &[SastFinding]) -> Option<String> {
     if findings.is_empty() {
         return None;
@@ -133,7 +148,14 @@ pub fn digest(findings: &[SastFinding]) -> Option<String> {
          A static-analysis pass already flagged the lines below, and they **will be posted** to this \
          review independently of you. Do NOT re-report them as your own findings. You MAY investigate a \
          lead further — confirm exploitability, trace a tainted input, or note if one is a false \
-         positive — but spend your budget on issues opengrep cannot catch.\n",
+         positive — but spend your budget on issues opengrep cannot catch.\n\n\
+         **Before writing ANY confirm/refute verdict about one of these findings** — in particular \
+         before calling one a false positive — call `read_file` on the EXACT `file`/line listed below \
+         (e.g. `start_line` = `end_line` = that line) and quote what it actually contains in your \
+         `evidence`. Reason from that real content, never from memory or a nearby/similar-looking line. \
+         A verdict recorded at a different line than the one listed is wrong by construction, even if \
+         the code you actually looked at happens to look similar — go back and read the exact line \
+         before you record anything about it.\n",
     );
     for f in findings {
         out.push_str(&format!(
@@ -167,5 +189,38 @@ mod tests {
         assert!(d.contains("will be posted"));
         assert!(d.contains("src/a.rs:9"));
         assert!(d.contains("Do NOT re-report"));
+    }
+
+    // Regression for the production incident (#305): opengrep deterministically flagged one exact line
+    // (a real secret at :216) in a file that also has an unrelated, un-flagged line nearby (a dev DB
+    // password at :60) — the digest must list ONLY the actually-flagged coordinate and must instruct
+    // the model to read that exact line (not a nearby/similar one) before triaging it.
+    #[test]
+    fn digest_anchors_to_the_exact_flagged_line_and_requires_reading_it() {
+        let real = SastFinding {
+            file: ".env.fullstack".into(),
+            line: 216,
+            rule_id: "generic.secrets.security.detected-generic-api-key".into(),
+            message: "Hardcoded MTN Mobile Money API key.".into(),
+            priority: "P1".into(),
+            help_uri: None,
+        };
+        let d = digest(std::slice::from_ref(&real)).expect("some");
+        assert!(
+            d.contains(".env.fullstack:216"),
+            "the real flagged coordinate is listed: {d}"
+        );
+        assert!(
+            !d.contains(".env.fullstack:60"),
+            "an un-flagged nearby line is never fabricated into the digest: {d}"
+        );
+        assert!(
+            d.contains("read_file") && d.contains("EXACT"),
+            "the digest requires reading the exact flagged line before any verdict: {d}"
+        );
+        assert!(
+            d.to_ascii_lowercase().contains("nearby"),
+            "the digest explicitly forbids reasoning about a nearby/similar line: {d}"
+        );
     }
 }

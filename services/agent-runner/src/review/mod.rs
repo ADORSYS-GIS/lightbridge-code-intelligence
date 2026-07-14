@@ -40,12 +40,13 @@ use lci_agent_clients::{
     CheckpointRuntime, ControlPlaneClient, ControlPlaneStepStore, EmbeddingsClient, TranscriptEntry,
 };
 use lci_agent_loop::{Conversation, LoopOutcome, RequestOptions, TranscriptEvent, TranscriptSink};
+use lci_agent_sast::SastConfig;
 use lci_agent_status::StatusHandle;
 use lci_agent_step::Passthrough;
 use lci_agent_tools::{RuntimeCaps, ToolCx, TurnFilter};
 use lci_review_agent::flows::{self, ReviewRunParams};
 use lci_review_agent::prompt::{self, PrDiffRef, PromptConfig};
-use lci_review_agent::tools::{ADD_REVIEW_COMMENT, tool_registry};
+use lci_review_agent::tools::{ADD_REVIEW_COMMENT, SastToolConfig, tool_registry};
 
 use crate::bootstrap::config::ReviewConfig;
 use crate::clone::PrDiff;
@@ -87,13 +88,22 @@ struct JobSink(Arc<Mutex<Vec<TranscriptEvent>>>);
 
 impl JobSink {
     fn entries(&self) -> Vec<TranscriptEvent> {
-        self.0.lock().expect("job sink mutex").clone()
+        // Recover from a poisoned mutex instead of panicking (consistent with `StatusHandle::with`
+        // and the telemetry mutex below): a panic elsewhere holding this lock must not also crash
+        // every subsequent read of the transcript-so-far.
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 }
 
 impl TranscriptSink for JobSink {
     fn record(&mut self, entry: TranscriptEvent) {
-        self.0.lock().expect("job sink mutex").push(entry);
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(entry);
     }
 }
 
@@ -107,13 +117,14 @@ pub async fn run_native_agent(
     review: &ReviewConfig,
     command: &str,
     diff: Option<&PrDiff>,
-    // Repo-native agent instructions (ADR-0036), prior reviews (A, #137), per-repo feedback memory (M1,
-    // ADR-0044), and the deterministic SAST digest (ADR-0061) — all injected into the prompt as
-    // untrusted context; `None` when absent.
+    // Repo-native agent instructions (ADR-0036), prior reviews (A, #137), and per-repo feedback memory
+    // (M1, ADR-0044) — all injected into the prompt as untrusted context; `None` when absent.
     repo_instructions: Option<&str>,
     prior_reviews: Option<&str>,
     repo_memory: Option<&str>,
-    sast_digest: Option<&str>,
+    // The resolved SAST config (ADR-0061), handed to the `run_sast` tool (ADR-0073) instead of driving a
+    // pre-agent pass. `None` when SAST is off — the tool then simply isn't registered/offered.
+    sast_config: Option<&SastConfig>,
     attribution: &[(String, String)],
     client: &ControlPlaneClient,
     embedder: &EmbeddingsClient,
@@ -135,8 +146,14 @@ pub async fn run_native_agent(
 
     // ── Offered tool surface: diff gate + per-tier allowlist + ADR-0066 MCP discovery ───────────────
     let diff_present = diff.is_some();
-    let (offered, dispatch_discovered) =
-        tool_surface::resolve_offered_tools(review, diff_present, client, task_id).await;
+    let (offered, dispatch_discovered) = tool_surface::resolve_offered_tools(
+        review,
+        diff_present,
+        sast_config.is_some(),
+        client,
+        task_id,
+    )
+    .await;
 
     // ── Run-start telemetry (ADR-0034/0062/0066), recorded at run START ─────────────────────────────
     telemetry::submit_run_start_telemetry(client, task_id, review, &offered, diff_present).await;
@@ -158,7 +175,6 @@ pub async fn run_native_agent(
         repo_instructions,
         prior_reviews,
         repo_memory,
-        sast_digest,
     );
     let initial_names: Vec<String> = offered
         .iter()
@@ -190,12 +206,22 @@ pub async fn run_native_agent(
         RuntimeCaps::default()
     };
 
-    // ── Tool registry (built-ins + discovered) ──────────────────────────────────────────────────
+    // ── Tool registry (built-ins + discovered + run_sast) ───────────────────────────────────────
+    // Shared feed the `run_sast` tool pushes leads into as it scans (ADR-0073); `SastAnchorGate` (#305)
+    // drains it mid-loop. Built once here so the same handle reaches both the tool (via `tool_registry`)
+    // and the gate (via `params.sast_leads`, below).
+    let sast_leads: lci_review_agent::policies::SastLeadSink = Arc::new(Mutex::new(Vec::new()));
+    let sast_tool_config = sast_config.map(|config| SastToolConfig {
+        config: config.clone(),
+        changed_files: diff.map(|pr| pr.files.clone()).unwrap_or_default(),
+        leads: Arc::clone(&sast_leads),
+    });
     let registry = tool_registry(
         Arc::new(client.clone()),
         Arc::new(embedder.clone()),
         dispatch_discovered,
         runtime_caps,
+        sast_tool_config,
     )
     .context("assembling review tool registry")?;
 
@@ -211,6 +237,7 @@ pub async fn run_native_agent(
         fast: review.fast,
         diff_present,
         diff_files: diff.map(|pr| pr.files.clone()).unwrap_or_default(),
+        sast_leads,
     };
     let workspace = flows::eager_workspace(checkout_root.to_path_buf());
     let cx = ToolCx {
@@ -297,8 +324,14 @@ pub async fn run_native_agent(
         poller.abort();
     }
     if let Some(handle) = status {
-        let (prompt, completion) =
-            telemetry::sum_usage(&telemetry_handle.lock().expect("telemetry mutex"));
+        // Recover from a poisoned mutex instead of panicking (consistent with `StatusHandle::with`
+        // and the usage poller above): a panic elsewhere holding this lock must not also crash the
+        // final usage snapshot.
+        let (prompt, completion) = telemetry::sum_usage(
+            &telemetry_handle
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        );
         handle.observe_usage(prompt, completion);
     }
 
@@ -308,7 +341,9 @@ pub async fn run_native_agent(
     transcript::append_transcript(
         transcript,
         &sink_handle.entries(),
-        &telemetry_handle.lock().expect("telemetry mutex"),
+        &telemetry_handle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()),
         task_id,
     );
 
@@ -317,4 +352,66 @@ pub async fn run_native_agent(
         LoopOutcome::Exhausted => ReviewOutcome::Exhausted,
         LoopOutcome::Aborted { reason } => ReviewOutcome::Aborted(reason),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lci_review_agent::model::TurnTelemetry;
+
+    /// Panic while holding `mutex`'s lock, on a background thread, then join it (discarding the
+    /// panic) — leaves the mutex poisoned exactly as a real panic-while-locked would.
+    fn poison<T: Send + 'static>(mutex: &Arc<Mutex<T>>) {
+        let for_thread = Arc::clone(mutex);
+        let _ = std::thread::spawn(move || {
+            let _guard = for_thread.lock().unwrap();
+            panic!("intentional poisoning for test");
+        })
+        .join();
+        assert!(mutex.is_poisoned(), "the mutex should now be poisoned");
+    }
+
+    #[test]
+    fn job_sink_recovers_from_a_poisoned_mutex() {
+        let mut sink = JobSink::default();
+        sink.record(TranscriptEvent::Policy {
+            turn: 0,
+            name: "pre-poison",
+            detail: serde_json::Value::Null,
+        });
+
+        poison(&sink.0);
+
+        // Both `record` (via `TranscriptSink`) and `entries` must recover instead of panicking, and
+        // the state recorded before the poisoning must still be there.
+        sink.record(TranscriptEvent::Policy {
+            turn: 1,
+            name: "post-poison",
+            detail: serde_json::Value::Null,
+        });
+        let entries = sink.entries();
+        assert_eq!(entries.len(), 2);
+    }
+
+    #[test]
+    fn telemetry_mutex_recovers_from_a_poisoned_mutex() {
+        let telemetry_handle: Arc<Mutex<Vec<TurnTelemetry>>> =
+            Arc::new(Mutex::new(vec![TurnTelemetry {
+                model: "test-model".to_string(),
+                prompt_tokens: Some(10),
+                completion_tokens: Some(5),
+                reasoning_tokens: None,
+                reasoning: None,
+            }]));
+
+        poison(&telemetry_handle);
+
+        // Same recovery pattern used in `run_native_agent`: `lock()` on a poisoned mutex must still
+        // yield the guard (via `unwrap_or_else(PoisonError::into_inner)`), not panic.
+        let guard = telemetry_handle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (prompt, completion) = telemetry::sum_usage(&guard);
+        assert_eq!((prompt, completion), (10, 5));
+    }
 }

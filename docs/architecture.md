@@ -128,8 +128,9 @@ each role is its own Deployment so they scale independently ([RFC-0001](rfc/0001
 
 - **`serve`** — the HTTP surface. Public-ish routes: `/github/webhook`, `/tasks*`, `/repositories`,
   `/admin/*`, health and `/metrics`. The OIDC-protected tasks/admin routes are a resource server
-  (below). The **internal runner API** (`/internal/tasks/{id}/*`) is authenticated by a shared bearer
-  (`AGENT_RUNNER_TOKEN`), not OIDC — it serves the Job's context fetch, chunk/graph ingest, scoped
+  (below). The **internal runner API** (`/internal/tasks/{id}/*`) is authenticated by a per-task token
+  (`AGENT_RUNNER_TOKEN`, HS256-signed from `RUNNER_TOKEN_SIGNING_KEY`, [ADR-0092](adr/0092-per-task-runner-tokens.md)),
+  not OIDC — it serves the Job's context fetch, chunk/graph ingest, scoped
   retrieval (`/search`, `/graph/query`), transcript submission, and the mediated review write actions
   (`/review/inline`, `/review/comment`, `/review/summary`, `/review/finalize`). `serve` holds the
   GitHub App key for **reads only**.

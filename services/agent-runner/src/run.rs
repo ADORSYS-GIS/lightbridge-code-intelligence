@@ -18,11 +18,11 @@ use std::path::Path;
 use uuid::Uuid;
 
 use crate::bootstrap::config::{
-    EmbeddingsConfig, ReviewConfig, ReviewConfigs, RunnerConfig, SastConfig,
+    EmbeddingsConfig, ReviewConfig, ReviewConfigs, RunnerConfig, SastConfig, resolve_sast_config,
 };
-use crate::clone::{self, PrDiff};
+use crate::clone;
 use crate::plane::Mode;
-use crate::{indexer, review, sast};
+use crate::{indexer, review};
 use lci_agent_clients::{ControlPlaneClient, EmbeddingsClient, TaskContext};
 use lci_agent_status::{Phase, StatusHandle, StatusServerConfig};
 
@@ -97,7 +97,7 @@ pub async fn run_once(mode: Option<Mode>) -> std::process::ExitCode {
     // Deterministic SAST pass (ADR-0061): opt-in, best-effort. Resolve is infallible — a misconfigured
     // block falls back to defaults, and `None` simply means SAST is off — because SAST is an additive
     // signal whose absence must never fail a review.
-    let sast_config = SastConfig::resolve(file_config.as_ref());
+    let sast_config = resolve_sast_config(file_config.as_ref());
 
     // Race the work against two stop signals; on either we exit promptly WITHOUT reporting a status
     // (the control plane already owns a cancelled row and we must not clobber it with `failed`):
@@ -373,44 +373,9 @@ async fn perform_indexing(
     Ok((chunks, graph))
 }
 
-/// A deterministic opengrep pass over the PR's changed files (ADR-0061). Its findings are buffered into
-/// the SAME review buffer the agent uses (the control plane scopes + posts them in the one grouped
-/// review — no second poster), and a digest is returned to feed the agent so it doesn't re-report those
-/// lines. Opt-in (`sast_config` is `None` when disabled) and best-effort: a scan failure is logged,
-/// never fatal. Needs the diff to scope to — without one, SAST is skipped. Buffers BEFORE the agent
-/// runs, so a true (file, line) collision lets the agent's richer finding win the upsert; the digest is
-/// what keeps such collisions rare.
-async fn run_sast_pass(
-    sast_config: Option<&SastConfig>,
-    diff: Option<&PrDiff>,
-    checkout: &Path,
-    client: &ControlPlaneClient,
-    task_id: Uuid,
-    status: Option<&StatusHandle>,
-) -> Option<String> {
-    let sast_findings = match (sast_config, diff) {
-        (Some(cfg), Some(d)) => {
-            if let Some(status) = status {
-                status.set_phase(Phase::Sast);
-            }
-            match sast::scan(cfg, checkout, &d.files).await {
-                Ok(findings) => findings,
-                Err(error) => {
-                    tracing::warn!(%error, "sast: opengrep scan failed (non-fatal)");
-                    Vec::new()
-                }
-            }
-        }
-        _ => Vec::new(),
-    };
-    if !sast_findings.is_empty() {
-        sast::buffer(client, task_id, &sast_findings).await;
-    }
-    sast::digest(&sast_findings)
-}
-
-/// Run the review step for one task: SAST + the native agent, then finalize. Returns
-/// `(review_summary, review_detail)` — the summary always folds into the top-level task summary; the
+/// Run the review step for one task: the native agent (which may call `run_sast`, ADR-0073), then
+/// finalize. Returns `(review_summary, review_detail)` — the summary always folds into the top-level
+/// task summary; the
 /// detail (when `Some`) is the review-failure/exhaustion/abort reason attached to the FINAL terminal
 /// status (#137). `Ok(("review disabled", None))` when this is an `index` task or the task's tier has
 /// no review model configured (a standalone `index` task — target_type `repository`, Epic #75 — has no
@@ -440,15 +405,6 @@ async fn perform_review(
     // Scope to the PR's change set when we can compute it (best-effort; an unavailable base commit
     // just yields an unscoped run).
     let diff = clone::pr_diff(checkout, context).await;
-    let sast_digest = run_sast_pass(
-        sast_config,
-        diff.as_ref(),
-        checkout,
-        client,
-        task_id,
-        status,
-    )
-    .await;
 
     // Repo-native agent instructions (ADR-0036): read the repo's AGENTS.md/CLAUDE.md/… and fold them
     // into the prompt as untrusted context so the review respects house rules.
@@ -464,7 +420,7 @@ async fn perform_review(
         repo_instructions.as_deref(),
         context.prior_reviews.as_deref(),
         context.repo_memory.as_deref(),
-        sast_digest.as_deref(),
+        sast_config,
         attribution,
         client,
         embedder,

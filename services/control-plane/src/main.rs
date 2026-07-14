@@ -39,6 +39,7 @@ mod mcp_client;
 mod outbox;
 mod restate_worker;
 mod review;
+mod runner_token;
 mod types;
 
 // Global allocator. The release images are static-musl (ADR-0080); musl's built-in malloc regresses
@@ -97,10 +98,12 @@ pub struct AppState {
         integrations::platform::Platform,
         Arc<dyn integrations::platform::CodePlatform>,
     >,
-    /// Shared bearer for the internal runner API (`AGENT_RUNNER_TOKEN`). `None` disables those
-    /// routes (they fail closed with 503) — the control plane injects the same value into each
-    /// agent Job so the runner can authenticate back (see internal.rs / ADR-0017).
-    pub runner_token: Option<Arc<String>>,
+    /// Mints/verifies per-task tokens for the internal runner API (`RUNNER_TOKEN_SIGNING_KEY`,
+    /// ADR-0092). `None` disables those routes (they fail closed with 503) — the dispatcher mints a
+    /// fresh, task-scoped token with the same signer and injects it into each agent Job's
+    /// `AGENT_RUNNER_TOKEN` env var; the signing key itself never leaves this process (see
+    /// internal.rs / integrations/k8s.rs / ADR-0017).
+    pub runner_token_signer: Option<Arc<runner_token::RunnerTokenSigner>>,
     /// Neo4j (Bolt) handle for the structural code graph (ADR-0019). `None` when `NEO4J_URI` is
     /// unset — the graph-ingest route then fails closed (503). Held here so the untrusted Job never
     /// gets Neo4j creds (it POSTs the graph through the internal API instead).
@@ -228,10 +231,7 @@ impl AppState {
             github,
             gitlab,
             platforms,
-            runner_token: std::env::var("AGENT_RUNNER_TOKEN")
-                .ok()
-                .filter(|token| !token.is_empty())
-                .map(Arc::new),
+            runner_token_signer: runner_token::RunnerTokenSigner::from_env().map(Arc::new),
             neo4j,
             metrics,
             review: Arc::new(review),
@@ -556,6 +556,15 @@ async fn main() -> anyhow::Result<()> {
         .or_else(|| std::env::var("CONTROL_PLANE_ROLE").ok())
         .unwrap_or_else(|| "serve".to_string());
 
+    // `mint-runner-token` is a local-dev/ops utility (ADR-0092), not a long-running role: it prints one
+    // token to stdout and exits. It needs only `RUNNER_TOKEN_SIGNING_KEY` from env, so it's handled
+    // before `AppState::from_env()` (which would otherwise require a database). Without it, running the
+    // agent-runner manually (docs/local-setup.md) has no way to obtain a token now that the internal API
+    // rejects anything but a validly-signed, task-scoped one — there is no shared dev bearer anymore.
+    if role == "mint-runner-token" {
+        return mint_runner_token_cli();
+    }
+
     let state = AppState::from_env().await?;
     match role.as_str() {
         "serve" => serve(state).await,
@@ -571,9 +580,34 @@ async fn main() -> anyhow::Result<()> {
         // The durable-replay store lifecycle owner (ADR-0087): TTL-sweeps the `durable_step` journal.
         "replay" => run_replay(state).await,
         other => anyhow::bail!(
-            "unknown role {other:?} (expected: serve | dispatcher | reconciler | restate-worker | a2a | notifier | replay [| poller])"
+            "unknown role {other:?} (expected: serve | dispatcher | reconciler | restate-worker | a2a | notifier | replay | mint-runner-token [| poller])"
         ),
     }
+}
+
+/// `control-plane mint-runner-token <task-id>` — mint one per-task runner token from
+/// `RUNNER_TOKEN_SIGNING_KEY` and print it to stdout, for exercising the internal API by hand
+/// (docs/local-setup.md) or debugging a stuck task in prod. `<task-id>` may also come from `TASK_ID`.
+/// TTL matches the dispatcher's own default (`AGENT_JOB_DEADLINE_SECONDS`, else 3600s).
+fn mint_runner_token_cli() -> anyhow::Result<()> {
+    use anyhow::Context;
+
+    let signer = runner_token::RunnerTokenSigner::from_env()
+        .ok_or_else(|| anyhow::anyhow!("RUNNER_TOKEN_SIGNING_KEY is not set"))?;
+    let task_id: uuid::Uuid = std::env::args()
+        .nth(2)
+        .or_else(|| std::env::var("TASK_ID").ok())
+        .ok_or_else(|| anyhow::anyhow!("usage: control-plane mint-runner-token <task-id>"))?
+        .parse()
+        .context("task id is not a valid UUID")?;
+    let deadline_seconds = std::env::var("AGENT_JOB_DEADLINE_SECONDS")
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .filter(|&secs| secs > 0)
+        .unwrap_or(3600);
+    let token = signer.mint(task_id, deadline_seconds)?;
+    println!("{token}");
+    Ok(())
 }
 
 /// The reconciler role (ADR-0058): a single replica that owns **all platform egress** — it drains

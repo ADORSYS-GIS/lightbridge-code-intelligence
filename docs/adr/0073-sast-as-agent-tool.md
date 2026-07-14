@@ -1,6 +1,6 @@
 # ADR-0073: SAST (opengrep) becomes an agent-called `run_sast` tool, not a pre-agent pass
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-07-08
 - **Deciders:** @stephane-segning
 
@@ -39,15 +39,26 @@ ADR-0061's *delivery mechanism* (deterministic, always-before-the-agent, LLM-awa
 `add_review_comment` mediated channel (no second poster, no reviewdog), language-scopes its ruleset,
 parses SARIF, and carries `priority` + `category: security`.
 
-Mechanics:
+Mechanics (as shipped — a per-crate extraction, R1e, moved the review agent into its own
+`lci-review-agent` crate before this landed, so the tool lives one level down from where this ADR
+originally sketched it):
 
-- **New built-in tool `run_sast`** in the agent's tool surface
-  (`services/agent-runner/src/review/native/tools.rs`): registered in `tool_defs()`, added to
-  `known_tool_names()`, and given a dispatch arm. Its dispatch body is today's pre-pass, moved verbatim:
-  `sast::scan` over the changed files → `sast::buffer` (the same mediated `add_review_comment` writes) →
-  return the `sast::digest` text as the **tool result** to the model (instead of a static prompt block).
-  Optional `files` arg to scope the scan to a subset of the changed set; absent → scan all changed
-  files. Idempotent: re-calling upserts by `(file, line)` exactly as the mediated channel already dedups.
+- **New built-in tool `run_sast`**, registered as any other built-in review tool is
+  (`services/review-agent/src/tools/sast.rs`, wired into `tool_defs()` / `known_tool_names()` /
+  `tool_registry()` in `services/review-agent/src/tools.rs`). Its `call()` is today's pre-pass, moved
+  verbatim (now in a shared `lci-agent-sast` crate both `agent-runner` and `review-agent` depend on):
+  `scan` over the changed files → `buffer` (the same mediated `add_review_comment` writes) → return
+  `digest`'s text as the **tool result** to the model (instead of a static prompt block). Optional
+  `files` arg to scope the scan to a subset of the changed set; absent → scan all changed files.
+  Idempotent: re-calling upserts by `(file, line)` exactly as the mediated channel already dedups. The
+  pre-agent pass lived in `services/agent-runner/src/run.rs` (`run_sast_pass`, called from
+  `perform_review`) — deleted outright, not deprecated.
+  - The SAST anchor gate (#305, `SastAnchorGate`) previously received its `Vec<SastLead>` at loop
+    construction, before the pre-pass's findings existed as a value. Since `run_sast` may not be called
+    until mid-loop (or never), the gate now reads from a shared `SastLeadSink`
+    (`Arc<Mutex<Vec<SastLead>>>`) the tool pushes into as it scans, drained at the top of every
+    `after_turn_actions` call — the gate still catches a misanchored verdict recorded the SAME turn as
+    the `run_sast` call that produced the real coordinates.
 - **Selectable per tier** ([ADR-0062](0062-two-tier-review-fast-auto-deep-on-demand.md) +
   [ADR-0066](0066-deep-tier-external-knowledge-tools.md)): `run_sast` becomes a `ReviewTool` enum variant
   so an operator lists it in `review.<tier>.tools`. Because the fast path strips everything except
@@ -58,10 +69,13 @@ Mechanics:
   `run_sast` early in a review (before `finish`) and not to re-report what it returns (the digest already
   says "recorded — retract with `retract_finding` if false"). This is the honor-system half ADR-0061
   deliberately avoided; see Consequences.
-- **Remove** the pre-agent pass (`main.rs` SAST block), the `sast_digest` parameter threaded through
-  `run_native_agent` / `build_messages`, and the static SAST prompt block + its `budgets.sast` share
-  (ADR-0070) — the digest now arrives as a tool result, not injected context. `sast::scan` / `buffer` /
-  `digest` and `SastConfig` (still global) are **kept and reused** by the tool.
+- **Remove** the pre-agent pass (`run_sast_pass` in `services/agent-runner/src/run.rs`), the
+  `sast_digest` parameter threaded through `run_native_agent` / `build_messages`, and the static SAST
+  prompt block + its `budgets.sast` share (ADR-0070) — the digest now arrives as a tool result, not
+  injected context. `scan` / `buffer` / `digest` and `SastConfig` (still global) are **kept and reused**
+  by the tool, now living in their own `lci-agent-sast` crate so both `agent-runner` (which resolves
+  `SastConfig` from env/file config) and `lci-review-agent` (which dispatches the tool) can depend on
+  them without a cycle.
 - **The fast tier stays multi-turn.** `FAST_TIER_MAX_TURNS = 5` already gives the call-`run_sast`-then-act
   round trip room (fast is cheap via *no retrieval* + *no refute bounce*, not via a single turn), so a
   tool works on fast without changing its loop shape.
