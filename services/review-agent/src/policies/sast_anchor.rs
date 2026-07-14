@@ -13,9 +13,17 @@ use std::collections::HashMap;
 
 use lci_agent_loop::{Nudge, PolicyAction, TurnOutcome, TurnPolicy, TurnState};
 use lci_agent_types::ToolOutcome;
+use serde_json::Value;
 
-use super::{arg_field, arg_field_i64, normalize_repo_path};
+use super::normalize_repo_path;
 use crate::tools::{ADD_REVIEW_COMMENT, RETRACT_FINDING};
+
+/// A string field from an already-parsed tool-call `arguments` object. `update` parses each call's JSON
+/// once and reuses the [`Value`] for every field it needs, rather than re-parsing the same raw string
+/// per field (`file`, `line`, `title`, `body`, `evidence`).
+fn str_field(value: &Value, key: &str) -> Option<String> {
+    value.get(key)?.as_str().map(str::to_string)
+}
 
 /// One opengrep-flagged coordinate the gate anchors verdicts to. Deliberately minimal (no message/
 /// priority) — the runner maps its own `sast::SastFinding` list onto these at the call boundary, so
@@ -88,26 +96,33 @@ impl SastAnchorGate {
                     {
                         continue;
                     }
-                    let Some(file) = arg_field(args, "file").map(|f| normalize_repo_path(&f))
+                    let Ok(parsed) = serde_json::from_str::<Value>(args) else {
+                        continue;
+                    };
+                    let Some(file) = str_field(&parsed, "file").map(|f| normalize_repo_path(&f))
                     else {
                         continue;
                     };
-                    let Some(line) = arg_field_i64(args, "line") else {
+                    let Some(line) = parsed.get("line").and_then(Value::as_i64) else {
                         continue;
                     };
-                    let key = (file.clone(), line);
                     let Some(coords) = self.leads.get(&file) else {
                         continue;
                     };
+                    let key = (file, line);
                     if coords.iter().any(|(l, _)| i64::from(*l) == line) {
                         // Anchored to the real flagged line — never a violation, whatever it says.
                         self.outstanding.remove(&key);
                         continue;
                     }
+                    // `evidence` is scanned too: it's exactly where the digest instructs the model to
+                    // quote the line it read (record.rs folds it into the rendered body), so a compliant
+                    // model's "false positive" verdict can land there instead of `body` (#406 review).
                     let text = format!(
-                        "{} {}",
-                        arg_field(args, "title").unwrap_or_default(),
-                        arg_field(args, "body").unwrap_or_default()
+                        "{} {} {}",
+                        str_field(&parsed, "title").unwrap_or_default(),
+                        str_field(&parsed, "body").unwrap_or_default(),
+                        str_field(&parsed, "evidence").unwrap_or_default(),
                     );
                     let rule_ids: Vec<&str> = coords.iter().map(|(_, id)| id.as_str()).collect();
                     if is_sast_verdict(&text, &rule_ids) {
@@ -123,9 +138,12 @@ impl SastAnchorGate {
                     {
                         continue;
                     }
+                    let Ok(parsed) = serde_json::from_str::<Value>(args) else {
+                        continue;
+                    };
                     let (Some(file), Some(line)) = (
-                        arg_field(args, "file").map(|f| normalize_repo_path(&f)),
-                        arg_field_i64(args, "line"),
+                        str_field(&parsed, "file").map(|f| normalize_repo_path(&f)),
+                        parsed.get("line").and_then(Value::as_i64),
                     ) else {
                         continue;
                     };
@@ -250,6 +268,32 @@ mod tests {
         // One-shot, like RefuteGate: a second finish attempt is not bounced again even though the
         // violation is technically still outstanding (cost control over a guarantee).
         assert!(gate.after_turn_actions(&state(2), &finish()).is_empty());
+    }
+
+    // A model following the digest's own instruction (quote the line you read into `evidence`) can put
+    // the "false positive" wording there instead of `body`. `record.rs` folds `evidence` into the
+    // rendered comment either way, so the gate must scan it too — not just `title`/`body` (PR #406
+    // review).
+    #[test]
+    fn catches_a_false_positive_claim_recorded_only_in_evidence() {
+        let mut gate = SastAnchorGate::new(leads(), false);
+        let misanchored = TurnOutcome {
+            assistant: ChatMessage::user(""),
+            results: vec![call(
+                ADD_REVIEW_COMMENT,
+                r#"{"file":".env.fullstack","line":60,"title":"Reviewed DATABASE_URL","body":"See evidence.","evidence":"Read .env.fullstack:60 — it's a dev password. False positive for the opengrep rule.","priority":"P2","category":"security"}"#,
+                ToolOutcome::Continue("recorded finding at .env.fullstack:60".into()),
+            )],
+            finish_requested: false,
+            abort_reason: None,
+        };
+        gate.after_turn_actions(&state(0), &misanchored);
+        assert!(
+            gate.after_turn_actions(&state(1), &finish())
+                .iter()
+                .any(|action| matches!(action, PolicyAction::RejectFinish(_))),
+            "a verdict hidden in `evidence` rather than `body` must still be caught"
+        );
     }
 
     // The correctly-anchored path: the model reads the real line and records its verdict there. No

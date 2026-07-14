@@ -41,15 +41,6 @@ fn arg_field(arguments: &str, key: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Pull an integer field out of a tool call's raw JSON `arguments` (e.g. `add_review_comment`'s `line`).
-/// Same "couldn't identify the target" contract as [`arg_field`].
-fn arg_field_i64(arguments: &str, key: &str) -> Option<i64> {
-    serde_json::from_str::<serde_json::Value>(arguments)
-        .ok()?
-        .get(key)?
-        .as_i64()
-}
-
 /// Normalize a model-supplied repo path so the same file can't dodge coverage/loop tracking by varying
 /// its spelling (backslashes, a leading `./`, or a leading `/`).
 fn normalize_repo_path(path: &str) -> String {
