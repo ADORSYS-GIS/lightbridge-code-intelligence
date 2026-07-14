@@ -100,6 +100,7 @@ mod tests {
             ChatMessage::assistant(AssistantTurn {
                 content: None,
                 tool_calls: Vec::new(),
+                ..Default::default()
             }),
             ChatMessage::tool("new", "y".repeat(4_000)),
         ];

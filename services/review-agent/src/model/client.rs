@@ -1,20 +1,18 @@
 //! [`ChatClient`]: the OpenAI-compatible Chat Completions transport (ADR-0026). Owns the client
-//! config (gateway URL/key/model, attribution, passthrough `extra`, retry policy, telemetry
-//! side-channel) and the request lifecycle — building the wire request, sending it with retry
-//! (ADR-0039), and parsing a buffered (non-stream) reply. The streaming reply path lives in
-//! [`super::stream`]; the retry/error classification in [`super::retry`]; the raw non-stream response
-//! DTOs in [`super::wire`].
+//! config (gateway URL/key/model, attribution, passthrough `extra`, retry policy) and the request
+//! lifecycle — building the wire request, sending it with retry (ADR-0039), and parsing a buffered
+//! (non-stream) reply. The streaming reply path lives in [`super::stream`]; the retry/error
+//! classification in [`super::retry`]; the raw non-stream response DTOs in [`super::wire`].
 
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde::Serialize;
 
 use lci_agent_clients::ratelimit::{self, RateLimitSnapshot};
 use lci_agent_loop::{ChatMessage, ChatRequest, ModelClient, StreamOptions};
-use lci_agent_types::{AssistantTurn, StepError, ToolDef};
+use lci_agent_types::{AssistantTurn, StepError, ToolDef, TurnTelemetry};
 
-use super::completion::{ChatParams, Completion, TurnTelemetry};
+use super::completion::{ChatParams, Completion};
 use super::http::{build_http_client, truncate_on_boundary};
 use super::retry::{ChatError, RetryPolicy, chat_error_to_step};
 use super::wire::ChatResponse;
@@ -46,12 +44,6 @@ pub struct ChatClient {
     /// legacy `complete_with_retry` behaviour. From `review.resilience.max_retries` (default policy
     /// otherwise). The engine still classifies the *final* failure via [`StepError`].
     retry_policy: RetryPolicy,
-    /// Interior-mutability side-channel for per-turn model telemetry (ADR-0034): [`AssistantTurn`] and
-    /// the engine's `TranscriptEvent::Assistant` drop token/reasoning fields, so [`ModelClient::complete`]
-    /// records the model + prompt/completion/reasoning tokens + reasoning text here per call. Sequential
-    /// calls ⇒ index == turn; the host zips it with the sink's assistant messages into the transcript.
-    /// Drained via [`ChatClient::telemetry_handle`].
-    telemetry: Arc<Mutex<Vec<TurnTelemetry>>>,
 }
 
 impl ChatClient {
@@ -85,13 +77,11 @@ impl ChatClient {
             stream: false,
             idle_timeout: request_timeout,
             retry_policy: RetryPolicy::default(),
-            telemetry: Arc::default(),
         }
     }
 
     /// Return a copy of this client that targets a different model id (same gateway/key/timeout/retry).
-    /// Cheap: clones the shared `reqwest::Client`. The telemetry side-channel is fresh — a retargeted
-    /// client is a distinct logical model, so its turns don't interleave with the original's.
+    /// Cheap: clones the shared `reqwest::Client`.
     pub fn for_model(&self, model: impl Into<String>) -> Self {
         Self {
             url: self.url.clone(),
@@ -103,7 +93,6 @@ impl ChatClient {
             stream: self.stream,
             idle_timeout: self.idle_timeout,
             retry_policy: self.retry_policy,
-            telemetry: Arc::default(),
         }
     }
 
@@ -112,14 +101,6 @@ impl ChatClient {
     pub fn with_retry_policy(mut self, policy: RetryPolicy) -> Self {
         self.retry_policy = policy;
         self
-    }
-
-    /// A shared handle to the per-turn telemetry captured by [`ModelClient::complete`]. Grab this
-    /// **before** moving the client into the loop; drain it (`handle.lock()…drain(..)`) after the run to
-    /// zip token/reasoning fields back into the transcript (sequential calls ⇒ index == turn).
-    #[must_use]
-    pub fn telemetry_handle(&self) -> Arc<Mutex<Vec<TurnTelemetry>>> {
-        Arc::clone(&self.telemetry)
     }
 
     /// Set provider-specific passthrough request fields (e.g. a reasoning budget). Merged verbatim into
@@ -399,9 +380,11 @@ impl ChatClient {
 
 impl ModelClient for ChatClient {
     /// Drive one engine turn: POST the engine's [`ChatRequest`] verbatim under this client's retry
-    /// policy, record the turn's telemetry (model + tokens + reasoning) on the side-channel, and return
-    /// the model-visible [`AssistantTurn`]. Failures map to [`StepError`]: transient
-    /// (timeout/connect/429/5xx/stream-stall) preserves the `Retry-After` hint; deterministic
+    /// policy, and return the [`AssistantTurn`] — its model-visible `content`/`tool_calls` plus this
+    /// turn's `telemetry` (model + tokens + reasoning). Telemetry rides on the turn itself (not a
+    /// side-channel) so it journals and replays with the turn under `CheckpointRuntime` (ADR-0087)
+    /// instead of silently going missing on a resumed turn (#411/#417). Failures map to [`StepError`]:
+    /// transient (timeout/connect/429/5xx/stream-stall) preserves the `Retry-After` hint; deterministic
     /// (4xx/malformed/no-choices) folds the response body into the terminal reason so the loop's
     /// context-overflow detection ("context length", …) still matches.
     async fn complete(&self, request: ChatRequest<'_>) -> Result<AssistantTurn, StepError> {
@@ -409,22 +392,17 @@ impl ModelClient for ChatClient {
             .send_with_retry(&request, self.retry_policy)
             .await
             .map_err(chat_error_to_step)?;
-        // Sequential per-turn push (calls are serialized by the loop ⇒ index == turn). The engine
-        // records exactly one `TranscriptEvent::Assistant` per successful turn, so the host zips the
-        // Nth telemetry entry with the Nth assistant message.
-        self.telemetry
-            .lock()
-            .expect("telemetry mutex")
-            .push(TurnTelemetry {
-                model: self.model.clone(),
-                prompt_tokens: completion.usage.and_then(|u| u.prompt_tokens),
-                completion_tokens: completion.usage.and_then(|u| u.completion_tokens),
-                reasoning_tokens: completion.usage.and_then(|u| u.reasoning_tokens()),
-                reasoning: completion.reasoning,
-            });
+        let telemetry = TurnTelemetry {
+            model: self.model.clone(),
+            prompt_tokens: completion.usage.and_then(|u| u.prompt_tokens),
+            completion_tokens: completion.usage.and_then(|u| u.completion_tokens),
+            reasoning_tokens: completion.usage.and_then(|u| u.reasoning_tokens()),
+            reasoning: completion.reasoning,
+        };
         Ok(AssistantTurn {
             content: completion.message.content,
             tool_calls: completion.message.tool_calls,
+            telemetry: Some(telemetry),
         })
     }
 }

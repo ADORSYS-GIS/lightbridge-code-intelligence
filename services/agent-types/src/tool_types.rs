@@ -2,6 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::TurnTelemetry;
+
 /// A tool call requested by an assistant turn.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ToolCallReq {
@@ -75,13 +77,20 @@ pub enum ToolOutcome {
     Abort(String),
 }
 
-/// The model-visible portion of one assistant completion.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+/// One assistant completion: the model-visible `content`/`tool_calls` the loop echoes back on the
+/// next turn, plus this turn's `telemetry` (tokens/reasoning) for the transcript/logs only.
+/// `telemetry` deliberately never reaches [`crate`]'s `ChatMessage` conversion, so it can never be
+/// echoed back to the model — but living on `AssistantTurn` itself means it journals and replays
+/// (ADR-0087 `CheckpointRuntime`) with the turn it describes, instead of a separate side-channel that
+/// silently goes empty on a resumed turn (the `reasoning_chars: 0`-on-replay bug, #411/#417).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct AssistantTurn {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_calls: Vec<ToolCallReq>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub telemetry: Option<TurnTelemetry>,
 }
 
 /// Compatibility aliases retained while the current Job loop moves in R1d/R1e.
@@ -93,6 +102,7 @@ pub type FunctionDef = FunctionSpec;
 #[cfg(test)]
 mod tests {
     use super::{AssistantTurn, FunctionCallReq, ToolCallReq, ToolOutcome, ToolSpec};
+    use crate::TurnTelemetry;
 
     #[test]
     fn tool_contracts_preserve_the_openai_wire_shape() {
@@ -130,13 +140,44 @@ mod tests {
                 },
                 extra_content: None,
             }],
+            telemetry: None,
         };
         let json = serde_json::to_string(&turn).unwrap();
         assert!(json.contains("finish"));
+        assert!(
+            !json.contains("telemetry"),
+            "a None telemetry is omitted, not serialized as null"
+        );
         assert_eq!(ToolOutcome::Finish, ToolOutcome::Finish);
         assert_eq!(
             ToolOutcome::Continue("ok".into()),
             serde_json::from_str(r#"{"Continue":"ok"}"#).unwrap()
+        );
+    }
+
+    // The journal (ADR-0087 `CheckpointRuntime`) round-trips whatever `AssistantTurn` the closure
+    // returns through `serde_json::Value` — this is the exact shape a resumed turn rehydrates into.
+    // Telemetry must survive that round-trip byte-for-byte, or a replayed turn silently loses its
+    // reasoning/token counts (#411/#417).
+    #[test]
+    fn telemetry_round_trips_through_the_same_value_journaling_uses() {
+        let turn = AssistantTurn {
+            content: Some("done".into()),
+            tool_calls: Vec::new(),
+            telemetry: Some(TurnTelemetry {
+                model: "glm-5p2".into(),
+                prompt_tokens: Some(20_775),
+                completion_tokens: Some(370),
+                reasoning_tokens: Some(0),
+                reasoning: Some("thinking about the diff".into()),
+            }),
+        };
+        let value = serde_json::to_value(&turn).unwrap();
+        let rehydrated: AssistantTurn = serde_json::from_value(value).unwrap();
+        assert_eq!(rehydrated, turn);
+        assert_eq!(
+            rehydrated.telemetry.unwrap().reasoning.as_deref(),
+            Some("thinking about the diff")
         );
     }
 }

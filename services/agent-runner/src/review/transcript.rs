@@ -1,29 +1,29 @@
-//! Reconstructing the ADR-0034 transcript from the loop's sink events plus the model client's per-turn
-//! telemetry side-channel.
+//! Reconstructing the ADR-0034 transcript from the loop's sink events.
 
 use lci_agent_clients::TranscriptEntry;
 use lci_agent_loop::TranscriptEvent;
 use lci_agent_types::ToolOutcome;
-use lci_review_agent::model::TurnTelemetry;
 use uuid::Uuid;
 
-/// Reconstruct the ADR-0034 transcript rows from the loop's sink events + the model client's per-turn
-/// telemetry (sequential model calls ⇒ index == the Nth assistant event). Assistant turns carry their
-/// tokens/model from the telemetry side-channel; tool results carry the (bounded) outcome text — the
+/// Reconstruct the ADR-0034 transcript rows from the loop's sink events. Each `Assistant` event
+/// carries its own `telemetry` (ADR-0087: it rides the journaled `AssistantTurn`, not a side-channel
+/// keyed by position — a resumed/replayed turn's telemetry is exactly what was journaled with it,
+/// never silently empty; see #411/#417). Tool results carry the (bounded) outcome text — the
 /// finish/abort terminal outcomes record no tool row, matching the legacy loop. Policy events are not
 /// transcript rows.
 pub(crate) fn append_transcript(
     transcript: &mut Vec<TranscriptEntry>,
     events: &[TranscriptEvent],
-    telemetry: &[TurnTelemetry],
     task_id: Uuid,
 ) {
-    let mut assistant_index = 0usize;
     for event in events {
         match event {
-            TranscriptEvent::Assistant { turn, message } => {
-                let telemetry = telemetry.get(assistant_index);
-                assistant_index += 1;
+            TranscriptEvent::Assistant {
+                turn,
+                message,
+                telemetry,
+            } => {
+                let telemetry = telemetry.as_ref();
                 // Proof-of-work (epic #137): one concise per-turn line, including the chain-of-thought
                 // length (the reliable "how far did it think" signal even when the gateway folds
                 // reasoning into `completion_tokens`).

@@ -284,10 +284,11 @@ impl<R: StepRuntime, M: ModelClient> AgentLoop<R, M> {
                 self.model.complete(request).await
             })
             .await;
-        let assistant = match completion {
-            Ok(turn) => {
+        let (assistant, telemetry) = match completion {
+            Ok(mut turn) => {
                 acc.consecutive_failures = 0;
-                ChatMessage::assistant(turn)
+                let telemetry = turn.telemetry.take();
+                (ChatMessage::assistant(turn), telemetry)
             }
             Err(error) if error.is_transient() => {
                 acc.consecutive_failures += 1;
@@ -308,6 +309,7 @@ impl<R: StepRuntime, M: ModelClient> AgentLoop<R, M> {
         self.sink.record(TranscriptEvent::Assistant {
             turn,
             message: assistant.clone(),
+            telemetry,
         });
         let calls = assistant.tool_calls.clone();
         conversation.messages.push(assistant.clone());
