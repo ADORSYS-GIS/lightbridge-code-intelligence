@@ -123,6 +123,66 @@ is **not** root-caused here; see
 investigation. Per this repo's refactor/investigation discipline, a new spike is filed rather than
 guessing at a fix in this same change.
 
+## Update (2026-07-14): dimension-isolation probes find no request-shape cause (#411)
+
+[#411](https://github.com/vymalo/lightbridge-code-intelligence/issues/411) was filed from the update
+above to isolate which dimension of a large real request — system-prompt size, tool count, or
+turn/message-history depth — suppresses `reasoning_content` capture, since #247's minimal-prompt
+probes could not explain PR [#409](https://github.com/vymalo/lightbridge-code-intelligence/pull/409)
+logging `reasoning_chars: 0` on all 7 turns.
+
+**Method:** seven ephemeral `curlimages/curl` Jobs in `lightbridge-agents` (same secrets/CA pattern as
+#247, deleted after each probe), each varying exactly one dimension against the real deep-tier config
+(`model: glm-5p2`, `stream: true`, `reasoning_effort: high`). Critically, this round used the **actual
+production system prompt and tool schemas**, not synthetic approximations: the `review-system.md` and
+`agent.json` deep-tier config were read directly off the live `lightbridge-agent-config` ConfigMap
+(`kubectl -n lightbridge-agents get configmap lightbridge-agent-config`), and the 10 real built-in tool
+specs were taken verbatim from `services/review-agent/src/tools/*.rs` (padded to ~20 with
+similarly-shaped synthetic `mcp__<server>__lookup` specs to match production's external-knowledge-tool
+count, since live MCP discovery wasn't reproduced). The real `review-system.md` is **25,302 chars**
+(≈6.3k tokens at the codebase's own `PROMPT_CHARS_PER_TOKEN` estimate) — smaller than the ticket's
+"~23k tokens" estimate, which likely conflated the file size with the full assembled prompt (system +
+tool-protocol + diff + tool schemas).
+
+| Probe | Shape | Prompt tokens | `reasoning_content` |
+|---|---|---:|---|
+| A (baseline) | Minimal prompt, 0 tools, trivial question | ~50 | **Present** — extensive (matches #247) |
+| B | Minimal prompt, 20 tools, trivial "don't call tools yet" question | 2,171 | **Absent** — 0 chars, direct terse answer |
+| C | Real `review-system.md` + tool-protocol, 0 tools | 6,260 | **Present** — 325 chars |
+| D | Real prompt + real diff sample + 20 tools, investigative task (turn 1) | 20,775 | **Present** — 370 chars, 3 tool calls |
+| E | Same conversation as D, turn 2 (post tool-result) | 21,147 | **Present** — 603 chars, 2 tool calls |
+| F | Real prompt + a ~260KB diff (near the deep tier's 300k-char ceiling) + 20 tools | 75,678 | **Present** — 770 chars, 3 tool calls |
+| G | Minimal prompt, 20 tools, forced investigative task (must call a tool) | 2,175 | **Present** — brief, 33 chars, 1 tool call |
+
+**Finding: none of the three hypothesized dimensions reproduce the symptom.** Prompt size (up to
+~76k tokens, near the deep tier's real ceiling), tool count (20, matching production), and turn depth
+(turn 1 → turn 2 of the same conversation) all left `reasoning_content` streaming normally whenever the
+turn's task was genuinely investigative — which every real review turn is. The **only** reproducible
+zero (probe B) correlates with **task triviality**, not tool count: probe G shows that offering the
+same 20 tools to a task that actually requires investigation still produces reasoning (if briefer, 33
+chars) — so probe B's zero is the model choosing not to think for a question it can answer in one
+clause, not a wire-level suppression. That pattern doesn't fit PR #409's incident either, since a real
+review's turns are inherently investigative (the `finish` verdict turn is the closest analog and still
+wouldn't explain all 7 being zero, only possibly the last).
+
+**Conclusion on the ticket's acceptance criteria:** the request shape is **not** the mechanism —
+`reasoning_content` deltas are present, off the real wire, for every faithful reconstruction of
+production's actual size/tool-count/turn-depth, including well past where the hypothesis predicted
+suppression. This rules out a structural, request-shape-driven code defect in
+`stream.rs::StreamDelta`/`collect_stream` or `agent-runner/src/review/transcript.rs`'s
+`reasoning_chars` line — both remain verified correct, now under realistic load as well as #247's
+isolated probes. PR #409's specific 7-turn zero streak remains **unexplained** but, given it could
+not be reproduced despite deliberately exceeding its own request's scale on every axis, is most
+plausibly a **one-off gateway/provider-side anomaly** (transient backend routing or degraded
+behavior at that moment) rather than a recurring
+systemic bug — there is nothing here to fix. Since the original raw wire data for that specific
+incident was never captured (only the aggregate `reasoning_chars: 0` log line survived), a recurrence
+today would be equally undiagnosable;
+[#417](https://github.com/vymalo/lightbridge-code-intelligence/issues/417) proposes the lightweight
+observability (a correlation id or bounded raw-sample logged only when `reasoning_chars == 0`) needed
+to actually root-cause it if it happens again, rather than guessing further. #411 is left open,
+linked to #417.
+
 ## Consequences
 
 - **Good:** a run's reasoning is now legible from a pod log tail and measurable per turn; the applied
@@ -146,4 +206,5 @@ guessing at a fix in this same change.
 - [ADR-0054](0054-review-model-and-provider-selection.md) — model & provider selection (reopened by the finding).
 - Epic [#137](https://github.com/vymalo/lightbridge-code-intelligence/issues/137) — native review agent (proof-of-work).
 - [#247](https://github.com/vymalo/lightbridge-code-intelligence/issues/247) — raw-SSE verification of the streamed reasoning key (2026-07-14 update above).
-- [#411](https://github.com/vymalo/lightbridge-code-intelligence/issues/411) — follow-up: root-cause `reasoning_chars: 0` on real deep-tier turns (opened from this update).
+- [#411](https://github.com/vymalo/lightbridge-code-intelligence/issues/411) — follow-up: root-cause `reasoning_chars: 0` on real deep-tier turns; dimension-isolation probes documented in the second 2026-07-14 update above. Left open, linked to #417.
+- [#417](https://github.com/vymalo/lightbridge-code-intelligence/issues/417) — follow-up: log a correlation id / bounded raw-sample when `reasoning_chars == 0` recurs, so a future incident is diagnosable (opened from #411's update).
