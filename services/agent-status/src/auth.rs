@@ -10,8 +10,13 @@ use axum::http::{HeaderMap, header};
 ///
 /// Fails closed on a blank `expected`: an unset/misconfigured token must never be satisfiable by a
 /// caller presenting an empty `Bearer` token (`Authorization: Bearer `, trimmed to `""`), which the
-/// constant-time comparison below would otherwise treat as a valid match.
+/// constant-time comparison below would otherwise treat as a valid match. `expected` is trimmed
+/// before the blank check and the comparison — a token provisioned from a file (e.g. a k8s Secret
+/// created from a file with a trailing newline) commonly carries incidental leading/trailing
+/// whitespace, and without trimming, a whitespace-padded `expected` would both dodge the blank check
+/// (non-empty) and never match the always-trimmed `presented`, locking out every legitimate caller.
 pub(crate) fn authorized(headers: &HeaderMap, expected: &str) -> bool {
+    let expected = expected.trim();
     if expected.is_empty() {
         return false;
     }
@@ -58,6 +63,22 @@ mod tests {
         assert!(!authorized(&headers_with_bearer(""), ""));
         assert!(!authorized(&headers_with_bearer("anything"), ""));
         assert!(!authorized(&HeaderMap::new(), ""));
+    }
+
+    #[test]
+    fn whitespace_only_expected_token_also_fails_closed() {
+        // A configured token that's whitespace-only after trimming must reject too, not just a
+        // literally-empty string — same fail-closed posture, different way to be "blank".
+        assert!(!authorized(&headers_with_bearer(""), "   "));
+        assert!(!authorized(&headers_with_bearer("anything"), "\n\t "));
+    }
+
+    #[test]
+    fn incidental_whitespace_on_the_configured_token_does_not_lock_out_a_legitimate_caller() {
+        // A token provisioned with a trailing newline (common from file-based k8s Secrets) must
+        // still authorize a client presenting the clean, trimmed token.
+        assert!(authorized(&headers_with_bearer("secret"), "secret\n"));
+        assert!(authorized(&headers_with_bearer("secret"), "  secret  "));
     }
 
     #[test]
