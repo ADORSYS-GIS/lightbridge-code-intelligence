@@ -76,6 +76,7 @@ fn pr_task(repository_id: i64, head: &str) -> NewTask {
         run_epoch: 0,
         tier: "fast".to_string(),
         trigger_comment_id: None,
+        trace_context: None,
     }
 }
 
@@ -746,6 +747,7 @@ async fn issue_target_task_round_trips_and_is_distinct_from_a_pr(pool: PgPool) {
         run_epoch: 0,
         tier: "deep".to_string(),
         trigger_comment_id: None,
+        trace_context: None,
     };
     let issue_id = create_task(&pool, &issue)
         .await
@@ -815,6 +817,7 @@ async fn explicit_mention_always_creates_a_task_at_the_next_epoch(pool: PgPool) 
         run_epoch: 0, // ignored by create_explicit_task — the INSERT computes the epoch
         tier: "deep".to_string(),
         trigger_comment_id: None,
+        trace_context: None,
     };
 
     let first = create_explicit_task(&pool, &mention("h1")).await.unwrap();
@@ -1015,6 +1018,7 @@ async fn list_repositories_summarises_activity(pool: PgPool) {
                 run_epoch: 0,
                 tier: "deep".to_string(),
                 trigger_comment_id: None,
+                trace_context: None,
             },
         )
         .await
@@ -1071,6 +1075,7 @@ async fn list_tasks_returns_most_recent_first(pool: PgPool) {
                 run_epoch: 0,
                 tier: "deep".to_string(),
                 trigger_comment_id: None,
+                trace_context: None,
             },
         )
         .await
@@ -1974,6 +1979,7 @@ async fn get_task_context_joins_repo_identity(pool: PgPool) {
             run_epoch: 0,
             tier: "deep".to_string(),
             trigger_comment_id: Some(918_273),
+            trace_context: None,
         },
     )
     .await

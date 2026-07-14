@@ -33,6 +33,12 @@ pub struct OutboxRow {
     pub payload: Value,
     pub attempts: i32,
     pub platform: Platform,
+    /// The originating task's W3C `traceparent` (ticket #246), copied from `tasks.trace_context` at
+    /// enqueue time (see [`enqueue_outbox_post`]) so the reconciler can re-parent its egress span even
+    /// long after the task row's ambient span context is gone. `None` for rows not tied to a task
+    /// (`task_id IS NULL`) or created before this column existed — the egress span then starts its own
+    /// independently-sampled root, which is a graceful degradation, not a bug.
+    pub trace_context: Option<String>,
 }
 
 /// Enqueue one GitHub-egress intent. Idempotent on `dedup_key` (`ON CONFLICT DO NOTHING`), so a
@@ -51,8 +57,10 @@ pub async fn enqueue_outbox_post(
     dedup_key: &str,
 ) -> Result<bool, sqlx::Error> {
     let inserted = sqlx::query(
-        "INSERT INTO outbox (platform, task_id, installation_id, owner, repo, kind, payload, dedup_key) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ON CONFLICT (dedup_key) DO NOTHING",
+        "INSERT INTO outbox (platform, task_id, installation_id, owner, repo, kind, payload, dedup_key, \
+         trace_context) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, (SELECT trace_context FROM tasks WHERE id = $2)) \
+         ON CONFLICT (dedup_key) DO NOTHING",
     )
     .bind(platform)
     .bind(task_id)
@@ -87,7 +95,8 @@ pub async fn enqueue_outbox_post(
 /// an in-flight one.
 pub async fn claim_outbox_batch(pool: &PgPool, limit: i64) -> Result<Vec<OutboxRow>, sqlx::Error> {
     sqlx::query_as::<_, OutboxRow>(
-        "SELECT id, task_id, installation_id, owner, repo, kind, payload, attempts, platform \
+        "SELECT id, task_id, installation_id, owner, repo, kind, payload, attempts, platform, \
+                trace_context \
          FROM outbox \
          WHERE status = 'pending' AND next_attempt_at <= now() \
          ORDER BY created_at, id \
@@ -145,7 +154,8 @@ pub async fn load_pending_outbox_row(
     id: i64,
 ) -> Result<Option<OutboxRow>, sqlx::Error> {
     sqlx::query_as::<_, OutboxRow>(
-        "SELECT id, task_id, installation_id, owner, repo, kind, payload, attempts, platform \
+        "SELECT id, task_id, installation_id, owner, repo, kind, payload, attempts, platform, \
+                trace_context \
          FROM outbox \
          WHERE id = $1 AND status = 'pending'",
     )

@@ -10,6 +10,7 @@ use k8s_openapi::api::core::v1::ServiceAccount;
 use kube::api::{DeleteParams, PostParams};
 use kube::{Api, Client};
 use serde_json::{Value, json};
+use tracing::Instrument;
 use uuid::Uuid;
 
 use crate::db::ClaimedTask;
@@ -226,69 +227,80 @@ async fn fetch_owner_reference(sa: &Api<ServiceAccount>, sa_name: &str) -> anyho
 
 impl TaskLauncher for KubeLauncher {
     async fn launch(&self, task: &ClaimedTask) -> anyhow::Result<String> {
-        let name = job_name(task);
-        // Resolve the SA ownerReference lazily + cached via `OnceCell`: fetched on first launch (when
-        // the SA exists), retried each launch until it succeeds, then reused — so a startup race or
-        // transient API error doesn't permanently leave Jobs un-owned. The internal lock is held only
-        // during the one-time init, never across every launch's `.await`.
-        let owner_reference = match self
-            .owner_reference
-            .get_or_try_init(|| fetch_owner_reference(&self.sa, &self.service_account))
-            .await
-        {
-            Ok(owner) => Some(owner),
-            Err(error) => {
-                tracing::warn!(%error, "could not resolve agent SA ownerReference; Job created un-owned");
-                None
+        // Ticket #246: this Job dispatch is one span in the webhook→task→Job→turns→egress trace.
+        // Re-parented from the task's stored `trace_context` (the webhook-receipt span's traceparent,
+        // read back here since dispatch can happen an arbitrary time after task creation); its OWN
+        // traceparent — not the task's — is what `job_manifest` pushes into the Job's env below, so the
+        // runner's root span becomes a child of THIS span, not a sibling of it.
+        let span = tracing::info_span!("job.dispatch", task_id = %task.id);
+        lci_observability::set_remote_parent(&span, task.trace_context.as_deref());
+        async move {
+            let name = job_name(task);
+            // Resolve the SA ownerReference lazily + cached via `OnceCell`: fetched on first launch (when
+            // the SA exists), retried each launch until it succeeds, then reused — so a startup race or
+            // transient API error doesn't permanently leave Jobs un-owned. The internal lock is held only
+            // during the one-time init, never across every launch's `.await`.
+            let owner_reference = match self
+                .owner_reference
+                .get_or_try_init(|| fetch_owner_reference(&self.sa, &self.service_account))
+                .await
+            {
+                Ok(owner) => Some(owner),
+                Err(error) => {
+                    tracing::warn!(%error, "could not resolve agent SA ownerReference; Job created un-owned");
+                    None
+                }
+            };
+            // A fresh token scoped to THIS task, valid no longer than the Job's own runtime cap (ADR-0092):
+            // a leaked value from this Job's env authenticates nothing for any other task, and stops
+            // working close to when Kubernetes would have killed this Job anyway.
+            let runner_token = resolve_runner_token(
+                self.token_signer.as_ref(),
+                task.id,
+                self.active_deadline_seconds,
+            )?;
+            let manifest = job_manifest(
+                &name,
+                JobConfig {
+                    image: image_for(
+                        task,
+                        self.indexer_image.as_deref(),
+                        self.review_image.as_deref(),
+                        &self.image,
+                    ),
+                    service_account: &self.service_account,
+                    control_plane_url: &self.control_plane_url,
+                    runner_token: &runner_token,
+                    ca_secret: self.ca_secret.as_deref(),
+                    active_deadline_seconds: self.active_deadline_seconds,
+                    review_system_prompt: self.review_system_prompt.as_deref(),
+                    agent_config_map: self.agent_config_map.as_deref(),
+                    resources: resources_for(
+                        task,
+                        self.indexer_resources.as_ref(),
+                        self.review_resources.as_ref(),
+                        self.resources.as_ref(),
+                    ),
+                    owner_reference,
+                },
+                task,
+            );
+            let job: Job = serde_json::from_value(manifest)?;
+            match self.jobs.create(&PostParams::default(), &job).await {
+                Ok(_) => Ok(name),
+                // The Job name is derived from the unique task id, so a 409 means *our own* Job already
+                // exists — e.g. a previous attempt created it but we crashed before recording job_name,
+                // or the create timed out after the apiserver accepted it. Adopt it instead of erroring,
+                // which would requeue and 409 forever (dispatch is at-least-once).
+                Err(kube::Error::Api(error)) if error.code == 409 => {
+                    tracing::warn!(job_name = %name, task_id = %task.id, "job already exists; adopting it");
+                    Ok(name)
+                }
+                Err(error) => Err(error.into()),
             }
-        };
-        // A fresh token scoped to THIS task, valid no longer than the Job's own runtime cap (ADR-0092):
-        // a leaked value from this Job's env authenticates nothing for any other task, and stops
-        // working close to when Kubernetes would have killed this Job anyway.
-        let runner_token = resolve_runner_token(
-            self.token_signer.as_ref(),
-            task.id,
-            self.active_deadline_seconds,
-        )?;
-        let manifest = job_manifest(
-            &name,
-            JobConfig {
-                image: image_for(
-                    task,
-                    self.indexer_image.as_deref(),
-                    self.review_image.as_deref(),
-                    &self.image,
-                ),
-                service_account: &self.service_account,
-                control_plane_url: &self.control_plane_url,
-                runner_token: &runner_token,
-                ca_secret: self.ca_secret.as_deref(),
-                active_deadline_seconds: self.active_deadline_seconds,
-                review_system_prompt: self.review_system_prompt.as_deref(),
-                agent_config_map: self.agent_config_map.as_deref(),
-                resources: resources_for(
-                    task,
-                    self.indexer_resources.as_ref(),
-                    self.review_resources.as_ref(),
-                    self.resources.as_ref(),
-                ),
-                owner_reference,
-            },
-            task,
-        );
-        let job: Job = serde_json::from_value(manifest)?;
-        match self.jobs.create(&PostParams::default(), &job).await {
-            Ok(_) => Ok(name),
-            // The Job name is derived from the unique task id, so a 409 means *our own* Job already
-            // exists — e.g. a previous attempt created it but we crashed before recording job_name,
-            // or the create timed out after the apiserver accepted it. Adopt it instead of erroring,
-            // which would requeue and 409 forever (dispatch is at-least-once).
-            Err(kube::Error::Api(error)) if error.code == 409 => {
-                tracing::warn!(job_name = %name, task_id = %task.id, "job already exists; adopting it");
-                Ok(name)
-            }
-            Err(error) => Err(error.into()),
         }
+        .instrument(span)
+        .await
     }
 
     async fn job_liveness(&self, job_name: &str) -> anyhow::Result<JobLiveness> {
@@ -459,6 +471,14 @@ fn job_manifest(name: &str, cfg: JobConfig, task: &ClaimedTask) -> Value {
         json!({ "name": "LLM_MODEL",
             "valueFrom": { "secretKeyRef": { "name": "lightbridge-agent-secrets", "key": "llm-model", "optional": true } } }),
     ];
+    // Ticket #246: the ONE cross-process trace-context handoff. `current_traceparent()` reads the
+    // "job.dispatch" span this manifest is built inside of (see `KubeLauncher::launch`), NOT the
+    // task's raw stored `trace_context` — so the Job's root span becomes a child of "job.dispatch",
+    // not a sibling of it. Absent when no OTel layer is active (no Tempo endpoint configured) or the
+    // dispatch span itself had no upstream trace to continue.
+    if let Some(traceparent) = lci_observability::current_traceparent() {
+        env.push(json!({ "name": "TRACEPARENT", "value": traceparent }));
+    }
     if !is_open {
         // Embeddings config (ADR-0018): required for index/review — a misconfigured Job fails loud
         // rather than silently embedding with the wrong model. `open` never gets these: it does not
@@ -633,6 +653,7 @@ mod tests {
             base_sha: None,
             head_sha: Some("deadbeef".to_string()),
             attempts: 1,
+            trace_context: None,
         }
     }
 

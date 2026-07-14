@@ -21,6 +21,7 @@ use std::time::Duration;
 
 use sqlx::PgPool;
 use sqlx::postgres::PgListener;
+use tracing::Instrument;
 
 use crate::config::ReviewSection;
 use crate::integrations::platform::{CodePlatform, Platform, ReactionTarget, RepoRef};
@@ -177,7 +178,16 @@ async fn drain_once(
                 "outbox: retrying delivery"
             );
         }
-        match deliver(pool, platform.as_ref(), &repo, review, &row).await {
+        // Ticket #246: the final span of the webhook→task→Job→turns→egress trace. Re-parented from
+        // the outbox row's stored `trace_context` (copied from `tasks.trace_context` at enqueue time,
+        // see `enqueue_outbox_post`) — `None` for a row not tied to a task, which starts its own
+        // independently-sampled root rather than failing.
+        let span = tracing::info_span!("egress.deliver", outbox_id = row.id, kind = %row.kind);
+        lci_observability::set_remote_parent(&span, row.trace_context.as_deref());
+        match deliver(pool, platform.as_ref(), &repo, review, &row)
+            .instrument(span)
+            .await
+        {
             Ok(platform_id) => {
                 let outcome = if platform_id.is_some() {
                     "posted"
