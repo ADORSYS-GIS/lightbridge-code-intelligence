@@ -197,6 +197,9 @@ impl A2aHandler {
             run_epoch: 0,
             tier: "deep".to_string(),
             trigger_comment_id: None,
+            // The A2A ingress face has no `webhook.receive` span (ticket #246 scoped tracing to the
+            // webhook path); a future A2A trace root is a separate, unscoped addition.
+            trace_context: None,
         };
 
         // Record a synthetic delivery so the task's `webhook_delivery_id` FK is satisfied and the

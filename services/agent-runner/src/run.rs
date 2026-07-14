@@ -15,6 +15,7 @@
 
 use std::path::Path;
 
+use tracing::Instrument;
 use uuid::Uuid;
 
 use crate::bootstrap::config::{
@@ -34,17 +35,37 @@ use lci_agent_status::{Phase, StatusHandle, StatusServerConfig};
 /// - `Some(Mode::Index | Mode::Review)` — force that mode (the `agent-plane` entrypoint, once the
 ///   dispatcher passes `--mode`). `Mode::Open` never reaches here: the plane guard rejects it.
 ///
-/// Installs the JSON tracing subscriber (identical filter to the prior `main`), then walks the task
-/// lifecycle, returning the process exit code the caller should propagate.
+/// Installs the JSON tracing subscriber (identical filter to the prior `main`) plus, when
+/// `OTEL_EXPORTER_OTLP_ENDPOINT` is set, an OTLP→Tempo export layer (ticket #246) — then walks the
+/// task lifecycle, returning the process exit code the caller should propagate.
+///
+/// A thin wrapper around [`run_once_body`]: the crypto-provider pin and tracing/OTel init happen
+/// first, `run_once_body` runs entirely inside the `runner.task` root span (re-parented from the
+/// Job's `TRACEPARENT` env var when present — the one cross-process trace handoff), and the OTel
+/// guard is flushed **unconditionally** afterward. This is a short-lived process (a K8s Job): every
+/// exit path — success, failure, SIGTERM, upstream cancellation — must reach the flush, or its
+/// still-batched spans are lost. `run_once_body` returning (rather than this function early-returning
+/// from inside the body) is what guarantees that; see its own doc comment for the SIGTERM/cancellation
+/// detail this fixes.
 pub async fn run_once(mode: Option<Mode>) -> std::process::ExitCode {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .json()
-        .init();
+    lci_observability::install_default_crypto_provider();
+    let otel_guard = lci_observability::init_tracing("agent-runner");
 
+    let root_span = tracing::info_span!("runner.task");
+    lci_observability::set_remote_parent(&root_span, std::env::var("TRACEPARENT").ok().as_deref());
+
+    let exit_code = run_once_body(mode).instrument(root_span).await;
+    otel_guard.shutdown().await;
+    exit_code
+}
+
+/// The task lifecycle proper — everything [`run_once`] used to do inline. Split out so [`run_once`]
+/// can flush the OTel guard unconditionally after this returns, regardless of *which* branch below
+/// produced the exit code (previously, the SIGTERM and upstream-cancellation arms of the
+/// `tokio::select!` below `return`ed directly from this function, which — had the flush lived here
+/// instead of in the caller — would have skipped it on exactly the two paths a forcibly-terminated Job
+/// most needs it covered).
+async fn run_once_body(mode: Option<Mode>) -> std::process::ExitCode {
     let config = match RunnerConfig::from_env() {
         Ok(config) => config,
         Err(error) => {
@@ -106,22 +127,35 @@ pub async fn run_once(mode: Option<Mode>) -> std::process::ExitCode {
     //  2. Upstream cancellation poll — the reaper only SIGTERMs us when it's running; if it's down
     //     (e.g. mid-deploy) a cancelled task's pod would otherwise run to completion. Polling our own
     //     status lets us self-cancel within ~10s regardless of the reaper.
+    // 128 + SIGTERM(15) / a synthetic-but-equivalent exit code for a self-cancel — kept as a value
+    // produced here rather than an early `return`, so the caller's OTel flush is never skipped (see
+    // `run_once_body`'s doc comment).
+    enum RunOnceOutcome {
+        Ran(anyhow::Result<RunResult>),
+        Terminated,
+        CancelledUpstream,
+    }
     let outcome = tokio::select! {
-        result = run(mode, &config, &client, &embeddings_config, &review_configs, sast_config.as_ref()) => result,
+        result = run(mode, &config, &client, &embeddings_config, &review_configs, sast_config.as_ref()) => RunOnceOutcome::Ran(result),
         _ = terminated() => {
             tracing::warn!(task_id = %config.task_id, "received SIGTERM; aborting promptly");
-            return std::process::ExitCode::from(143); // 128 + SIGTERM(15)
+            RunOnceOutcome::Terminated
         }
         _ = cancelled_upstream(&client, config.task_id) => {
             tracing::warn!(task_id = %config.task_id, "task no longer active upstream (cancelled); aborting promptly");
-            return std::process::ExitCode::from(143);
+            RunOnceOutcome::CancelledUpstream
         }
     };
     match outcome {
-        Ok(RunResult {
+        // The control plane already owns a cancelled row in both cases; reporting here would clobber
+        // it with a status it doesn't have (matches the pre-existing behavior of the old early-`return`).
+        RunOnceOutcome::Terminated | RunOnceOutcome::CancelledUpstream => {
+            std::process::ExitCode::from(143)
+        }
+        RunOnceOutcome::Ran(Ok(RunResult {
             summary,
             review_detail,
-        }) => {
+        })) => {
             tracing::info!(task_id = %config.task_id, summary, "task succeeded");
             // Carry the review-failure/exhaustion/abort detail (if any) onto the FINAL terminal status,
             // not a mid-run `running` report (#137): the control plane clears `error_detail` on every
@@ -129,7 +163,7 @@ pub async fn run_once(mode: Option<Mode>) -> std::process::ExitCode {
             report(&client, &config, "succeeded", review_detail.as_deref()).await;
             std::process::ExitCode::SUCCESS
         }
-        Err(error) => {
+        RunOnceOutcome::Ran(Err(error)) => {
             let detail = error.to_string();
             tracing::error!(task_id = %config.task_id, error = %detail, "task failed");
             report(&client, &config, "failed", Some(&detail)).await;

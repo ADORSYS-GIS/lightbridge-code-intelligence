@@ -39,6 +39,9 @@ lci-config = { path = "../config" }
 # In-house code-graph crate (ADR-0086 / RFC-0007 slice 1). The sole structural-graph engine, built
 # in-process (tree-sitter); replaced the retired Python Graphify CLI (ADR-0019).
 lci-codegraph = { path = "../codegraph" }
+# Shared tracing/OTel bootstrap (ticket #246): JSON logs (as before) + optional OTLP→Tempo export, plus
+# the crypto-provider pin this binary needs but never had (see lci-observability's doc comment).
+lci-observability = { path = "../observability" }
 mimalloc.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -46,6 +49,7 @@ tokio.workspace = true
 futures.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+tracing-opentelemetry.workspace = true
 reqwest.workspace = true
 uuid.workspace = true
 # Regex selectors for the per-tier `mcp__<server>__<tool>` tool allowlist (ADR-0066).

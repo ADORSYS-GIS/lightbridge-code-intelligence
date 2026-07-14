@@ -432,6 +432,7 @@ async fn dedups_against_a_webhook_triggered_review(pool: PgPool) {
             run_epoch: 0,
             tier: "deep".to_string(),
             trigger_comment_id: None,
+            trace_context: None,
         },
     )
     .await
@@ -764,6 +765,7 @@ async fn get_update_is_fk_safe_after_underlying_task_deleted(pool: PgPool) {
             run_epoch: 0,
             tier: "deep".to_string(),
             trigger_comment_id: None,
+            trace_context: None,
         },
     )
     .await
@@ -945,6 +947,7 @@ async fn transitions_append_gapfree_events_and_non_a2a_appends_none(pool: PgPool
             run_epoch: 0,
             tier: "deep".to_string(),
             trigger_comment_id: None,
+            trace_context: None,
         },
     )
     .await

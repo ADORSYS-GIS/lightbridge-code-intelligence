@@ -77,6 +77,10 @@ pub struct NewTask {
     /// reactions target the triggering comment. `None` for the automatic `pull_request opened` review
     /// (no trigger comment → the reactions land on the PR body) and for index tasks.
     pub trigger_comment_id: Option<i64>,
+    /// W3C `traceparent` of the webhook-receipt span that created this task (ticket #246), captured via
+    /// `lci_observability::current_traceparent()`. Persisted (not held in memory) so it survives the
+    /// dispatcher's queueing delay; read back at dispatch time to parent the Job's own trace.
+    pub trace_context: Option<String>,
 }
 
 /// A task claimed by the dispatcher for execution (the subset needed to launch its Job).
@@ -91,6 +95,9 @@ pub struct ClaimedTask {
     pub base_sha: Option<String>,
     pub head_sha: Option<String>,
     pub attempts: i32,
+    /// See [`NewTask::trace_context`] — carried through so [`crate::integrations::k8s::KubeLauncher`]
+    /// can re-parent the Job's trace under it.
+    pub trace_context: Option<String>,
 }
 /// Initial-status SQL for a newly inserted task (ADR-0055 index-readiness gate). A **non-`index`**
 /// task (review / ask — anything that reads the index) starts `waiting_for_index` when an `index` task
@@ -133,8 +140,9 @@ pub async fn create_task(pool: &PgPool, task: &NewTask) -> Result<Option<Uuid>, 
     let id = Uuid::new_v4();
     let inserted: Option<(Uuid, String)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "INSERT INTO tasks (id, repository_id, installation_id, webhook_delivery_id, target_type, \
-         target_id, command_text, base_sha, head_sha, run_epoch, tier, trigger_comment_id, status) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, {INITIAL_TASK_STATUS_SQL}) \
+         target_id, command_text, base_sha, head_sha, run_epoch, tier, trigger_comment_id, \
+         trace_context, status) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, {INITIAL_TASK_STATUS_SQL}) \
          ON CONFLICT (repository_id, target_type, target_id, command_text, head_sha, run_epoch) \
          DO NOTHING \
          RETURNING id, status"
@@ -151,6 +159,7 @@ pub async fn create_task(pool: &PgPool, task: &NewTask) -> Result<Option<Uuid>, 
     .bind(task.run_epoch)
     .bind(&task.tier)
     .bind(task.trigger_comment_id)
+    .bind(&task.trace_context)
     .fetch_optional(pool)
     .await?;
 
@@ -183,8 +192,9 @@ pub async fn create_explicit_task(pool: &PgPool, task: &NewTask) -> Result<Uuid,
         let id = Uuid::new_v4();
         let result = sqlx::query_as::<_, (Uuid, String)>(sqlx::AssertSqlSafe(format!(
             "INSERT INTO tasks (id, repository_id, installation_id, webhook_delivery_id, target_type, \
-             target_id, command_text, base_sha, head_sha, tier, trigger_comment_id, run_epoch, status) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, \
+             target_id, command_text, base_sha, head_sha, tier, trigger_comment_id, trace_context, \
+             run_epoch, status) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, \
                (SELECT COALESCE(MAX(run_epoch), -1) + 1 FROM tasks \
                 WHERE repository_id = $2 AND target_type = $5 AND target_id = $6 \
                   AND command_text = $7 AND head_sha IS NOT DISTINCT FROM $9), \
@@ -202,6 +212,7 @@ pub async fn create_explicit_task(pool: &PgPool, task: &NewTask) -> Result<Uuid,
         .bind(&task.head_sha)
         .bind(&task.tier)
         .bind(task.trigger_comment_id)
+        .bind(&task.trace_context)
         .fetch_one(pool)
         .await;
         match result {
@@ -319,7 +330,7 @@ pub async fn claim_next_task(
            LIMIT 1 \
          ) \
          RETURNING id, repository_id, installation_id, target_type, target_id, command_text, \
-                   base_sha, head_sha, attempts",
+                   base_sha, head_sha, attempts, trace_context",
     )
     .bind(owner)
     .bind(lease.as_secs_f64())
