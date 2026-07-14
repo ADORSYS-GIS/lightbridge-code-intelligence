@@ -10,8 +10,10 @@ use k8s_openapi::api::core::v1::ServiceAccount;
 use kube::api::{DeleteParams, PostParams};
 use kube::{Api, Client};
 use serde_json::{Value, json};
+use uuid::Uuid;
 
 use crate::db::ClaimedTask;
+use crate::runner_token::RunnerTokenSigner;
 
 /// Liveness of a task's Kubernetes Job, as the reaper reads it (RFC-0001 Phase 2). The Job — not a
 /// timer — is the source of truth for whether a `running` task is still doing work.
@@ -52,9 +54,10 @@ pub struct KubeLauncher {
     service_account: String,
     /// In-cluster URL the runner calls back for context + status (the control plane's own Service).
     control_plane_url: String,
-    /// Shared bearer the runner presents to that internal API (ADR-0017). Injected into the Job so
-    /// the runner can authenticate; empty when unset (the internal API is then disabled anyway).
-    runner_token: String,
+    /// Mints the per-task token each Job presents to the internal API (ADR-0092, hardening ADR-0017).
+    /// `None` when `RUNNER_TOKEN_SIGNING_KEY` is unset — Jobs then get an empty `AGENT_RUNNER_TOKEN`
+    /// (the internal API is disabled anyway in that case, so there's nothing to authenticate).
+    token_signer: Option<RunnerTokenSigner>,
     /// Secret (in the agents namespace) holding the internal CA (`ca.crt`) the runner must trust to
     /// reach the eaig gateway's HTTPS embeddings endpoint. `None` → no CA volume mounted.
     ca_secret: Option<String>,
@@ -150,7 +153,7 @@ impl KubeLauncher {
             "CONTROL_PLANE_INTERNAL_URL",
             "http://lightbridge-ci-control-plane:8080",
         );
-        let runner_token = std::env::var("AGENT_RUNNER_TOKEN").unwrap_or_default();
+        let token_signer = RunnerTokenSigner::from_env();
         let ca_secret = pick_opt(
             agent.and_then(|a| a.ca_secret.as_deref()),
             "AGENT_CA_SECRET",
@@ -183,7 +186,7 @@ impl KubeLauncher {
             review_image,
             service_account,
             control_plane_url,
-            runner_token,
+            token_signer,
             ca_secret,
             active_deadline_seconds,
             review_system_prompt,
@@ -239,6 +242,14 @@ impl TaskLauncher for KubeLauncher {
                 None
             }
         };
+        // A fresh token scoped to THIS task, valid no longer than the Job's own runtime cap (ADR-0092):
+        // a leaked value from this Job's env authenticates nothing for any other task, and stops
+        // working close to when Kubernetes would have killed this Job anyway.
+        let runner_token = resolve_runner_token(
+            self.token_signer.as_ref(),
+            task.id,
+            self.active_deadline_seconds,
+        )?;
         let manifest = job_manifest(
             &name,
             JobConfig {
@@ -250,7 +261,7 @@ impl TaskLauncher for KubeLauncher {
                 ),
                 service_account: &self.service_account,
                 control_plane_url: &self.control_plane_url,
-                runner_token: &self.runner_token,
+                runner_token: &runner_token,
                 ca_secret: self.ca_secret.as_deref(),
                 active_deadline_seconds: self.active_deadline_seconds,
                 review_system_prompt: self.review_system_prompt.as_deref(),
@@ -319,6 +330,21 @@ impl TaskLauncher for KubeLauncher {
 /// Deterministic, collision-free Job name for a task (the task id is unique).
 fn job_name(task: &ClaimedTask) -> String {
     format!("lightbridge-agent-{}", task.id)
+}
+
+/// The token to inject as this Job's `AGENT_RUNNER_TOKEN` (ADR-0092): a fresh, task-scoped mint when
+/// a signer is configured, else empty — matching the pre-#243 degrade where an absent signing secret
+/// left the internal API disabled (503) regardless of what the Job carries. Pure so the "two tasks
+/// get different tokens" property is unit-tested without a cluster.
+fn resolve_runner_token(
+    signer: Option<&RunnerTokenSigner>,
+    task_id: Uuid,
+    active_deadline_seconds: i64,
+) -> anyhow::Result<String> {
+    match signer {
+        Some(signer) => signer.mint(task_id, active_deadline_seconds),
+        None => Ok(String::new()),
+    }
 }
 
 /// The launcher-derived inputs to a Job manifest — everything that isn't the task itself. Grouped so
@@ -998,6 +1024,28 @@ mod tests {
         assert!(
             !env.iter().any(|e| e.name == "REVIEW_SYSTEM_PROMPT"),
             "no override → the env var is absent (runner uses its default)"
+        );
+    }
+
+    // ADR-0092 (issue #243): the Job's AGENT_RUNNER_TOKEN is now a fresh, task-scoped mint rather than
+    // one shared secret — pin that two tasks never get the same value, and that an unconfigured
+    // signer degrades to empty (matching the old "internal API disabled" behavior) rather than an error.
+    #[test]
+    fn resolve_runner_token_mints_distinct_tokens_per_task() {
+        let signer = RunnerTokenSigner::new(b"test-signing-key");
+        let a = resolve_runner_token(Some(&signer), Uuid::new_v4(), 3600).expect("mint a");
+        let b = resolve_runner_token(Some(&signer), Uuid::new_v4(), 3600).expect("mint b");
+        assert_ne!(a, b, "two different tasks must never share a token");
+        assert!(!a.is_empty());
+    }
+
+    #[test]
+    fn resolve_runner_token_is_empty_without_a_configured_signer() {
+        let token =
+            resolve_runner_token(None, Uuid::new_v4(), 3600).expect("no signer still succeeds");
+        assert_eq!(
+            token, "",
+            "no signing key → empty, same as the pre-#243 unset case"
         );
     }
 

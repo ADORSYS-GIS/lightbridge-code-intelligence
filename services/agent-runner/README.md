@@ -51,8 +51,10 @@ See [docs/jobs-and-lifecycle.md](../../docs/jobs-and-lifecycle.md).
 
 No GitHub App key, no datastore credentials: the agent's retrieval tools go through the control-plane
 API (the trust property from [ADR-0020](../../docs/adr/0020-mcp-servers-via-control-plane.md), now
-in-process rather than via stdio MCP servers). It holds only the short-lived install token, the shared
-`AGENT_RUNNER_TOKEN`, the embeddings key, and a mounted internal-CA cert.
+in-process rather than via stdio MCP servers). It holds only the short-lived install token, a per-task
+`AGENT_RUNNER_TOKEN` (minted for this Job alone and worthless against any other task's callbacks,
+[ADR-0092](../../docs/adr/0092-per-task-runner-tokens.md)), the embeddings key, and a mounted
+internal-CA cert.
 
 ## Cancellation
 

@@ -4,8 +4,10 @@
 //! which has no platform credentials of its own. Per the trust boundary (ADR-0002) the runner calls
 //! back here to (a) fetch its task context plus a platform-appropriate clone URL + token, and (b)
 //! report status transitions. These routes are **not** OIDC-protected (the caller is a pod, not a
-//! user): they authenticate with a shared bearer (`AGENT_RUNNER_TOKEN`) the control plane injects
-//! into the Job. Absent that token in this process, the routes fail closed (503) — never open.
+//! user): they authenticate with a per-task token (ADR-0092) the control plane mints at dispatch time
+//! and injects into the Job's `AGENT_RUNNER_TOKEN` env var. Absent a signing key in this process, the
+//! routes fail closed (503) — never open. A token that verifies but was minted for a *different* task
+//! is rejected (403) — a leaked Job env is worthless against any other task's callbacks.
 //!
 //! Platform handling (ADR-0072): GitHub mints a short-lived installation token and sends a plain
 //! clone_url (the runner splices `x-access-token:<token>@`). GitLab embeds the token in the
@@ -17,22 +19,25 @@ use axum::http::StatusCode;
 use axum::http::request::Parts;
 use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
-use subtle::ConstantTimeEq;
 use uuid::Uuid;
 
 use crate::AppState;
 use crate::integrations::platform::{CodePlatform, Platform, RepoRef};
+use crate::runner_token::RunnerTokenSigner;
 
-/// Authenticates a runner request by comparing its `Authorization: Bearer` token against the
-/// configured `AGENT_RUNNER_TOKEN`, in constant time. A unit extractor: presence of the value is
-/// the whole proof, so there is nothing to carry.
+/// Authenticates a runner request: its `Authorization: Bearer` token must verify against the
+/// configured signing key, not be expired, AND be scoped (`tid` claim) to the same task id as the
+/// request's own `{id}` path parameter (ADR-0092). A unit extractor: a successful check is the whole
+/// proof, so there is nothing to carry.
 pub struct RunnerAuth;
 
-/// Rejections for the internal API. 401 for a bad/missing token; 503 when the shared secret is not
+/// Rejections for the internal API. 401 for a missing/invalid/expired token; 403 when the token is
+/// otherwise valid but scoped to a different task (a cross-task replay); 503 when no signing key is
 /// configured in this process (so the surface is closed rather than unauthenticated).
 pub enum RunnerAuthError {
     MissingToken,
     InvalidToken,
+    ForeignTask,
     Disabled,
 }
 
@@ -41,6 +46,9 @@ impl IntoResponse for RunnerAuthError {
         let (status, msg) = match self {
             RunnerAuthError::MissingToken => (StatusCode::UNAUTHORIZED, "missing bearer token"),
             RunnerAuthError::InvalidToken => (StatusCode::UNAUTHORIZED, "invalid runner token"),
+            RunnerAuthError::ForeignTask => {
+                (StatusCode::FORBIDDEN, "token not valid for this task")
+            }
             RunnerAuthError::Disabled => {
                 (StatusCode::SERVICE_UNAVAILABLE, "runner api not configured")
             }
@@ -56,17 +64,41 @@ impl FromRequestParts<AppState> for RunnerAuth {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, RunnerAuthError> {
-        let expected = state
-            .runner_token
+        // Every route this extractor guards is `/internal/tasks/{id}/...`, so the path always carries
+        // the task id the request claims to be for — checked below against the presented token's own
+        // `tid` claim. `Path` reads route params the router already matched before extraction runs, so
+        // this doesn't conflict with the handler's own `Path(id)` extraction later. A parse failure
+        // here can't happen for any route this extractor is actually used on; it's mapped to
+        // `InvalidToken` rather than adding a rejection variant for an unreachable case.
+        let Path(task_id) = Path::<Uuid>::from_request_parts(parts, state)
+            .await
+            .map_err(|_| RunnerAuthError::InvalidToken)?;
+        let signer = state
+            .runner_token_signer
             .as_ref()
             .ok_or(RunnerAuthError::Disabled)?;
         let presented = bearer_token(parts).ok_or(RunnerAuthError::MissingToken)?;
-        // Constant-time compare so a wrong token can't be recovered byte-by-byte via timing.
-        if presented.as_bytes().ct_eq(expected.as_bytes()).into() {
-            Ok(RunnerAuth)
-        } else {
-            Err(RunnerAuthError::InvalidToken)
-        }
+        verify_runner_token(signer, &presented, task_id)
+    }
+}
+
+/// Verify a presented bearer against the task id its own route claims. Pure, so cross-task rejection
+/// and the accept path are unit-tested without building an HTTP request. `Ok` only when the
+/// signature checks out, the token hasn't expired, AND its `tid` claim matches `task_id` — a
+/// validly-signed token minted for a *different* task is rejected as [`RunnerAuthError::ForeignTask`]
+/// rather than accepted just because this process signed it (issue #243).
+fn verify_runner_token(
+    signer: &RunnerTokenSigner,
+    presented: &str,
+    task_id: Uuid,
+) -> Result<RunnerAuth, RunnerAuthError> {
+    let token_task_id = signer
+        .verify(presented)
+        .map_err(|_| RunnerAuthError::InvalidToken)?;
+    if token_task_id == task_id {
+        Ok(RunnerAuth)
+    } else {
+        Err(RunnerAuthError::ForeignTask)
     }
 }
 
@@ -1976,6 +2008,46 @@ async fn handle_review_failure(state: &AppState, pool: &sqlx::PgPool, id: Uuid) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ADR-0092 (issue #243): a per-task runner token must authenticate ONLY the task it was minted
+    // for. A leaked Job env used to be good for every task, forever; these pin the replacement
+    // contract — same-task accepted, cross-task ("foreign") rejected — independent of the HTTP layer.
+    #[test]
+    fn matching_task_token_is_accepted() {
+        let signer = RunnerTokenSigner::new(b"test-signing-key");
+        let task_id = Uuid::new_v4();
+        let token = signer.mint(task_id, 3600).expect("mint");
+        assert!(matches!(
+            verify_runner_token(&signer, &token, task_id),
+            Ok(RunnerAuth)
+        ));
+    }
+
+    #[test]
+    fn a_token_minted_for_one_task_is_rejected_for_another() {
+        let signer = RunnerTokenSigner::new(b"test-signing-key");
+        let task_a = Uuid::new_v4();
+        let task_b = Uuid::new_v4();
+        let token_for_a = signer.mint(task_a, 3600).expect("mint");
+        assert!(matches!(
+            verify_runner_token(&signer, &token_for_a, task_b),
+            Err(RunnerAuthError::ForeignTask)
+        ));
+    }
+
+    #[test]
+    fn a_bad_signature_is_rejected_as_invalid_not_foreign() {
+        let signer_a = RunnerTokenSigner::new(b"key-a");
+        let signer_b = RunnerTokenSigner::new(b"key-b");
+        let task_id = Uuid::new_v4();
+        let token = signer_a.mint(task_id, 3600).expect("mint");
+        // Same task id, wrong key: must fail as InvalidToken (unverifiable), never leak into the
+        // ForeignTask branch (which would imply the signature was trusted).
+        assert!(matches!(
+            verify_runner_token(&signer_b, &token, task_id),
+            Err(RunnerAuthError::InvalidToken)
+        ));
+    }
 
     // ADR-0056 reply-drop policy (the docs PR #224 regression). The gate is "a PR review is posted",
     // NOT "there are findings" — a clean review (verdict summary, zero findings) must still suppress the

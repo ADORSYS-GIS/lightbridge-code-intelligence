@@ -49,15 +49,18 @@ cargo run -p control-plane reconciler   # reconciler (GitHub egress + feedback p
 ## Trust boundary
 
 The GitHub App key never leaves this service. A Job receives only a short-lived (~1h) installation token
-plus the shared `AGENT_RUNNER_TOKEN` and embeddings key — never datastore credentials
-([ADR-0020](../../docs/adr/0020-mcp-servers-via-control-plane.md)). The runner *proposes*; the control
-plane *validates and writes back*.
+plus a per-task `AGENT_RUNNER_TOKEN` and the embeddings key — never datastore credentials
+([ADR-0020](../../docs/adr/0020-mcp-servers-via-control-plane.md)). `AGENT_RUNNER_TOKEN` is minted fresh
+per Job from `RUNNER_TOKEN_SIGNING_KEY` — a signing key that, unlike the token it produces, never itself
+leaves this service ([ADR-0092](../../docs/adr/0092-per-task-runner-tokens.md)). The runner *proposes*;
+the control plane *validates and writes back*.
 
 ## Configuration
 
 Read from `/etc/lightbridge/control-plane.json` (mounted ConfigMap) or env. Key knobs: `agent.*`
 (runner image, namespace, service account, resources, deadline, CA secret), `dispatcher.*` (lease /
-poll / reap cadences), the OIDC issuer/audience + `PERMISSIONS_CLAIM`, and `AGENT_RUNNER_TOKEN`. See
+poll / reap cadences), the OIDC issuer/audience + `PERMISSIONS_CLAIM`, and `RUNNER_TOKEN_SIGNING_KEY`
+(the per-task runner-token signing key, ADR-0092). See
 [`src/config.rs`](src/config.rs) and [docs/kubernetes-deployment.md](../../docs/kubernetes-deployment.md).
 
 ## Tests
