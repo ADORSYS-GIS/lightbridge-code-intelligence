@@ -9,7 +9,9 @@
 //! ([`EmbeddingsConfig`]), [`review`] (the review LLM config + two-tier resolution — the biggest
 //! piece), [`redact`] (the audit-trail redaction pass, split out because it's a security-sensitive
 //! concern in its own right), and [`sast`] ([`SastConfig`]). Every type that used to live in this one
-//! file is re-exported here, so callers keep using `bootstrap::config::Whatever` unchanged.
+//! file is re-exported here, so callers keep using `bootstrap::config::Whatever` unchanged. SAST's
+//! config *value type* ([`SastConfig`]) now lives in `lci-agent-sast` (ADR-0073); [`sast`] here only
+//! resolves it from the file config / environment.
 
 mod defaults;
 mod embeddings;
@@ -26,7 +28,8 @@ pub use file::{
     EmbeddingsFile, EmbeddingsTuningFile, FileConfig, McpToolPattern, ReviewFile, ReviewTool,
     ReviewToolSelector, SastFile, load_file_config,
 };
+pub use lci_agent_sast::SastConfig;
 pub use redact::REDACTED;
 pub use review::{ResilienceConfig, ReviewConfig, ReviewConfigs};
 pub use runner::RunnerConfig;
-pub use sast::SastConfig;
+pub(crate) use sast::resolve_sast_config;

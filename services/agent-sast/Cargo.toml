@@ -1,0 +1,20 @@
+[package]
+name = "lci-agent-sast"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "SAST (opengrep) scan/buffer/digest — ADR-0061, invoked as the run_sast agent tool per ADR-0073."
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+anyhow.workspace = true
+lci-agent-clients = { path = "../agent-clients" }
+serde = { workspace = true }
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true

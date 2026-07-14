@@ -24,6 +24,9 @@ anyhow.workspace = true
 clap.workspace = true
 lci-agent-clients = { path = "../agent-clients" }
 lci-agent-loop = { path = "../agent-loop" }
+# SAST (opengrep) scan/buffer/digest, invoked as the `run_sast` tool (ADR-0073); the bootstrap config
+# resolver here builds its `SastConfig` value from env/file, then hands it to the tool registry.
+lci-agent-sast = { path = "../agent-sast" }
 # Host-agnostic live per-review status projection + read-only HTTP surface (RFC-0007 slice 5,
 # ADR-0085). Flag-gated (`LCI_STATUS_API`, default off) so it is prod-neutral until an operator
 # enables it; the loop runs identically whether or not the status server is on.

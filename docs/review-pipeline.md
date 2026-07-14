@@ -1,8 +1,8 @@
 # Review pipeline (native agent, two-tier, SAST, verification)
 
 This document describes the whole review subsystem end to end: from a GitHub event, through
-tier selection, the deterministic SAST pass, the native agent loop, control-plane shaping of the
-posted output, and finally egress to GitHub. It is the companion to
+tier selection, the native agent loop (which may call the opengrep SAST tool), control-plane shaping of
+the posted output, and finally egress to GitHub. It is the companion to
 [github-app-and-control-plane.md](github-app-and-control-plane.md) (the App + trust boundary) and
 [indexing-and-storage.md](indexing-and-storage.md) (the retrieval substrate the deep tier reads from).
 
@@ -31,8 +31,8 @@ flowchart TD
     subgraph RUN[agent-runner Job]
         CLONE[clone + checkout]
         IDX{repo indexed?}
-        SAST[opengrep SAST pass]
         AGENT[native agent loop]
+        SAST["run_sast tool (opengrep, ADR-0073) — called on demand, not automatic"]
     end
     subgraph FIN[control-plane: serve finalize]
         VAL[validate vs PR diff]
@@ -46,11 +46,11 @@ flowchart TD
     W --> T --> J --> CLONE --> IDX
     IDX -->|no / index task| FULLIDX[semantic + structural index]
     IDX -->|yes| REUSE[reuse base index]
-    FULLIDX --> SAST
-    REUSE --> SAST
-    SAST --> AGENT
+    FULLIDX --> AGENT
+    REUSE --> AGENT
+    AGENT -.->|agent calls it, mid-loop| SAST
+    SAST -.->|buffered findings, no second poster| FIN
     AGENT -->|buffered add_review_comment / finish| FIN
-    SAST -->|buffered findings, no second poster| FIN
     VAL --> SHAPE --> OUT --> REC
 ```
 
@@ -75,8 +75,10 @@ Why two tiers ([ADR-0062](adr/0062-two-tier-review-fast-auto-deep-on-demand.md))
 multi-minute-to-~25-minute job whose cost is dominated by `reasoning_effort` + turn count + retrieval
 depth (not the model id — [ADR-0060](adr/0060-capture-model-reasoning-and-glm-5-2-latency-finding.md)).
 Running it on every opened PR over-taxes trivial changes. The lever is the **loop shape** (tools /
-effort / turns / timeout), tuned per tier — plus the near-instant deterministic SAST source
-([ADR-0061](adr/0061-sast-deterministic-finding-source.md)).
+effort / turns / timeout), tuned per tier — plus the near-instant `run_sast` opengrep tool
+([ADR-0061](adr/0061-sast-deterministic-finding-source.md) +
+[ADR-0073](adr/0073-sast-as-agent-tool.md)), offered on both tiers when an operator lists it in
+`review.<tier>.tools`.
 
 ## 2. Per-tier configuration
 
@@ -122,10 +124,12 @@ the exact dispatched tool names):
 | `Finish` | `finish` | terminal (verdict) |
 | `ReportProgress` | `report_progress` | control |
 | `Abort` | `abort` | terminal |
+| `RunSast` | `run_sast` | write (deterministic opengrep scan, ADR-0073) |
 
 A typical fast allowlist is `["add_review_comment", "finish", "abort"]` — diff-only, no retrieval.
 When unset, the tier uses the built-in default (the full surface for deep; the wind-down
-write/finish/abort set for fast).
+write/finish/abort set for fast). `run_sast` is **never** in either built-in default — an operator must
+list it explicitly (and set `sast.enabled`) for a tier to offer it.
 
 ### The two prompts
 
@@ -142,9 +146,10 @@ the operator prompt followed by a small, code-owned **tool-protocol** stanza (`T
   pass that claims only what the diff proves, with anything unverifiable downgraded to a P2 question
   (it has no retrieval to confirm a deeper claim).
 
-The diff itself, the SAST digest, prior reviews, repo memory, and repo instructions are all assembled
-into the **user** message by `build_messages` (see below); the tool-protocol/persona in the system
-message stays authoritative over that untrusted context.
+The diff itself, prior reviews, repo memory, and repo instructions are all assembled into the **user**
+message by `build_messages` (see below); the tool-protocol/persona in the system message stays
+authoritative over that untrusted context. The SAST digest is no longer part of this static assembly —
+it's a `run_sast` tool result (§4, ADR-0073).
 
 ## 3. Indexing decision (before review)
 
@@ -154,14 +159,24 @@ on an already-indexed repo **reuses the base index**
 and has the PR diff in its prompt — so the costly re-index is skipped. Retrieval pins to the latest
 indexed snapshot ([ADR-0050](adr/0050-retrieval-pins-to-latest-indexed-snapshot.md)).
 
-## 4. Deterministic SAST pass (ADR-0061)
+## 4. SAST — the `run_sast` tool (ADR-0061 + ADR-0073)
 
-`services/agent-runner/src/sast/mod.rs` runs **opengrep** (the LGPL Semgrep CE fork) over the PR's
-**changed files only**, deterministically (same code + rules ⇒ same findings, no LLM, no tokens). It is
-opt-in (`sast.enabled`, default off — rollout is image-then-config) and best-effort (a scan failure is
-logged, never fatal).
+`lci-agent-sast` (a shared crate both `agent-runner` and `lci-review-agent` depend on) runs **opengrep**
+(the LGPL Semgrep CE fork) over the PR's **changed files only**, deterministically (same code + rules ⇒
+same findings, no LLM, no tokens). It is opt-in (`sast.enabled`, default off — rollout is
+image-then-config) and best-effort (a scan failure is logged, never fatal).
 
-Pipeline:
+**It is no longer an automatic pre-agent pass (superseded, ADR-0073).** opengrep now runs *only* when the
+review agent calls the `run_sast` tool (`services/review-agent/src/tools/sast.rs`) — a built-in tool like
+any other, offered per tier via `review.<tier>.tools` (§2/§5), and only when a diff is present (nothing to
+scope a scan to otherwise). This fixes the ADR-0061 pre-pass's original cost: it ran at the start of
+*every* review runner, including a purely conversational `@mention` that never touches the diff — the
+run kind is only decided *inside* the agent loop (ADR-0033/ADR-0037), so a pre-agent scan couldn't tell a
+review from a question. The trade-off is deliberate and accepted: SAST coverage is now LLM-gated (a model
+that never calls `run_sast` gets zero deterministic coverage on that run) rather than forced — see
+ADR-0073's Consequences.
+
+Pipeline (unchanged — the tool's `call()` runs the same steps the old pre-pass did, verbatim):
 
 1. **Scope** to changed files that still exist on disk (deletions have no tree to scan), rejecting any
    absolute or `..`-escaping path (`is_safe_relative`).
@@ -180,19 +195,24 @@ Pipeline:
    excess logged, not silently dropped — [ADR-0033](adr/0033-inbound-command-parsing-and-run-kinds.md)).
    A finding that can't anchor to a `file:line` is dropped (not actionable on a PR).
 
-The findings then take two paths (`main.rs`):
+The findings then take two paths, both inside the tool's `call()`:
 
-- **Buffered** into the *same* review buffer via the mediated `add_review_comment` action
-  (`sast::buffer`) — category `security`, an attributed title (`🔍 opengrep: …`) and body
-  (rule id, a "verify before acting / suppress with `opengrep-ignore`" note, and the rule's docs link).
-  They ride the **existing review channel** — the control plane scopes/renders/posts them in the one
-  grouped review; there is **no second poster** ([ADR-0059](adr/0059-reconciler-owns-all-github-egress.md)).
-- A compact **digest** (`sast::digest`) is injected into the agent prompt so the agent is *aware* of
-  what opengrep already flagged and doesn't re-report those lines (it may deepen a lead). The digest is
-  advisory: it does **not** gate posting — SAST findings post regardless of what the agent does.
+- **Buffered** into the *same* review buffer via the mediated `add_review_comment` action (`buffer`) —
+  category `security`, an attributed title (`🔍 opengrep: …`) and body (rule id, a "verify before
+  acting / suppress with `opengrep-ignore`" note, and the rule's docs link). They ride the **existing
+  review channel** — the control plane scopes/renders/posts them in the one grouped review; there is
+  **no second poster** ([ADR-0059](adr/0059-reconciler-owns-all-github-egress.md)).
+- A compact **digest** (`digest`) is returned as the tool's **result** (no longer a static prompt block,
+  ADR-0073) so the agent is *aware* of what opengrep already flagged and doesn't re-report those lines
+  (it may deepen a lead). The digest is advisory: it does **not** gate posting — SAST findings post
+  regardless of what the agent does with the digest.
+- The findings also feed `SastAnchorGate` (#305): a shared sink the tool pushes into, so the gate can
+  reject a "false positive" verdict the agent anchors to a line opengrep did **not** flag — even when the
+  agent calls `run_sast` and mis-anchors its verdict in the same turn.
 
-SAST is buffered *before* the agent runs, so a true `(file, line)` collision lets the agent's richer
-finding win the upsert; the digest keeps such collisions rare.
+SAST is buffered the moment the tool runs (mid-loop, whenever the agent calls it) — before the tool
+result even reaches the model — so a true `(file, line)` collision lets the agent's later, richer finding
+win the upsert; the digest keeps such collisions rare.
 
 ## 5. The native agent loop
 
@@ -298,23 +318,23 @@ latency) and the model's **reasoning_content** are logged
 ### Context injected into the prompt (`build_messages`)
 
 The user message is assembled in this order (each `None` simply omits its block; all are **untrusted**
-context — the tool-protocol stays authoritative):
+context — the tool-protocol stays authoritative). The SAST digest is **not** in this list — ADR-0073 made
+it a `run_sast` tool result, not a static block:
 
 1. The maintainer's request + the changed-file list + the unified diff (capped at `max_diff_chars`).
-2. **SAST digest** (ADR-0061) — placed right after the diff because it's about the diff.
-3. **Prior review** ([ADR-0040](adr/0040-re-review-reads-prior-findings.md)) — the agent's own most
+2. **Prior review** ([ADR-0040](adr/0040-re-review-reads-prior-findings.md)) — the agent's own most
    recent review of this target, so a re-review reconciles with rather than contradicts its past output.
-4. **Repo feedback memory M1** ([ADR-0044](adr/0044-feedback-memory-m1.md)) — findings a human
+3. **Repo feedback memory M1** ([ADR-0044](adr/0044-feedback-memory-m1.md)) — findings a human
    rejected (👎) here before, so the run doesn't re-raise known false positives.
-5. **Repo-native agent instructions** ([ADR-0036](adr/0036-auto-read-agent-instruction-files.md)) — the
+4. **Repo-native agent instructions** ([ADR-0036](adr/0036-auto-read-agent-instruction-files.md)) — the
    repo's AGENTS.md/CLAUDE.md/… house rules.
 
 Prior review and repo memory are formatted control-plane-side (`format_prior_review`,
 `format_repo_memory` in `services/control-plane/src/review.rs`) and passed in via the task context.
 
-Each of these five static blocks is individually bounded on its assembly side (diff `max_diff_chars`;
-SAST `sast.max_findings` one-liners; priors `PRIOR_BLOCK_CHAR_CAP = 8k`; memory `LIMIT 30`;
-instructions `TOTAL_CAP = 32 KiB`). Those constants were tuned for ~1M-token windows, so
+Each of these four static blocks is individually bounded on its assembly side (diff `max_diff_chars`;
+priors `PRIOR_BLOCK_CHAR_CAP = 8k`; memory `LIMIT 30`; instructions `TOTAL_CAP = 32 KiB`). Those
+constants were tuned for ~1M-token windows, so
 **[ADR-0070](adr/0070-window-proportional-prompt-budgets.md)** makes them window-proportional:
 `PromptBudgets::for_review` gives each block `min(absolute ceiling, share-of-window)` (diff 25%, others
 1–2%), floored at `MIN_BLOCK_CHARS` so a shrunk block keeps its framing. With **no `context_window` set
@@ -416,7 +436,7 @@ author isn't left in silence.
 | `review.context_window` | `agent.json` | enables conversation budgeting (ADR-0045) |
 | `review.extra` | `agent.json` | passthrough params, notably the reasoning budget |
 | `review.stream` | `agent.json` / `LLM_STREAM` | SSE streaming |
-| `sast.enabled` + `sast.*` | `agent.json` | opt-in opengrep pass (ADR-0061) |
+| `sast.enabled` + `sast.*` | `agent.json` | opt-in opengrep config; also needs `run_sast` in `review.<tier>.tools` to actually be offered (ADR-0061 + ADR-0073) |
 | model + reasoning budget | ai-helm-values | **operator-tuned, churns — read live** |
 
 > Per the strict `deny_unknown_fields` file config, a deploy that touches these fields must land in the

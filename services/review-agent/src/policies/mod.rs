@@ -27,7 +27,7 @@ pub use coverage::{CoverageGate, CoverageState};
 pub use fast_tier::FastTierGuard;
 pub use finding_nudge::FindingFinishNudge;
 pub use refute::RefuteGate;
-pub use sast_anchor::{SastAnchorGate, SastLead};
+pub use sast_anchor::{SastAnchorGate, SastLead, SastLeadSink};
 pub use scratchpad::ScratchpadLoopGuard;
 
 /// Pull a string field out of a tool call's raw JSON `arguments`. `None` on malformed JSON, a missing

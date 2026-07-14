@@ -6,7 +6,7 @@ use std::time::Duration;
 use anyhow::Context;
 
 use super::finding::truncate;
-use crate::bootstrap::config::SastConfig;
+use crate::config::SastConfig;
 
 /// Whether a changed-file path is safe to hand to `checkout.join()` for scanning: relative and not
 /// climbing out of the tree with `..`. Guards the `Path::join` footgun where an absolute path silently

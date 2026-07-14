@@ -10,6 +10,7 @@
 //! miss" reason.
 
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use lci_agent_loop::{Nudge, PolicyAction, TurnOutcome, TurnPolicy, TurnState};
 use lci_agent_types::ToolOutcome;
@@ -26,8 +27,9 @@ fn str_field(value: &Value, key: &str) -> Option<String> {
 }
 
 /// One opengrep-flagged coordinate the gate anchors verdicts to. Deliberately minimal (no message/
-/// priority) — the runner maps its own `sast::SastFinding` list onto these at the call boundary, so
-/// `review-agent` stays independent of the runner's SAST module.
+/// priority) — the `run_sast` tool (`crate::tools::sast`) maps its own `lci_agent_sast::SastFinding`
+/// list onto these as it scans (ADR-0073), so this policy module stays independent of the SAST scan
+/// crate's richer finding shape.
 #[derive(Debug, Clone)]
 pub struct SastLead {
     pub file: String,
@@ -60,8 +62,20 @@ fn real_coords(file: &str, coords: &[(u32, String)]) -> String {
         .join(", ")
 }
 
+/// Shared feed the `run_sast` tool pushes newly-scanned leads into mid-loop (ADR-0073: SAST findings are
+/// only known once the agent calls the tool, not at loop-construction time like the old pre-agent pass).
+/// [`SastAnchorGate`] drains it at the top of every [`TurnPolicy::after_turn_actions`] call. A `Vec`
+/// behind a mutex, not a channel — the gate needs the FULL accumulated set each time, not just what
+/// arrived since the last drain.
+pub type SastLeadSink = Arc<Mutex<Vec<SastLead>>>;
+
 pub struct SastAnchorGate {
-    /// Normalized repo-relative file → the opengrep coordinates flagged in it.
+    /// The shared feed [`run_sast`](crate::tools::sast) pushes into as it scans.
+    sink: SastLeadSink,
+    /// How many `sink` entries are already folded into `leads` — lets [`Self::sync_leads`] pick up only
+    /// what's new since the last call instead of re-normalizing the whole sink every turn.
+    merged: usize,
+    /// Normalized repo-relative file → the opengrep coordinates flagged in it, as of the last sync.
     leads: HashMap<String, Coords>,
     /// Outstanding misanchored verdicts, keyed by the (wrong) `(file, line)` they were recorded at.
     outstanding: HashMap<(String, i64), Coords>,
@@ -71,20 +85,34 @@ pub struct SastAnchorGate {
 
 impl SastAnchorGate {
     #[must_use]
-    pub fn new(leads: impl IntoIterator<Item = SastLead>, fast: bool) -> Self {
-        let mut by_file: HashMap<String, Coords> = HashMap::new();
-        for lead in leads {
-            by_file
-                .entry(normalize_repo_path(&lead.file))
-                .or_default()
-                .push((lead.line, lead.rule_id));
-        }
+    pub fn new(sink: SastLeadSink, fast: bool) -> Self {
         Self {
-            leads: by_file,
+            sink,
+            merged: 0,
+            leads: HashMap::new(),
             outstanding: HashMap::new(),
             fast,
             bounced: false,
         }
+    }
+
+    /// Fold any leads `run_sast` pushed into the sink since the last call into `self.leads`. Called at
+    /// the top of every [`TurnPolicy::after_turn_actions`], BEFORE the fast/empty short-circuit — a
+    /// same-turn `run_sast` → `add_review_comment` sequence must still be caught, and by the time a
+    /// turn's `after_turn_actions` fires, every tool call dispatched that turn (including `run_sast`) has
+    /// already completed and pushed its leads.
+    fn sync_leads(&mut self) {
+        let sink = self
+            .sink
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for lead in &sink[self.merged..] {
+            self.leads
+                .entry(normalize_repo_path(&lead.file))
+                .or_default()
+                .push((lead.line, lead.rule_id.clone()));
+        }
+        self.merged = sink.len();
     }
 
     fn update(&mut self, outcome: &TurnOutcome) {
@@ -169,7 +197,11 @@ impl TurnPolicy for SastAnchorGate {
         _state: &TurnState<'_>,
         outcome: &TurnOutcome,
     ) -> Vec<PolicyAction> {
-        if self.fast || self.leads.is_empty() {
+        if self.fast {
+            return Vec::new();
+        }
+        self.sync_leads();
+        if self.leads.is_empty() {
             return Vec::new();
         }
         self.update(outcome);
@@ -224,6 +256,12 @@ mod tests {
         }]
     }
 
+    /// A sink pre-populated as if `run_sast` had already scanned before the gate's first turn — the
+    /// equivalent of the old pre-loop `Vec<SastLead>` constructor argument.
+    fn sink_of(leads: Vec<SastLead>) -> SastLeadSink {
+        Arc::new(Mutex::new(leads))
+    }
+
     fn finish() -> TurnOutcome {
         TurnOutcome {
             assistant: ChatMessage::user(""),
@@ -238,7 +276,7 @@ mod tests {
     // touched :216. The gate must reject the finish and name the real coordinate.
     #[test]
     fn bounces_a_false_positive_claim_anchored_to_the_wrong_line() {
-        let mut gate = SastAnchorGate::new(leads(), false);
+        let mut gate = SastAnchorGate::new(sink_of(leads()), false);
         let misanchored = TurnOutcome {
             assistant: ChatMessage::user(""),
             results: vec![call(
@@ -276,7 +314,7 @@ mod tests {
     // review).
     #[test]
     fn catches_a_false_positive_claim_recorded_only_in_evidence() {
-        let mut gate = SastAnchorGate::new(leads(), false);
+        let mut gate = SastAnchorGate::new(sink_of(leads()), false);
         let misanchored = TurnOutcome {
             assistant: ChatMessage::user(""),
             results: vec![call(
@@ -300,7 +338,7 @@ mod tests {
     // bounce — anchoring to the flagged coordinate is exactly what's required, whatever the verdict.
     #[test]
     fn allows_a_verdict_anchored_to_the_real_flagged_line() {
-        let mut gate = SastAnchorGate::new(leads(), false);
+        let mut gate = SastAnchorGate::new(sink_of(leads()), false);
         let anchored = TurnOutcome {
             assistant: ChatMessage::user(""),
             results: vec![call(
@@ -319,7 +357,7 @@ mod tests {
     // verdict must not be caught — the gate targets mislabeled triage, not every comment near a lead.
     #[test]
     fn ignores_an_unrelated_finding_in_the_same_file() {
-        let mut gate = SastAnchorGate::new(leads(), false);
+        let mut gate = SastAnchorGate::new(sink_of(leads()), false);
         let unrelated = TurnOutcome {
             assistant: ChatMessage::user(""),
             results: vec![call(
@@ -337,7 +375,7 @@ mod tests {
     // Retracting the misanchored finding clears the violation, so a later finish is not bounced for it.
     #[test]
     fn retracting_the_wrong_finding_clears_the_violation() {
-        let mut gate = SastAnchorGate::new(leads(), false);
+        let mut gate = SastAnchorGate::new(sink_of(leads()), false);
         let misanchored = TurnOutcome {
             assistant: ChatMessage::user(""),
             results: vec![call(
@@ -367,7 +405,7 @@ mod tests {
     // — disabled, matching RefuteGate/CoverageGate's fast-tier opt-out.
     #[test]
     fn disabled_in_fast_tier() {
-        let mut gate = SastAnchorGate::new(leads(), true);
+        let mut gate = SastAnchorGate::new(sink_of(leads()), true);
         let misanchored = TurnOutcome {
             assistant: ChatMessage::user(""),
             results: vec![call(
@@ -380,5 +418,53 @@ mod tests {
         };
         gate.after_turn_actions(&state(0), &misanchored);
         assert!(gate.after_turn_actions(&state(1), &finish()).is_empty());
+    }
+
+    // ADR-0073: leads are no longer known at gate-construction time — `run_sast` may not be called until
+    // mid-loop, or on the same turn as the misanchored verdict. Construct the gate with an EMPTY sink,
+    // push a lead into it from outside afterwards (simulating the tool's dispatch), and confirm the very
+    // next `after_turn_actions` call picks it up and still bounces a misanchored verdict recorded in that
+    // SAME turn — proving `sync_leads` runs before the turn's tool results are scanned, not after.
+    #[test]
+    fn picks_up_leads_pushed_into_the_sink_after_construction() {
+        let sink: SastLeadSink = Arc::new(Mutex::new(Vec::new()));
+        let mut gate = SastAnchorGate::new(Arc::clone(&sink), false);
+
+        // Turn 0: no leads yet — nothing to anchor against, so nothing is flagged.
+        let unrelated = TurnOutcome {
+            assistant: ChatMessage::user(""),
+            results: vec![],
+            finish_requested: false,
+            abort_reason: None,
+        };
+        assert!(gate.after_turn_actions(&state(0), &unrelated).is_empty());
+
+        // The tool "runs" mid-loop: it pushes its finding into the shared sink, then the SAME turn's
+        // tool results already contain a misanchored verdict (a same-turn run_sast → add_review_comment
+        // sequence).
+        sink.lock().unwrap().push(SastLead {
+            file: ".env.fullstack".into(),
+            line: 216,
+            rule_id: "generic.secrets.security.detected-generic-api-key".into(),
+        });
+        let misanchored = TurnOutcome {
+            assistant: ChatMessage::user(""),
+            results: vec![call(
+                ADD_REVIEW_COMMENT,
+                r#"{"file":".env.fullstack","line":60,"title":"False positive","body":"Not a real secret.","priority":"P2","category":"security"}"#,
+                ToolOutcome::Continue("recorded finding at .env.fullstack:60".into()),
+            )],
+            finish_requested: false,
+            abort_reason: None,
+        };
+        assert!(gate.after_turn_actions(&state(1), &misanchored).is_empty());
+
+        let actions = gate.after_turn_actions(&state(2), &finish());
+        assert!(
+            actions
+                .iter()
+                .any(|action| matches!(action, PolicyAction::RejectFinish(_))),
+            "a lead delivered after construction is still honored"
+        );
     }
 }
