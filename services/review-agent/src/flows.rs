@@ -17,8 +17,8 @@ use lci_agent_step::StepRuntime;
 use lci_agent_tools::{ToolCx, ToolRegistry, TurnFilter};
 
 use crate::policies::{
-    CoverageGate, FastTierGuard, FindingFinishNudge, RefuteGate, ScratchpadLoopGuard,
-    render_fast_refusal,
+    CoverageGate, FastTierGuard, FindingFinishNudge, RefuteGate, SastAnchorGate, SastLead,
+    ScratchpadLoopGuard, render_fast_refusal,
 };
 pub use crate::tools::EagerWorkspace;
 use crate::tools::{RETRACT_FINDING, tool_defs};
@@ -60,6 +60,10 @@ pub struct ReviewRunParams {
     pub diff_present: bool,
     /// The changed-file set the coverage gate tracks engagement against.
     pub diff_files: Vec<String>,
+    /// The opengrep coordinates the deterministic SAST pass flagged this run (ADR-0061), so
+    /// [`SastAnchorGate`] can reject a triage verdict anchored to a different line (#305). Empty when
+    /// SAST is off or found nothing.
+    pub sast_leads: Vec<SastLead>,
 }
 
 /// Build a [`Workspace`](lci_agent_tools::Workspace) over an already-materialized checkout root, for
@@ -125,7 +129,7 @@ where
 
     // Policy order is a behavioural contract (registration order = evaluation order in the engine):
     // context trim → wind-down → read budgets → turn budget → fast guard → scratchpad guard → coverage
-    // gate → refute gate → finding-finish nudge.
+    // gate → refute gate → SAST anchor gate → finding-finish nudge.
     let policies: Vec<Box<dyn TurnPolicy>> = vec![
         Box::new(ContextWindowTrim::new(params.context_window)),
         Box::new(
@@ -141,6 +145,7 @@ where
         Box::new(ScratchpadLoopGuard::new()),
         Box::new(coverage),
         Box::new(RefuteGate::new(params.fast)),
+        Box::new(SastAnchorGate::new(params.sast_leads, params.fast)),
         Box::new(FindingFinishNudge::new(params.fast)),
     ];
 
@@ -264,6 +269,7 @@ mod tests {
             } else {
                 Vec::new()
             },
+            sast_leads: Vec::new(),
         };
         run_review(
             Passthrough,

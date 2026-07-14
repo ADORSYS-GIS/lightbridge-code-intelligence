@@ -134,6 +134,7 @@ async fn drive(scenario: GoldenScenario) -> (LegacyTrace, Vec<String>) {
         } else {
             Vec::new()
         },
+        sast_leads: Vec::new(),
     };
 
     let model = ScriptedModel::new(scenario.script().turns);

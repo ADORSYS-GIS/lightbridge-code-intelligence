@@ -375,11 +375,12 @@ async fn perform_indexing(
 
 /// A deterministic opengrep pass over the PR's changed files (ADR-0061). Its findings are buffered into
 /// the SAME review buffer the agent uses (the control plane scopes + posts them in the one grouped
-/// review — no second poster), and a digest is returned to feed the agent so it doesn't re-report those
-/// lines. Opt-in (`sast_config` is `None` when disabled) and best-effort: a scan failure is logged,
-/// never fatal. Needs the diff to scope to — without one, SAST is skipped. Buffers BEFORE the agent
-/// runs, so a true (file, line) collision lets the agent's richer finding win the upsert; the digest is
-/// what keeps such collisions rare.
+/// review — no second poster), a digest is returned to feed the agent so it doesn't re-report those
+/// lines, and the findings themselves are returned so the caller can anchor the SAST triage gate
+/// (#305) to their real coordinates. Opt-in (`sast_config` is `None` when disabled) and best-effort: a
+/// scan failure is logged, never fatal. Needs the diff to scope to — without one, SAST is skipped.
+/// Buffers BEFORE the agent runs, so a true (file, line) collision lets the agent's richer finding win
+/// the upsert; the digest is what keeps such collisions rare.
 async fn run_sast_pass(
     sast_config: Option<&SastConfig>,
     diff: Option<&PrDiff>,
@@ -387,7 +388,7 @@ async fn run_sast_pass(
     client: &ControlPlaneClient,
     task_id: Uuid,
     status: Option<&StatusHandle>,
-) -> Option<String> {
+) -> (Vec<sast::SastFinding>, Option<String>) {
     let sast_findings = match (sast_config, diff) {
         (Some(cfg), Some(d)) => {
             if let Some(status) = status {
@@ -406,7 +407,8 @@ async fn run_sast_pass(
     if !sast_findings.is_empty() {
         sast::buffer(client, task_id, &sast_findings).await;
     }
-    sast::digest(&sast_findings)
+    let digest = sast::digest(&sast_findings);
+    (sast_findings, digest)
 }
 
 /// Run the review step for one task: SAST + the native agent, then finalize. Returns
@@ -440,7 +442,7 @@ async fn perform_review(
     // Scope to the PR's change set when we can compute it (best-effort; an unavailable base commit
     // just yields an unscoped run).
     let diff = clone::pr_diff(checkout, context).await;
-    let sast_digest = run_sast_pass(
+    let (sast_findings, sast_digest) = run_sast_pass(
         sast_config,
         diff.as_ref(),
         checkout,
@@ -465,6 +467,7 @@ async fn perform_review(
         context.prior_reviews.as_deref(),
         context.repo_memory.as_deref(),
         sast_digest.as_deref(),
+        &sast_findings,
         attribution,
         client,
         embedder,
