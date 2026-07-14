@@ -162,7 +162,7 @@ impl Tool for RunSastTool {
 mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
-    use std::sync::Mutex;
+    use std::sync::{LazyLock, Mutex};
 
     use lci_agent_clients::{ControlPlaneClient, EmbeddingsClient};
     use lci_agent_types::FunctionCallReq;
@@ -172,6 +172,15 @@ mod tests {
 
     use super::*;
     use crate::tools::EagerWorkspace;
+
+    /// `lci_agent_sast::process::run_opengrep` writes SARIF to a FIXED path
+    /// (`$TMPDIR/sast-run/opengrep.sarif`) — safe in production (one scan per pod, ADR-0004) but a real
+    /// race if two scans run concurrently in the same process, which `cargo test`'s default
+    /// parallel-test-function execution does. Serialize the handful of tests below that trigger a real
+    /// `sast::scan` call so they never race on that shared path (caught by CI, not locally — narrow
+    /// window, thread-count dependent).
+    static SAST_SCAN_SERIAL: LazyLock<tokio::sync::Mutex<()>> =
+        LazyLock::new(|| tokio::sync::Mutex::new(()));
 
     fn call(arguments: &str) -> ToolCallReq {
         ToolCallReq {
@@ -250,6 +259,7 @@ mod tests {
 
     #[tokio::test]
     async fn finds_a_finding_buffers_it_and_feeds_the_lead_sink() {
+        let _serial = SAST_SCAN_SERIAL.lock().await;
         let cp = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path(format!(
@@ -314,6 +324,7 @@ mod tests {
 
     #[tokio::test]
     async fn no_findings_means_no_buffered_write_and_an_empty_sink() {
+        let _serial = SAST_SCAN_SERIAL.lock().await;
         // No mocks mounted on the control plane at all — a write here would fail loudly (panic on the
         // unmatched request), proving nothing gets buffered when opengrep finds nothing.
         let cp = MockServer::start().await;
@@ -355,6 +366,7 @@ mod tests {
 
     #[tokio::test]
     async fn files_arg_scopes_the_scan_to_a_subset_of_changed_files() {
+        let _serial = SAST_SCAN_SERIAL.lock().await;
         let cp = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path(format!(
@@ -407,6 +419,7 @@ mod tests {
     // the PR's changed-file set — a model asking for a file outside the diff must not get it scanned.
     #[tokio::test]
     async fn files_arg_cannot_widen_the_scan_past_changed_files() {
+        let _serial = SAST_SCAN_SERIAL.lock().await;
         let stub_dir = tempfile::tempdir().unwrap();
         let marker = stub_dir.path().join("ran");
         let bin = write_stub_opengrep(stub_dir.path(), &marker, ONE_FINDING_SARIF);
