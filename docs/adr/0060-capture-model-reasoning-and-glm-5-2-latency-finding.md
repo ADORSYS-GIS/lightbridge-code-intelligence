@@ -70,6 +70,59 @@ Conclusions:
 > ⚠️ The 4m02s / ~0.9 tok/s default-effort row is an outlier (likely a DeepInfra cold-start / queue
 > spike at that moment), not a representative decode rate. The `low`-effort rows are the steady state.
 
+## Update (2026-07-14): raw-SSE verification of the streamed reasoning key (#247)
+
+[#237](https://github.com/vymalo/lightbridge-code-intelligence/issues/237) added
+`#[serde(default, alias = "reasoning")]` to `reasoning_content` on both the non-stream
+(`wire.rs::ResponseMessage`) and streaming (`stream.rs::StreamDelta`) DTOs, as a guess at why
+streamed GLM-5.2 turns logged `reasoning_chars: 0` while non-stream turns logged thousands. It was
+never checked against a raw SSE sample from the gateway. [#247](https://github.com/vymalo/lightbridge-code-intelligence/issues/247)
+closes that gap.
+
+**Method:** two ephemeral, short-lived diagnostic Jobs (`curlimages/curl`, deleted immediately
+after) in the `lightbridge-agents` namespace, reusing the same `lightbridge-agent-secrets`
+(`llm-base-url`/`llm-api-key`) and `lightbridge-agent-ca` the real agent-runner Jobs use — so the
+request hit the real internal gateway with the real deep-tier params (`model: glm-5p2`,
+`stream: true`, `reasoning_effort: high`), once with a plain prompt and once with a tool offered
+(mirroring a review turn's `tool_choice: "auto"`). The raw `data: {...}` bytes were captured before
+any deserialization.
+
+**Finding: the gateway streams reasoning under `reasoning_content` — never `reasoning`.** Every
+delta in both probes carried it under its primary (non-aliased) name, e.g.:
+
+```
+data: {"...,"choices":[{"index":0,"delta":{"role":"assistant","content":"","reasoning_content":"1",...
+data: {"...,"choices":[{"index":0,"delta":{"...,"reasoning_content":" me read the file","tool_calls":null},...
+data: {"...,"choices":[{"index":0,"delta":{"...,"reasoning_content":null,"tool_calls":[{"index":0,"id":"call_b63f","function":{"arguments":"{\"path\": \"src/main.rs\"}","name":"read_file"},"type":"function"}]},"finish_reason":null}],"usage":null}
+```
+
+This held for a plain text turn (315 completion tokens, real chain-of-thought streamed the whole
+way) **and** for a tool-call turn (model reasons briefly — `"Let me read the file src/main.rs to
+check for bugs."` — then emits the `read_file` call). `usage.reasoning_tokens` was `0` in both,
+confirming the ADR's existing note that this gateway folds reasoning into `completion_tokens` and
+reports the token breakdown as `0` regardless — `reasoning_content` length remains the only
+reliable signal.
+
+**Conclusion on the ticket's literal question: the `#[serde(alias = "reasoning")]` is confirmed
+harmless and correctly shaped, but was never the actual mechanism.** This gateway/model pairing has
+always emitted `reasoning_content` under its primary name; the alias is dead code for this
+provider (kept as cheap defensive coverage for a provider that does use the other name, per the
+original #237 rationale — no reason to remove it).
+
+**Open question the ticket surfaced, not resolved by this verification:** a real deep-tier review
+run captured during this investigation (task `5a82c172-…`, PR
+[#409](https://github.com/vymalo/lightbridge-code-intelligence/pull/409), image
+`sha-71261f6` — which already contains the #237 alias) logged `reasoning_chars: 0` on **all 7**
+`agent turn complete` lines, including turns that (per the probes above) should be entirely capable
+of carrying `reasoning_content`. So the original symptom the alias was meant to fix **still
+reproduces in production**, via some mechanism other than the wire field name — plausibly something
+specific to the much larger real request (a ~23k-token system prompt + diff + 20 tools, versus the
+probes' single short prompt and ≤1 tool). This is outside #247's scope (verifying the serde key) and
+is **not** root-caused here; see
+[#411](https://github.com/vymalo/lightbridge-code-intelligence/issues/411) for the follow-up
+investigation. Per this repo's refactor/investigation discipline, a new spike is filed rather than
+guessing at a fix in this same change.
+
 ## Consequences
 
 - **Good:** a run's reasoning is now legible from a pod log tail and measurable per turn; the applied
@@ -92,3 +145,5 @@ Conclusions:
 - [ADR-0051](0051-per-model-config.md) — per-model config; the `review.model` / `review.extra` levers.
 - [ADR-0054](0054-review-model-and-provider-selection.md) — model & provider selection (reopened by the finding).
 - Epic [#137](https://github.com/adorsys-gis/lightbridge-code-intelligence/issues/137) — native review agent (proof-of-work).
+- [#247](https://github.com/vymalo/lightbridge-code-intelligence/issues/247) — raw-SSE verification of the streamed reasoning key (2026-07-14 update above).
+- [#411](https://github.com/vymalo/lightbridge-code-intelligence/issues/411) — follow-up: root-cause `reasoning_chars: 0` on real deep-tier turns (opened from this update).
