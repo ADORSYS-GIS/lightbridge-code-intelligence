@@ -36,7 +36,9 @@ This RFC therefore does three things instead of proposing the boundary from scra
    write-back — none of which are "GitLab is unsupported," all of which are "here is what GitLab
    support does *not* yet do."
 3. **Gives a build/no-build call on each gap**, per the repo's stated discipline against building
-   for hypothetical future requirements.
+   for hypothetical future requirements — except the single-tenant gap, which turned out to already
+   be in flight as its own PR while this RFC was being drafted (§Gap 2); this RFC defers to that
+   work rather than re-deciding or re-reviewing it.
 
 ## Motivation
 
@@ -161,7 +163,28 @@ installation" concept; the closest analogs are:
   which projects the token's group/project membership actually grants, decided at token-creation
   time in GitLab, not in code here.
 
+Note: whatever ships from Gap 2 below (per-project tokens) narrows this gap's blast radius —
+a leaked token then compromises one project instead of every configured one — without adding the
+missing piece, minting/expiry. The two gaps are related but distinct; Gap 2's fix does not close
+Gap 1.
+
 ### Gap 2 — one GitLab tenant per control-plane deployment
+
+> **⚠️ Already in flight — out of this RFC's scope.** [PR #414](https://github.com/vymalo/lightbridge-code-intelligence/pull/414)
+> (@leghadjeu-christian, opened 2026-07-14, solving [ai-helm#653](https://github.com/ADORSYS-GIS/ai-helm/issues/653))
+> replaces the single global `GITLAB_API_TOKEN`/`GITLAB_API_URL`/`GITLAB_WEBHOOK_SECRET`/`GITLAB_BOT_HANDLE`
+> env vars with a `gitlab.projects[]` array in `control-plane.json` — a `GitlabRegistry` +
+> `GitlabPlatformRouter` give each configured GitLab project its own access token, webhook secret,
+> API URL, and bot handle, selected by the webhook payload's `project.id`. That is exactly the gap
+> described below. It was opened the same day as this RFC, independently of it — this RFC's
+> original draft called this gap "no-build until a second tenant is real"; that reasoning no longer
+> holds, because a real need was already being built. Rather than re-litigate a design already
+> under active review (gemini-code-assist, lightbridge-assistant, and the repo owner have all left
+> substantive comments on #414 — a startup-blast-radius footgun where one bad project entry takes
+> down GitHub too, a `path_with_namespace` cross-check that breaks silently on project rename, a
+> pre-auth JSON-parse surface, and a test-coverage gap on the new verification path, among others),
+> this RFC just points at it and steps back. The description below is retained as the *problem*
+> statement Gap 2 was written against; treat #414 as its answer, not this RFC.
 
 `GITLAB_API_TOKEN` and `GITLAB_API_URL` are single, global env vars. GitHub's App model lets one
 Lightbridge deployment serve arbitrarily many GitHub orgs, each with its own installation and
@@ -226,10 +249,10 @@ directly. Worth a trivial follow-up fix; not a reason to touch the trait itself.
   as the *sole* action because it would leave Gaps 1–3 undocumented anywhere reviewable, and #253's
   acceptance criteria explicitly asked for a build/no-build + phasing call, which a bare "already
   done" comment doesn't give.
-- **Build the OAuth-app / per-tenant-token routing now, speculatively.** Rejected — no second
-  GitLab tenant exists today to justify it, and it's exactly the "design for hypothetical future
-  requirements" this repo's own conventions warn against. Revisit only when a real second tenant
-  (or a real least-privilege incident) forces the question.
+- **Build the heavier OAuth-app + refresh-token flow for Gap 1, speculatively.** Still rejected —
+  no evidence a GitLab tenant needs per-project *minted, expiring* tokens rather than
+  operator-managed static ones. This is distinct from Gap 2's per-project *static*-token routing,
+  which turned out to already be needed and is answered by #414, not by this RFC.
 - **Extend `CodePlatform` with `open_pull_request` now, ahead of `open` mode shipping.** Rejected
   for the same reason: no caller exists yet (`open` mode is gated on its own security sign-off,
   RFC-0007). Building the forge method first would mean designing its contract without a real
@@ -243,10 +266,9 @@ directly. Worth a trivial follow-up fix; not a reason to touch the trait itself.
   reviews**, with the shortest expiry GitLab allows for the deployment's rotation cadence, and a
   rotation runbook — not a new minting subsystem. No ADR needed unless an operator incident makes
   the tradeoff unacceptable in practice.
-- **Gap 2 (single-tenant GitLab) — no-build until a second tenant is real.** If/when a second
-  GitLab instance or a second independently-scoped token is actually needed, that's a
-  `Platform::GitLab` → `Vec<GitlabClient>` (or a webhook-payload-derived routing key) design
-  question for its own ADR at that time, not now.
+- **Gap 2 (single-tenant GitLab) — already being built, out of scope here.** [PR #414](https://github.com/vymalo/lightbridge-code-intelligence/pull/414)
+  is the live answer; its own review thread is where design questions on it belong. This RFC takes
+  no further position on it beyond noting it closes the gap.
 - **Gap 3 (`open`-mode write-back) — deferred, tracked by ADR-0088 already.** `CodePlatform::open_pull_request`
   should be designed alongside `open` mode's own activation and security sign-off, not ahead of it.
 - **Stale doc comments in `platform.rs`/`github.rs`** — mechanical fix, not a design question;
