@@ -395,15 +395,14 @@ mod tests {
 
     #[test]
     fn telemetry_mutex_recovers_from_a_poisoned_mutex() {
-        let telemetry_handle: Arc<Mutex<Vec<TurnTelemetry>>> = Arc::new(Mutex::new(vec![
-            TurnTelemetry {
+        let telemetry_handle: Arc<Mutex<Vec<TurnTelemetry>>> =
+            Arc::new(Mutex::new(vec![TurnTelemetry {
                 model: "test-model".to_string(),
                 prompt_tokens: Some(10),
                 completion_tokens: Some(5),
                 reasoning_tokens: None,
                 reasoning: None,
-            },
-        ]));
+            }]));
 
         poison(&telemetry_handle);
 
