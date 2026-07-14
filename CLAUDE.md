@@ -25,8 +25,8 @@ This stanza is intentionally thin — read the site; do not duplicate the doctri
 clear way — even if it costs more turns, more tool calls, or a slower PR. This governs every
 trade-off below: split the god-file properly rather than patch around it; write the extra
 regression test rather than trust that a change is safe; read a bot's full comment rather than
-skim the summary. Autonomy and momentum (below) are about *not stalling on process* — they are not
-license to cut a corner on the code itself.
+skim the summary. Autonomy and momentum — the general "drive this end-to-end, don't stall on
+process" working style — are not license to cut a corner on the code itself.
 
 ### Code quality conventions (established across the 2026-07 repo-wide refactor)
 
