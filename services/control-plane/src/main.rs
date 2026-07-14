@@ -72,9 +72,6 @@ use crate::queue::{dispatcher, tasks};
 pub struct AppState {
     /// Secret used to verify GitHub webhook signatures (`X-Hub-Signature-256`).
     pub github_webhook_secret: Arc<String>,
-    /// Secret used to verify GitLab webhook tokens (`X-Gitlab-Token`). Empty when GitLab is not
-    /// configured — the unified webhook route rejects GitLab traffic in that case.
-    pub gitlab_webhook_secret: Arc<String>,
     /// In-memory delivery-id dedup set — the fallback when no database is configured (dev). With a
     /// pool, the webhook dedups on the `webhook_deliveries` PRIMARY KEY instead.
     pub seen_deliveries: Arc<Mutex<HashSet<String>>>,
@@ -88,8 +85,9 @@ pub struct AppState {
     pub allow_no_db: bool,
     /// GitHub App auth (App JWT → installation tokens). `None` when the App env is unset.
     pub github: Option<github::GithubApp>,
-    /// GitLab API client (static `PRIVATE-TOKEN`). `None` when `GITLAB_API_TOKEN` is unset.
-    pub gitlab: Option<gitlab::GitlabClient>,
+    /// File-configured GitLab projects. `None` when `gitlab.enabled` is false in
+    /// `control-plane.json`. There is intentionally no `GITLAB_*` env fallback.
+    pub gitlab: Option<gitlab::GitlabRegistry>,
     /// Platform dispatch table (ADR-0072): maps each configured `Platform` to its `CodePlatform`
     /// implementation. Built once at startup from the configured GitHub App + GitLab client; shared
     /// by the HTTP handlers (e.g. `finalize_review`) and the reconciler so both pick the right
@@ -120,10 +118,6 @@ pub struct AppState {
     /// whose body starts with `@<handle>` triggers a re-review (the first review is automatic on PR
     /// open). Default `lightbridge-assistant`.
     pub app_handle: Arc<String>,
-    /// The GitLab bot's handle (e.g. `lightbridge-bot`), from `GITLAB_BOT_HANDLE`. A MR note whose
-    /// body starts with `@<handle>` triggers a deep review. Default `lightbridge-bot`. Used only
-    /// for GitLab webhook events; GitHub events continue to use `app_handle`.
-    pub gitlab_app_handle: Arc<String>,
     /// Dotted claim path the caller's **permissions** list is read from (ADR-0023), from
     /// `PERMISSIONS_CLAIM`. Default `permissions`. Endpoints authorize on permissions, not roles.
     pub permissions_claim: Arc<String>,
@@ -154,6 +148,10 @@ impl AppState {
         let knowledge_tools = file_config
             .as_ref()
             .map(|f| f.knowledge_tools.clone())
+            .unwrap_or_default();
+        let gitlab_config = file_config
+            .as_ref()
+            .map(|f| f.gitlab.clone())
             .unwrap_or_default();
         // Egress routing (RFC-0005 Phase A / ADR-0074). Absent config → `drain` (no behavior change).
         // Built once and shared by every producer; fails loud if `restate` mode lacks an ingress URL.
@@ -198,7 +196,7 @@ impl AppState {
             }
         }
         let github = github::GithubApp::from_env();
-        let gitlab = gitlab::GitlabClient::from_env();
+        let gitlab = gitlab::GitlabRegistry::from_config(&gitlab_config)?;
         // Build the platform dispatch table (ADR-0072) once, from the configured implementations.
         // Shared by the HTTP handlers and the reconciler so both pick the right implementation per task.
         let mut platforms: std::collections::HashMap<
@@ -211,19 +209,17 @@ impl AppState {
                 Arc::new(app) as Arc<dyn integrations::platform::CodePlatform>,
             );
         }
-        if let Some(client) = gitlab.clone() {
+        if let Some(registry) = gitlab.clone() {
             platforms.insert(
                 integrations::platform::Platform::GitLab,
-                Arc::new(client) as Arc<dyn integrations::platform::CodePlatform>,
+                Arc::new(gitlab::GitlabPlatformRouter::new(registry))
+                    as Arc<dyn integrations::platform::CodePlatform>,
             );
         }
 
         Ok(Self {
             github_webhook_secret: Arc::new(
                 std::env::var("GITHUB_WEBHOOK_SECRET").unwrap_or_default(),
-            ),
-            gitlab_webhook_secret: Arc::new(
-                std::env::var("GITLAB_WEBHOOK_SECRET").unwrap_or_default(),
             ),
             seen_deliveries: Arc::new(Mutex::new(HashSet::new())),
             jwt: jwt::from_env(),
@@ -245,12 +241,6 @@ impl AppState {
                     .ok()
                     .filter(|h| !h.trim().is_empty())
                     .unwrap_or_else(|| "lightbridge-assistant".to_string()),
-            ),
-            gitlab_app_handle: Arc::new(
-                std::env::var("GITLAB_BOT_HANDLE")
-                    .ok()
-                    .filter(|h| !h.trim().is_empty())
-                    .unwrap_or_else(|| "lightbridge-bot".to_string()),
             ),
             permissions_claim: Arc::new(
                 std::env::var("PERMISSIONS_CLAIM")
@@ -472,17 +462,20 @@ async fn track_http_metrics(req: Request, next: Next) -> Response {
 }
 
 /// Readiness fails closed when required configuration is missing or a dependency is unreachable, so
-/// a misconfigured pod is not handed traffic it would only reject: no webhook secret for ANY
-/// platform, missing OIDC issuer / unreachable JWKS, or a configured-but-unreachable database.
+/// a misconfigured pod is not handed traffic it would only reject: no webhook platform configured,
+/// missing OIDC issuer / unreachable JWKS, or a configured-but-unreachable database.
 async fn readiness(State(state): State<AppState>) -> impl IntoResponse {
-    // At least one platform's webhook secret must be configured. A pod with no secret at all
-    // would accept no traffic, so it's not ready.
+    // At least one webhook platform must be configured. GitHub still uses an env secret; GitLab is
+    // configured only through `control-plane.json`.
     let github_configured = !state.github_webhook_secret.is_empty();
-    let gitlab_configured = !state.gitlab_webhook_secret.is_empty();
+    let gitlab_configured = state
+        .gitlab
+        .as_ref()
+        .is_some_and(gitlab::GitlabRegistry::is_configured);
     if !github_configured && !gitlab_configured {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
-            "no webhook secret configured (set GITHUB_WEBHOOK_SECRET or GITLAB_WEBHOOK_SECRET)",
+            "no webhook platform configured (set GITHUB_WEBHOOK_SECRET or configure gitlab.projects[] in control-plane.json)",
         );
     }
     match &state.jwt {
@@ -604,7 +597,7 @@ async fn run_reconciler(state: AppState) -> anyhow::Result<()> {
         anyhow::bail!(
             "reconciler requires at least one platform implementation \
              (set GITHUB_APP_ID + GITHUB_APP_PRIVATE_KEY for GitHub, \
-             or GITLAB_API_TOKEN + GITLAB_API_URL for GitLab)"
+             or configure gitlab.projects[] in control-plane.json for GitLab)"
         );
     }
     spawn_metrics_server(state.metrics.clone());

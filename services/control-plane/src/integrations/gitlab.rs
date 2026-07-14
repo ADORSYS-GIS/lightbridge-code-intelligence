@@ -2,14 +2,15 @@
 //!
 //! GitLab's API model differs from GitHub's in three ways that shape this file:
 //!
-//! 1. **Auth is a single static token** (`PRIVATE-TOKEN` header), not per-installation tokens.
-//!    `GITLAB_API_TOKEN` (project/group/personal access token) is all we need; there is no
-//!    installation/App-JWT dance.
+//! 1. **Auth is configured per project** (`PRIVATE-TOKEN` header), not per-installation tokens.
+//!    `control-plane.json` carries the configured GitLab projects; each project has its own access
+//!    token and webhook secret. There is intentionally no `GITLAB_*` env fallback.
 //! 2. **No "review" object** — inline comments are "discussion threads" with a `position` object
 //!    (base/head/start SHA + path + line), and the review body is a plain MR note. `post_review`
 //!    fetches the MR's `diff_refs` first, posts each inline as a discussion, then the body as a note.
-//! 3. **Webhook auth is a plain token** (`X-Gitlab-Token` header), not HMAC. `verify_webhook`
-//!    does a constant-time comparison against `GITLAB_WEBHOOK_SECRET`.
+//! 3. **Webhook auth is a plain token** (`X-Gitlab-Token` header), not HMAC. The webhook handler
+//!    reads the payload's `project.id`, resolves the configured project, then calls
+//!    `verify_webhook` on that project client.
 //!
 //! Notes on note addressing:
 //! - GitLab notes are scoped to their parent (MR or issue) — there is NO global
@@ -24,9 +25,10 @@
 use async_trait::async_trait;
 use reqwest::Client;
 
+use crate::config::GitlabSection;
 use crate::integrations::platform::*;
 
-/// GitLab API client. One static token, one base URL — no token minting.
+/// GitLab API client for one configured project token + one base URL — no token minting.
 #[derive(Clone)]
 pub struct GitlabClient {
     /// Base API URL, e.g. `https://gitlab.com/api/v4` (no trailing slash).
@@ -40,31 +42,20 @@ pub struct GitlabClient {
 }
 
 impl GitlabClient {
-    /// Construct from env. Returns `None` when `GITLAB_API_TOKEN` is unset/empty (GitLab not
-    /// configured). `GITLAB_API_URL` defaults to `https://gitlab.com/api/v4` (GitLab.com SaaS);
-    /// self-hosted instances set it to `https://<host>/api/v4`.
-    pub fn from_env() -> Option<Self> {
-        let token = std::env::var("GITLAB_API_TOKEN").unwrap_or_default();
-        if token.is_empty() {
-            return None;
-        }
-        // Fail fast if the token contains bytes that can't be a valid header value —
-        // otherwise every API call would silently go out unauthenticated (ADR-0072).
+    /// Construct from validated file configuration. Fails loud if credentials cannot be used as
+    /// HTTP headers; otherwise API calls would silently go out unauthenticated.
+    pub fn new(api_url: String, token: String, webhook_secret: String) -> anyhow::Result<Self> {
         if reqwest::header::HeaderValue::from_str(&token).is_err() {
-            tracing::error!("GITLAB_API_TOKEN contains invalid header bytes — GitLab disabled");
-            return None;
+            anyhow::bail!("GitLab access token contains invalid header bytes");
         }
-        let api_url = std::env::var("GITLAB_API_URL")
-            .unwrap_or_else(|_| "https://gitlab.com/api/v4".to_string())
-            .trim_end_matches('/')
-            .to_string();
-        let webhook_secret = std::env::var("GITLAB_WEBHOOK_SECRET").unwrap_or_default();
+        if reqwest::header::HeaderValue::from_str(&webhook_secret).is_err() {
+            anyhow::bail!("GitLab webhook secret contains invalid header bytes");
+        }
         let http = Client::builder()
             .user_agent("lightbridge-code-intelligence")
-            .build()
-            .ok()?;
-        Some(Self {
-            api_url,
+            .build()?;
+        Ok(Self {
+            api_url: api_url.trim_end_matches('/').to_string(),
             token,
             webhook_secret,
             http,
@@ -169,6 +160,219 @@ struct DiffRefs {
     head_sha: Option<String>,
     start_sha: Option<String>,
     web_url: Option<String>,
+}
+
+/// One configured GitLab project and its private API/webhook client.
+#[derive(Clone)]
+pub struct GitlabProject {
+    pub project_id: i64,
+    pub path_with_namespace: String,
+    pub bot_handle: String,
+    pub client: GitlabClient,
+}
+
+/// File-configured GitLab project registry keyed by GitLab `project.id`.
+#[derive(Clone, Default)]
+pub struct GitlabRegistry {
+    by_project_id: std::collections::HashMap<i64, GitlabProject>,
+}
+
+impl GitlabRegistry {
+    pub fn from_config(section: &GitlabSection) -> anyhow::Result<Option<Self>> {
+        section.validate()?;
+        if !section.enabled {
+            return Ok(None);
+        }
+
+        let mut by_project_id = std::collections::HashMap::new();
+        for project in &section.projects {
+            let api_url = section.resolved_api_url(project).to_string();
+            let bot_handle = section.resolved_bot_handle(project).to_string();
+            let client = GitlabClient::new(
+                api_url,
+                project.access_token.clone(),
+                project.webhook_secret.clone(),
+            )?;
+            by_project_id.insert(
+                project.project_id,
+                GitlabProject {
+                    project_id: project.project_id,
+                    path_with_namespace: project.path_with_namespace.clone(),
+                    bot_handle,
+                    client,
+                },
+            );
+        }
+
+        tracing::info!(
+            projects = by_project_id.len(),
+            "configured GitLab projects from control-plane file config"
+        );
+        Ok(Some(Self { by_project_id }))
+    }
+
+    pub fn get(&self, project_id: i64) -> Option<&GitlabProject> {
+        self.by_project_id.get(&project_id)
+    }
+
+    pub fn client_for_project(&self, project_id: i64) -> Option<&GitlabClient> {
+        self.get(project_id).map(|project| &project.client)
+    }
+
+    pub fn client_for_repo(&self, repo: &RepoRef) -> Option<&GitlabClient> {
+        self.client_for_project(repo.installation_id)
+    }
+
+    pub fn bot_handle(&self, project_id: i64) -> Option<&str> {
+        self.get(project_id)
+            .map(|project| project.bot_handle.as_str())
+    }
+
+    pub fn is_configured(&self) -> bool {
+        !self.by_project_id.is_empty()
+    }
+}
+
+/// `CodePlatform` adapter that preserves platform-level dispatch while selecting the concrete
+/// GitLab client by `RepoRef.installation_id` (`project.id` for GitLab).
+#[derive(Clone)]
+pub struct GitlabPlatformRouter {
+    registry: GitlabRegistry,
+}
+
+impl GitlabPlatformRouter {
+    pub fn new(registry: GitlabRegistry) -> Self {
+        Self { registry }
+    }
+
+    fn client<'a>(&'a self, repo: &RepoRef) -> anyhow::Result<&'a GitlabClient> {
+        self.registry.client_for_repo(repo).ok_or_else(|| {
+            anyhow::anyhow!("GitLab project {} is not configured", repo.installation_id)
+        })
+    }
+}
+
+#[async_trait]
+impl CodePlatform for GitlabPlatformRouter {
+    fn name(&self) -> &'static str {
+        "gitlab"
+    }
+
+    fn verify_webhook(&self, _headers: &axum::http::HeaderMap, _body: &[u8]) -> bool {
+        // Project-specific GitLab webhook verification needs the JSON payload's `project.id` to
+        // choose the right secret, so `http::webhook` calls the resolved project client directly.
+        false
+    }
+
+    fn delivery_id(&self, headers: &axum::http::HeaderMap) -> Option<String> {
+        headers
+            .get("x-gitlab-event-uuid")?
+            .to_str()
+            .ok()
+            .map(|s| s.to_string())
+    }
+
+    fn event_type(&self, headers: &axum::http::HeaderMap) -> Option<String> {
+        headers
+            .get("x-gitlab-event")?
+            .to_str()
+            .ok()
+            .map(|s| s.to_string())
+    }
+
+    async fn list_changed_files(
+        &self,
+        repo: &RepoRef,
+        pr_number: i64,
+    ) -> anyhow::Result<Vec<ChangedFile>> {
+        self.client(repo)?.list_changed_files(repo, pr_number).await
+    }
+
+    async fn default_branch(&self, repo: &RepoRef) -> anyhow::Result<String> {
+        self.client(repo)?.default_branch(repo).await
+    }
+
+    async fn pr_shas(
+        &self,
+        repo: &RepoRef,
+        pr_number: i64,
+    ) -> anyhow::Result<(Option<String>, Option<String>)> {
+        self.client(repo)?.pr_shas(repo, pr_number).await
+    }
+
+    async fn post_review(
+        &self,
+        repo: &RepoRef,
+        review: &ReviewPost,
+    ) -> anyhow::Result<PostedReview> {
+        self.client(repo)?.post_review(repo, review).await
+    }
+
+    async fn post_comment(
+        &self,
+        repo: &RepoRef,
+        issue_number: i64,
+        body: &str,
+        noteable_type: Option<&str>,
+    ) -> anyhow::Result<PostedComment> {
+        self.client(repo)?
+            .post_comment(repo, issue_number, body, noteable_type)
+            .await
+    }
+
+    async fn add_reaction(
+        &self,
+        repo: &RepoRef,
+        target: ReactionTarget,
+        emoji: &str,
+        noteable_type: Option<&str>,
+    ) -> anyhow::Result<()> {
+        self.client(repo)?
+            .add_reaction(repo, target, emoji, noteable_type)
+            .await
+    }
+
+    async fn add_labels(
+        &self,
+        repo: &RepoRef,
+        issue_number: i64,
+        labels: &[String],
+    ) -> anyhow::Result<()> {
+        self.client(repo)?
+            .add_labels(repo, issue_number, labels)
+            .await
+    }
+
+    async fn list_review_comments(
+        &self,
+        repo: &RepoRef,
+        pr_number: i64,
+        review_id: i64,
+    ) -> anyhow::Result<Vec<ReviewCommentRef>> {
+        self.client(repo)?
+            .list_review_comments(repo, pr_number, review_id)
+            .await
+    }
+
+    async fn list_comment_reactions(
+        &self,
+        repo: &RepoRef,
+        comment_id: i64,
+        is_review_comment: bool,
+        iid: Option<i64>,
+        noteable_type: Option<&str>,
+    ) -> anyhow::Result<Vec<Reaction>> {
+        self.client(repo)?
+            .list_comment_reactions(repo, comment_id, is_review_comment, iid, noteable_type)
+            .await
+    }
+
+    fn clone_url(&self, repo: &RepoRef) -> String {
+        self.registry
+            .client_for_repo(repo)
+            .map(|client| client.clone_url(repo))
+            .unwrap_or_default()
+    }
 }
 
 #[async_trait]
@@ -572,5 +776,67 @@ impl CodePlatform for GitlabClient {
             "https://oauth2:{}@{}/{}.git",
             self.token, host, repo.full_name
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{GitlabProjectConfig, GitlabSection};
+
+    fn project(project_id: i64, path: &str, token: &str, secret: &str) -> GitlabProjectConfig {
+        GitlabProjectConfig {
+            project_id,
+            path_with_namespace: path.to_string(),
+            api_url: None,
+            access_token: token.to_string(),
+            webhook_secret: secret.to_string(),
+            bot_handle: None,
+        }
+    }
+
+    #[test]
+    fn disabled_config_builds_no_registry() {
+        let section = GitlabSection::default();
+        let registry = GitlabRegistry::from_config(&section).expect("disabled config is valid");
+        assert!(registry.is_none());
+    }
+
+    #[test]
+    fn registry_resolves_clients_and_handles_by_project_id() {
+        let section = GitlabSection {
+            enabled: true,
+            default_api_url: Some("https://gitlab.example.com/api/v4".to_string()),
+            default_bot_handle: Some("lightbridge-bot".to_string()),
+            projects: vec![
+                project(1001, "group/service-a", "token-a", "secret-a"),
+                GitlabProjectConfig {
+                    bot_handle: Some("lb-reviewer".to_string()),
+                    ..project(1002, "group/service-b", "token-b", "secret-b")
+                },
+            ],
+        };
+        let registry = GitlabRegistry::from_config(&section)
+            .expect("valid config builds")
+            .expect("enabled config produces registry");
+
+        assert!(registry.is_configured());
+        assert_eq!(registry.bot_handle(1001), Some("lightbridge-bot"));
+        assert_eq!(registry.bot_handle(1002), Some("lb-reviewer"));
+        assert!(registry.client_for_project(1001).is_some());
+        assert!(registry.client_for_project(9999).is_none());
+
+        let repo = RepoRef {
+            platform: Platform::GitLab,
+            full_name: "group/service-b".to_string(),
+            platform_repo_id: 1002,
+            installation_id: 1002,
+        };
+        let clone_url = registry
+            .client_for_repo(&repo)
+            .expect("repo resolves through installation_id")
+            .clone_url(&repo);
+        assert!(clone_url.contains("oauth2:token-b@"));
+        assert!(clone_url.ends_with("/group/service-b.git"));
     }
 }
