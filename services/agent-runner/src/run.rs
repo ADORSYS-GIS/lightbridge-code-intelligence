@@ -13,13 +13,17 @@
 //! "index"` check, so the deployed path — which passes no flag — is unchanged. Everything else
 //! (checkout, indexing, the native review loop, status reporting, self-cancel poll) is verbatim.
 
+use std::path::Path;
+
+use uuid::Uuid;
+
 use crate::bootstrap::config::{
     EmbeddingsConfig, ReviewConfig, ReviewConfigs, RunnerConfig, SastConfig,
 };
-use crate::clone;
+use crate::clone::{self, PrDiff};
 use crate::plane::Mode;
 use crate::{indexer, review, sast};
-use lci_agent_clients::{ControlPlaneClient, EmbeddingsClient};
+use lci_agent_clients::{ControlPlaneClient, EmbeddingsClient, TaskContext};
 use lci_agent_status::{Phase, StatusHandle, StatusServerConfig};
 
 /// Do exactly one task and exit — the `run-once` host (ADR-0085).
@@ -210,22 +214,7 @@ async fn run(
     // re-affirms it from the pod and is a no-op if already set).
     report(client, config, "running", None).await;
 
-    // Live per-review status projection (RFC-0007 slice 5, ADR-0085): flag-gated, default OFF. When
-    // `LCI_STATUS_API` is set, the run-once host runs a tiny read-only HTTP server alongside the loop
-    // exposing live progress (turn, current tool name, findings so far, tokens, phase, elapsed).
-    // Unset ⇒ no handle, no sink wrapping, no server — byte-identical to today's path (prod-neutral,
-    // dormant). The status mechanism is host-agnostic; the `serve` HOST topology stays gated on the
-    // measurement in #358.
-    let status_config = StatusServerConfig::from_env(&config.runner_token);
-    let status = status_config
-        .as_ref()
-        .map(|_| StatusHandle::new(config.task_id));
-    // Detached: the server runs until the process exits (the run-once model). Dropping the returned
-    // JoinHandle does not abort the task.
-    let _status_server = match (status.clone(), status_config) {
-        (Some(handle), Some(config)) => Some(lci_agent_status::spawn(handle, config)),
-        _ => None,
-    };
+    let (status, _status_server) = start_status_server(config);
 
     let context = client.get_context(config.task_id).await?;
     tracing::info!(
@@ -273,37 +262,15 @@ async fn run(
 
     let checkout = clone::checkout(&context, &config.workdir).await?;
 
-    // Index when this is an `index` task (mode), or a cold repo with no base index yet. A review on an
-    // already-indexed repo REUSES the base index (it searches related code via the MCP tools and has
-    // the PR diff in its prompt), so we skip the costly full re-index — that re-index was why a review
-    // took roughly as long as an index every time (ADR-0025).
-    let needs_index = is_index || !context.repo_indexed;
-    let (chunk_count, graph_summary) = if needs_index {
-        if let Some(status) = &status {
-            status.set_phase(Phase::Indexing);
-        }
-        // ── Semantic index: tree-sitter → pgvector (epic #5, slice 2) ────────────────────────
-        let chunks = indexer::index_checkout(&context, &checkout, client, &embedder).await?;
-        // ── Structural index: in-house lci-codegraph → Neo4j (epic #5, slice 3, ADR-0086) ─────
-        // The structural graph is built in-process by the `lci-codegraph` crate (tree-sitter); it
-        // replaced the retired Python Graphify CLI (ADR-0019) — no flag, no fallback.
-        // Best-effort: the semantic index already landed, and the graph store may be unconfigured
-        // (control plane returns 503). A graph failure is logged, not fatal — the task still succeeds.
-        let graph_result = indexer::graph::index_graph(&context, &checkout, client).await;
-        let graph = match graph_result {
-            Ok((nodes, edges)) => format!("{nodes} nodes / {edges} edges"),
-            Err(error) => {
-                tracing::warn!(%error, "structural graph indexing failed (non-fatal)");
-                "graph skipped".to_string()
-            }
-        };
-        (chunks, graph)
-    } else {
-        tracing::info!(
-            "repo already indexed — reusing the base index (skipping re-index for review)"
-        );
-        (0, "reused base index".to_string())
-    };
+    let (chunk_count, graph_summary) = perform_indexing(
+        is_index,
+        &context,
+        &checkout,
+        client,
+        &embedder,
+        status.as_ref(),
+    )
+    .await?;
 
     // ── Review: the native agent acts via mediated write tools (default, ADR-0026/0037), then the
     // control plane flushes the buffered findings/replies as one grouped review on finalize.
@@ -311,161 +278,19 @@ async fn run(
     // Runs only when the LLM is configured; non-fatal (indexing already landed). A standalone `index`
     // task (target_type `repository`, Epic #75) has no PR, so skip review regardless of LLM config.
     // Tracks an optional review-failure/exhaustion/abort detail to attach to the FINAL status (#137).
-    let mut review_detail: Option<String> = None;
-    // Two-tier review (ADR-0062): pick the per-tier config by the task's tier (`fast` → single diff-only
-    // turn, no retrieval; `deep` → full run). An `index` task runs no review. The selected fast config
-    // already carries the structural `fast` flag (set in `resolve_tiers`).
-    let selected_review = (!is_index)
-        .then(|| review_configs.for_tier(&context.tier))
-        .flatten();
-    let review_summary = match selected_review {
-        Some(review) => {
-            // Scope to the PR's change set when we can compute it (best-effort; an unavailable base
-            // commit just yields an unscoped run).
-            let diff = clone::pr_diff(&checkout, &context).await;
-            // ── SAST (ADR-0061): a deterministic opengrep pass over the PR's changed files. Its findings
-            // are buffered into the SAME review buffer (the control plane scopes + posts them in the one
-            // grouped review — no second poster), and a digest is fed to the agent so it doesn't
-            // re-report those lines. Opt-in (sast_config is None when disabled) and best-effort: a scan
-            // failure is logged, never fatal. Needs the diff to scope to — without it, SAST is skipped.
-            let sast_findings = match (sast_config, diff.as_ref()) {
-                (Some(cfg), Some(d)) => {
-                    if let Some(status) = &status {
-                        status.set_phase(Phase::Sast);
-                    }
-                    match sast::scan(cfg, &checkout, &d.files).await {
-                        Ok(findings) => findings,
-                        Err(error) => {
-                            tracing::warn!(%error, "sast: opengrep scan failed (non-fatal)");
-                            Vec::new()
-                        }
-                    }
-                }
-                _ => Vec::new(),
-            };
-            // Buffer before the agent runs so a true (file, line) collision lets the agent's richer
-            // finding win the upsert; the digest is what keeps such collisions rare (ADR-0061).
-            if !sast_findings.is_empty() {
-                sast::buffer(client, config.task_id, &sast_findings).await;
-            }
-            let sast_digest = sast::digest(&sast_findings);
-            // Repo-native agent instructions (ADR-0036): read the repo's AGENTS.md/CLAUDE.md/… and
-            // fold them into the prompt as untrusted context so the review respects house rules.
-            let repo_instructions = review::instructions::read_agent_instructions(&checkout).await;
-            let mut transcript = Vec::new();
-            if let Some(status) = &status {
-                status.set_phase(Phase::Reviewing);
-            }
-            let outcome = review::run_native_agent(
-                review,
-                &context.command,
-                diff.as_ref(),
-                repo_instructions.as_deref(),
-                context.prior_reviews.as_deref(),
-                context.repo_memory.as_deref(),
-                sast_digest.as_deref(),
-                &attribution,
-                client,
-                &embedder,
-                config.task_id,
-                &checkout,
-                &mut transcript,
-                status.as_ref(),
-            )
-            .await;
-            if let Some(status) = &status {
-                status.set_phase(Phase::Finalizing);
-            }
-            // Submit the transcript regardless of outcome (ADR-0034) — a failed run's reasoning is the
-            // most useful to inspect. Best-effort: never let it change the task result.
-            if !transcript.is_empty()
-                && let Err(error) = client.submit_transcript(config.task_id, &transcript).await
-            {
-                tracing::warn!(%error, "submitting transcript failed (non-fatal)");
-            }
-            // Net invariant (#137): every review run leaves a VISIBLE artifact unless the gateway was
-            // unreachable. We finalize on Finished AND Exhausted AND Aborted — finalize flushes the
-            // buffered findings, and its empty-run backstop posts a clean "no issues" review for a PR
-            // when the buffer is empty. The old code bailed on exhaustion and dropped the buffer; a real
-            // prod run lost 5 findings that way at turn 16. Only a true transport `Err` posts nothing.
-            //
-            // Finalize failure IS fatal (unlike the rest of review, which is best-effort): the review is
-            // ready and the failure is almost always transient (GitHub/network), so the task fails +
-            // retries rather than being silently marked succeeded with nothing posted. A retry re-runs
-            // the agent from a cleared buffer; the single-artifact case re-posts cleanly, the rare mixed
-            // reply+review case may duplicate the part that posted — proper fix is GitHub-side idempotency
-            // via posted IDs (ADR-0035).
-            match outcome {
-                Ok(review::ReviewOutcome::Finished) => {
-                    // "finished" is the only outcome the control plane may treat as a provably clean
-                    // pass (ADR-0068: zero findings → suppress the post, 👍 only).
-                    client.finalize_review(config.task_id, "finished").await?;
-                    "review posted".to_string()
-                }
-                Ok(review::ReviewOutcome::Exhausted) => {
-                    if review.fast {
-                        // FAST tier (ADR-0062): a fast run that ends without `finish` is normal, not "out
-                        // of budget." The quick-pass framing — the 🅵 banner + the "mention @handle for a
-                        // deeper review" pointer — is rendered CONTROL-PLANE-SIDE at finalize, where the
-                        // real GitHub App handle lives (the runner doesn't have it, and hardcoded the wrong
-                        // `@lightbridge` before). So DON'T set a summary here: an exhausted fast pass just
-                        // finalizes, and finalize composes the fast body from the task tier + whatever the
-                        // run buffered (inline findings still post). A finished fast run is the same — its
-                        // `finish` verdict becomes the summary the fast body wraps. The outcome is still
-                        // "exhausted" — honest — so a zero-findings exhausted fast pass POSTS its banner
-                        // review rather than 👍-ing an incomplete pass as clean (ADR-0068).
-                        client.finalize_review(config.task_id, "exhausted").await?;
-                        review_detail =
-                            Some("fast pass exhausted; framed control-plane-side".to_string());
-                        "review posted (fast pass)".to_string()
-                    } else {
-                        // DEEP tier: the honest truncation note with its real budget.
-                        let note = format!(
-                            "⚠️ Review hit its step budget ({} turns) — posting the findings gathered so \
-                             far; some areas may be unreviewed.",
-                            review.max_turns
-                        );
-                        if let Err(error) = client.set_review_summary(config.task_id, &note).await {
-                            tracing::warn!(%error, "setting truncation summary failed (non-fatal)");
-                        }
-                        client.finalize_review(config.task_id, "exhausted").await?;
-                        review_detail = Some(note);
-                        "review posted (truncated at step budget)".to_string()
-                    }
-                }
-                Ok(review::ReviewOutcome::Aborted(reason)) => {
-                    // The model couldn't complete the review. An aborted run is incomplete and
-                    // unverified — its buffered findings never went through the refute pass — so clear
-                    // them first and post ONLY the honest note, never half-baked/placeholder findings
-                    // (a `placeholder` P1 reached a PR this way — run 7c15f9bb). Best-effort clear.
-                    let note = format!("Couldn't complete this review: {reason}");
-                    if let Err(error) = client.clear_findings(config.task_id).await {
-                        tracing::warn!(%error, "clearing findings on abort failed (non-fatal)");
-                    }
-                    if let Err(error) = client.set_review_summary(config.task_id, &note).await {
-                        tracing::warn!(%error, "setting abort summary failed (non-fatal)");
-                    }
-                    // "aborted" makes the control plane POST the note (never a silent misleading 👍)
-                    // and react 😕 (ADR-0068).
-                    client.finalize_review(config.task_id, "aborted").await?;
-                    review_detail = Some(note);
-                    "review aborted (note posted)".to_string()
-                }
-                Err(error) => {
-                    // A true transport/chat failure — the gateway was unreachable and nothing useful
-                    // happened. Stays non-fatal (indexing already landed; nothing is posted), but carry
-                    // the reason to the FINAL terminal status (#137) rather than a mid-run `running`
-                    // report — the control plane clears `error_detail` on every `running` transition, so
-                    // a detail reported there would be erased before a human or retry could see it.
-                    let detail = format!("review run failed: {error:#}");
-                    tracing::warn!(%detail, "review run failed (non-fatal; nothing posted)");
-                    review_detail = Some(detail);
-                    "review failed".to_string()
-                }
-            }
-        }
-        None => "review disabled".to_string(),
-    };
+    let (review_summary, review_detail) = perform_review(
+        is_index,
+        review_configs,
+        sast_config,
+        &context,
+        &checkout,
+        client,
+        &embedder,
+        &attribution,
+        config.task_id,
+        status.as_ref(),
+    )
+    .await?;
 
     if let Some(status) = &status {
         status.set_phase(Phase::Done);
@@ -482,6 +307,273 @@ async fn run(
                 .unwrap_or(&context.default_branch),
         ),
         review_detail,
+    })
+}
+
+/// Live per-review status projection (RFC-0007 slice 5, ADR-0085): flag-gated, default OFF. When
+/// `LCI_STATUS_API` is set, the run-once host runs a tiny read-only HTTP server alongside the loop
+/// exposing live progress (turn, current tool name, findings so far, tokens, phase, elapsed). Unset ⇒
+/// no handle, no sink wrapping, no server — byte-identical to today's path (prod-neutral, dormant). The
+/// status mechanism is host-agnostic; the `serve` HOST topology stays gated on the measurement in #358.
+///
+/// The server is detached: it runs until the process exits (the run-once model). Dropping the returned
+/// `JoinHandle` does not abort the task, but the caller keeps it alive for the duration of `run()`
+/// anyway (today's exact behaviour).
+fn start_status_server(
+    config: &RunnerConfig,
+) -> (Option<StatusHandle>, Option<tokio::task::JoinHandle<()>>) {
+    let status_config = StatusServerConfig::from_env(&config.runner_token);
+    let status = status_config
+        .as_ref()
+        .map(|_| StatusHandle::new(config.task_id));
+    let server = match (status.clone(), status_config) {
+        (Some(handle), Some(config)) => Some(lci_agent_status::spawn(handle, config)),
+        _ => None,
+    };
+    (status, server)
+}
+
+/// Index when this is an `index` task (mode), or a cold repo with no base index yet. A review on an
+/// already-indexed repo REUSES the base index (it searches related code via the MCP tools and has the
+/// PR diff in its prompt), so we skip the costly full re-index — that re-index was why a review took
+/// roughly as long as an index every time (ADR-0025). Returns `(chunk_count, graph_summary)`.
+async fn perform_indexing(
+    is_index: bool,
+    context: &TaskContext,
+    checkout: &Path,
+    client: &ControlPlaneClient,
+    embedder: &EmbeddingsClient,
+    status: Option<&StatusHandle>,
+) -> anyhow::Result<(usize, String)> {
+    let needs_index = is_index || !context.repo_indexed;
+    if !needs_index {
+        tracing::info!(
+            "repo already indexed — reusing the base index (skipping re-index for review)"
+        );
+        return Ok((0, "reused base index".to_string()));
+    }
+    if let Some(status) = status {
+        status.set_phase(Phase::Indexing);
+    }
+    // ── Semantic index: tree-sitter → pgvector (epic #5, slice 2) ────────────────────────
+    let chunks = indexer::index_checkout(context, checkout, client, embedder).await?;
+    // ── Structural index: in-house lci-codegraph → Neo4j (epic #5, slice 3, ADR-0086) ─────
+    // The structural graph is built in-process by the `lci-codegraph` crate (tree-sitter); it
+    // replaced the retired Python Graphify CLI (ADR-0019) — no flag, no fallback.
+    // Best-effort: the semantic index already landed, and the graph store may be unconfigured
+    // (control plane returns 503). A graph failure is logged, not fatal — the task still succeeds.
+    let graph_result = indexer::graph::index_graph(context, checkout, client).await;
+    let graph = match graph_result {
+        Ok((nodes, edges)) => format!("{nodes} nodes / {edges} edges"),
+        Err(error) => {
+            tracing::warn!(%error, "structural graph indexing failed (non-fatal)");
+            "graph skipped".to_string()
+        }
+    };
+    Ok((chunks, graph))
+}
+
+/// A deterministic opengrep pass over the PR's changed files (ADR-0061). Its findings are buffered into
+/// the SAME review buffer the agent uses (the control plane scopes + posts them in the one grouped
+/// review — no second poster), and a digest is returned to feed the agent so it doesn't re-report those
+/// lines. Opt-in (`sast_config` is `None` when disabled) and best-effort: a scan failure is logged,
+/// never fatal. Needs the diff to scope to — without one, SAST is skipped. Buffers BEFORE the agent
+/// runs, so a true (file, line) collision lets the agent's richer finding win the upsert; the digest is
+/// what keeps such collisions rare.
+async fn run_sast_pass(
+    sast_config: Option<&SastConfig>,
+    diff: Option<&PrDiff>,
+    checkout: &Path,
+    client: &ControlPlaneClient,
+    task_id: Uuid,
+    status: Option<&StatusHandle>,
+) -> Option<String> {
+    let sast_findings = match (sast_config, diff) {
+        (Some(cfg), Some(d)) => {
+            if let Some(status) = status {
+                status.set_phase(Phase::Sast);
+            }
+            match sast::scan(cfg, checkout, &d.files).await {
+                Ok(findings) => findings,
+                Err(error) => {
+                    tracing::warn!(%error, "sast: opengrep scan failed (non-fatal)");
+                    Vec::new()
+                }
+            }
+        }
+        _ => Vec::new(),
+    };
+    if !sast_findings.is_empty() {
+        sast::buffer(client, task_id, &sast_findings).await;
+    }
+    sast::digest(&sast_findings)
+}
+
+/// Run the review step for one task: SAST + the native agent, then finalize. Returns
+/// `(review_summary, review_detail)` — the summary always folds into the top-level task summary; the
+/// detail (when `Some`) is the review-failure/exhaustion/abort reason attached to the FINAL terminal
+/// status (#137). `Ok(("review disabled", None))` when this is an `index` task or the task's tier has
+/// no review model configured (a standalone `index` task — target_type `repository`, Epic #75 — has no
+/// PR, so it skips review regardless of LLM config). Two-tier review (ADR-0062): the per-tier config is
+/// picked by the task's tier (`fast` → single diff-only turn, no retrieval; `deep` → full run); the
+/// selected fast config already carries the structural `fast` flag (set in `resolve_tiers`).
+#[allow(clippy::too_many_arguments)]
+async fn perform_review(
+    is_index: bool,
+    review_configs: &ReviewConfigs,
+    sast_config: Option<&SastConfig>,
+    context: &TaskContext,
+    checkout: &Path,
+    client: &ControlPlaneClient,
+    embedder: &EmbeddingsClient,
+    attribution: &[(String, String)],
+    task_id: Uuid,
+    status: Option<&StatusHandle>,
+) -> anyhow::Result<(String, Option<String>)> {
+    let Some(review) = (!is_index)
+        .then(|| review_configs.for_tier(&context.tier))
+        .flatten()
+    else {
+        return Ok(("review disabled".to_string(), None));
+    };
+
+    // Scope to the PR's change set when we can compute it (best-effort; an unavailable base commit
+    // just yields an unscoped run).
+    let diff = clone::pr_diff(checkout, context).await;
+    let sast_digest = run_sast_pass(
+        sast_config,
+        diff.as_ref(),
+        checkout,
+        client,
+        task_id,
+        status,
+    )
+    .await;
+
+    // Repo-native agent instructions (ADR-0036): read the repo's AGENTS.md/CLAUDE.md/… and fold them
+    // into the prompt as untrusted context so the review respects house rules.
+    let repo_instructions = review::instructions::read_agent_instructions(checkout).await;
+    let mut transcript = Vec::new();
+    if let Some(status) = status {
+        status.set_phase(Phase::Reviewing);
+    }
+    let outcome = review::run_native_agent(
+        review,
+        &context.command,
+        diff.as_ref(),
+        repo_instructions.as_deref(),
+        context.prior_reviews.as_deref(),
+        context.repo_memory.as_deref(),
+        sast_digest.as_deref(),
+        attribution,
+        client,
+        embedder,
+        task_id,
+        checkout,
+        &mut transcript,
+        status,
+    )
+    .await;
+    if let Some(status) = status {
+        status.set_phase(Phase::Finalizing);
+    }
+    // Submit the transcript regardless of outcome (ADR-0034) — a failed run's reasoning is the most
+    // useful to inspect. Best-effort: never let it change the task result.
+    if !transcript.is_empty()
+        && let Err(error) = client.submit_transcript(task_id, &transcript).await
+    {
+        tracing::warn!(%error, "submitting transcript failed (non-fatal)");
+    }
+
+    finalize_review_outcome(outcome, review, client, task_id).await
+}
+
+/// Map a finished agent run onto a visible PR artifact and the top-level summary/detail (#137). Net
+/// invariant: every review run leaves a VISIBLE artifact unless the gateway was unreachable. We
+/// finalize on Finished AND Exhausted AND Aborted — finalize flushes the buffered findings, and its
+/// empty-run backstop posts a clean "no issues" review for a PR when the buffer is empty. The old code
+/// bailed on exhaustion and dropped the buffer; a real prod run lost 5 findings that way at turn 16.
+/// Only a true transport `Err` posts nothing.
+///
+/// Finalize failure IS fatal (unlike the rest of review, which is best-effort): the review is ready and
+/// the failure is almost always transient (GitHub/network), so the task fails + retries rather than
+/// being silently marked succeeded with nothing posted. A retry re-runs the agent from a cleared
+/// buffer; the single-artifact case re-posts cleanly, the rare mixed reply+review case may duplicate
+/// the part that posted — proper fix is GitHub-side idempotency via posted IDs (ADR-0035).
+async fn finalize_review_outcome(
+    outcome: anyhow::Result<review::ReviewOutcome>,
+    review: &ReviewConfig,
+    client: &ControlPlaneClient,
+    task_id: Uuid,
+) -> anyhow::Result<(String, Option<String>)> {
+    Ok(match outcome {
+        Ok(review::ReviewOutcome::Finished) => {
+            // "finished" is the only outcome the control plane may treat as a provably clean pass
+            // (ADR-0068: zero findings → suppress the post, 👍 only).
+            client.finalize_review(task_id, "finished").await?;
+            ("review posted".to_string(), None)
+        }
+        Ok(review::ReviewOutcome::Exhausted) => {
+            if review.fast {
+                // FAST tier (ADR-0062): a fast run that ends without `finish` is normal, not "out of
+                // budget." The quick-pass framing — the 🅵 banner + the "mention @handle for a deeper
+                // review" pointer — is rendered CONTROL-PLANE-SIDE at finalize, where the real GitHub
+                // App handle lives (the runner doesn't have it, and hardcoded the wrong `@lightbridge`
+                // before). So DON'T set a summary here: an exhausted fast pass just finalizes, and
+                // finalize composes the fast body from the task tier + whatever the run buffered
+                // (inline findings still post). A finished fast run is the same — its `finish` verdict
+                // becomes the summary the fast body wraps. The outcome is still "exhausted" — honest —
+                // so a zero-findings exhausted fast pass POSTS its banner review rather than 👍-ing an
+                // incomplete pass as clean (ADR-0068).
+                client.finalize_review(task_id, "exhausted").await?;
+                (
+                    "review posted (fast pass)".to_string(),
+                    Some("fast pass exhausted; framed control-plane-side".to_string()),
+                )
+            } else {
+                // DEEP tier: the honest truncation note with its real budget.
+                let note = format!(
+                    "⚠️ Review hit its step budget ({} turns) — posting the findings gathered so \
+                     far; some areas may be unreviewed.",
+                    review.max_turns
+                );
+                if let Err(error) = client.set_review_summary(task_id, &note).await {
+                    tracing::warn!(%error, "setting truncation summary failed (non-fatal)");
+                }
+                client.finalize_review(task_id, "exhausted").await?;
+                (
+                    "review posted (truncated at step budget)".to_string(),
+                    Some(note),
+                )
+            }
+        }
+        Ok(review::ReviewOutcome::Aborted(reason)) => {
+            // The model couldn't complete the review. An aborted run is incomplete and unverified —
+            // its buffered findings never went through the refute pass — so clear them first and post
+            // ONLY the honest note, never half-baked/placeholder findings (a `placeholder` P1 reached a
+            // PR this way — run 7c15f9bb). Best-effort clear.
+            let note = format!("Couldn't complete this review: {reason}");
+            if let Err(error) = client.clear_findings(task_id).await {
+                tracing::warn!(%error, "clearing findings on abort failed (non-fatal)");
+            }
+            if let Err(error) = client.set_review_summary(task_id, &note).await {
+                tracing::warn!(%error, "setting abort summary failed (non-fatal)");
+            }
+            // "aborted" makes the control plane POST the note (never a silent misleading 👍) and react
+            // 😕 (ADR-0068).
+            client.finalize_review(task_id, "aborted").await?;
+            ("review aborted (note posted)".to_string(), Some(note))
+        }
+        Err(error) => {
+            // A true transport/chat failure — the gateway was unreachable and nothing useful happened.
+            // Stays non-fatal (indexing already landed; nothing is posted), but carry the reason to the
+            // FINAL terminal status (#137) rather than a mid-run `running` report — the control plane
+            // clears `error_detail` on every `running` transition, so a detail reported there would be
+            // erased before a human or retry could see it.
+            let detail = format!("review run failed: {error:#}");
+            tracing::warn!(%detail, "review run failed (non-fatal; nothing posted)");
+            ("review failed".to_string(), Some(detail))
+        }
     })
 }
 
