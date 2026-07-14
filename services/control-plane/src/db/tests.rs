@@ -2,7 +2,7 @@ use super::*;
 use serde_json::json;
 // The REAL journaled step-result types (ADR-0087) — used by the durable_step round-trip so the
 // test proves `from_value::<T>` rehydration through jsonb, not a hand-authored Value.
-use lci_agent_types::{AssistantTurn, FunctionCallReq, ToolCallReq, ToolOutcome};
+use lci_agent_types::{AssistantTurn, FunctionCallReq, ToolCallReq, ToolOutcome, TurnTelemetry};
 
 // Integration tests: `#[sqlx::test]` provisions a fresh database, runs the migrations, and hands
 // us a pool. Requires a reachable Postgres via `DATABASE_URL` (see `compose.yaml`); skipped when
@@ -2570,7 +2570,9 @@ async fn has_active_index_task_gates_a_repo_mid_index(pool: PgPool) {
 /// A realistic `AssistantTurn` (an `llm_turn:{n}` step result) built from the REAL loop type, so
 /// the round-trip is asserted against exactly what the loop serializes — including the serde
 /// contract the loop relies on: `ToolCallReq.kind` renames to `"type"` and `extra_content: None`
-/// is skipped. A hand-authored `Value` would silently drift from this.
+/// is skipped. A hand-authored `Value` would silently drift from this. Carries `telemetry` too
+/// (#411/#417): that's the field this journal round-trip must preserve so a resumed turn's
+/// reasoning/token counts survive replay instead of silently reading back as `reasoning_chars: 0`.
 fn assistant_turn_result() -> AssistantTurn {
     AssistantTurn {
         content: Some("Looking at the diff now.".into()),
@@ -2583,6 +2585,13 @@ fn assistant_turn_result() -> AssistantTurn {
             },
             extra_content: None,
         }],
+        telemetry: Some(TurnTelemetry {
+            model: "glm-5p2".into(),
+            prompt_tokens: Some(20_775),
+            completion_tokens: Some(370),
+            reasoning_tokens: Some(0),
+            reasoning: Some("Let me look at the diff before deciding.".into()),
+        }),
     }
 }
 

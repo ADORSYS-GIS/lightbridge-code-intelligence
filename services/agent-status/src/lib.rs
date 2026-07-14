@@ -260,7 +260,9 @@ mod tests {
                 message: ChatMessage::assistant(lci_agent_types::AssistantTurn {
                     content: None,
                     tool_calls: Vec::new(),
+                    ..Default::default()
                 }),
+                telemetry: None,
             },
             &tools,
         );

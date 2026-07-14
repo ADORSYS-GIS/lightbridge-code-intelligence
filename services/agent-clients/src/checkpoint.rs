@@ -266,7 +266,7 @@ mod tests {
 
     use lci_agent_loop::{
         AgentLoop, ChatMessage, Conversation, LoopLimits, LoopOutcome, RequestOptions,
-        TranscriptSink,
+        TranscriptEvent, TranscriptSink,
     };
     use lci_agent_testkit::{CapturingSink, ScriptedModel, StaticTool};
     use lci_agent_tools::{
@@ -274,7 +274,8 @@ mod tests {
         WorkspaceError,
     };
     use lci_agent_types::{
-        AssistantTurn, FunctionCallReq, StepError, ToolCallReq, ToolOutcome, ToolSpec, step_names,
+        AssistantTurn, FunctionCallReq, StepError, ToolCallReq, ToolOutcome, ToolSpec,
+        TurnTelemetry, step_names,
     };
 
     struct TmpWorkspace(std::path::PathBuf);
@@ -296,6 +297,7 @@ mod tests {
                 },
                 extra_content: None,
             }],
+            ..Default::default()
         }
     }
 
@@ -311,7 +313,36 @@ mod tests {
                 },
                 extra_content: None,
             }],
+            ..Default::default()
         }
+    }
+
+    /// Like [`read_turn`] but with telemetry attached — the shape a real `ChatClient` reply carries
+    /// (#411/#417): reasoning text + token counts riding the turn itself, not a side-channel.
+    fn read_turn_with_telemetry(reasoning: &str) -> AssistantTurn {
+        AssistantTurn {
+            telemetry: Some(TurnTelemetry {
+                model: "m".into(),
+                prompt_tokens: Some(100),
+                completion_tokens: Some(20),
+                reasoning_tokens: Some(15),
+                reasoning: Some(reasoning.into()),
+            }),
+            ..read_turn()
+        }
+    }
+
+    /// The `telemetry` recorded on the Nth `TranscriptEvent::Assistant` among `events` (turn index,
+    /// not vec position — a run can also record `Tool`/`Policy` events between assistant turns).
+    fn assistant_telemetry(events: &[TranscriptEvent], turn: usize) -> Option<&TurnTelemetry> {
+        events.iter().find_map(|event| match event {
+            TranscriptEvent::Assistant {
+                turn: t,
+                telemetry,
+                ..
+            } if *t == turn => telemetry.as_ref(),
+            _ => None,
+        })
     }
 
     /// A read-only `read_file` + a terminal `finish`, registered under replay-capable caps (which is
@@ -366,18 +397,23 @@ mod tests {
         }
     }
 
+    /// Drive the loop under `CheckpointRuntime`, returning both the outcome and every recorded
+    /// transcript event — so a caller can inspect what a replayed turn actually carried (e.g. its
+    /// `telemetry`), not just that the run finished.
     async fn drive(
         store: Arc<InMemoryStepStore>,
         model: ScriptedModel,
         max_turns: usize,
-    ) -> LoopOutcome {
+    ) -> (LoopOutcome, Vec<TranscriptEvent>) {
         let checkout = std::env::temp_dir();
         let workspace = TmpWorkspace(checkout);
         let cx = ToolCx {
             task_id: Uuid::nil(),
             workspace: &workspace,
         };
-        let sink: Box<dyn TranscriptSink> = Box::new(CapturingSink::default());
+        let capturing = CapturingSink::default();
+        let sink_handle = capturing.clone();
+        let sink: Box<dyn TranscriptSink> = Box::new(capturing);
         let mut agent = AgentLoop::new(
             CheckpointRuntime::new(store),
             model,
@@ -386,7 +422,8 @@ mod tests {
             sink,
             limits(max_turns),
         );
-        agent.run(conversation(), &cx).await.unwrap()
+        let outcome = agent.run(conversation(), &cx).await.unwrap();
+        (outcome, sink_handle.entries())
     }
 
     /// The ADR-0087 / #356 merge bar: drive the loop under `CheckpointRuntime` + an in-memory store,
@@ -400,7 +437,7 @@ mod tests {
         // Run 1: the pod processes 2 turns (both `read_file`), then "dies" — we bound it at 2 turns.
         // Each turn journals `llm_turn:{n}` (the model reply) and `tools:{n}` (the read batch).
         let run1_model = ScriptedModel::new([read_turn(), read_turn()]);
-        let out1 = drive(store.clone(), run1_model.clone(), 2).await;
+        let (out1, _) = drive(store.clone(), run1_model.clone(), 2).await;
         assert_eq!(
             out1,
             LoopOutcome::Exhausted,
@@ -421,12 +458,45 @@ mod tests {
         // Run 2: the SAME store is requeued (same run_epoch). Turns 0 and 1 must replay from the
         // journal — this fresh model is only ever asked about turn 2 onward. It finishes at turn 2.
         let run2_model = ScriptedModel::new([finish_turn()]);
-        let out2 = drive(store.clone(), run2_model.clone(), 5).await;
+        let (out2, _) = drive(store.clone(), run2_model.clone(), 5).await;
         assert_eq!(out2, LoopOutcome::Finished, "run 2 resumes and finishes");
         assert_eq!(
             run2_model.requests().len(),
             1,
             "ZERO duplicate model calls: turns 0..1 replayed from the journal, only turn 2 ran live"
+        );
+    }
+
+    /// The #411/#417 regression: telemetry (reasoning/tokens) must survive a resume, not just the
+    /// model-visible content/tool_calls. Before the fix, telemetry rode a side-channel populated only
+    /// when the model closure actually ran — a replayed turn skipped the closure, so its `AssistantTurn`
+    /// journaled fine but the turn's reasoning/tokens were unrecoverable after resume. Telemetry now
+    /// rides ON the journaled `AssistantTurn` itself, so it replays with the turn by construction.
+    #[tokio::test]
+    async fn resume_preserves_telemetry_on_the_replayed_turn() {
+        let store = Arc::new(InMemoryStepStore::new());
+
+        // Run 1: one turn, carrying real telemetry (reasoning text + token counts) — the shape
+        // `ChatClient::complete` actually returns. The pod "dies" right after.
+        let run1_model = ScriptedModel::new([read_turn_with_telemetry("thinking about the diff")]);
+        let (out1, events1) = drive(store.clone(), run1_model, 1).await;
+        assert_eq!(out1, LoopOutcome::Exhausted, "run 1 stops after its turn");
+        let live_telemetry = assistant_telemetry(&events1, 0)
+            .expect("run 1's live turn carries telemetry")
+            .clone();
+        assert_eq!(live_telemetry.reasoning.as_deref(), Some("thinking about the diff"));
+
+        // Run 2: the SAME store resumes. Turn 0 replays from the journal — a fresh model that would
+        // return DIFFERENT telemetry if asked proves it never runs for turn 0.
+        let run2_model = ScriptedModel::new([finish_turn()]);
+        let (out2, events2) = drive(store.clone(), run2_model, 5).await;
+        assert_eq!(out2, LoopOutcome::Finished, "run 2 resumes and finishes");
+
+        let replayed_telemetry = assistant_telemetry(&events2, 0)
+            .expect("the replayed turn still carries its original telemetry, not None");
+        assert_eq!(
+            replayed_telemetry, &live_telemetry,
+            "telemetry on a replayed turn is byte-identical to what the live turn recorded"
         );
     }
 
@@ -550,7 +620,7 @@ mod tests {
 
         // A subsequent run over the purged store re-executes turn 0 (no replay to serve it).
         let model = ScriptedModel::new([finish_turn()]);
-        let out = drive(store.clone(), model.clone(), 5).await;
+        let (out, _) = drive(store.clone(), model.clone(), 5).await;
         assert_eq!(out, LoopOutcome::Finished);
         assert_eq!(
             model.requests().len(),

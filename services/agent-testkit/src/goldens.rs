@@ -53,6 +53,7 @@ impl GoldenScenario {
                 },
                 extra_content,
             }],
+            ..Default::default()
         };
         let turns = match self {
             Self::PlainConvergeFinish => vec![
@@ -107,6 +108,7 @@ impl GoldenScenario {
             Self::ExhaustedBackstop => vec![AssistantTurn {
                 content: Some("still thinking".into()),
                 tool_calls: Vec::new(),
+                ..Default::default()
             }],
         };
         GoldenScript { turns }

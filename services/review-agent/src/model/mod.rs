@@ -13,10 +13,10 @@
 //!
 //! Split by seam (ADR-0086-style crate hygiene pass): [`client`] owns the [`ChatClient`] transport and
 //! the request lifecycle; [`stream`] owns the SSE reassembly path; [`wire`] owns the raw non-stream
-//! response DTOs; [`completion`] owns the output types callers consume ([`Completion`]/[`Usage`]/
-//! [`TurnTelemetry`]); [`retry`] owns the backoff policy and transient/deterministic error
-//! classification; [`http`] owns the `reqwest::Client` construction. This file only re-exports the
-//! public surface — no logic lives here.
+//! response DTOs; [`completion`] owns the output types callers consume ([`Completion`]/[`Usage`]);
+//! [`retry`] owns the backoff policy and transient/deterministic error classification; [`http`] owns
+//! the `reqwest::Client` construction. This file only re-exports the public surface — no logic lives
+//! here.
 
 mod client;
 mod completion;
@@ -26,8 +26,10 @@ mod stream;
 mod wire;
 
 pub use client::ChatClient;
-pub use completion::{ChatParams, Completion, CompletionTokensDetails, TurnTelemetry, Usage};
-pub use lci_agent_types::{AssistantTurn, FunctionCall, FunctionDef, StepError, ToolCall, ToolDef};
+pub use completion::{ChatParams, Completion, CompletionTokensDetails, Usage};
+pub use lci_agent_types::{
+    AssistantTurn, FunctionCall, FunctionDef, StepError, ToolCall, ToolDef, TurnTelemetry,
+};
 pub use retry::{ChatError, RetryPolicy};
 
 /// Default per-request timeout (seconds) for one chat round-trip (ADR-0039). eaig can legitimately take
