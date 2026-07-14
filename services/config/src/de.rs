@@ -6,24 +6,39 @@
 
 use serde::de::Error;
 use serde::{Deserialize, Deserializer};
+use std::fmt::Display;
+use std::str::FromStr;
 
+/// A JSON number of type `T`, or a numeric string that parses as `T` (substitution always yields
+/// strings). Deserializing the `Num` arm directly into `T` — rather than through a fixed-width
+/// intermediate like `i64` — is what makes this correct for every target width: a literal JSON `-5`
+/// or a substituted `"-5"` against `T = u64` now goes through `u64`'s own (rejecting) parse/
+/// deserialize, instead of silently clamping through an `i64` detour; a value in `i64::MAX..=u64::MAX`
+/// deserializes straight into `u64`/`usize` instead of failing to fit in the old `i64` intermediate;
+/// and the target width (`u64`/`usize`) is respected on every platform, so there's no `as usize`
+/// truncation step on 32-bit targets.
 #[derive(Deserialize)]
 #[serde(untagged)]
-enum IntOrStr {
-    Int(i64),
+enum NumOrStr<T> {
+    Num(T),
     Str(String),
 }
 
-fn parse_opt<'de, D: Deserializer<'de>>(d: D) -> Result<Option<i64>, D::Error> {
-    match Option::<IntOrStr>::deserialize(d)? {
+fn parse_opt<'de, T, D>(d: D) -> Result<Option<T>, D::Error>
+where
+    T: Deserialize<'de> + FromStr,
+    T::Err: Display,
+    D: Deserializer<'de>,
+{
+    match Option::<NumOrStr<T>>::deserialize(d)? {
         None => Ok(None),
-        Some(IntOrStr::Int(n)) => Ok(Some(n)),
-        Some(IntOrStr::Str(s)) => {
+        Some(NumOrStr::Num(n)) => Ok(Some(n)),
+        Some(NumOrStr::Str(s)) => {
             let trimmed = s.trim();
             if trimmed.is_empty() {
                 Ok(None)
             } else {
-                trimmed.parse::<i64>().map(Some).map_err(D::Error::custom)
+                trimmed.parse::<T>().map(Some).map_err(D::Error::custom)
             }
         }
     }
@@ -34,35 +49,17 @@ pub fn opt_i64<'de, D: Deserializer<'de>>(d: D) -> Result<Option<i64>, D::Error>
 }
 
 pub fn opt_u64<'de, D: Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Error> {
-    Ok(parse_opt(d)?.map(|n| n.max(0) as u64))
+    parse_opt(d)
 }
 
 pub fn opt_usize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<usize>, D::Error> {
-    Ok(parse_opt(d)?.map(|n| n.max(0) as usize))
-}
-
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum FloatOrStr {
-    Float(f64),
-    Str(String),
+    parse_opt(d)
 }
 
 /// Like [`opt_i64`] but for fractional fields (e.g. `temperature`, `top_p`): accepts a JSON number
 /// or a numeric string (substitution always yields strings). Empty / null → `None`.
 pub fn opt_f64<'de, D: Deserializer<'de>>(d: D) -> Result<Option<f64>, D::Error> {
-    match Option::<FloatOrStr>::deserialize(d)? {
-        None => Ok(None),
-        Some(FloatOrStr::Float(n)) => Ok(Some(n)),
-        Some(FloatOrStr::Str(s)) => {
-            let trimmed = s.trim();
-            if trimmed.is_empty() {
-                Ok(None)
-            } else {
-                trimmed.parse::<f64>().map(Some).map_err(D::Error::custom)
-            }
-        }
-    }
+    parse_opt(d)
 }
 
 #[derive(Deserialize)]
@@ -169,6 +166,37 @@ mod tests {
         assert_eq!(cfg.stream, Some(true), "bool string from default coerces");
         assert_eq!(cfg.literal, Some(false), "literal JSON bool still works");
         assert_eq!(cfg.unset, None, "empty substitution → None, not an error");
+    }
+
+    #[test]
+    fn negative_value_is_rejected_not_silently_clamped_to_zero() {
+        #[derive(Deserialize)]
+        struct Cfg {
+            #[serde(default, deserialize_with = "opt_u64")]
+            #[allow(dead_code)]
+            timeout: Option<u64>,
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c.json");
+        // A negative substituted value must surface as an error, not clamp to 0 and mask the bug.
+        std::fs::write(&path, r#"{ "timeout": "{env:T:--5}" }"#).unwrap();
+        assert!(load_with::<Cfg>(&path, &env_of(&[])).is_err());
+    }
+
+    #[test]
+    fn value_above_i64_max_deserializes_into_u64() {
+        #[derive(Deserialize)]
+        struct Cfg {
+            #[serde(default, deserialize_with = "opt_u64")]
+            big: Option<u64>,
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c.json");
+        // 18446744073709551615 = u64::MAX, well past i64::MAX (9223372036854775807) — the old i64
+        // intermediate would fail to parse this even though it fits in the target u64.
+        std::fs::write(&path, r#"{ "big": "18446744073709551615" }"#).unwrap();
+        let cfg: Cfg = load_with(&path, &env_of(&[])).unwrap();
+        assert_eq!(cfg.big, Some(u64::MAX));
     }
 
     #[test]
