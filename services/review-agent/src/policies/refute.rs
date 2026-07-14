@@ -12,10 +12,27 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use lci_agent_loop::{Nudge, PolicyAction, TurnOutcome, TurnPolicy, TurnState};
+use lci_agent_tools::TurnFilter;
 use lci_agent_types::ToolOutcome;
 
 use super::{arg_field, arg_int_field, normalize_repo_path};
-use crate::tools::{ADD_REVIEW_COMMENT, READ_FILE, RETRACT_FINDING};
+use crate::tools::{
+    ADD_REVIEW_COMMENT, GRAPH_FIND_SYMBOL, GRAPH_GET_CALLERS, READ_FILE, RETRACT_FINDING,
+    VECTOR_SEMANTIC_SEARCH,
+};
+
+/// The retrieval set a bounce's re-verification turn must have — regardless of whatever wind-down
+/// (or any other budget policy) has already narrowed away for that turn (#407): without at least
+/// `read_file`, the bounce's "search for disconfirming evidence" directive is unexecutable, and the
+/// one bounce a P0/P1 finding gets is spent on a turn with no way to act on it.
+fn reverify_tool_filter() -> TurnFilter {
+    TurnFilter::all().force_names([
+        READ_FILE,
+        GRAPH_FIND_SYMBOL,
+        GRAPH_GET_CALLERS,
+        VECTOR_SEMANTIC_SEARCH,
+    ])
+}
 
 /// Phrases marking a finding as an *absence* claim. Deliberately broad, bare (article-free) substring
 /// matching over the finding's own text (title/body/evidence) — a false negative here just falls back to
@@ -127,6 +144,9 @@ pub struct RefuteGate {
     engaged: BTreeSet<String>,
     bounced: bool,
     fast: bool,
+    /// Set for exactly the turn following a bounce (#407): consumed and cleared by the very next
+    /// `before_turn` call, so the forced retrieval set applies to that one re-verification turn only.
+    force_reverify_next_turn: bool,
 }
 
 impl RefuteGate {
@@ -137,6 +157,7 @@ impl RefuteGate {
             engaged: BTreeSet::new(),
             bounced: false,
             fast,
+            force_reverify_next_turn: false,
         }
     }
 }
@@ -147,7 +168,17 @@ impl TurnPolicy for RefuteGate {
     }
 
     fn before_turn(&mut self, _state: &TurnState<'_>) -> Vec<PolicyAction> {
-        Vec::new()
+        if !self.force_reverify_next_turn {
+            return Vec::new();
+        }
+        self.force_reverify_next_turn = false;
+        vec![
+            PolicyAction::Record {
+                name: Some("refute_reverify_tools_forced"),
+                detail: serde_json::json!({}),
+            },
+            PolicyAction::Narrow(reverify_tool_filter()),
+        ]
     }
 
     fn after_turn_actions(
@@ -206,6 +237,7 @@ impl TurnPolicy for RefuteGate {
             return Vec::new();
         }
         self.bounced = true;
+        self.force_reverify_next_turn = true;
         let absence_findings: Vec<&Finding> =
             self.findings.values().filter(|f| f.absence_claim).collect();
         let mut message = "Before you finish: you recorded P0/P1 finding(s). Re-verify each one — but \
