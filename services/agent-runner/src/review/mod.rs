@@ -40,17 +40,16 @@ use lci_agent_clients::{
     CheckpointRuntime, ControlPlaneClient, ControlPlaneStepStore, EmbeddingsClient, TranscriptEntry,
 };
 use lci_agent_loop::{Conversation, LoopOutcome, RequestOptions, TranscriptEvent, TranscriptSink};
+use lci_agent_sast::SastConfig;
 use lci_agent_status::StatusHandle;
 use lci_agent_step::Passthrough;
 use lci_agent_tools::{RuntimeCaps, ToolCx, TurnFilter};
 use lci_review_agent::flows::{self, ReviewRunParams};
-use lci_review_agent::policies::SastLead;
 use lci_review_agent::prompt::{self, PrDiffRef, PromptConfig};
-use lci_review_agent::tools::{ADD_REVIEW_COMMENT, tool_registry};
+use lci_review_agent::tools::{ADD_REVIEW_COMMENT, SastToolConfig, tool_registry};
 
 use crate::bootstrap::config::ReviewConfig;
 use crate::clone::PrDiff;
-use crate::sast::SastFinding;
 
 /// How the agent loop ended (#137). Distinct from `Err`, which is reserved for a transport/loop failure
 /// where the gateway was unreachable and nothing useful happened. The caller maps these to a visible
@@ -118,17 +117,14 @@ pub async fn run_native_agent(
     review: &ReviewConfig,
     command: &str,
     diff: Option<&PrDiff>,
-    // Repo-native agent instructions (ADR-0036), prior reviews (A, #137), per-repo feedback memory (M1,
-    // ADR-0044), and the deterministic SAST digest (ADR-0061) — all injected into the prompt as
-    // untrusted context; `None` when absent.
+    // Repo-native agent instructions (ADR-0036), prior reviews (A, #137), and per-repo feedback memory
+    // (M1, ADR-0044) — all injected into the prompt as untrusted context; `None` when absent.
     repo_instructions: Option<&str>,
     prior_reviews: Option<&str>,
     repo_memory: Option<&str>,
-    sast_digest: Option<&str>,
-    // The SAST findings the digest above summarizes, kept structured so the SAST anchor gate (#305)
-    // can reject a triage verdict anchored to a line opengrep never flagged. Empty when SAST is off or
-    // found nothing — the gate is then a no-op.
-    sast_findings: &[SastFinding],
+    // The resolved SAST config (ADR-0061), handed to the `run_sast` tool (ADR-0073) instead of driving a
+    // pre-agent pass. `None` when SAST is off — the tool then simply isn't registered/offered.
+    sast_config: Option<&SastConfig>,
     attribution: &[(String, String)],
     client: &ControlPlaneClient,
     embedder: &EmbeddingsClient,
@@ -150,8 +146,14 @@ pub async fn run_native_agent(
 
     // ── Offered tool surface: diff gate + per-tier allowlist + ADR-0066 MCP discovery ───────────────
     let diff_present = diff.is_some();
-    let (offered, dispatch_discovered) =
-        tool_surface::resolve_offered_tools(review, diff_present, client, task_id).await;
+    let (offered, dispatch_discovered) = tool_surface::resolve_offered_tools(
+        review,
+        diff_present,
+        sast_config.is_some(),
+        client,
+        task_id,
+    )
+    .await;
 
     // ── Run-start telemetry (ADR-0034/0062/0066), recorded at run START ─────────────────────────────
     telemetry::submit_run_start_telemetry(client, task_id, review, &offered, diff_present).await;
@@ -173,7 +175,6 @@ pub async fn run_native_agent(
         repo_instructions,
         prior_reviews,
         repo_memory,
-        sast_digest,
     );
     let initial_names: Vec<String> = offered
         .iter()
@@ -205,12 +206,22 @@ pub async fn run_native_agent(
         RuntimeCaps::default()
     };
 
-    // ── Tool registry (built-ins + discovered) ──────────────────────────────────────────────────
+    // ── Tool registry (built-ins + discovered + run_sast) ───────────────────────────────────────
+    // Shared feed the `run_sast` tool pushes leads into as it scans (ADR-0073); `SastAnchorGate` (#305)
+    // drains it mid-loop. Built once here so the same handle reaches both the tool (via `tool_registry`)
+    // and the gate (via `params.sast_leads`, below).
+    let sast_leads: lci_review_agent::policies::SastLeadSink = Arc::new(Mutex::new(Vec::new()));
+    let sast_tool_config = sast_config.map(|config| SastToolConfig {
+        config: config.clone(),
+        changed_files: diff.map(|pr| pr.files.clone()).unwrap_or_default(),
+        leads: Arc::clone(&sast_leads),
+    });
     let registry = tool_registry(
         Arc::new(client.clone()),
         Arc::new(embedder.clone()),
         dispatch_discovered,
         runtime_caps,
+        sast_tool_config,
     )
     .context("assembling review tool registry")?;
 
@@ -226,14 +237,7 @@ pub async fn run_native_agent(
         fast: review.fast,
         diff_present,
         diff_files: diff.map(|pr| pr.files.clone()).unwrap_or_default(),
-        sast_leads: sast_findings
-            .iter()
-            .map(|f| SastLead {
-                file: f.file.clone(),
-                line: f.line,
-                rule_id: f.rule_id.clone(),
-            })
-            .collect(),
+        sast_leads,
     };
     let workspace = flows::eager_workspace(checkout_root.to_path_buf());
     let cx = ToolCx {
@@ -391,15 +395,14 @@ mod tests {
 
     #[test]
     fn telemetry_mutex_recovers_from_a_poisoned_mutex() {
-        let telemetry_handle: Arc<Mutex<Vec<TurnTelemetry>>> = Arc::new(Mutex::new(vec![
-            TurnTelemetry {
+        let telemetry_handle: Arc<Mutex<Vec<TurnTelemetry>>> =
+            Arc::new(Mutex::new(vec![TurnTelemetry {
                 model: "test-model".to_string(),
                 prompt_tokens: Some(10),
                 completion_tokens: Some(5),
                 reasoning_tokens: None,
                 reasoning: None,
-            },
-        ]));
+            }]));
 
         poison(&telemetry_handle);
 

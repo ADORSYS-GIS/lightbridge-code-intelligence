@@ -18,6 +18,7 @@ pub mod mcp;
 pub mod read_file;
 pub mod record;
 pub mod reply;
+pub mod sast;
 pub mod vector;
 
 pub use finish::{ABORT, FINISH, REPORT_PROGRESS};
@@ -26,6 +27,7 @@ pub use mcp::MCP_TOOL_PREFIX;
 pub use read_file::READ_FILE;
 pub use record::{ADD_REVIEW_COMMENT, RETRACT_FINDING};
 pub use reply::ADD_COMMENT;
+pub use sast::{RUN_SAST, SastToolConfig};
 pub use vector::VECTOR_SEMANTIC_SEARCH;
 
 pub(crate) const DEFAULT_LIMIT: i64 = 10;
@@ -63,7 +65,7 @@ pub const EMPTY_RETRIEVAL_RESULT: &str = "No results matched. An empty result me
     open the relevant file with `read_file`. Do not record a finding from an empty retrieval alone \
     (ADR-0047).";
 
-/// The complete built-in surface in the legacy stable order.
+/// The complete built-in surface in the legacy stable order, plus `run_sast` (ADR-0073) appended last.
 pub fn tool_defs() -> Vec<ToolSpec> {
     let mut specs = Vec::new();
     specs.push(vector::spec());
@@ -73,6 +75,7 @@ pub fn tool_defs() -> Vec<ToolSpec> {
     specs.push(reply::spec());
     specs.push(finish::finish_spec());
     specs.extend(finish::aux_specs());
+    specs.push(sast::spec());
     specs
 }
 
@@ -88,15 +91,20 @@ pub fn known_tool_names() -> Vec<&'static str> {
         FINISH,
         REPORT_PROGRESS,
         ABORT,
+        RUN_SAST,
     ]
 }
 
 /// Assemble the exact concrete tools. Each module owns its own spec, replay class, and execution.
+/// `sast` is `None` when SAST is off or there's no diff to scope a scan to (ADR-0073) — `run_sast` then
+/// simply isn't registered, so a dispatch attempt is refused as an unknown tool rather than silently
+/// scanning nothing.
 pub fn tool_registry(
     client: Arc<ControlPlaneClient>,
     embedder: Arc<EmbeddingsClient>,
     discovered: impl IntoIterator<Item = ToolSpec>,
     caps: RuntimeCaps,
+    sast: Option<SastToolConfig>,
 ) -> Result<ToolRegistry, RegistryError> {
     let services = ReviewServices { client, embedder };
     let mut registry = ToolRegistry::new();
@@ -108,6 +116,9 @@ pub fn tool_registry(
     finish::register(&mut registry, &services, caps)?;
     for spec in discovered {
         mcp::register(&mut registry, &services, spec, caps)?;
+    }
+    if let Some(tool_config) = sast {
+        self::sast::register(&mut registry, &services, tool_config, caps)?;
     }
     Ok(registry)
 }
@@ -154,6 +165,7 @@ impl Tools {
                 Arc::new(embedder.clone()),
                 discovered,
                 RuntimeCaps::default(),
+                None,
             )?,
             workspace: EagerWorkspace(checkout_root.to_path_buf()),
             task_id,
@@ -185,7 +197,7 @@ fn render_refusal(refusal: DispatchRefusal) -> ToolOutcome {
         DispatchRefusal::NotOffered { tool_name } => ToolOutcome::Continue(format!(
             "error: unknown tool {tool_name:?}. Available tools: {VECTOR_SEMANTIC_SEARCH}, \
              {GRAPH_FIND_SYMBOL}, {GRAPH_GET_CALLERS}, {READ_FILE}, {ADD_REVIEW_COMMENT}, \
-             {ADD_COMMENT}, {FINISH}, {REPORT_PROGRESS}, {ABORT}, plus any discovered \
+             {ADD_COMMENT}, {FINISH}, {REPORT_PROGRESS}, {ABORT}, {RUN_SAST}, plus any discovered \
              {MCP_TOOL_PREFIX}<server>__<tool>."
         )),
     }

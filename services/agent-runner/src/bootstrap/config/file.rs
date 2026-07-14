@@ -182,11 +182,15 @@ pub enum ReviewTool {
     ReportProgress,
     #[serde(rename = "abort")]
     Abort,
+    /// The deterministic opengrep pass, now a tool the agent calls on demand instead of an automatic
+    /// pre-agent scan (ADR-0073) — an operator must list it explicitly for either tier to offer it.
+    #[serde(rename = "run_sast")]
+    RunSast,
 }
 
 impl ReviewTool {
     /// Every variant, in the canonical tool order — the operator-facing list of valid built-in names.
-    pub const ALL: [ReviewTool; 10] = [
+    pub const ALL: [ReviewTool; 11] = [
         ReviewTool::VectorSemanticSearch,
         ReviewTool::GraphFindSymbol,
         ReviewTool::GraphGetCallers,
@@ -197,6 +201,7 @@ impl ReviewTool {
         ReviewTool::Finish,
         ReviewTool::ReportProgress,
         ReviewTool::Abort,
+        ReviewTool::RunSast,
     ];
 
     /// The canonical tool name the agent dispatches — the exact string in [`lci_review_agent::tools`].
@@ -212,6 +217,7 @@ impl ReviewTool {
             ReviewTool::Finish => "finish",
             ReviewTool::ReportProgress => "report_progress",
             ReviewTool::Abort => "abort",
+            ReviewTool::RunSast => "run_sast",
         }
     }
 

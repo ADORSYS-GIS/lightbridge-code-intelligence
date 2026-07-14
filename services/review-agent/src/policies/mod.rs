@@ -27,7 +27,7 @@ pub use coverage::{CoverageGate, CoverageState};
 pub use fast_tier::FastTierGuard;
 pub use finding_nudge::FindingFinishNudge;
 pub use refute::RefuteGate;
-pub use sast_anchor::{SastAnchorGate, SastLead};
+pub use sast_anchor::{SastAnchorGate, SastLead, SastLeadSink};
 pub use scratchpad::ScratchpadLoopGuard;
 
 /// Pull a string field out of a tool call's raw JSON `arguments`. `None` on malformed JSON, a missing
@@ -49,9 +49,10 @@ fn arg_int_field(arguments: &str, key: &str) -> Option<i64> {
         .as_i64()
 }
 
-/// Normalize a model-supplied repo path so the same file can't dodge coverage/loop tracking by varying
-/// its spelling (backslashes, a leading `./`, or a leading `/`).
-fn normalize_repo_path(path: &str) -> String {
+/// Normalize a model-supplied repo path so the same file can't dodge coverage/loop tracking — or the
+/// `run_sast` tool's changed-file scoping check (`crate::tools::sast`) — by varying its spelling
+/// (backslashes, a leading `./`, or a leading `/`).
+pub(crate) fn normalize_repo_path(path: &str) -> String {
     path.replace('\\', "/")
         .trim()
         .trim_start_matches("./")

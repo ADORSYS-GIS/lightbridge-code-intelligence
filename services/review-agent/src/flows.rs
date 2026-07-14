@@ -17,7 +17,7 @@ use lci_agent_step::StepRuntime;
 use lci_agent_tools::{ToolCx, ToolRegistry, TurnFilter};
 
 use crate::policies::{
-    CoverageGate, FastTierGuard, FindingFinishNudge, RefuteGate, SastAnchorGate, SastLead,
+    CoverageGate, FastTierGuard, FindingFinishNudge, RefuteGate, SastAnchorGate, SastLeadSink,
     ScratchpadLoopGuard, render_fast_refusal,
 };
 pub use crate::tools::EagerWorkspace;
@@ -60,10 +60,10 @@ pub struct ReviewRunParams {
     pub diff_present: bool,
     /// The changed-file set the coverage gate tracks engagement against.
     pub diff_files: Vec<String>,
-    /// The opengrep coordinates the deterministic SAST pass flagged this run (ADR-0061), so
-    /// [`SastAnchorGate`] can reject a triage verdict anchored to a different line (#305). Empty when
-    /// SAST is off or found nothing.
-    pub sast_leads: Vec<SastLead>,
+    /// The shared feed the `run_sast` tool pushes opengrep leads into as it scans (ADR-0073), so
+    /// [`SastAnchorGate`] can reject a triage verdict anchored to a different line (#305). Starts empty
+    /// and may never fill — SAST off, no diff, or the agent simply never calls the tool.
+    pub sast_leads: SastLeadSink,
 }
 
 /// Build a [`Workspace`](lci_agent_tools::Workspace) over an already-materialized checkout root, for
@@ -186,7 +186,7 @@ where
 mod tests {
     use super::*;
 
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     use lci_agent_clients::{ControlPlaneClient, EmbeddingsClient};
     use lci_agent_loop::{ChatMessage, RequestOptions};
@@ -236,6 +236,7 @@ mod tests {
             Arc::new(embedder),
             [],
             RuntimeCaps::default(),
+            None,
         )
         .unwrap();
         let workspace = eager_workspace(checkout.path().to_path_buf());
@@ -269,7 +270,7 @@ mod tests {
             } else {
                 Vec::new()
             },
-            sast_leads: Vec::new(),
+            sast_leads: Arc::new(Mutex::new(Vec::new())),
         };
         run_review(
             Passthrough,

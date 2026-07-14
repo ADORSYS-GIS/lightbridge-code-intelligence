@@ -12,6 +12,7 @@ members = [
     "services/agent-step",
     "services/agent-tools",
     "services/agent-clients",
+    "services/agent-sast",
     "services/agent-loop",
     "services/agent-status",
     "services/codegraph",

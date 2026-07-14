@@ -108,6 +108,7 @@ dependencies = [
  "futures",
  "lci-agent-clients",
  "lci-agent-loop",
+ "lci-agent-sast",
  "lci-agent-status",
  "lci-agent-step",
  "lci-agent-testkit",
@@ -2699,6 +2700,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "lci-agent-sast"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "lci-agent-clients",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "lci-agent-status"
 version = "0.1.0"
 dependencies = [
@@ -2823,6 +2837,7 @@ dependencies = [
  "futures",
  "lci-agent-clients",
  "lci-agent-loop",
+ "lci-agent-sast",
  "lci-agent-step",
  "lci-agent-testkit",
  "lci-agent-tools",
