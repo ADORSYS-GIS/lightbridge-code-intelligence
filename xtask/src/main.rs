@@ -9,22 +9,45 @@
 mod commands;
 mod process;
 
+use clap::{Parser, Subcommand};
+
+#[derive(Parser)]
+#[command(name = "xtask", about = "Workspace automation (cargo-xtask pattern)")]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Task>,
+}
+
+#[derive(Subcommand)]
+enum Task {
+    /// Run the full local CI gate (fmt, lint, build, test, validate-schema, dependency-hygiene).
+    Ci,
+    /// Format the workspace (`cargo fmt` + Biome for JS/TS).
+    Fmt,
+    /// Lint the workspace (`cargo clippy` + Biome check).
+    Lint,
+    /// Build the workspace.
+    Build,
+    /// Run the Rust test suite (prefers `cargo-nextest`, falls back to `cargo test`).
+    Test,
+    /// Validate committed schema files via `cratestack-cli` (best-effort — skips if absent).
+    ValidateSchema,
+    /// Check dependency hygiene across the workspace.
+    DependencyHygiene,
+}
+
 fn main() -> anyhow::Result<()> {
-    let task = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| "help".to_string());
-    match task.as_str() {
-        "ci" => commands::ci::ci(),
-        "fmt" => commands::workspace::fmt(),
-        "lint" => commands::workspace::lint(),
-        "build" => commands::workspace::build(),
-        "test" => commands::test::test(),
-        "validate-schema" => commands::schema::validate_schema(),
-        "dependency-hygiene" => commands::dependency_hygiene::dependency_hygiene(),
-        _ => {
-            eprintln!(
-                "usage: cargo xtask <ci|fmt|lint|build|test|validate-schema|dependency-hygiene>"
-            );
+    let cli = Cli::parse();
+    match cli.command {
+        Some(Task::Ci) => commands::ci::ci(),
+        Some(Task::Fmt) => commands::workspace::fmt(),
+        Some(Task::Lint) => commands::workspace::lint(),
+        Some(Task::Build) => commands::workspace::build(),
+        Some(Task::Test) => commands::test::test(),
+        Some(Task::ValidateSchema) => commands::schema::validate_schema(),
+        Some(Task::DependencyHygiene) => commands::dependency_hygiene::dependency_hygiene(),
+        None => {
+            Cli::parse_from(["xtask", "--help"]);
             Ok(())
         }
     }
