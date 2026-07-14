@@ -10,7 +10,7 @@ use lci_agent_loop::{Nudge, PolicyAction, TurnOutcome, TurnPolicy, TurnState, wi
 use lci_agent_types::ToolOutcome;
 
 use super::{arg_field, normalize_repo_path};
-use crate::tools::{ADD_REVIEW_COMMENT, READ_FILE};
+use crate::tools::{ADD_REVIEW_COMMENT, FINISH, READ_FILE};
 
 const COVERAGE_MAX_LISTED: usize = 15;
 
@@ -117,7 +117,7 @@ impl CoverageGate {
                         self.engaged.insert(normalize_repo_path(&path));
                     }
                 }
-                "finish" if matches!(result.outcome, ToolOutcome::Finish) => {
+                FINISH if matches!(result.outcome, ToolOutcome::Finish) => {
                     self.summary = arg_field(&result.call.function.arguments, "summary");
                 }
                 _ => {}
