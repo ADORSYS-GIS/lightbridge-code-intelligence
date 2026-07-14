@@ -143,7 +143,15 @@ fn is_test(path: &str, name: &str) -> bool {
     if TEST_SUFFIXES.iter().any(|s| name.ends_with(s)) {
         return true;
     }
-    const TEST_DIR_SEGMENTS: &[&str] = &["__tests__", "__snapshots__"];
+    // pytest's OTHER naming convention (`test_*.py`, vs. the `_test.py` suffix already matched above).
+    if name.starts_with("test_") && name.ends_with(".py") {
+        return true;
+    }
+    // `tests`/`test` as a whole path segment: Rust's own top-level integration-test convention
+    // (`services/*/tests/*.rs`, e.g. this crate's own `tests/golden_parity.rs`), plus the equivalent
+    // Python/JS/TS/Go layouts. Exact-segment match only — never a substring — so e.g. `latest/` or
+    // `attestation/` isn't swept in.
+    const TEST_DIR_SEGMENTS: &[&str] = &["__tests__", "__snapshots__", "tests", "test"];
     path.split('/').any(|seg| TEST_DIR_SEGMENTS.contains(&seg))
 }
 
@@ -214,8 +222,26 @@ mod tests {
             "src/foo.test.ts",
             "src/bar.spec.tsx",
             "__tests__/baz.js",
+            // pytest's other naming convention, and the bare `tests`/`test` directory convention
+            // (Rust's own top-level integration-test layout, e.g. this crate's own
+            // `services/review-agent/tests/golden_parity.rs` — flagged by review as previously
+            // misclassified `Source`).
+            "tests/test_signup.py",
+            "services/review-agent/tests/golden_parity.rs",
+            "test/helpers/fixture.rb",
         ] {
             assert_eq!(classify_path(p), FileSignal::Test, "{p}");
+        }
+    }
+
+    #[test]
+    fn does_not_sweep_in_paths_that_merely_contain_test_as_a_substring() {
+        for p in [
+            "latest/CHANGELOG.md",
+            "attestation/policy.rs",
+            "src/testable.rs",
+        ] {
+            assert_ne!(classify_path(p), FileSignal::Test, "{p}");
         }
     }
 

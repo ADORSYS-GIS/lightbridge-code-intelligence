@@ -101,20 +101,37 @@ fn low_signal_summary(low_signal: &[(String, FileSignal)]) -> Option<String> {
 /// Whether `text` cites `path` (or its basename) with a line number — e.g. `pending_p2p_repository.dart:30`
 /// in a finding's `evidence` — the signal that the model used a changed file's diff hunk without a
 /// separate `read_file` call (#306).
+///
+/// A match only counts as a citation when it's a *complete* path/basename token: the character
+/// immediately before the match must not be part of a longer path or identifier (alphanumeric, `_`,
+/// `-`, `.`, or `/`), and the match must be followed by `:<digit>`. Both halves of that boundary check
+/// close two real false positives PR review caught on the naive substring version of this function:
+/// - Without the leading-boundary check, a citation of `remain.rs:10` would credit `main.rs`
+///   (`"main.rs:"` is a literal suffix of `"remain.rs:"`).
+/// - Without also rejecting a `/` immediately before a match, a full-path citation like
+///   `services/a/mod.rs:42` would credit every *other* changed file also named `mod.rs`
+///   (`services/b/mod.rs`) — its basename appears as a boundary-passing substring nested inside the
+///   cited file's own directory prefix.
 fn cites_path_with_line(text: &str, path: &str) -> bool {
-    let has_citation = |needle: &str| {
-        text.match_indices(needle).any(|(idx, _)| {
-            text[idx + needle.len()..]
-                .chars()
-                .next()
-                .is_some_and(|c| c.is_ascii_digit())
-        })
+    let is_citation_at = |needle: &str, idx: usize| {
+        let boundary_ok = match text[..idx].chars().next_back() {
+            None => true,
+            Some(c) => !(c.is_alphanumeric() || matches!(c, '_' | '-' | '.' | '/')),
+        };
+        let mut after = text[idx + needle.len()..].chars();
+        boundary_ok && after.next() == Some(':') && after.next().is_some_and(|c| c.is_ascii_digit())
     };
-    if has_citation(&format!("{path}:")) {
+    if text
+        .match_indices(path)
+        .any(|(idx, _)| is_citation_at(path, idx))
+    {
         return true;
     }
     let basename = path.rsplit('/').next().unwrap_or(path);
-    basename != path && has_citation(&format!("{basename}:"))
+    basename != path
+        && text
+            .match_indices(basename)
+            .any(|(idx, _)| is_citation_at(basename, idx))
 }
 
 #[derive(Clone, Default)]
@@ -236,19 +253,28 @@ impl CoverageGate {
             return false;
         };
         let uncovered = self.uncovered();
-        if uncovered.is_empty() {
+        let low_signal_note = low_signal_summary(&self.low_signal);
+        // Nothing to disclose: every gated file was engaged and no low-signal files were even excluded.
+        if uncovered.is_empty() && low_signal_note.is_none() {
             return false;
         }
-        let mut amended = format!(
-            "{summary}\n\n{}",
-            coverage_disclosure(
+        let mut amended = summary.to_string();
+        if !uncovered.is_empty() {
+            amended.push_str("\n\n");
+            amended.push_str(&coverage_disclosure(
                 self.changed.len() - uncovered.len(),
                 self.changed.len(),
                 &uncovered,
-            )
-        );
-        if let Some(note) = low_signal_summary(&self.low_signal) {
-            amended.push_str("\n>\n");
+            ));
+        }
+        // Surfaced even when source coverage is complete (#306) — a source+generated PR whose source got
+        // fully reviewed must still say the generated files were excluded, not go silent about them.
+        if let Some(note) = low_signal_note {
+            amended.push_str(if uncovered.is_empty() {
+                "\n\n"
+            } else {
+                "\n>\n"
+            });
             amended.push_str(&note);
         }
         *self.state.0.lock().expect("coverage state mutex") = Some(amended);
@@ -455,5 +481,110 @@ mod tests {
             disclosed.contains("11 additional changed file(s)"),
             "{disclosed}"
         );
+    }
+
+    /// Review-caught false positive (gemini-code-assist, high): a naive substring match on
+    /// `"{basename}:"` matches `remain.rs:10` as a suffix hit for `main.rs`, wrongly crediting a file
+    /// that was never actually cited.
+    #[test]
+    fn citation_does_not_match_a_suffix_of_a_longer_filename() {
+        assert!(!cites_path_with_line(
+            "the bug is in remain.rs:10, not here",
+            "src/main.rs"
+        ));
+        // A real citation of `main.rs` (clean word boundary) still matches.
+        assert!(cites_path_with_line(
+            "the bug is in main.rs:10, see above",
+            "src/main.rs"
+        ));
+    }
+
+    /// Review-caught false positive (lightbridge-assistant + chatgpt-codex-connector, independently):
+    /// two changed files that share a basename must not cross-credit each other when only ONE of them
+    /// is cited by its full path — the basename fallback must not match a basename nested inside a
+    /// *different* file's full-path citation.
+    #[test]
+    fn citation_of_one_files_full_path_does_not_credit_a_different_file_sharing_its_basename() {
+        let text = "caused by the missing check at lib/repositories/store.rs:42";
+        assert!(cites_path_with_line(text, "lib/repositories/store.rs"));
+        assert!(!cites_path_with_line(text, "src/auth/store.rs"));
+    }
+
+    /// A bare basename citation (no directory prefix) still credits the one changed file that owns
+    /// that basename — the boundary fix must not regress the original diff-cited-file scenario when
+    /// there's no ambiguity.
+    #[test]
+    fn bare_basename_citation_without_a_directory_prefix_still_credits_the_file() {
+        assert!(cites_path_with_line(
+            "see pending_p2p_repository.dart:30 for the missing check",
+            "lib/repositories/pending_p2p_repository.dart"
+        ));
+    }
+
+    /// Review-caught gap (chatgpt-codex-connector): the low-signal summary used to be gated behind a
+    /// non-empty `uncovered` set, so a PR whose source was fully reviewed but which also changed
+    /// generated/test/config files got no disclosure at all — contradicting the "reported, not
+    /// silently dropped" design. A fully-covered run with excluded files must still get a (shorter,
+    /// non-alarming) info-only note.
+    #[test]
+    fn discloses_low_signal_exclusions_even_when_source_coverage_is_complete() {
+        let changed = ["src/main.rs", "lib/l10n/app_localizations.dart"];
+        let (mut gate, coverage) = CoverageGate::new(changed, 1, 5, false);
+        gate.update(&TurnOutcome {
+            assistant: ChatMessage::user(""),
+            results: vec![call(
+                READ_FILE,
+                r#"{"path":"src/main.rs"}"#,
+                ToolOutcome::Continue("source".into()),
+            )],
+            finish_requested: false,
+            abort_reason: None,
+        });
+        assert!(gate.uncovered().is_empty(), "the only source file was read");
+        gate.update(&TurnOutcome {
+            assistant: ChatMessage::user(""),
+            results: vec![call("finish", r#"{"summary":"done"}"#, ToolOutcome::Finish)],
+            finish_requested: true,
+            abort_reason: None,
+        });
+        assert!(
+            gate.disclose(),
+            "a low-signal exclusion note must still be posted"
+        );
+        let disclosed = coverage.amended_summary().expect("disclosure recorded");
+        assert!(
+            !disclosed.contains("Never opened or commented on"),
+            "{disclosed}"
+        );
+        assert!(
+            disclosed.contains("1 additional changed file(s)"),
+            "{disclosed}"
+        );
+        assert!(disclosed.contains("generated"), "{disclosed}");
+    }
+
+    /// The fully-clean case (no uncovered source, no low-signal exclusions at all) still posts nothing
+    /// — matches [`coverage_requires_real_engagement_before_accepting_finish`]'s existing expectation.
+    #[test]
+    fn discloses_nothing_when_fully_covered_with_no_low_signal_files() {
+        let (mut gate, coverage) = CoverageGate::new(["src/main.rs"], 1, 5, false);
+        gate.update(&TurnOutcome {
+            assistant: ChatMessage::user(""),
+            results: vec![call(
+                READ_FILE,
+                r#"{"path":"src/main.rs"}"#,
+                ToolOutcome::Continue("source".into()),
+            )],
+            finish_requested: false,
+            abort_reason: None,
+        });
+        gate.update(&TurnOutcome {
+            assistant: ChatMessage::user(""),
+            results: vec![call("finish", r#"{"summary":"done"}"#, ToolOutcome::Finish)],
+            finish_requested: true,
+            abort_reason: None,
+        });
+        assert!(!gate.disclose());
+        assert!(coverage.amended_summary().is_none());
     }
 }
