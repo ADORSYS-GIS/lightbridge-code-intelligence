@@ -32,7 +32,11 @@ pub const DEFAULT_STATUS_PORT: u16 = 8091;
 
 /// Configuration for the read-only status server. Built by the host only when the feature is enabled.
 ///
-/// - `bind_addr` — the IP to bind (default `0.0.0.0` so a sibling container/Service can reach it).
+/// - `bind_addr` — the IP to bind (default `127.0.0.1`: the server runs in-process inside the
+///   agent-runner Job, with no sidecar container or Service in front of it — same-pod access via
+///   `kubectl exec`/`port-forward` still reaches a loopback-bound server, since both operate within
+///   the pod's network namespace. `LCI_STATUS_BIND` overrides for a deploy that does front it with a
+///   Service).
 /// - `port` — the TCP port ([`DEFAULT_STATUS_PORT`] by default).
 /// - `bearer_token` — the token `GET /status` requires; a dedicated read token, else the runner token.
 #[derive(Clone, Debug, bon::Builder)]
@@ -49,7 +53,8 @@ impl StatusServerConfig {
     /// - `LCI_STATUS_API` — must be truthy (`1`/`true`/`yes`, case-insensitive) to enable; unset or
     ///   anything else ⇒ `None` (prod-neutral, dormant).
     /// - `LCI_STATUS_PORT` — the port; falls back to [`DEFAULT_STATUS_PORT`] when unset/unparseable.
-    /// - `LCI_STATUS_BIND` — the bind IP; falls back to `0.0.0.0` when unset/unparseable.
+    /// - `LCI_STATUS_BIND` — the bind IP; falls back to `127.0.0.1` when unset/unparseable (see
+    ///   [`StatusServerConfig`]'s `bind_addr` doc for why loopback is the conservative default).
     /// - `LCI_STATUS_TOKEN` — a dedicated read token; falls back to `runner_token` when unset/blank.
     #[must_use]
     pub fn from_env(runner_token: &str) -> Option<Self> {
@@ -57,7 +62,7 @@ impl StatusServerConfig {
             return None;
         }
         let port = env_parsed("LCI_STATUS_PORT", DEFAULT_STATUS_PORT);
-        let bind_addr = env_parsed("LCI_STATUS_BIND", IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+        let bind_addr = env_parsed("LCI_STATUS_BIND", IpAddr::V4(Ipv4Addr::LOCALHOST));
         let bearer_token = std::env::var("LCI_STATUS_TOKEN")
             .ok()
             .map(|raw| raw.trim().to_string())
@@ -183,7 +188,10 @@ mod tests {
         let config = StatusServerConfig::from_env("runner-token").expect("enabled");
         assert_eq!(config.port, DEFAULT_STATUS_PORT);
         assert_eq!(config.bearer_token, "runner-token");
-        assert_eq!(config.bind_addr, IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+        // Conservative default: loopback-only, since the server runs in-process in the agent-runner
+        // Job with no sidecar/Service in front of it (#367) — same-pod access (kubectl exec/
+        // port-forward) still reaches it via the pod's network namespace.
+        assert_eq!(config.bind_addr, IpAddr::V4(Ipv4Addr::LOCALHOST));
 
         // A dedicated read token overrides the runner token.
         unsafe {
@@ -195,9 +203,23 @@ mod tests {
                 .bearer_token,
             "read-only-token"
         );
+
+        // `LCI_STATUS_BIND` still overrides the conservative default for a deploy that fronts the
+        // server with its own Service.
+        unsafe {
+            std::env::set_var("LCI_STATUS_BIND", "0.0.0.0");
+        }
+        assert_eq!(
+            StatusServerConfig::from_env("runner-token")
+                .expect("enabled")
+                .bind_addr,
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+        );
+
         unsafe {
             std::env::remove_var("LCI_STATUS_API");
             std::env::remove_var("LCI_STATUS_TOKEN");
+            std::env::remove_var("LCI_STATUS_BIND");
         }
     }
 
