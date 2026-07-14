@@ -23,24 +23,22 @@ pub(crate) fn append_transcript(
                 message,
                 telemetry,
             } => {
+                let telemetry = telemetry.as_ref();
                 // Proof-of-work (epic #137): one concise per-turn line, including the chain-of-thought
                 // length (the reliable "how far did it think" signal even when the gateway folds
                 // reasoning into `completion_tokens`).
                 tracing::info!(
                     task_id = %task_id,
                     turn,
-                    model = telemetry.as_ref().map(|entry| entry.model.as_str()).unwrap_or("?"),
-                    prompt_tokens = telemetry.as_ref().and_then(|entry| entry.prompt_tokens).unwrap_or(-1),
+                    model = telemetry.map(|entry| entry.model.as_str()).unwrap_or("?"),
+                    prompt_tokens = telemetry.and_then(|entry| entry.prompt_tokens).unwrap_or(-1),
                     completion_tokens = telemetry
-                        .as_ref()
                         .and_then(|entry| entry.completion_tokens)
                         .unwrap_or(-1),
                     reasoning_tokens = telemetry
-                        .as_ref()
                         .and_then(|entry| entry.reasoning_tokens)
                         .unwrap_or(-1),
                     reasoning_chars = telemetry
-                        .as_ref()
                         .and_then(|entry| entry.reasoning.as_deref())
                         .map(|reasoning| reasoning.chars().count())
                         .unwrap_or(0),
@@ -52,10 +50,10 @@ pub(crate) fn append_transcript(
                     tool_calls: (!message.tool_calls.is_empty())
                         .then(|| serde_json::to_value(&message.tool_calls).unwrap_or_default()),
                     tool_name: None,
-                    prompt_tokens: telemetry.as_ref().and_then(|entry| entry.prompt_tokens),
-                    completion_tokens: telemetry.as_ref().and_then(|entry| entry.completion_tokens),
-                    reasoning_tokens: telemetry.as_ref().and_then(|entry| entry.reasoning_tokens),
-                    model: telemetry.as_ref().map(|entry| entry.model.clone()),
+                    prompt_tokens: telemetry.and_then(|entry| entry.prompt_tokens),
+                    completion_tokens: telemetry.and_then(|entry| entry.completion_tokens),
+                    reasoning_tokens: telemetry.and_then(|entry| entry.reasoning_tokens),
+                    model: telemetry.map(|entry| entry.model.clone()),
                 });
             }
             TranscriptEvent::Tool { call, outcome, .. } => {

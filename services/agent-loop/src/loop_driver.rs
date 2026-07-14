@@ -285,9 +285,9 @@ impl<R: StepRuntime, M: ModelClient> AgentLoop<R, M> {
             })
             .await;
         let (assistant, telemetry) = match completion {
-            Ok(turn) => {
+            Ok(mut turn) => {
                 acc.consecutive_failures = 0;
-                let telemetry = turn.telemetry.clone();
+                let telemetry = turn.telemetry.take();
                 (ChatMessage::assistant(turn), telemetry)
             }
             Err(error) if error.is_transient() => {

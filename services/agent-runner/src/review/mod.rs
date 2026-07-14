@@ -82,11 +82,14 @@ fn durable_replay_enabled() -> bool {
 
 /// A [`TranscriptSink`] that captures the loop's events so the host can reconstruct the ADR-0034
 /// transcript afterwards (even on error). Cloneable handle: grab a clone before boxing it into the
-/// loop, read [`entries`](Self::entries) once the run returns.
+/// loop, then lock `.0` directly to read the events once the run returns — cloning the whole
+/// (possibly still-growing) transcript via [`entries`](Self::entries) is test-only; production reads
+/// hold the lock in place instead (the live status poller ticks every second on it).
 #[derive(Clone, Default)]
 struct JobSink(Arc<Mutex<Vec<TranscriptEvent>>>);
 
 impl JobSink {
+    #[cfg(test)]
     fn entries(&self) -> Vec<TranscriptEvent> {
         // Recover from a poisoned mutex instead of panicking (consistent with `StatusHandle::with`
         // and the telemetry mutex below): a panic elsewhere holding this lock must not also crash
@@ -274,7 +277,14 @@ pub async fn run_native_agent(
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 tick.tick().await;
-                let (prompt, completion) = telemetry::sum_usage(&sink_handle.entries());
+                // Lock and read in place rather than `entries()` — this ticks every second for the
+                // life of the run, so cloning the whole (growing) transcript each time is wasteful.
+                let guard = sink_handle
+                    .0
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let (prompt, completion) = telemetry::sum_usage(&guard);
+                drop(guard);
                 handle.observe_usage(prompt, completion);
             }
         })
@@ -316,7 +326,11 @@ pub async fn run_native_agent(
     if let Some(poller) = usage_poller {
         poller.abort();
     }
-    let final_events = sink_handle.entries();
+    // One lock for both reads below instead of `entries()` cloning the whole transcript twice.
+    let final_events = sink_handle
+        .0
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     if let Some(handle) = status {
         let (prompt, completion) = telemetry::sum_usage(&final_events);
         handle.observe_usage(prompt, completion);
@@ -326,6 +340,7 @@ pub async fn run_native_agent(
     // the caller still submits a failed run's reasoning. Each `Assistant` event carries its own
     // telemetry (ADR-0087) — no separate side-channel to zip against.
     transcript::append_transcript(transcript, &final_events, task_id);
+    drop(final_events);
 
     Ok(match outcome? {
         LoopOutcome::Finished => ReviewOutcome::Finished,
