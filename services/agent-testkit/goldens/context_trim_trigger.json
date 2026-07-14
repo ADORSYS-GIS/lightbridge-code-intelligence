@@ -53,7 +53,7 @@
                   "type": "integer"
                 },
                 "priority": {
-                  "description": "P0 = must fix (bug/security/data-loss), P1 = should fix, P2 = minor/nit.",
+                  "description": "P0 = blocking — security/data-loss: exploitable without special access, or causes data/state loss on a realistic path. P1 = blocking — a real defect: demonstrably wrong on a realistic input or precondition, even if that precondition is rare; decide by IMPACT IF REAL, not by how confident you feel. P2 = non-blocking: cosmetic, needs an already-broken precondition, or a claim you cannot verify from the diff alone. Never downgrade a defect you can prove to P2 to dodge scrutiny — a wrong severity costs more trust than a missed one.",
                   "enum": [
                     "P0",
                     "P1",
@@ -243,7 +243,7 @@
                   "type": "integer"
                 },
                 "priority": {
-                  "description": "P0 = must fix (bug/security/data-loss), P1 = should fix, P2 = minor/nit.",
+                  "description": "P0 = blocking — security/data-loss: exploitable without special access, or causes data/state loss on a realistic path. P1 = blocking — a real defect: demonstrably wrong on a realistic input or precondition, even if that precondition is rare; decide by IMPACT IF REAL, not by how confident you feel. P2 = non-blocking: cosmetic, needs an already-broken precondition, or a claim you cannot verify from the diff alone. Never downgrade a defect you can prove to P2 to dodge scrutiny — a wrong severity costs more trust than a missed one.",
                   "enum": [
                     "P0",
                     "P1",
@@ -451,7 +451,7 @@
                   "type": "integer"
                 },
                 "priority": {
-                  "description": "P0 = must fix (bug/security/data-loss), P1 = should fix, P2 = minor/nit.",
+                  "description": "P0 = blocking — security/data-loss: exploitable without special access, or causes data/state loss on a realistic path. P1 = blocking — a real defect: demonstrably wrong on a realistic input or precondition, even if that precondition is rare; decide by IMPACT IF REAL, not by how confident you feel. P2 = non-blocking: cosmetic, needs an already-broken precondition, or a claim you cannot verify from the diff alone. Never downgrade a defect you can prove to P2 to dodge scrutiny — a wrong severity costs more trust than a missed one.",
                   "enum": [
                     "P0",
                     "P1",
@@ -676,7 +676,7 @@
                   "type": "integer"
                 },
                 "priority": {
-                  "description": "P0 = must fix (bug/security/data-loss), P1 = should fix, P2 = minor/nit.",
+                  "description": "P0 = blocking — security/data-loss: exploitable without special access, or causes data/state loss on a realistic path. P1 = blocking — a real defect: demonstrably wrong on a realistic input or precondition, even if that precondition is rare; decide by IMPACT IF REAL, not by how confident you feel. P2 = non-blocking: cosmetic, needs an already-broken precondition, or a claim you cannot verify from the diff alone. Never downgrade a defect you can prove to P2 to dodge scrutiny — a wrong severity costs more trust than a missed one.",
                   "enum": [
                     "P0",
                     "P1",

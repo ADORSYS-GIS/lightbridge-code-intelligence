@@ -35,12 +35,22 @@ struct RetractArgs {
     reason: Option<String>,
 }
 
+/// The `priority` field's description (below) is the only severity rubric anchor that ships with
+/// every deployment regardless of the operator's own `config.reviewSystemPrompt` (ai-helm-values) —
+/// #285/#421 found no other in-repo text anchors P0/P1/P2 at all. It's impact-anchored ("decide by
+/// IMPACT IF REAL, not by how confident you feel"), matching the operator-side calibration already
+/// shipped for the same reason (ai-helm-values#53 — severity must not become a confidence dial a model
+/// can hide behind), and it treats P1 as blocking (not merely "should fix") to match how this product
+/// actually uses it (epic #252's own trust contract: "P1 = fix before merge, P2 = nit").
+///
+/// This wording is a hypothesis, not a proven fix — #421 explicitly blocks the actual claim of
+/// improvement on a before/after measurement from the #420 variance harness; see that ticket.
 pub fn specs() -> [ToolSpec; 2] {
     [
         ToolSpec::function(
             ADD_REVIEW_COMMENT,
             "Record one inline review finding on a line the diff adds or changes. Call once per finding as you go; nothing posts until `finish`. Re-recording the same (file, line) refines it.",
-            serde_json::json!({"type":"object","properties":{"file":{"type":"string","description":"Path from repo root."},"line":{"type":"integer","description":"The line this finding anchors to — a line the diff adds or changes. When `start_line` is also given, this is the LAST line of the multi-line range."},"start_line":{"type":"integer","description":"Optional. The FIRST line of a multi-line range; the range ends at `line`. Omit for a single-line finding. Leave unset unless the finding's evidence genuinely spans multiple contiguous lines."},"title":{"type":"string","description":"Short (≤ ~8 words)."},"priority":{"type":"string","enum":["P0","P1","P2"],"description":"P0 = must fix (bug/security/data-loss), P1 = should fix, P2 = minor/nit."},"category":{"type":"string","enum":["security","correctness","quality","style","performance"],"description":"The dimension this finding is about."},"body":{"type":"string","description":"Why it matters."},"evidence":{"type":"string","description":"REQUIRED: the concrete proof — the exact lines / symbol this finding rests on, so it can be verified. If you can't cite it, don't record the finding."},"suggestion":{"type":"string","description":"Optional exact replacement source for `line` (no diff markers)."}},"required":["file","line","title","priority","category","body"]}),
+            serde_json::json!({"type":"object","properties":{"file":{"type":"string","description":"Path from repo root."},"line":{"type":"integer","description":"The line this finding anchors to — a line the diff adds or changes. When `start_line` is also given, this is the LAST line of the multi-line range."},"start_line":{"type":"integer","description":"Optional. The FIRST line of a multi-line range; the range ends at `line`. Omit for a single-line finding. Leave unset unless the finding's evidence genuinely spans multiple contiguous lines."},"title":{"type":"string","description":"Short (≤ ~8 words)."},"priority":{"type":"string","enum":["P0","P1","P2"],"description":"P0 = blocking — security/data-loss: exploitable without special access, or causes data/state loss on a realistic path. P1 = blocking — a real defect: demonstrably wrong on a realistic input or precondition, even if that precondition is rare; decide by IMPACT IF REAL, not by how confident you feel. P2 = non-blocking: cosmetic, needs an already-broken precondition, or a claim you cannot verify from the diff alone. Never downgrade a defect you can prove to P2 to dodge scrutiny — a wrong severity costs more trust than a missed one."},"category":{"type":"string","enum":["security","correctness","quality","style","performance"],"description":"The dimension this finding is about."},"body":{"type":"string","description":"Why it matters."},"evidence":{"type":"string","description":"REQUIRED: the concrete proof — the exact lines / symbol this finding rests on, so it can be verified. If you can't cite it, don't record the finding."},"suggestion":{"type":"string","description":"Optional exact replacement source for `line` (no diff markers)."}},"required":["file","line","title","priority","category","body"]}),
         ),
         ToolSpec::function(
             RETRACT_FINDING,
