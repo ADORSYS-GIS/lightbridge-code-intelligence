@@ -17,9 +17,12 @@ use lci_agent_types::ToolOutcome;
 use super::{arg_field, arg_int_field, normalize_repo_path};
 use crate::tools::{ADD_REVIEW_COMMENT, READ_FILE, RETRACT_FINDING};
 
-/// Phrases marking a finding as an *absence* claim. Deliberately broad substring matching over the
-/// finding's own text (title/body/evidence) — a false negative here just falls back to the pre-existing
-/// generic re-verify nudge, so over-matching is far cheaper than under-matching.
+/// Phrases marking a finding as an *absence* claim. Deliberately broad, bare (article-free) substring
+/// matching over the finding's own text (title/body/evidence) — a false negative here just falls back to
+/// the pre-existing generic re-verify nudge, so over-matching is far cheaper than under-matching. Bare
+/// forms ("without", "missing", "lacks", "omits") are intentional, not "without the"/"without a": the
+/// motivating incident's own finding read "Cancel request rejected without Idempotency-Key" — no
+/// article — and a qualifier-anchored marker would have missed the exact case this exists to catch.
 const ABSENCE_MARKERS: &[&str] = &[
     "never sent",
     "never set",
@@ -27,30 +30,38 @@ const ABSENCE_MARKERS: &[&str] = &[
     "never present",
     "never populated",
     "never applied",
+    "never has",
     "not sent",
     "not set",
     "not present",
     "not included",
     "not populated",
     "not applied",
+    "not have",
     "no longer sent",
-    "without the",
-    "without a",
-    "missing the",
-    "missing a",
+    "no longer set",
+    "no longer included",
+    "without",
+    "missing",
+    "lacks",
+    "omits",
+    "omitted",
+    "sends no",
+    "sent no",
+    "send no",
+    "includes no",
+    "contains no",
     "doesn't send",
     "does not send",
     "doesn't set",
     "does not set",
     "doesn't include",
     "does not include",
+    "doesn't have",
+    "does not have",
     "fails to send",
     "fails to set",
     "fails to include",
-    "lacks the",
-    "lacks a",
-    "omits the",
-    "omitted",
 ];
 
 fn is_absence_claim(text: &str) -> bool {
@@ -313,6 +324,29 @@ mod tests {
         assert!(nudge.contains("bff/cmd/server/main.go:580"));
         assert!(nudge.contains("transport interceptor"));
         assert!(nudge.contains("bff/cmd/server/main.go"));
+    }
+
+    /// Regression for a codex finding on #403: the marker list must catch the *bare* (article-free)
+    /// phrasing the motivating incident actually used — "without Idempotency-Key", not "without the/a
+    /// Idempotency-Key" — with no other matching language anywhere else in the finding to lean on.
+    #[test]
+    fn bare_without_phrasing_alone_is_detected_as_absence_claim() {
+        let mut gate = RefuteGate::new(false);
+        gate.after_turn_actions(
+            &state(0),
+            &finding_turn(
+                r#"{"priority":"P1","file":"bff/cmd/server/main.go","line":580,"title":"Cancel request rejected without Idempotency-Key","body":"every cancel attempt will be rejected with 400","evidence":"pending_p2p_repository.dart:30"}"#,
+            ),
+        );
+        let actions = gate.after_turn_actions(&state(1), &finish_turn());
+        let nudge = actions
+            .iter()
+            .find_map(|action| match action {
+                PolicyAction::RejectFinish(Nudge(text)) => Some(text.clone()),
+                _ => None,
+            })
+            .expect("expected a RejectFinish nudge");
+        assert!(nudge.contains("transport interceptor"));
     }
 
     /// The engaged-files list in the outward-search directive is capped (mirrors `CoverageGate`'s
