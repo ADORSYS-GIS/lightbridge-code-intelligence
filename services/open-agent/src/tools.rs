@@ -5,11 +5,12 @@
 //! (the agent never touches a forge token). Contrast `review`, whose registry is read-only + mediated
 //! comment tools and which never executes repository code.
 
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
 use lci_agent_clients::ControlPlaneClient;
-use lci_agent_tools::{RegistryError, RuntimeCaps, ToolRegistry};
+use lci_agent_tools::{RegistryError, RuntimeCaps, ToolCx, ToolRegistry};
 use lci_agent_types::ToolSpec;
 
 pub mod apply_patch;
@@ -19,6 +20,7 @@ pub mod propose_pr;
 pub mod read_file;
 pub mod run_command;
 pub mod terminal;
+mod walk;
 
 pub use apply_patch::EDIT_FILE;
 pub use find_files::FIND_FILES;
@@ -50,6 +52,15 @@ pub(crate) fn parse<T: serde::de::DeserializeOwned>(arguments: &str) -> Result<T
             "error: invalid arguments — {error}. Re-call with arguments matching the tool's schema."
         )
     })
+}
+
+/// Materialize the sandbox workdir root, mapping a [`Workspace`](lci_agent_tools::Workspace) failure
+/// into the one model-facing error string every tool reports for it. Every tool call starts here.
+pub(crate) async fn resolve_root<'a>(cx: &'a ToolCx<'a>) -> Result<&'a Path, String> {
+    cx.workspace
+        .root()
+        .await
+        .map_err(|error| format!("error: could not materialize the sandbox workdir: {error}"))
 }
 
 /// The complete built-in open surface, in a stable order (navigation → write → execute → terminal).

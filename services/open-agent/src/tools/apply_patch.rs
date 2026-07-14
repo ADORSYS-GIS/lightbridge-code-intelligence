@@ -15,7 +15,7 @@ use lci_agent_tools::{
 use lci_agent_types::{ToolCallReq, ToolOutcome, ToolSpec};
 use serde::Deserialize;
 
-use super::parse;
+use super::{parse, resolve_root};
 use crate::workspace::resolve_write;
 
 /// The write tool's model-facing name. ADR-0088 calls the write tool `apply_patch`/`edit_file`; we
@@ -67,13 +67,9 @@ impl Tool for EditFileTool {
                 Ok(args) => args,
                 Err(error) => return ToolOutcome::Continue(error),
             };
-            let root = match cx.workspace.root().await {
+            let root = match resolve_root(cx).await {
                 Ok(root) => root,
-                Err(error) => {
-                    return ToolOutcome::Continue(format!(
-                        "error: could not materialize the sandbox workdir: {error}"
-                    ));
-                }
+                Err(error) => return ToolOutcome::Continue(error),
             };
             // The path-safety boundary: reject `..` + out-of-workdir symlink escapes (ADR-0088).
             let target = match resolve_write(root, &args.path) {

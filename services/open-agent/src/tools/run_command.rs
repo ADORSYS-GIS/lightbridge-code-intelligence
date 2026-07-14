@@ -19,7 +19,7 @@ use lci_agent_types::{ToolCallReq, ToolOutcome, ToolSpec};
 use serde::Deserialize;
 use tokio::process::Command;
 
-use super::parse;
+use super::{parse, resolve_root};
 
 pub const RUN_COMMAND: &str = "run_command";
 
@@ -85,13 +85,9 @@ impl Tool for RunCommandTool {
             if args.command.trim().is_empty() {
                 return ToolOutcome::Continue("error: command must not be empty.".into());
             }
-            let root = match cx.workspace.root().await {
+            let root = match resolve_root(cx).await {
                 Ok(root) => root.to_path_buf(),
-                Err(error) => {
-                    return ToolOutcome::Continue(format!(
-                        "error: could not materialize the sandbox workdir: {error}"
-                    ));
-                }
+                Err(error) => return ToolOutcome::Continue(error),
             };
             ToolOutcome::Continue(
                 run(

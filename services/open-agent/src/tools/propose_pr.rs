@@ -23,7 +23,7 @@ use lci_agent_types::{ToolCallReq, ToolOutcome, ToolSpec};
 use serde::Deserialize;
 use tokio::process::Command;
 
-use super::{OpenServices, parse};
+use super::{OpenServices, parse, resolve_root};
 
 pub const PROPOSE_PR: &str = "propose_pr";
 
@@ -95,13 +95,9 @@ impl Tool for ProposePrTool {
                 Ok(args) => args,
                 Err(error) => return ToolOutcome::Continue(error),
             };
-            let root = match cx.workspace.root().await {
+            let root = match resolve_root(cx).await {
                 Ok(root) => root.to_path_buf(),
-                Err(error) => {
-                    return ToolOutcome::Continue(format!(
-                        "error: could not materialize the sandbox workdir: {error}"
-                    ));
-                }
+                Err(error) => return ToolOutcome::Continue(error),
             };
             // No silent default: capturing `HEAD~1..HEAD` would ship only the last commit for a
             // multi-commit branch while the PR targets `base`. Require the caller to name the base.
