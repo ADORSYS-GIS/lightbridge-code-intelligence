@@ -13,13 +13,18 @@
 //! 1. **Truncate on file boundaries, not bytes.** The diff is split into per-file sections (each a whole
 //!    `diff --git …` block) and packed *whole* until the next one wouldn't fit. A file is either shown
 //!    completely or listed as not-shown — never cut mid-hunk.
-//! 2. **Deprioritise generated / lock-file noise.** Lockfiles, `*.min.js`, snapshots, etc. carry almost
-//!    no review signal per byte, so they're set aside and listed rather than rendered — freeing the whole
-//!    budget for source. (If a PR changes *only* such files we still render them, so the diff isn't blank.)
+//! 2. **Deprioritise low-signal noise.** Lockfiles, minified/bundled/snapshot output, generated code,
+//!    tests, and config/docs (see [`crate::path_signal`]) carry little-to-no review signal per byte, so
+//!    they're set aside and listed rather than rendered — freeing the whole budget for source. (If a PR
+//!    changes *only* such files we still render them, so the diff isn't blank.)
 //!
 //! The caller ([`super::build_messages`]) turns [`RenderedDiff::omitted_for_budget`] and
 //! [`RenderedDiff::low_signal`] into an explicit "these files were NOT shown" block in the prompt, so the
 //! model can state honest coverage and never raises a defect about code it was never given.
+//!
+//! [`is_low_signal_path`] delegates to [`crate::path_signal::classify_path`] — the same classification
+//! the coverage gate ([`crate::policies::coverage`]) uses for its denominator (#306), so "this file
+//! carries no real review signal" means the same thing everywhere in the review agent.
 
 /// One file's slice of a unified diff: its repo-relative path and the raw `diff --git …` block (header +
 /// hunks) exactly as git emitted it — both borrowed from the original diff (no per-file allocation).
@@ -43,42 +48,11 @@ pub struct RenderedDiff<'a> {
     pub low_signal: Vec<&'a str>,
 }
 
-/// Whether a path is generated / lock-file noise that carries little review signal per byte, so it's
-/// deprioritised out of the rendered diff (still disclosed in the file list). Matched on the normalised
-/// (forward-slash) path so `a\b\Cargo.lock` classifies the same as `a/b/Cargo.lock`.
+/// Whether a path carries little-to-no review signal per byte, so it's deprioritised out of the
+/// rendered diff (still disclosed in the file list). See [`crate::path_signal::classify_path`] for the
+/// classification itself — shared with the coverage gate (#306).
 fn is_low_signal_path(path: &str) -> bool {
-    // Only allocate to normalise when a backslash is actually present (Windows-style paths are rare).
-    let normalized;
-    let p = if path.contains('\\') {
-        normalized = path.replace('\\', "/");
-        normalized.as_str()
-    } else {
-        path
-    };
-    let name = p.rsplit('/').next().unwrap_or(p);
-
-    // Exact lock / dependency-manifest files across ecosystems.
-    const LOCK_FILES: &[&str] = &[
-        "Cargo.lock",
-        "package-lock.json",
-        "pnpm-lock.yaml",
-        "yarn.lock",
-        "npm-shrinkwrap.json",
-        "bun.lockb",
-        "composer.lock",
-        "Gemfile.lock",
-        "poetry.lock",
-        "Pipfile.lock",
-        "go.sum",
-        "flake.lock",
-    ];
-    if LOCK_FILES.contains(&name) {
-        return true;
-    }
-
-    // Minified / bundled / map artefacts and common snapshot dumps — high-byte, low-signal.
-    const NOISE_SUFFIXES: &[&str] = &[".min.js", ".min.css", ".map", ".snap", ".bundle.js"];
-    NOISE_SUFFIXES.iter().any(|s| name.ends_with(s))
+    crate::path_signal::classify_path(path).is_low_signal()
 }
 
 /// The repo-relative path a `diff --git …` section is about. Prefers the `+++ b/…` header (present for
@@ -249,6 +223,11 @@ mod tests {
             "styles/x.min.css",
             "bundle.js.map",
             "components/__snapshots__/a.snap",
+            // Broadened classification (#306): generated code, tests, and docs are also low-signal — see
+            // `path_signal` for the full classifier test matrix, this just checks the delegation wires up.
+            "lib/l10n/app_localizations.dart",
+            "src/foo_test.go",
+            "docs/adr/0063.md",
         ] {
             assert!(is_low_signal_path(p), "{p} should be low-signal");
         }
@@ -256,7 +235,6 @@ mod tests {
             "src/auth/store.rs",
             "Cargo.toml",
             "clients/lci/src/main.rs",
-            "docs/adr/0063.md",
             "app.js", // not minified
         ] {
             assert!(!is_low_signal_path(p), "{p} should be source");
