@@ -22,10 +22,9 @@
 pub mod chunk;
 pub mod graph;
 pub mod ignore_list;
-pub mod language;
+pub mod lang;
 pub mod pdf;
 pub mod tags;
-pub mod ts;
 pub mod tuning;
 pub mod walk;
 

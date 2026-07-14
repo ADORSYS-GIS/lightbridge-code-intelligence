@@ -30,6 +30,7 @@ use serde::Serialize;
 use tree_sitter::{Node, Tree};
 
 use crate::chunk::interesting_node;
+use crate::lang::{self, GraphStrategy, LanguageSupport};
 use crate::tags;
 
 /// One graph node. Field set mirrors `agent-clients::GraphNodePayload` exactly.
@@ -98,17 +99,22 @@ struct CallSite {
 #[must_use]
 pub fn extract_file(tree: &Tree, source_file: &str, source: &str, language: &str) -> FileSymbols {
     let mut facts = FileSymbols::default();
-    // The definition/call *classifier*: Rust keeps its own node-kind extractor (byte-stable golden);
-    // every other language identifies defs + calls via the grammar's bundled `tags.scm` query. The
-    // `tagged` binding owns the query result the `Classifier::Tagged` variant borrows for the walk.
+    // The definition/call *classifier* is chosen by the language's registry [`GraphStrategy`]: Rust
+    // keeps its own node-kind extractor (byte-stable golden); every other language identifies defs +
+    // calls via the grammar's bundled `tags.scm` query. An unknown language, or one with no graph
+    // extractor, yields empty facts. The `tagged` binding owns the query result the
+    // `Classifier::Tagged` variant borrows for the walk.
     let tagged;
-    let classifier = if language == "rust" {
-        Classifier::Rust
-    } else if let Some(symbols) = tags::extract(language, tree, source) {
-        tagged = symbols;
-        Classifier::Tagged(&tagged)
-    } else {
-        return facts;
+    let classifier = match lang::by_id(language).and_then(LanguageSupport::graph_strategy) {
+        Some(GraphStrategy::RustNative) => Classifier::Rust,
+        Some(GraphStrategy::Tags(_)) => match tags::extract(language, tree, source) {
+            Some(symbols) => {
+                tagged = symbols;
+                Classifier::Tagged(&tagged)
+            }
+            None => return facts,
+        },
+        None => return facts,
     };
 
     // The file node: id = the path, label = the file name, line 1 (1-based, matching Graphify's `L1`
@@ -563,13 +569,13 @@ pub fn resolve(files: Vec<FileSymbols>) -> Graph {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ts;
+    use crate::lang;
 
     fn graph_of_lang(language: &str, files: &[(&str, &str)]) -> Graph {
         let facts: Vec<FileSymbols> = files
             .iter()
             .map(|(path, src)| {
-                let tree = ts::parse(src, language).expect("source parses");
+                let tree = lang::parse(src, language).expect("source parses");
                 extract_file(&tree, path, src, language)
             })
             .collect();

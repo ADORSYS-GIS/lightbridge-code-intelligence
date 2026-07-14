@@ -15,9 +15,8 @@ use ignore::WalkBuilder;
 use crate::chunk::{self, Chunk, MAX_FILE_BYTES};
 use crate::graph::{self, FileSymbols, Graph};
 use crate::ignore_list::{IgnoreConfig, IgnoreList};
-use crate::language;
+use crate::lang;
 use crate::pdf::{self, PdfOutcome};
-use crate::ts;
 use crate::tuning::IndexTuning;
 
 /// Options for [`walk_checkout`]. `bon` builder (≥3 fields, ADR-0083 idiom).
@@ -118,7 +117,7 @@ pub fn walk_checkout(root: &Path, options: &WalkOptions) -> anyhow::Result<WalkO
             .replace('\\', "/");
 
         // ── PDFs: bounded text extraction → windowed chunks ──────────────────────────────────────
-        if options.extract_pdfs && language::is_pdf(path) {
+        if options.extract_pdfs && lang::is_pdf(path) {
             match pdf::extract_from_path(path) {
                 PdfOutcome::Text(text) => {
                     let file_chunks = chunk::chunk_text(&rel_path, &text, "pdf", options.tuning);
@@ -141,7 +140,7 @@ pub fn walk_checkout(root: &Path, options: &WalkOptions) -> anyhow::Result<WalkO
         }
 
         // ── Source / text files ─────────────────────────────────────────────────────────────────
-        let Some(lang) = language::from_path(path) else {
+        let Some(language) = lang::from_path(path) else {
             continue;
         };
         // Bound the read at the I/O level, not via `metadata().len()`: the file could grow (or be a
@@ -159,20 +158,20 @@ pub fn walk_checkout(root: &Path, options: &WalkOptions) -> anyhow::Result<WalkO
             continue; // over the byte cap
         }
 
-        let file_chunks = if options.build_graph && language::has_graph(lang) {
+        let file_chunks = if options.build_graph && lang::has_graph(language) {
             // Parse ONCE and feed both the chunker and the graph builder (ADR-0086 "parse once").
-            if let Some(tree) = ts::parse(&source, lang) {
-                file_symbols.push(graph::extract_file(&tree, &rel_path, &source, lang));
-                let mut cs = chunk::chunk_tree(&tree, &rel_path, &source, lang, options.tuning);
+            if let Some(tree) = lang::parse(&source, language) {
+                file_symbols.push(graph::extract_file(&tree, &rel_path, &source, language));
+                let mut cs = chunk::chunk_tree(&tree, &rel_path, &source, language, options.tuning);
                 if cs.is_empty() {
-                    cs = chunk::chunk_text(&rel_path, &source, lang, options.tuning);
+                    cs = chunk::chunk_text(&rel_path, &source, language, options.tuning);
                 }
                 cs
             } else {
-                chunk::chunk_file(&rel_path, &source, lang, options.tuning)
+                chunk::chunk_file(&rel_path, &source, language, options.tuning)
             }
         } else {
-            chunk::chunk_file(&rel_path, &source, lang, options.tuning)
+            chunk::chunk_file(&rel_path, &source, language, options.tuning)
         };
 
         if !file_chunks.is_empty() {
