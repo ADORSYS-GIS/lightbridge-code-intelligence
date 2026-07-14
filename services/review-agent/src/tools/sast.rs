@@ -14,7 +14,7 @@ use lci_agent_types::{ToolCallReq, ToolOutcome, ToolSpec};
 use serde::Deserialize;
 
 use super::{ReviewServices, parse};
-use crate::policies::{SastLead, SastLeadSink};
+use crate::policies::{SastLead, SastLeadSink, normalize_repo_path};
 
 pub const RUN_SAST: &str = "run_sast";
 
@@ -93,7 +93,34 @@ impl Tool for RunSastTool {
                     ));
                 }
             };
-            let targets = args.files.unwrap_or_else(|| self.changed_files.clone());
+            // A `files` arg only ever SCOPES DOWN the scan — it must not be able to widen it past the
+            // PR's changed-file set (bug caught in PR review, gemini-code-assist): match against
+            // `self.changed_files` normalized (backslashes / leading `./` or `/`), but scan using the
+            // CANONICAL spelling from `changed_files` rather than the model's raw string, so a
+            // differently-spelled-but-equal request still resolves to the exact path the diff carries.
+            let targets = match args.files {
+                Some(requested) => {
+                    let canonical: std::collections::HashMap<String, &String> = self
+                        .changed_files
+                        .iter()
+                        .map(|f| (normalize_repo_path(f), f))
+                        .collect();
+                    requested
+                        .iter()
+                        .filter_map(|f| {
+                            canonical.get(&normalize_repo_path(f)).map(|f| (*f).clone())
+                        })
+                        .collect()
+                }
+                None => self.changed_files.clone(),
+            };
+            if targets.is_empty() {
+                return ToolOutcome::Continue(
+                    "SAST scan complete: none of the requested files are in this PR's changed-file \
+                     set (run_sast only scans the diff — nothing to record)."
+                        .to_string(),
+                );
+            }
             let findings = match sast::scan(&self.config, root, &targets).await {
                 Ok(findings) => findings,
                 Err(error) => {
@@ -373,6 +400,69 @@ mod tests {
         assert!(
             !argv.contains("other.rs"),
             "the un-requested changed file is NOT scanned: {argv}"
+        );
+    }
+
+    // PR review (gemini-code-assist): `files` must only ever SCOPE DOWN the scan, never widen it past
+    // the PR's changed-file set — a model asking for a file outside the diff must not get it scanned.
+    #[tokio::test]
+    async fn files_arg_cannot_widen_the_scan_past_changed_files() {
+        let stub_dir = tempfile::tempdir().unwrap();
+        let marker = stub_dir.path().join("ran");
+        let bin = write_stub_opengrep(stub_dir.path(), &marker, ONE_FINDING_SARIF);
+
+        let checkout = tempfile::tempdir().unwrap();
+        tokio::fs::create_dir_all(checkout.path().join("src"))
+            .await
+            .unwrap();
+        tokio::fs::write(checkout.path().join("src/exec.rs"), "fn main() {}\n")
+            .await
+            .unwrap();
+        tokio::fs::write(checkout.path().join(".env"), "SECRET=shh\n")
+            .await
+            .unwrap();
+
+        let cp = MockServer::start().await;
+        let leads: SastLeadSink = Arc::new(Mutex::new(Vec::new()));
+        let tool = tool(
+            &cp.uri(),
+            config(bin),
+            vec!["src/exec.rs".to_string()],
+            Arc::clone(&leads),
+        );
+        let workspace = EagerWorkspace::new(checkout.path().to_path_buf());
+        let cx = ToolCx {
+            task_id: Uuid::nil(),
+            workspace: &workspace,
+        };
+
+        // Requests a file that exists in the checkout but is NOT in this PR's changed-file set.
+        let outcome = tool.call(&cx, &call(r#"{"files":[".env"]}"#)).await;
+
+        assert!(
+            !marker.exists(),
+            "opengrep must never run when every requested file is out of scope"
+        );
+        assert_eq!(
+            outcome,
+            ToolOutcome::Continue(
+                "SAST scan complete: none of the requested files are in this PR's changed-file \
+                 set (run_sast only scans the diff — nothing to record)."
+                    .to_string()
+            )
+        );
+
+        // A mix of in-scope and out-of-scope requests keeps only the in-scope one.
+        tool.call(&cx, &call(r#"{"files":[".env","src/exec.rs"]}"#))
+            .await;
+        let argv = std::fs::read_to_string(format!("{}.argv", marker.display())).unwrap();
+        assert!(
+            argv.contains("src/exec.rs"),
+            "the in-scope file is scanned: {argv}"
+        );
+        assert!(
+            !argv.contains(".env"),
+            "the out-of-scope file is dropped: {argv}"
         );
     }
 }

@@ -106,7 +106,11 @@ impl SastAnchorGate {
             .sink
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        for lead in &sink[self.merged..] {
+        // `run_sast` only ever pushes into the sink today, so `merged` can never legitimately exceed
+        // `sink.len()` — but clamp defensively (PR review, gemini-code-assist) so a future refactor that
+        // clears/truncates the shared sink can't turn this into an out-of-bounds slice panic.
+        let start = self.merged.min(sink.len());
+        for lead in &sink[start..] {
             self.leads
                 .entry(normalize_repo_path(&lead.file))
                 .or_default()
@@ -466,5 +470,26 @@ mod tests {
                 .any(|action| matches!(action, PolicyAction::RejectFinish(_))),
             "a lead delivered after construction is still honored"
         );
+    }
+
+    // PR review (gemini-code-assist): `merged` tracks how far into the sink the gate has already read,
+    // but nothing today guarantees the sink only ever grows. If a future refactor ever clears/truncates
+    // it, an unclamped `&sink[self.merged..]` would panic (slice start past the end). Simulate exactly
+    // that — sync once against a populated sink, then shrink it externally — and confirm `sync_leads`
+    // (called via `after_turn_actions`) doesn't panic and simply treats the shrink as "nothing new".
+    #[test]
+    fn sync_leads_does_not_panic_if_the_sink_shrinks_after_a_prior_sync() {
+        let sink: SastLeadSink = Arc::new(Mutex::new(leads()));
+        let mut gate = SastAnchorGate::new(Arc::clone(&sink), false);
+
+        // First sync: merged advances to the sink's current length (1).
+        assert!(gate.after_turn_actions(&state(0), &finish()).is_empty());
+
+        // Shrink the sink back to empty — not reachable from any current production code path
+        // (`run_sast` only ever pushes), but exactly the future-refactor scenario the clamp guards.
+        sink.lock().unwrap().clear();
+
+        // Must not panic; `self.merged` (1) now exceeds `sink.len()` (0).
+        assert!(gate.after_turn_actions(&state(1), &finish()).is_empty());
     }
 }
