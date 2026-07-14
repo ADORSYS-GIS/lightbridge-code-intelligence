@@ -167,7 +167,7 @@ pub async fn claim_next_push_config(
                SELECT COALESCE(MAX(e.seq), 0) FROM a2a_task_events e \
                WHERE e.a2a_task_id = c.a2a_task_id \
              ) \
-           ORDER BY c.next_attempt_at \
+           ORDER BY c.next_attempt_at, c.config_id \
            FOR UPDATE SKIP LOCKED \
            LIMIT 1 \
          ) \
@@ -342,7 +342,7 @@ pub async fn sweep_terminal_a2a_tasks(
                  'TASK_STATE_CANCELED', 'TASK_STATE_REJECTED' \
                ) \
              ) \
-           ORDER BY t.created_at \
+           ORDER BY t.created_at, t.a2a_task_id \
            LIMIT $2 \
          )",
     )
