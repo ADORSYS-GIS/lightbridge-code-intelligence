@@ -31,8 +31,9 @@ One control-plane binary runs in three roles (`serve`, `dispatcher`, and `reconc
 disposable per-task Jobs. `serve` handles the HTTP API + reads, `dispatcher` consumes the work queue
 and launches Jobs, and `reconciler` drains the GitHub-egress outbox (the single writer to GitHub) and
 polls feedback. A Job never receives the GitHub App key — it bootstraps a short-lived installation
-token at runtime — but it **is** injected with the shared runner bearer (`AGENT_RUNNER_TOKEN`) and the
-embeddings API key it needs to do its work (see [Secrets a Job holds](#secrets-a-job-holds)).
+token at runtime — but it **is** injected with a per-task, short-lived runner token
+(`AGENT_RUNNER_TOKEN`, minted per Job from `RUNNER_TOKEN_SIGNING_KEY`, [ADR-0092](docs/adr/0092-per-task-runner-tokens.md))
+and the embeddings API key it needs to do its work (see [Secrets a Job holds](#secrets-a-job-holds)).
 
 ```mermaid
 flowchart TD
@@ -217,13 +218,14 @@ is **not** credential-free, though. Today the dispatcher injects into every runn
 | Secret | Source | Lifetime | Notes |
 |---|---|---|---|
 | GitHub installation token | minted per task by `serve` | ~1h, auto-expires | the only GitHub credential a Job sees |
-| `AGENT_RUNNER_TOKEN` | plaintext env in the pod spec | long-lived, **shared** across all Jobs | bearer for the internal API; a hardening target (move to a `secretKeyRef`, per-task scoping) |
+| `AGENT_RUNNER_TOKEN` | plaintext env in the pod spec, but minted per task | scoped to ONE task, expires with its Job's `activeDeadlineSeconds` | signed by `RUNNER_TOKEN_SIGNING_KEY` (control-plane-only, never in a Job); bearer for the internal API — a leaked value authenticates only this task ([ADR-0092](docs/adr/0092-per-task-runner-tokens.md)) |
 | `EMBEDDINGS_API_KEY` | `secretKeyRef` → `lightbridge-agent-secrets` | long-lived, shared | the embeddings gateway key ([ADR-0018](docs/adr/0018-openai-compatible-embeddings.md)) |
 | internal-CA cert | mounted from a Secret | n/a | trusts the internal HTTPS embeddings gateway |
 
-So "no long-lived secrets in the Job" is **not** accurate — only the GitHub App key is withheld.
-Narrowing the shared `AGENT_RUNNER_TOKEN`'s exposure (secret ref + per-task scoping) is tracked as a
-follow-up.
+So "no long-lived secrets in the Job" is **not** accurate — only the GitHub App key is withheld, and
+`EMBEDDINGS_API_KEY` is still a standing shared secret. `AGENT_RUNNER_TOKEN` is no longer one of the
+long-lived ones, though: [ADR-0092](docs/adr/0092-per-task-runner-tokens.md) narrowed it to a per-task,
+short-lived signed token.
 
 ---
 

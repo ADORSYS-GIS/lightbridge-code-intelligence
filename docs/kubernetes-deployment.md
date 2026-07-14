@@ -118,9 +118,12 @@ The Job carries the task context and callback wiring as env (`job_manifest`):
 
 - `TASK_ID`, `REPOSITORY_ID`, `INSTALLATION_ID`, `COMMAND`, `TARGET_TYPE`, `TARGET_ID`, `ATTEMPT`,
   and `BASE_SHA` / `HEAD_SHA` (each omitted when absent).
-- `CONTROL_PLANE_URL` + `AGENT_RUNNER_TOKEN` — where the runner calls back and the shared bearer it
-  presents to that internal API ([ADR-0017](adr/0017-agent-runner-control-plane-bootstrap.md)). The
-  runner re-fetches full context from the internal API rather than trusting these for anything
+- `CONTROL_PLANE_URL` + `AGENT_RUNNER_TOKEN` — where the runner calls back and the per-task token it
+  presents to that internal API. The token is a fresh HS256 JWT minted for this Job's task id at
+  dispatch time, signed by the (never-injected) `RUNNER_TOKEN_SIGNING_KEY`
+  ([ADR-0017](adr/0017-agent-runner-control-plane-bootstrap.md) /
+  [ADR-0092](adr/0092-per-task-runner-tokens.md)) — it authenticates only this task, not every Job's.
+  The runner re-fetches full context from the internal API rather than trusting these for anything
   security-sensitive.
 - **Embeddings (required)** — `EMBEDDINGS_BASE_URL` / `EMBEDDINGS_API_KEY` / `EMBEDDINGS_MODEL` from
   Secret `lightbridge-agent-secrets`. Required (no defaults) so a misconfigured Job fails loud rather

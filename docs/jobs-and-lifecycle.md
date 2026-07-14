@@ -317,8 +317,10 @@ Job).
 `restartPolicy: Never`, `backoffLimit: 1`, `ttlSecondsAfterFinished: 900` (post-completion cleanup),
 and `activeDeadlineSeconds` from `AGENT_JOB_DEADLINE_SECONDS` (default **3600 = 1h** — large repos can
 legitimately index for tens of minutes; this is the `timed_out` boundary). The pod gets `TASK_ID`,
-`CONTROL_PLANE_URL`, the shared bearer (`AGENT_RUNNER_TOKEN`), the optional CA secret, and the mounted
-agent ConfigMap (`agent.json` + prompt templates). A 409 on create is treated as "adopt our own Job"
+`CONTROL_PLANE_URL`, a per-task signed token (`AGENT_RUNNER_TOKEN`, minted for this task id and expiring
+with its own `activeDeadlineSeconds` — [ADR-0092](adr/0092-per-task-runner-tokens.md)), the optional CA
+secret, and the mounted agent ConfigMap (`agent.json` + prompt templates). A 409 on create is treated as
+"adopt our own Job"
 (the name is task-id-derived, so a 409 is a previous attempt we crashed before recording) rather than
 erroring forever.
 

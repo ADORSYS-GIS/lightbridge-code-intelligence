@@ -64,9 +64,14 @@ and auth, run it with:
 DATABASE_URL=postgres://lightbridge:lightbridge@localhost:5432/lightbridge \
 NEO4J_URI=bolt://localhost:7687 NEO4J_USER=neo4j NEO4J_PASSWORD=lightbridge \
 OIDC_ISSUER=http://localhost:8081/realms/lightbridge OIDC_AUDIENCE=lightbridge-api \
-AGENT_RUNNER_TOKEN=dev-runner-token \
+RUNNER_TOKEN_SIGNING_KEY=dev-signing-key \
 cargo run -p control-plane          # migrations run automatically on connect
 ```
+
+`RUNNER_TOKEN_SIGNING_KEY` replaces the old shared `AGENT_RUNNER_TOKEN` dev bearer
+([ADR-0092](adr/0092-per-task-runner-tokens.md)): the control plane now mints a fresh, per-task token
+for each Job rather than accepting one fixed string, so there's no static value to hardcode here — see
+§3 for how the manual runner gets a token to present.
 
 Permission-based authz (ADR-0023): the dev realm should emit a `permissions` claim. To exercise gated
 endpoints (`task:read`, `repo:approve`, `task:cancel`, …) add those to the dev user's token via a
@@ -113,14 +118,22 @@ Creating a task leaves it **`queued`**; something must run the Job.
 
 ### Manual runner (no cluster)
 
-Grab the queued task's id (from `/dashboard/runs` or the DB) and run the runner against your local
-control plane:
+Grab the queued task's id (from `/dashboard/runs` or the DB), mint it a token, and run the runner
+against your local control plane:
 
 ```bash
-TASK_ID=<uuid> CONTROL_PLANE_URL=http://localhost:8080 AGENT_RUNNER_TOKEN=dev-runner-token \
+TASK_ID=<uuid>
+TOKEN=$(RUNNER_TOKEN_SIGNING_KEY=dev-signing-key cargo run -p control-plane -- mint-runner-token "$TASK_ID")
+
+TASK_ID="$TASK_ID" CONTROL_PLANE_URL=http://localhost:8080 AGENT_RUNNER_TOKEN="$TOKEN" \
 EMBEDDINGS_BASE_URL=<openai-compatible-url> EMBEDDINGS_API_KEY=<key> EMBEDDINGS_MODEL=<model> \
 cargo run -p agent-runner
 ```
+
+`mint-runner-token` (ADR-0092) is the same signer the dispatcher itself mints Job tokens with — it
+needs only `RUNNER_TOKEN_SIGNING_KEY` (matching what you started the control plane with) and the task
+id, and prints one token to stdout. The token is scoped to that task and expires after
+`AGENT_JOB_DEADLINE_SECONDS` (default 1h) — mint a fresh one if the run takes long enough to expire.
 
 It fetches context, clones, indexes (pgvector + Neo4j), and — for a review task — runs OpenCode
 (requires `opencode` on PATH + an LLM provider; indexing-only works without it).
@@ -156,7 +169,8 @@ just ci      # the full local gate (schema lint + build + xtask ci)
 | `DATABASE_URL` | control plane | `postgres://lightbridge:lightbridge@localhost:5432/lightbridge` |
 | `NEO4J_URI` / `NEO4J_USER` / `NEO4J_PASSWORD` | control plane | `bolt://localhost:7687` / `neo4j` / `lightbridge` |
 | `OIDC_ISSUER` / `OIDC_AUDIENCE` | control plane + web | `http://localhost:8081/realms/lightbridge` / `lightbridge-api` |
-| `AGENT_RUNNER_TOKEN` | control plane + runner | any shared dev string |
+| `RUNNER_TOKEN_SIGNING_KEY` | control plane | any dev string (never given to the runner) |
+| `AGENT_RUNNER_TOKEN` | runner | minted per task via `mint-runner-token` (§3) |
 | `GITHUB_APP_ID` / `GITHUB_APP_PRIVATE_KEY` / `GITHUB_WEBHOOK_SECRET` / `GITHUB_APP_HANDLE` | control plane | from your test GitHub App |
 | `EMBEDDINGS_BASE_URL` / `EMBEDDINGS_API_KEY` / `EMBEDDINGS_MODEL` | runner | any OpenAI-compatible endpoint |
 | `GITHUB_APP_INSTALL_URL` / `PERMISSIONS_CLAIM` | web | App page URL / `permissions` |
