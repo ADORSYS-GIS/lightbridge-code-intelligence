@@ -11,7 +11,7 @@ use lci_agent_types::{ToolCallReq, ToolOutcome, ToolSpec};
 use serde::Deserialize;
 use tokio::io::AsyncReadExt;
 
-use super::parse;
+use super::{parse, resolve_root};
 use crate::workspace::resolve_read;
 
 pub const READ_FILE: &str = "read_file";
@@ -63,13 +63,9 @@ impl Tool for ReadFileTool {
                 Ok(args) => args,
                 Err(error) => return ToolOutcome::Continue(error),
             };
-            let root = match cx.workspace.root().await {
+            let root = match resolve_root(cx).await {
                 Ok(root) => root,
-                Err(error) => {
-                    return ToolOutcome::Continue(format!(
-                        "error: could not materialize the sandbox workdir: {error}"
-                    ));
-                }
+                Err(error) => return ToolOutcome::Continue(error),
             };
             let path = match resolve_read(root, &args.path) {
                 Ok(path) => path,

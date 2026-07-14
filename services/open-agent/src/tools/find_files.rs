@@ -1,6 +1,7 @@
 //! `find_files` — list working-tree paths whose name contains a substring. Read-only navigation,
 //! sandbox-scoped, never following directory symlinks out of the workdir.
 
+use std::ops::ControlFlow;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -11,7 +12,8 @@ use lci_agent_tools::{
 use lci_agent_types::{ToolCallReq, ToolOutcome, ToolSpec};
 use serde::Deserialize;
 
-use super::parse;
+use super::walk::walk_files;
+use super::{parse, resolve_root};
 
 pub const FIND_FILES: &str = "find_files";
 const MAX_RESULTS: usize = 200;
@@ -57,13 +59,9 @@ impl Tool for FindFilesTool {
                 Ok(args) => args,
                 Err(error) => return ToolOutcome::Continue(error),
             };
-            let root = match cx.workspace.root().await {
+            let root = match resolve_root(cx).await {
                 Ok(root) => root.to_path_buf(),
-                Err(error) => {
-                    return ToolOutcome::Continue(format!(
-                        "error: could not materialize the sandbox workdir: {error}"
-                    ));
-                }
+                Err(error) => return ToolOutcome::Continue(error),
             };
             let needle = args.name_contains.clone();
             let found = tokio::task::spawn_blocking(move || walk(&root, &needle))
@@ -80,38 +78,20 @@ impl Tool for FindFilesTool {
 
 fn walk(root: &Path, needle: &str) -> Vec<String> {
     let mut found = Vec::new();
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            if found.len() >= MAX_RESULTS {
-                return found;
-            }
-            let path = entry.path();
-            let Ok(meta) = std::fs::symlink_metadata(&path) else {
-                continue;
-            };
-            if meta.file_type().is_symlink() {
-                continue;
-            }
-            if meta.is_dir() {
-                if path.file_name().and_then(|n| n.to_str()) != Some(".git") {
-                    stack.push(path);
-                }
-                continue;
-            }
-            let rel = path
-                .strip_prefix(root)
-                .unwrap_or(&path)
-                .display()
-                .to_string();
-            if rel.contains(needle) {
-                found.push(rel);
-            }
+    walk_files(root, |path, _meta| {
+        if found.len() >= MAX_RESULTS {
+            return ControlFlow::Break(());
         }
-    }
+        let rel = path
+            .strip_prefix(root)
+            .unwrap_or(path)
+            .display()
+            .to_string();
+        if rel.contains(needle) {
+            found.push(rel);
+        }
+        ControlFlow::Continue(())
+    });
     found.sort();
     found
 }
