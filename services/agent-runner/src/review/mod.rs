@@ -88,13 +88,22 @@ struct JobSink(Arc<Mutex<Vec<TranscriptEvent>>>);
 
 impl JobSink {
     fn entries(&self) -> Vec<TranscriptEvent> {
-        self.0.lock().expect("job sink mutex").clone()
+        // Recover from a poisoned mutex instead of panicking (consistent with `StatusHandle::with`
+        // and the telemetry mutex below): a panic elsewhere holding this lock must not also crash
+        // every subsequent read of the transcript-so-far.
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 }
 
 impl TranscriptSink for JobSink {
     fn record(&mut self, entry: TranscriptEvent) {
-        self.0.lock().expect("job sink mutex").push(entry);
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(entry);
     }
 }
 
@@ -315,8 +324,14 @@ pub async fn run_native_agent(
         poller.abort();
     }
     if let Some(handle) = status {
-        let (prompt, completion) =
-            telemetry::sum_usage(&telemetry_handle.lock().expect("telemetry mutex"));
+        // Recover from a poisoned mutex instead of panicking (consistent with `StatusHandle::with`
+        // and the usage poller above): a panic elsewhere holding this lock must not also crash the
+        // final usage snapshot.
+        let (prompt, completion) = telemetry::sum_usage(
+            &telemetry_handle
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        );
         handle.observe_usage(prompt, completion);
     }
 
@@ -326,7 +341,9 @@ pub async fn run_native_agent(
     transcript::append_transcript(
         transcript,
         &sink_handle.entries(),
-        &telemetry_handle.lock().expect("telemetry mutex"),
+        &telemetry_handle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()),
         task_id,
     );
 
@@ -335,4 +352,67 @@ pub async fn run_native_agent(
         LoopOutcome::Exhausted => ReviewOutcome::Exhausted,
         LoopOutcome::Aborted { reason } => ReviewOutcome::Aborted(reason),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lci_review_agent::model::TurnTelemetry;
+
+    /// Panic while holding `mutex`'s lock, on a background thread, then join it (discarding the
+    /// panic) — leaves the mutex poisoned exactly as a real panic-while-locked would.
+    fn poison<T: Send + 'static>(mutex: &Arc<Mutex<T>>) {
+        let for_thread = Arc::clone(mutex);
+        let _ = std::thread::spawn(move || {
+            let _guard = for_thread.lock().unwrap();
+            panic!("intentional poisoning for test");
+        })
+        .join();
+        assert!(mutex.is_poisoned(), "the mutex should now be poisoned");
+    }
+
+    #[test]
+    fn job_sink_recovers_from_a_poisoned_mutex() {
+        let mut sink = JobSink::default();
+        sink.record(TranscriptEvent::Policy {
+            turn: 0,
+            name: "pre-poison",
+            detail: serde_json::Value::Null,
+        });
+
+        poison(&sink.0);
+
+        // Both `record` (via `TranscriptSink`) and `entries` must recover instead of panicking, and
+        // the state recorded before the poisoning must still be there.
+        sink.record(TranscriptEvent::Policy {
+            turn: 1,
+            name: "post-poison",
+            detail: serde_json::Value::Null,
+        });
+        let entries = sink.entries();
+        assert_eq!(entries.len(), 2);
+    }
+
+    #[test]
+    fn telemetry_mutex_recovers_from_a_poisoned_mutex() {
+        let telemetry_handle: Arc<Mutex<Vec<TurnTelemetry>>> = Arc::new(Mutex::new(vec![
+            TurnTelemetry {
+                model: "test-model".to_string(),
+                prompt_tokens: Some(10),
+                completion_tokens: Some(5),
+                reasoning_tokens: None,
+                reasoning: None,
+            },
+        ]));
+
+        poison(&telemetry_handle);
+
+        // Same recovery pattern used in `run_native_agent`: `lock()` on a poisoned mutex must still
+        // yield the guard (via `unwrap_or_else(PoisonError::into_inner)`), not panic.
+        let guard = telemetry_handle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (prompt, completion) = telemetry::sum_usage(&guard);
+        assert_eq!((prompt, completion), (10, 5));
+    }
 }

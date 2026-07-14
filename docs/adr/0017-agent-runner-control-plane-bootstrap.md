@@ -71,3 +71,8 @@ internal routes fail closed (503) rather than serving unauthenticated callers.
   managed Secret, or mTLS/SA-token auth) is a follow-up and noted in the runner ticket.
 - Neutral, because pre-minted per-task Secrets remain a possible optimization if the callback round
   trip ever matters.
+
+**⚠️ Amended 2026-07-14 ([ADR-0092](0092-per-task-runner-tokens.md)):** the "Bad" line above is
+resolved — `AGENT_RUNNER_TOKEN` is still the Job env var name, but its value is now a fresh,
+short-lived, per-task signed token minted at dispatch, not one long-lived value shared across every
+Job. The bootstrap contract itself (this ADR) is unchanged; only the bearer's scope is.
