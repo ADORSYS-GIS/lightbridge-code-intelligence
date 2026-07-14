@@ -144,6 +144,6 @@ guessing at a fix in this same change.
 - [ADR-0045](0045-context-window-budget.md) — the context budget (`context_window`, separate knob).
 - [ADR-0051](0051-per-model-config.md) — per-model config; the `review.model` / `review.extra` levers.
 - [ADR-0054](0054-review-model-and-provider-selection.md) — model & provider selection (reopened by the finding).
-- Epic [#137](https://github.com/adorsys-gis/lightbridge-code-intelligence/issues/137) — native review agent (proof-of-work).
+- Epic [#137](https://github.com/vymalo/lightbridge-code-intelligence/issues/137) — native review agent (proof-of-work).
 - [#247](https://github.com/vymalo/lightbridge-code-intelligence/issues/247) — raw-SSE verification of the streamed reasoning key (2026-07-14 update above).
 - [#411](https://github.com/vymalo/lightbridge-code-intelligence/issues/411) — follow-up: root-cause `reasoning_chars: 0` on real deep-tier turns (opened from this update).
