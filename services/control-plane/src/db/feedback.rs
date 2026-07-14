@@ -51,7 +51,7 @@ pub async fn list_pollable_comments(
              OR (rc.created_at < now() - interval '3 days' \
                  AND (rc.platform_comment_id % 72) = (extract(epoch from now())::bigint / $2) % 72) \
            ) \
-         ORDER BY rc.created_at",
+         ORDER BY rc.created_at, rc.id",
     )
     .bind(within_days)
     .bind(interval_secs.max(1))
@@ -152,7 +152,7 @@ pub async fn get_feedback(pool: &PgPool, task_id: Uuid) -> Result<Vec<FeedbackRo
          FROM review_feedback f \
          LEFT JOIN review_comments rc \
            ON rc.platform_comment_id = f.platform_comment_id AND rc.kind = f.comment_kind \
-         WHERE f.task_id = $1 ORDER BY f.created_at",
+         WHERE f.task_id = $1 ORDER BY f.created_at, f.id",
     )
     .bind(task_id)
     .fetch_all(pool)

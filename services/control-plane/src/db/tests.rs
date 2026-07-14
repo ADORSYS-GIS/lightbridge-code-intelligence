@@ -2795,3 +2795,297 @@ async fn durable_step_run_epoch_resolves_from_the_task_row(pool: PgPool) {
         "an unknown task has no run_epoch"
     );
 }
+
+// ---------------------------------------------------------------------------
+// #400 (bug 2): the six `ORDER BY <timestamp>` queries with no secondary tie-breaker could return
+// same-timestamp rows in non-deterministic order. Each fix adds an `id`-family tie-break; these
+// tests pin the tie-break by forcing a genuine timestamp tie and asserting the resulting order is
+// exactly the (timestamp, id) order — not merely "stable within one run", which a tiny freshly
+// inserted table can appear to satisfy even without the fix.
+// ---------------------------------------------------------------------------
+
+/// `list_pollable_comments`'s `ORDER BY rc.created_at, rc.id`: two review comments on the same task
+/// forced to an identical `created_at` must list in exactly the (created_at, id) order — computed
+/// independently here from `review_comments` directly — not whatever order the heap returns.
+#[sqlx::test]
+async fn list_pollable_comments_ties_break_on_id(pool: PgPool) {
+    let repo_id = seed(&pool).await;
+    let task_id = create_task(&pool, &pr_task(repo_id, "head1"))
+        .await
+        .unwrap()
+        .unwrap();
+
+    store_review_comments(
+        &pool,
+        task_id,
+        &[
+            ReviewCommentRef {
+                platform_comment_id: 1,
+                kind: "inline".to_string(),
+                file: Some("a.rs".to_string()),
+                line: Some(1),
+            },
+            ReviewCommentRef {
+                platform_comment_id: 2,
+                kind: "inline".to_string(),
+                file: Some("b.rs".to_string()),
+                line: Some(2),
+            },
+        ],
+    )
+    .await
+    .unwrap();
+
+    // Force an exact created_at tie (separate INSERTs would otherwise likely differ by microseconds).
+    sqlx::query("UPDATE review_comments SET created_at = now() WHERE task_id = $1")
+        .bind(task_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let rows: Vec<(Uuid, i64)> = sqlx::query_as(
+        "SELECT id, platform_comment_id FROM review_comments WHERE task_id = $1 ORDER BY id",
+    )
+    .bind(task_id)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    let expected_order: Vec<i64> = rows.iter().map(|(_, pcid)| *pcid).collect();
+
+    let pollable = list_pollable_comments(&pool, 7, 3600).await.unwrap();
+    let order: Vec<i64> = pollable
+        .into_iter()
+        .filter(|c| c.task_id == task_id)
+        .map(|c| c.platform_comment_id)
+        .collect();
+    assert_eq!(
+        order, expected_order,
+        "a created_at tie must break on id, matching an independent (created_at, id) query"
+    );
+}
+
+/// `get_feedback`'s `ORDER BY f.created_at, f.id`: `reconcile_comment_feedback` inserts several
+/// reactions inside ONE transaction, so they share the exact same `created_at` (Postgres `now()` is
+/// stable for a whole transaction) — a genuine tie with no manual timestamp manipulation needed.
+#[sqlx::test]
+async fn get_feedback_ties_break_on_id(pool: PgPool) {
+    let repo_id = seed(&pool).await;
+    let task_id = create_task(&pool, &pr_task(repo_id, "head1"))
+        .await
+        .unwrap()
+        .unwrap();
+
+    reconcile_comment_feedback(
+        &pool,
+        task_id,
+        555,
+        "inline",
+        &[
+            ("alice".to_string(), "+1".to_string()),
+            ("bob".to_string(), "-1".to_string()),
+            ("carol".to_string(), "heart".to_string()),
+        ],
+    )
+    .await
+    .unwrap();
+
+    let rows: Vec<(Uuid, String)> =
+        sqlx::query_as("SELECT id, reactor FROM review_feedback WHERE task_id = $1 ORDER BY id")
+            .bind(task_id)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    let expected_order: Vec<String> = rows.iter().map(|(_, reactor)| reactor.clone()).collect();
+
+    // Assert repeatedly: a same-timestamp tie with no secondary key can flip between calls even
+    // within one connection, so this also proves the order is stable, not just correct once.
+    for _ in 0..3 {
+        let feedback = get_feedback(&pool, task_id).await.unwrap();
+        let order: Vec<String> = feedback.into_iter().map(|f| f.reactor).collect();
+        assert_eq!(
+            order, expected_order,
+            "a created_at tie must break on id, and stay stable across repeated reads"
+        );
+    }
+}
+
+/// `claim_next_push_config`'s `ORDER BY c.next_attempt_at, c.config_id`: two due configs on the same
+/// task forced to an identical `next_attempt_at` must claim in ascending `config_id` order — the
+/// lower id first, then the higher, then nothing (both now leased).
+#[sqlx::test]
+async fn claim_next_push_config_ties_break_on_config_id(pool: PgPool) {
+    let a2a_task_id = Uuid::new_v4();
+    let task_json = json!({ "id": a2a_task_id.to_string() });
+    sqlx::query(
+        "INSERT INTO a2a_tasks (a2a_task_id, context_id, caller_id, skill, state, version, task_json) \
+         VALUES ($1, 'ctx', 'caller', 'review', 'TASK_STATE_WORKING', 1, $2)",
+    )
+    .bind(a2a_task_id)
+    .bind(&task_json)
+    .execute(&pool)
+    .await
+    .unwrap();
+    // One undelivered event so both configs are "due" (delivered_seq 0 < max(seq)).
+    sqlx::query(
+        "INSERT INTO a2a_task_events (a2a_task_id, seq, kind, state, final, payload) \
+         VALUES ($1, 1, 'status-update', 'TASK_STATE_WORKING', false, $2)",
+    )
+    .bind(a2a_task_id)
+    .bind(&task_json)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let config_a = Uuid::new_v4();
+    let config_b = Uuid::new_v4();
+    insert_push_config(
+        &pool,
+        config_a,
+        a2a_task_id,
+        "https://93.184.216.34/a",
+        None,
+        "caller",
+    )
+    .await
+    .unwrap();
+    insert_push_config(
+        &pool,
+        config_b,
+        a2a_task_id,
+        "https://93.184.216.34/b",
+        None,
+        "caller",
+    )
+    .await
+    .unwrap();
+    // Force an exact tie on next_attempt_at (both default to now(), but separate INSERTs can differ
+    // by microseconds).
+    sqlx::query("UPDATE a2a_push_configs SET next_attempt_at = now() WHERE a2a_task_id = $1")
+        .bind(a2a_task_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let (lower, higher) = if config_a < config_b {
+        (config_a, config_b)
+    } else {
+        (config_b, config_a)
+    };
+
+    let first = claim_next_push_config(&pool, "owner-a", Duration::from_secs(60))
+        .await
+        .unwrap()
+        .expect("one of the two due configs is claimed");
+    assert_eq!(first.config_id, lower, "the lower config_id wins the tie");
+
+    let second = claim_next_push_config(&pool, "owner-b", Duration::from_secs(60))
+        .await
+        .unwrap()
+        .expect("the second due config is claimed next");
+    assert_eq!(second.config_id, higher);
+
+    assert!(
+        claim_next_push_config(&pool, "owner-c", Duration::from_secs(60))
+            .await
+            .unwrap()
+            .is_none(),
+        "both configs are now leased — nothing left to claim"
+    );
+}
+
+/// `claim_next_task`'s `ORDER BY priority DESC, created_at, id`: two queued tasks with the same
+/// (default) priority and an identical `created_at` must claim in ascending `id` order.
+#[sqlx::test]
+async fn claim_next_task_ties_break_on_id(pool: PgPool) {
+    let repo_id = seed(&pool).await;
+    let first = create_task(&pool, &pr_task(repo_id, "head1"))
+        .await
+        .unwrap()
+        .unwrap();
+    let second = create_task(&pool, &pr_task(repo_id, "head2"))
+        .await
+        .unwrap()
+        .unwrap();
+
+    // Force an exact created_at tie (both already share the default priority 100).
+    sqlx::query("UPDATE tasks SET created_at = now() WHERE id = ANY($1)")
+        .bind([first, second].as_slice())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let (lower, higher) = if first < second {
+        (first, second)
+    } else {
+        (second, first)
+    };
+
+    let claimed_first = claim_next_task(&pool, "owner-a", Duration::from_secs(60))
+        .await
+        .unwrap()
+        .expect("a queued task is claimed");
+    assert_eq!(
+        claimed_first.id, lower,
+        "the lower id wins the created_at tie"
+    );
+
+    let claimed_second = claim_next_task(&pool, "owner-b", Duration::from_secs(60))
+        .await
+        .unwrap()
+        .expect("the second queued task is claimed next");
+    assert_eq!(claimed_second.id, higher);
+
+    assert!(
+        claim_next_task(&pool, "owner-c", Duration::from_secs(60))
+            .await
+            .unwrap()
+            .is_none(),
+        "both tasks are now running — nothing left to claim"
+    );
+}
+
+/// `list_reapable_tasks`'s `ORDER BY started_at NULLS FIRST, id`: two expired-lease `running` tasks
+/// with an identical `started_at` must list in ascending `id` order.
+#[sqlx::test]
+async fn list_reapable_tasks_ties_break_on_id(pool: PgPool) {
+    let repo_id = seed(&pool).await;
+    let first = create_task(&pool, &pr_task(repo_id, "head1"))
+        .await
+        .unwrap()
+        .unwrap();
+    let second = create_task(&pool, &pr_task(repo_id, "head2"))
+        .await
+        .unwrap()
+        .unwrap();
+
+    claim_next_task(&pool, "owner-a", Duration::from_secs(60))
+        .await
+        .unwrap();
+    claim_next_task(&pool, "owner-a", Duration::from_secs(60))
+        .await
+        .unwrap();
+
+    // Force both leases already-expired and started_at an exact tie.
+    sqlx::query(
+        "UPDATE tasks SET started_at = now(), lease_expires_at = now() - interval '1 minute' \
+         WHERE id = ANY($1)",
+    )
+    .bind([first, second].as_slice())
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let (lower, higher) = if first < second {
+        (first, second)
+    } else {
+        (second, first)
+    };
+
+    let reapable = list_reapable_tasks(&pool, 100).await.unwrap();
+    let order: Vec<Uuid> = reapable.iter().map(|t| t.id).collect();
+    assert_eq!(
+        order,
+        vec![lower, higher],
+        "a started_at tie must break on id ascending"
+    );
+}
