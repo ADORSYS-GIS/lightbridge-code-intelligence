@@ -208,6 +208,15 @@ fn line_from_diff_hunk(diff_hunk: &str, position: u64) -> Option<u32> {
                     return None;
                 }
             }
+            // `\ No newline at end of file` — a boundary marker, not new-file content. GitHub's
+            // `position` still counts it as one hunk line (the enumerate() above already does that
+            // unconditionally), but it must not advance `new_line`, or every line after it in the
+            // hunk resolves one line too high.
+            Some(b'\\') => {
+                if position_in_hunk == position {
+                    return None;
+                }
+            }
             _ => {
                 new_line += 1;
                 if position_in_hunk == position {
@@ -275,11 +284,32 @@ fn gh_api(path: &str) -> anyhow::Result<serde_json::Value> {
         .with_context(|| format!("parsing JSON from `gh api {path}`"))
 }
 
+/// Fetch every page of a GitHub list endpoint and concatenate them. `gh api` alone defaults to a
+/// 30-item first page — for this tool's entire purpose (comparing findings across runs), silently
+/// truncating a review with more findings than that would corrupt the variance report rather than
+/// error out, so this loops on `page`/`per_page=100` (the API's max) until a short page ends it.
+/// (Deliberately not `gh api --paginate`: without `--slurp` it prints each page as its own top-level
+/// JSON array back to back, which `serde_json::from_slice` can't parse as one document — a real fix
+/// needs either that flag pair or manual paging; this takes manual paging to keep `gh_api` itself
+/// simple and single-purpose.)
 fn gh_api_array(path: &str) -> anyhow::Result<Vec<serde_json::Value>> {
-    match gh_api(path)? {
-        serde_json::Value::Array(items) => Ok(items),
-        other => bail!("expected a JSON array from `gh api {path}`, got {other}"),
+    let mut items = Vec::new();
+    let mut page = 1u32;
+    let separator = if path.contains('?') { '&' } else { '?' };
+    loop {
+        let page_path = format!("{path}{separator}per_page=100&page={page}");
+        let batch = match gh_api(&page_path)? {
+            serde_json::Value::Array(items) => items,
+            other => bail!("expected a JSON array from `gh api {page_path}`, got {other}"),
+        };
+        let batch_len = batch.len();
+        items.extend(batch);
+        if batch_len < 100 {
+            break;
+        }
+        page += 1;
     }
+    Ok(items)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -653,6 +683,18 @@ mod tests {
     fn line_from_diff_hunk_returns_none_for_a_pure_deletion_position() {
         let hunk = "@@ -1,2 +1,1 @@\n-removed\n context";
         assert_eq!(line_from_diff_hunk(hunk, 1), None);
+    }
+
+    #[test]
+    fn line_from_diff_hunk_does_not_advance_new_line_on_the_no_newline_marker() {
+        // Caught by lightbridge-assistant on PR #422: the `\ No newline at end of file` marker
+        // starts with `\`, not `-`/`+`/` `, and must not count as new-file content. Without the
+        // dedicated match arm, position 4 ("+new") would resolve to 12 instead of 11.
+        let hunk = "@@ -10,2 +10,2 @@\n context\n-old\n\\ No newline at end of file\n+new";
+        assert_eq!(line_from_diff_hunk(hunk, 1), Some(10)); // " context"
+        assert_eq!(line_from_diff_hunk(hunk, 2), None); // "-old"
+        assert_eq!(line_from_diff_hunk(hunk, 3), None); // "\ No newline..." — not content
+        assert_eq!(line_from_diff_hunk(hunk, 4), Some(11)); // "+new" — NOT 12
     }
 
     #[test]
