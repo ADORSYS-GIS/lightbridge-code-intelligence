@@ -42,15 +42,8 @@ pub struct GitlabClient {
 }
 
 impl GitlabClient {
-    /// Construct from validated file configuration. Fails loud if credentials cannot be used as
-    /// HTTP headers; otherwise API calls would silently go out unauthenticated.
+    /// Construct from already-validated file configuration.
     pub fn new(api_url: String, token: String, webhook_secret: String) -> anyhow::Result<Self> {
-        if reqwest::header::HeaderValue::from_str(&token).is_err() {
-            anyhow::bail!("GitLab access token contains invalid header bytes");
-        }
-        if reqwest::header::HeaderValue::from_str(&webhook_secret).is_err() {
-            anyhow::bail!("GitLab webhook secret contains invalid header bytes");
-        }
         let http = Client::builder()
             .user_agent("lightbridge-code-intelligence")
             .build()?;
@@ -166,7 +159,6 @@ struct DiffRefs {
 #[derive(Clone)]
 pub struct GitlabProject {
     pub project_id: i64,
-    pub path_with_namespace: String,
     pub bot_handle: String,
     pub client: GitlabClient,
 }
@@ -197,7 +189,6 @@ impl GitlabRegistry {
                 project.project_id,
                 GitlabProject {
                     project_id: project.project_id,
-                    path_with_namespace: project.path_with_namespace.clone(),
                     bot_handle,
                     client,
                 },
@@ -368,10 +359,16 @@ impl CodePlatform for GitlabPlatformRouter {
     }
 
     fn clone_url(&self, repo: &RepoRef) -> String {
-        self.registry
-            .client_for_repo(repo)
-            .map(|client| client.clone_url(repo))
-            .unwrap_or_default()
+        match self.registry.client_for_repo(repo) {
+            Some(client) => client.clone_url(repo),
+            None => {
+                tracing::warn!(
+                    project_id = repo.installation_id,
+                    "GitLab clone URL requested for unconfigured project"
+                );
+                String::new()
+            }
+        }
     }
 }
 
@@ -784,10 +781,9 @@ mod tests {
     use super::*;
     use crate::config::{GitlabProjectConfig, GitlabSection};
 
-    fn project(project_id: i64, path: &str, token: &str, secret: &str) -> GitlabProjectConfig {
+    fn project(project_id: i64, token: &str, secret: &str) -> GitlabProjectConfig {
         GitlabProjectConfig {
             project_id,
-            path_with_namespace: path.to_string(),
             api_url: None,
             access_token: token.to_string(),
             webhook_secret: secret.to_string(),
@@ -809,10 +805,10 @@ mod tests {
             default_api_url: Some("https://gitlab.example.com/api/v4".to_string()),
             default_bot_handle: Some("lightbridge-bot".to_string()),
             projects: vec![
-                project(1001, "group/service-a", "token-a", "secret-a"),
+                project(1001, "token-a", "secret-a"),
                 GitlabProjectConfig {
                     bot_handle: Some("lb-reviewer".to_string()),
-                    ..project(1002, "group/service-b", "token-b", "secret-b")
+                    ..project(1002, "token-b", "secret-b")
                 },
             ],
         };

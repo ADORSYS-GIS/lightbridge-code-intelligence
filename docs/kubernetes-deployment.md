@@ -218,13 +218,11 @@ Each configured GitLab project has its own access token and webhook secret:
     "projects": [
       {
         "project_id": 1001,
-        "path_with_namespace": "group/service-a",
         "access_token": "<mounted-secret-value>",
         "webhook_secret": "<mounted-secret-value>"
       },
       {
         "project_id": 1002,
-        "path_with_namespace": "group/platform/service-b",
         "api_url": "https://gitlab.internal.example/api/v4",
         "access_token": "<mounted-secret-value>",
         "webhook_secret": "<mounted-secret-value>",

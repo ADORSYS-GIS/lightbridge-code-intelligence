@@ -168,11 +168,20 @@ fn verify_gitlab_project_webhook(
     body: &[u8],
     payload: &serde_json::Value,
 ) -> bool {
+    verify_gitlab_project_webhook_with_registry(state.gitlab.as_ref(), headers, body, payload)
+}
+
+fn verify_gitlab_project_webhook_with_registry(
+    registry: Option<&crate::integrations::gitlab::GitlabRegistry>,
+    headers: &HeaderMap,
+    body: &[u8],
+    payload: &serde_json::Value,
+) -> bool {
     let Some(project_id) = payload["project"]["id"].as_i64() else {
         tracing::warn!("GitLab webhook missing project.id");
         return false;
     };
-    let Some(registry) = state.gitlab.as_ref() else {
+    let Some(registry) = registry else {
         tracing::warn!(project_id, "GitLab webhook received but GitLab is not configured");
         return false;
     };
@@ -180,16 +189,6 @@ fn verify_gitlab_project_webhook(
         tracing::warn!(project_id, "GitLab webhook for unconfigured project");
         return false;
     };
-    let webhook_path = payload["project"]["path_with_namespace"].as_str();
-    if webhook_path != Some(project.path_with_namespace.as_str()) {
-        tracing::warn!(
-            project_id,
-            ?webhook_path,
-            configured = %project.path_with_namespace,
-            "GitLab webhook project path mismatch"
-        );
-        return false;
-    }
 
     project.client.verify_webhook(headers, body)
 }
@@ -1239,18 +1238,6 @@ fn verify_signature(secret: &[u8], body: &[u8], signature: &str) -> bool {
     expected.as_bytes().ct_eq(signature.as_bytes()).into()
 }
 
-/// Constant-time plain-token verification of the GitLab webhook token (`X-Gitlab-Token`).
-/// GitLab doesn't use HMAC — it sends the raw secret in a header — so we compare in constant time
-/// to avoid timing leaks. An unset secret rejects everything (fail closed).
-#[cfg(test)]
-fn verify_gitlab_token(secret: &str, token: &str) -> bool {
-    if secret.is_empty() {
-        return false;
-    }
-    use subtle::ConstantTimeEq;
-    secret.as_bytes().ct_eq(token.as_bytes()).into()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1405,20 +1392,81 @@ mod tests {
         assert_eq!(detect_platform(&headers), None);
     }
 
-    #[test]
-    fn gitlab_token_rejects_when_secret_unset() {
-        assert!(!verify_gitlab_token("", "anything"));
+    fn gitlab_registry() -> crate::integrations::gitlab::GitlabRegistry {
+        let section = crate::config::GitlabSection {
+            enabled: true,
+            default_api_url: Some("https://gitlab.example.com/api/v4".to_string()),
+            default_bot_handle: Some("lightbridge-bot".to_string()),
+            projects: vec![
+                crate::config::GitlabProjectConfig {
+                    project_id: 1001,
+                    api_url: None,
+                    access_token: "token-a".to_string(),
+                    webhook_secret: "secret-a".to_string(),
+                    bot_handle: None,
+                },
+                crate::config::GitlabProjectConfig {
+                    project_id: 1002,
+                    api_url: None,
+                    access_token: "token-b".to_string(),
+                    webhook_secret: "secret-b".to_string(),
+                    bot_handle: None,
+                },
+            ],
+        };
+        crate::integrations::gitlab::GitlabRegistry::from_config(&section)
+            .expect("valid config")
+            .expect("enabled registry")
     }
 
     #[test]
-    fn gitlab_token_accepts_a_valid_match() {
-        let secret = "it is a secret";
-        assert!(verify_gitlab_token(secret, secret));
+    fn gitlab_project_webhook_accepts_matching_project_secret() {
+        let registry = gitlab_registry();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-gitlab-token", "secret-a".parse().unwrap());
+        let payload = serde_json::json!({ "project": { "id": 1001 } });
+
+        assert!(verify_gitlab_project_webhook_with_registry(
+            Some(&registry),
+            &headers,
+            b"{}",
+            &payload
+        ));
     }
 
     #[test]
-    fn gitlab_token_rejects_a_mismatch() {
-        assert!(!verify_gitlab_token("secret", "wrong"));
+    fn gitlab_project_webhook_rejects_wrong_project_secret() {
+        let registry = gitlab_registry();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-gitlab-token", "secret-b".parse().unwrap());
+        let payload = serde_json::json!({ "project": { "id": 1001 } });
+
+        assert!(!verify_gitlab_project_webhook_with_registry(
+            Some(&registry),
+            &headers,
+            b"{}",
+            &payload
+        ));
+    }
+
+    #[test]
+    fn gitlab_project_webhook_rejects_missing_or_unknown_project() {
+        let registry = gitlab_registry();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-gitlab-token", "secret-a".parse().unwrap());
+
+        assert!(!verify_gitlab_project_webhook_with_registry(
+            Some(&registry),
+            &headers,
+            b"{}",
+            &serde_json::json!({ "project": {} })
+        ));
+        assert!(!verify_gitlab_project_webhook_with_registry(
+            Some(&registry),
+            &headers,
+            b"{}",
+            &serde_json::json!({ "project": { "id": 9999 } })
+        ));
     }
 
     #[test]

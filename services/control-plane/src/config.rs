@@ -49,8 +49,6 @@ pub struct GitlabSection {
 pub struct GitlabProjectConfig {
     /// Numeric GitLab project id; also used as `tasks.installation_id` for GitLab.
     pub project_id: i64,
-    /// Full GitLab path, e.g. `group/subgroup/repo`; cross-checked against webhook payloads.
-    pub path_with_namespace: String,
     /// Optional per-project API URL, e.g. `https://gitlab.example.com/api/v4`.
     pub api_url: Option<String>,
     /// Project/group/PAT token sent as `PRIVATE-TOKEN`.
@@ -104,18 +102,6 @@ impl GitlabSection {
         for project in &self.projects {
             if !seen.insert(project.project_id) {
                 anyhow::bail!("duplicate GitLab project_id {}", project.project_id);
-            }
-            if project.path_with_namespace.trim().is_empty() {
-                anyhow::bail!(
-                    "GitLab project {} has empty path_with_namespace",
-                    project.project_id
-                );
-            }
-            if self.resolved_api_url(project).trim().is_empty() {
-                anyhow::bail!("GitLab project {} has empty api_url", project.project_id);
-            }
-            if self.resolved_bot_handle(project).trim().is_empty() {
-                anyhow::bail!("GitLab project {} has empty bot_handle", project.project_id);
             }
             if project.access_token.trim().is_empty() {
                 anyhow::bail!("GitLab project {} has empty access_token", project.project_id);
@@ -398,13 +384,11 @@ mod tests {
             "projects": [
               {
                 "project_id": 1,
-                "path_with_namespace": "a/one",
                 "access_token": "token-a",
                 "webhook_secret": "secret-a"
               },
               {
                 "project_id": 1,
-                "path_with_namespace": "b/two",
                 "access_token": "token-b",
                 "webhook_secret": "secret-b"
               }
@@ -427,7 +411,6 @@ mod tests {
             "projects": [
               {
                 "project_id": 1,
-                "path_with_namespace": "a/one",
                 "access_token": "",
                 "webhook_secret": "secret-a"
               }
@@ -452,7 +435,6 @@ mod tests {
             "projects": [
               {
                 "project_id": 7,
-                "path_with_namespace": "group/repo",
                 "access_token": "token",
                 "webhook_secret": "secret"
               }
