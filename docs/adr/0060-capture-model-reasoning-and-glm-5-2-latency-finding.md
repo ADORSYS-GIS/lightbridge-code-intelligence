@@ -183,6 +183,35 @@ observability (a correlation id or bounded raw-sample logged only when `reasonin
 to actually root-cause it if it happens again, rather than guessing further. #411 is left open,
 linked to #417.
 
+## Update (2026-07-15): the `agent reasoning` line was silently dropped — restored, and `agent content` added (#411)
+
+Two independent problems surfaced after #411's capture fix (PR #425) landed and deep-tier
+`reasoning_chars` finally went non-zero in prod:
+
+1. **Capture bug (fixed in #425, separate PR):** the *streaming* deserializer dropped every delta
+   carrying an explicit `"tool_calls": null` (GLM-5.2, MiMo), because `#[serde(default)]` on a
+   non-`Option` `Vec` rejects an explicit `null`. That is why `reasoning_chars: 0` persisted on every
+   deep-tier turn even though the wire carried reasoning — the earlier curl probes above tested the
+   wire, never the Rust deserializer.
+
+2. **Visibility regression (this ADR's concern):** the `agent reasoning` log line specified here — the
+   one that logs the *actual chain-of-thought text*, bounded by `REASONING_LOG_CHARS` — was **lost**
+   when `agent-runner`'s review path was split into `review/transcript.rs` (the "split god-files, no
+   behavior change" pass #395, and the #423 telemetry-on-the-turn rewrite). The reconstructed code kept
+   only the `reasoning_chars` **count** on `agent turn complete` and threw the text away again. So a
+   maintainer tailing a pod saw `reasoning_chars: 11675` — proof the data survived the parser, but not
+   a single character of what the model actually thought. A char count is not proof-of-work.
+
+**Restored and extended:** `append_transcript` again emits the per-turn `agent reasoning` line (the
+chain-of-thought text, bounded by `REASONING_LOG_CHARS`, default 4000, `0` = unbounded), and now a
+symmetric `agent content` line (the model's *visible answer* for the turn, bounded by a new
+`CONTENT_LOG_CHARS`, same semantics). Both are load-bearing for an operator and were requested as
+distinct signals: reasoning shows *how* the model got there, content shows *what* it concluded. Both
+skip cleanly on a pure tool-call turn (no prose). Reasoning stays off `ChatMessage` (never echoed to
+the model) exactly as this ADR requires — it is a logs-only signal. This closes the visibility half of
+#411 (capture in #425, visibility here); persisting reasoning to the DB transcript / UI remains the
+still-open follow-up noted under Consequences.
+
 ## Consequences
 
 - **Good:** a run's reasoning is now legible from a pod log tail and measurable per turn; the applied
