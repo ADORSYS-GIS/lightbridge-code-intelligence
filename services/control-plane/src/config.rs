@@ -103,11 +103,31 @@ impl GitlabSection {
             if !seen.insert(project.project_id) {
                 anyhow::bail!("duplicate GitLab project_id {}", project.project_id);
             }
+            let api_url = self.resolved_api_url(project);
+            let parsed_api_url = reqwest::Url::parse(api_url).map_err(|error| {
+                anyhow::anyhow!(
+                    "GitLab project {} api_url is not a valid URL: {}",
+                    project.project_id,
+                    error
+                )
+            })?;
+            if !matches!(parsed_api_url.scheme(), "http" | "https") {
+                anyhow::bail!(
+                    "GitLab project {} api_url must use http or https",
+                    project.project_id
+                );
+            }
             if project.access_token.trim().is_empty() {
-                anyhow::bail!("GitLab project {} has empty access_token", project.project_id);
+                anyhow::bail!(
+                    "GitLab project {} has empty access_token",
+                    project.project_id
+                );
             }
             if project.webhook_secret.trim().is_empty() {
-                anyhow::bail!("GitLab project {} has empty webhook_secret", project.project_id);
+                anyhow::bail!(
+                    "GitLab project {} has empty webhook_secret",
+                    project.project_id
+                );
             }
             if reqwest::header::HeaderValue::from_str(&project.access_token).is_err() {
                 anyhow::bail!(
@@ -423,6 +443,26 @@ mod tests {
             .validate()
             .expect_err("empty access token fails");
         assert!(err.to_string().contains("empty access_token"));
+    }
+
+    #[test]
+    fn gitlab_rejects_invalid_api_url() {
+        let json = r#"{
+          "gitlab": {
+            "enabled": true,
+            "projects": [
+              {
+                "project_id": 7,
+                "api_url": "htps://gitlab.example.com/api/v4",
+                "access_token": "token",
+                "webhook_secret": "secret"
+              }
+            ]
+          }
+        }"#;
+        let config: FileConfig = serde_json::from_str(json).expect("config parses");
+        let err = config.gitlab.validate().expect_err("invalid api_url fails");
+        assert!(err.to_string().contains("api_url must use http or https"));
     }
 
     #[test]

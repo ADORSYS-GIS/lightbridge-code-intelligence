@@ -199,7 +199,17 @@ impl AppState {
             }
         }
         let github = github::GithubApp::from_env();
-        let gitlab = gitlab::GitlabRegistry::from_config(&gitlab_config)?;
+        // A bad GitLab config must not take down GitHub in the same process — degrade GitLab only.
+        let gitlab = match gitlab::GitlabRegistry::from_config(&gitlab_config) {
+            Ok(registry) => registry,
+            Err(error) => {
+                tracing::error!(
+                    %error,
+                    "invalid GitLab config in control-plane.json; GitLab integration disabled"
+                );
+                None
+            }
+        };
         // Build the platform dispatch table (ADR-0072) once, from the configured implementations.
         // Shared by the HTTP handlers and the reconciler so both pick the right implementation per task.
         let mut platforms: std::collections::HashMap<
@@ -294,10 +304,16 @@ fn app(state: AppState) -> Router {
         .route("/readyz", get(readiness))
         .route("/metrics", get(metrics_endpoint))
         // Unified webhook route — detects the platform (GitHub/GitLab) from headers.
-        .route("/webhook", post(webhook::webhook_router))
+        .route(
+            "/webhook",
+            post(webhook::webhook_router).layer(DefaultBodyLimit::max(webhook::MAX_BODY_BYTES)),
+        )
         // Legacy GitHub webhook route — forwards to the unified handler. Kept during the
         // transition so existing webhook configurations don't break.
-        .route("/github/webhook", post(webhook::github_webhook_legacy))
+        .route(
+            "/github/webhook",
+            post(webhook::github_webhook_legacy).layer(DefaultBodyLimit::max(webhook::MAX_BODY_BYTES)),
+        )
         .route("/me", get(jwt::me))
         .route("/tasks", get(tasks::list))
         .route("/tasks/{id}", get(tasks::get))

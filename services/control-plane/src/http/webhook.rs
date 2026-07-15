@@ -20,6 +20,10 @@ use crate::integrations::platform::{CodePlatform, Platform, RepoRef};
 
 type HmacSha256 = Hmac<Sha256>;
 
+/// Maximum webhook body size before HMAC / JSON verification. GitLab must parse JSON pre-auth to
+/// read `project.id` for per-project secret selection; this caps attacker-controlled parse cost.
+pub const MAX_BODY_BYTES: usize = 1024 * 1024;
+
 /// Detect the platform from webhook headers.
 /// GitHub sends `X-GitHub-Event`; GitLab sends `X-Gitlab-Event`.
 fn detect_platform(headers: &HeaderMap) -> Option<Platform> {
@@ -51,36 +55,31 @@ pub async fn webhook_router(
     tracing::info!(%platform, "webhook received");
 
     // GitLab needs the payload's `project.id` to select the configured per-project webhook secret.
-    // The payload is not trusted or acted on until verification succeeds.
+    // The helper returns the verified payload, making ownership explicit.
     let gitlab_payload = if platform == Platform::GitLab {
-        match serde_json::from_slice(&body) {
+        match verified_gitlab_payload(&state, &headers, &body) {
             Ok(payload) => Some(payload),
-            Err(error) => {
-                tracing::error!(%error, %platform, "webhook payload is not valid JSON");
+            Err(GitlabPayloadError::InvalidJson) => {
                 return (StatusCode::BAD_REQUEST, "invalid json payload").into_response();
+            }
+            Err(GitlabPayloadError::InvalidSignature) => {
+                crate::http::metrics::webhook_signature_failure(&platform.to_string());
+                tracing::warn!(%platform, "invalid webhook signature");
+                return (StatusCode::UNAUTHORIZED, "invalid signature").into_response();
             }
         }
     } else {
         None
     };
 
-    // Verify signature — platform-specific.
-    let valid = match platform {
-        Platform::GitHub => verify_signature(
+    // Verify GitHub signature. GitLab verification happens in `verified_gitlab_payload`.
+    if platform == Platform::GitHub
+        && !verify_signature(
             state.github_webhook_secret.as_bytes(),
             &body,
             &header(&headers, "x-hub-signature-256"),
-        ),
-        Platform::GitLab => verify_gitlab_project_webhook(
-            &state,
-            &headers,
-            &body,
-            gitlab_payload
-                .as_ref()
-                .expect("GitLab payload parsed before verification"),
-        ),
-    };
-    if !valid {
+        )
+    {
         crate::http::metrics::webhook_signature_failure(&platform.to_string());
         tracing::warn!(%platform, "invalid webhook signature");
         return (StatusCode::UNAUTHORIZED, "invalid signature").into_response();
@@ -162,13 +161,31 @@ pub async fn github_webhook_legacy(
     webhook_router(state, headers, body).await
 }
 
-fn verify_gitlab_project_webhook(
+enum GitlabPayloadError {
+    InvalidJson,
+    InvalidSignature,
+}
+
+fn verified_gitlab_payload(
     state: &AppState,
     headers: &HeaderMap,
     body: &[u8],
-    payload: &serde_json::Value,
-) -> bool {
-    verify_gitlab_project_webhook_with_registry(state.gitlab.as_ref(), headers, body, payload)
+) -> Result<serde_json::Value, GitlabPayloadError> {
+    let platform = Platform::GitLab;
+    let payload = match serde_json::from_slice(body) {
+        Ok(payload) => payload,
+        Err(error) => {
+            tracing::error!(%error, %platform, "webhook payload is not valid JSON");
+            return Err(GitlabPayloadError::InvalidJson);
+        }
+    };
+
+    if !verify_gitlab_project_webhook_with_registry(state.gitlab.as_ref(), headers, body, &payload)
+    {
+        return Err(GitlabPayloadError::InvalidSignature);
+    }
+
+    Ok(payload)
 }
 
 fn verify_gitlab_project_webhook_with_registry(
@@ -182,7 +199,10 @@ fn verify_gitlab_project_webhook_with_registry(
         return false;
     };
     let Some(registry) = registry else {
-        tracing::warn!(project_id, "GitLab webhook received but GitLab is not configured");
+        tracing::warn!(
+            project_id,
+            "GitLab webhook received but GitLab is not configured"
+        );
         return false;
     };
     let Some(project) = registry.get(project_id) else {

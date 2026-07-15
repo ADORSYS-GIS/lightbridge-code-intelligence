@@ -232,11 +232,7 @@ pub async fn get_context(
         }
         Platform::GitLab => {
             let Some(registry) = state.gitlab.as_ref() else {
-                return (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "gitlab not configured",
-                )
-                    .into_response();
+                return (StatusCode::SERVICE_UNAVAILABLE, "gitlab not configured").into_response();
             };
             let Some(gitlab) = registry.client_for_repo(&repo_ref) else {
                 tracing::warn!(
