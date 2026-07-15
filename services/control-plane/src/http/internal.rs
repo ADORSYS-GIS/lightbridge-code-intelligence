@@ -231,14 +231,22 @@ pub async fn get_context(
             (app.clone_url(&repo_ref), token)
         }
         Platform::GitLab => {
-            let Some(gitlab) = state.gitlab.as_ref() else {
+            let Some(registry) = state.gitlab.as_ref() else {
+                return (StatusCode::SERVICE_UNAVAILABLE, "gitlab not configured").into_response();
+            };
+            let Some(gitlab) = registry.client_for_repo(&repo_ref) else {
+                tracing::warn!(
+                    task_id = %id,
+                    project_id = context.installation_id,
+                    "GitLab project config missing for task context"
+                );
                 return (
                     StatusCode::SERVICE_UNAVAILABLE,
-                    "gitlab client not configured",
+                    "gitlab project not configured",
                 )
                     .into_response();
             };
-            // GitlabClient::clone_url() embeds the token (oauth2:<token>@host).
+            // GitlabClient::clone_url() embeds the project token (oauth2:<token>@host).
             (gitlab.clone_url(&repo_ref), String::new())
         }
     };
@@ -1612,7 +1620,25 @@ pub async fn finalize_review(
             // Platform-aware bot handle (Phase 6): GitLab reviews must name the GitLab bot, not the
             // GitHub App handle, so the "request a deep review" @mention resolves on the right platform.
             let handle = match context.platform {
-                crate::integrations::platform::Platform::GitLab => state.gitlab_app_handle.as_str(),
+                crate::integrations::platform::Platform::GitLab => {
+                    let Some(handle) = state
+                        .gitlab
+                        .as_ref()
+                        .and_then(|registry| registry.bot_handle(context.installation_id))
+                    else {
+                        tracing::error!(
+                            task_id = %id,
+                            project_id = context.installation_id,
+                            "GitLab bot handle missing for fast review rendering"
+                        );
+                        return (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "gitlab project not configured",
+                        )
+                            .into_response();
+                    };
+                    handle
+                }
                 crate::integrations::platform::Platform::GitHub => state.app_handle.as_str(),
             };
             crate::review::render_fast_body(

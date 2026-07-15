@@ -57,10 +57,13 @@ the control plane *validates and writes back*.
 
 ## Configuration
 
-Read from `/etc/lightbridge/control-plane.json` (mounted ConfigMap) or env. Key knobs: `agent.*`
-(runner image, namespace, service account, resources, deadline, CA secret), `dispatcher.*` (lease /
-poll / reap cadences), the OIDC issuer/audience + `PERMISSIONS_CLAIM`, and `RUNNER_TOKEN_SIGNING_KEY`
-(the per-task runner-token signing key, ADR-0092). See
+Read from `/etc/lightbridge/control-plane.json` (mounted ConfigMap/Secret) plus the remaining
+process env for non-file knobs. Key file knobs: `agent.*` (runner image, namespace, service account,
+resources, deadline, CA secret), `dispatcher.*` (lease / poll / reap cadences), `review.*`,
+`embeddings.*`, `knowledge_tools.*`, `egress.*`, and file-only `gitlab.projects[]`. Remaining env
+knobs include the OIDC issuer/audience, `PERMISSIONS_CLAIM`, and `RUNNER_TOKEN_SIGNING_KEY` (the
+per-task runner-token signing key, ADR-0092). GitLab no longer uses `GITLAB_*` env vars; configure
+GitLab projects in `control-plane.json`. See
 [`src/config.rs`](src/config.rs) and [docs/kubernetes-deployment.md](../../docs/kubernetes-deployment.md).
 
 ## Tests

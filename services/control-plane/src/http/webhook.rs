@@ -21,6 +21,10 @@ use crate::integrations::platform::{CodePlatform, Platform, RepoRef};
 
 type HmacSha256 = Hmac<Sha256>;
 
+/// Maximum webhook body size before HMAC / JSON verification. GitLab must parse JSON pre-auth to
+/// read `project.id` for per-project secret selection; this caps attacker-controlled parse cost.
+pub const MAX_BODY_BYTES: usize = 1024 * 1024;
+
 /// Detect the platform from webhook headers.
 /// GitHub sends `X-GitHub-Event`; GitLab sends `X-Gitlab-Event`.
 fn detect_platform(headers: &HeaderMap) -> Option<Platform> {
@@ -70,19 +74,32 @@ async fn webhook_router_body(state: AppState, headers: HeaderMap, body: Bytes) -
     tracing::info!(%platform, "webhook received");
     tracing::Span::current().record("platform", tracing::field::display(&platform));
 
-    // Verify signature — platform-specific.
-    let valid = match platform {
-        Platform::GitHub => verify_signature(
+    // GitLab needs the payload's `project.id` to select the configured per-project webhook secret.
+    // The helper returns the verified payload, making ownership explicit.
+    let gitlab_payload = if platform == Platform::GitLab {
+        match verified_gitlab_payload(&state, &headers, &body) {
+            Ok(payload) => Some(payload),
+            Err(GitlabPayloadError::InvalidJson) => {
+                return (StatusCode::BAD_REQUEST, "invalid json payload").into_response();
+            }
+            Err(GitlabPayloadError::InvalidSignature) => {
+                crate::http::metrics::webhook_signature_failure(&platform.to_string());
+                tracing::warn!(%platform, "invalid webhook signature");
+                return (StatusCode::UNAUTHORIZED, "invalid signature").into_response();
+            }
+        }
+    } else {
+        None
+    };
+
+    // Verify GitHub signature. GitLab verification happens in `verified_gitlab_payload`.
+    if platform == Platform::GitHub
+        && !verify_signature(
             state.github_webhook_secret.as_bytes(),
             &body,
             &header(&headers, "x-hub-signature-256"),
-        ),
-        Platform::GitLab => verify_gitlab_token(
-            &state.gitlab_webhook_secret,
-            &header(&headers, "x-gitlab-token"),
-        ),
-    };
-    if !valid {
+        )
+    {
         crate::http::metrics::webhook_signature_failure(&platform.to_string());
         tracing::warn!(%platform, "invalid webhook signature");
         return (StatusCode::UNAUTHORIZED, "invalid signature").into_response();
@@ -106,12 +123,15 @@ async fn webhook_router_body(state: AppState, headers: HeaderMap, body: Bytes) -
     tracing::Span::current().record("event", &event);
 
     // Parse the payload up front: reject non-JSON bodies (never persist `null`).
-    let payload: serde_json::Value = match serde_json::from_slice(&body) {
-        Ok(payload) => payload,
-        Err(error) => {
-            tracing::error!(%error, %platform, %delivery_id, "webhook payload is not valid JSON");
-            return (StatusCode::BAD_REQUEST, "invalid json payload").into_response();
-        }
+    let payload: serde_json::Value = match gitlab_payload {
+        Some(payload) => payload,
+        None => match serde_json::from_slice(&body) {
+            Ok(payload) => payload,
+            Err(error) => {
+                tracing::error!(%error, %platform, %delivery_id, "webhook payload is not valid JSON");
+                return (StatusCode::BAD_REQUEST, "invalid json payload").into_response();
+            }
+        },
     };
 
     // Dedup (and persist, when a database is configured). `is_new` is false for a replayed
@@ -161,6 +181,58 @@ pub async fn github_webhook_legacy(
     body: Bytes,
 ) -> Response {
     webhook_router(state, headers, body).await
+}
+
+enum GitlabPayloadError {
+    InvalidJson,
+    InvalidSignature,
+}
+
+fn verified_gitlab_payload(
+    state: &AppState,
+    headers: &HeaderMap,
+    body: &[u8],
+) -> Result<serde_json::Value, GitlabPayloadError> {
+    let platform = Platform::GitLab;
+    let payload = match serde_json::from_slice(body) {
+        Ok(payload) => payload,
+        Err(error) => {
+            tracing::error!(%error, %platform, "webhook payload is not valid JSON");
+            return Err(GitlabPayloadError::InvalidJson);
+        }
+    };
+
+    if !verify_gitlab_project_webhook_with_registry(state.gitlab.as_ref(), headers, body, &payload)
+    {
+        return Err(GitlabPayloadError::InvalidSignature);
+    }
+
+    Ok(payload)
+}
+
+fn verify_gitlab_project_webhook_with_registry(
+    registry: Option<&crate::integrations::gitlab::GitlabRegistry>,
+    headers: &HeaderMap,
+    body: &[u8],
+    payload: &serde_json::Value,
+) -> bool {
+    let Some(project_id) = payload["project"]["id"].as_i64() else {
+        tracing::warn!("GitLab webhook missing project.id");
+        return false;
+    };
+    let Some(registry) = registry else {
+        tracing::warn!(
+            project_id,
+            "GitLab webhook received but GitLab is not configured"
+        );
+        return false;
+    };
+    let Some(project) = registry.get(project_id) else {
+        tracing::warn!(project_id, "GitLab webhook for unconfigured project");
+        return false;
+    };
+
+    project.client.verify_webhook(headers, body)
 }
 
 /// GitHub webhook → internal action mapping (the only events that do anything beyond being
@@ -335,7 +407,11 @@ async fn handle_gitlab_merge_request(
                 .or_else(|| attrs["last_commit"]["id"].as_str())
                 .map(str::to_string);
             if base_sha.is_none() {
-                if let Some(gitlab) = state.gitlab.as_ref() {
+                if let Some(gitlab) = state
+                    .gitlab
+                    .as_ref()
+                    .and_then(|registry| registry.client_for_project(project_id))
+                {
                     let repo_ref = RepoRef {
                         platform: Platform::GitLab,
                         full_name: format!("{owner}/{name}"),
@@ -370,7 +446,8 @@ async fn handle_gitlab_merge_request(
                     tracing::warn!(
                         delivery_id,
                         mr = mr_iid,
-                        "GitLab MR payload missing diff_refs and no GitLab client configured; \
+                        project_id,
+                        "GitLab MR payload missing diff_refs and no GitLab project client configured; \
                          review may run on an empty diff"
                     );
                 }
@@ -484,20 +561,6 @@ async fn handle_gitlab_note(
     let Some(pool) = state.db.as_ref() else {
         return;
     };
-    // GitLab note hooks don't carry an `action` — the hook fires on creation only.
-    let body = payload["object_attributes"]["note"]
-        .as_str()
-        .unwrap_or_default();
-    if !mentions_handle(body, &state.gitlab_app_handle) {
-        return;
-    }
-    // `noteable_type` tells us MR vs issue: "MergeRequest" or "Issue".
-    let noteable_type = payload["object_attributes"]["noteable_type"]
-        .as_str()
-        .unwrap_or_default();
-    let is_pr = noteable_type == "MergeRequest";
-    let target_type = if is_pr { "pull_request" } else { "issue" };
-
     let project = &payload["project"];
     let Some((project_id, owner, name, default_branch)) = gitlab_project_identity(project) else {
         tracing::warn!(
@@ -507,6 +570,31 @@ async fn handle_gitlab_note(
         return;
     };
     let installation_id = project_id;
+    // GitLab note hooks don't carry an `action` — the hook fires on creation only.
+    let body = payload["object_attributes"]["note"]
+        .as_str()
+        .unwrap_or_default();
+    let Some(bot_handle) = state
+        .gitlab
+        .as_ref()
+        .and_then(|registry| registry.bot_handle(project_id))
+    else {
+        tracing::warn!(
+            delivery_id,
+            project_id,
+            "GitLab note project is not configured; skipping"
+        );
+        return;
+    };
+    if !mentions_handle(body, bot_handle) {
+        return;
+    }
+    // `noteable_type` tells us MR vs issue: "MergeRequest" or "Issue".
+    let noteable_type = payload["object_attributes"]["noteable_type"]
+        .as_str()
+        .unwrap_or_default();
+    let is_pr = noteable_type == "MergeRequest";
+    let target_type = if is_pr { "pull_request" } else { "issue" };
 
     // The MR/issue iid: `merge_request.iid` for MR notes, `issue.iid` for issue notes.
     let target_iid = if is_pr {
@@ -546,10 +634,15 @@ async fn handle_gitlab_note(
 
     // An MR re-review needs the base/head SHAs to scope the diff; a plain issue has no diff.
     let (base_sha, head_sha) = if is_pr {
-        let Some(gitlab) = state.gitlab.as_ref() else {
+        let Some(gitlab) = state
+            .gitlab
+            .as_ref()
+            .and_then(|registry| registry.client_for_project(project_id))
+        else {
             tracing::warn!(
                 delivery_id,
-                "GitLab client not configured; cannot fetch MR SHAs"
+                project_id,
+                "GitLab project client not configured; cannot fetch MR SHAs"
             );
             return;
         };
@@ -1193,17 +1286,6 @@ fn verify_signature(secret: &[u8], body: &[u8], signature: &str) -> bool {
     expected.as_bytes().ct_eq(signature.as_bytes()).into()
 }
 
-/// Constant-time plain-token verification of the GitLab webhook token (`X-Gitlab-Token`).
-/// GitLab doesn't use HMAC — it sends the raw secret in a header — so we compare in constant time
-/// to avoid timing leaks. An unset secret rejects everything (fail closed).
-fn verify_gitlab_token(secret: &str, token: &str) -> bool {
-    if secret.is_empty() {
-        return false;
-    }
-    use subtle::ConstantTimeEq;
-    secret.as_bytes().ct_eq(token.as_bytes()).into()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1358,20 +1440,81 @@ mod tests {
         assert_eq!(detect_platform(&headers), None);
     }
 
-    #[test]
-    fn gitlab_token_rejects_when_secret_unset() {
-        assert!(!verify_gitlab_token("", "anything"));
+    fn gitlab_registry() -> crate::integrations::gitlab::GitlabRegistry {
+        let section = crate::config::GitlabSection {
+            enabled: true,
+            default_api_url: Some("https://gitlab.example.com/api/v4".to_string()),
+            default_bot_handle: Some("lightbridge-bot".to_string()),
+            projects: vec![
+                crate::config::GitlabProjectConfig {
+                    project_id: 1001,
+                    api_url: None,
+                    access_token: "token-a".to_string(),
+                    webhook_secret: "secret-a".to_string(),
+                    bot_handle: None,
+                },
+                crate::config::GitlabProjectConfig {
+                    project_id: 1002,
+                    api_url: None,
+                    access_token: "token-b".to_string(),
+                    webhook_secret: "secret-b".to_string(),
+                    bot_handle: None,
+                },
+            ],
+        };
+        crate::integrations::gitlab::GitlabRegistry::from_config(&section)
+            .expect("valid config")
+            .expect("enabled registry")
     }
 
     #[test]
-    fn gitlab_token_accepts_a_valid_match() {
-        let secret = "it is a secret";
-        assert!(verify_gitlab_token(secret, secret));
+    fn gitlab_project_webhook_accepts_matching_project_secret() {
+        let registry = gitlab_registry();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-gitlab-token", "secret-a".parse().unwrap());
+        let payload = serde_json::json!({ "project": { "id": 1001 } });
+
+        assert!(verify_gitlab_project_webhook_with_registry(
+            Some(&registry),
+            &headers,
+            b"{}",
+            &payload
+        ));
     }
 
     #[test]
-    fn gitlab_token_rejects_a_mismatch() {
-        assert!(!verify_gitlab_token("secret", "wrong"));
+    fn gitlab_project_webhook_rejects_wrong_project_secret() {
+        let registry = gitlab_registry();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-gitlab-token", "secret-b".parse().unwrap());
+        let payload = serde_json::json!({ "project": { "id": 1001 } });
+
+        assert!(!verify_gitlab_project_webhook_with_registry(
+            Some(&registry),
+            &headers,
+            b"{}",
+            &payload
+        ));
+    }
+
+    #[test]
+    fn gitlab_project_webhook_rejects_missing_or_unknown_project() {
+        let registry = gitlab_registry();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-gitlab-token", "secret-a".parse().unwrap());
+
+        assert!(!verify_gitlab_project_webhook_with_registry(
+            Some(&registry),
+            &headers,
+            b"{}",
+            &serde_json::json!({ "project": {} })
+        ));
+        assert!(!verify_gitlab_project_webhook_with_registry(
+            Some(&registry),
+            &headers,
+            b"{}",
+            &serde_json::json!({ "project": { "id": 9999 } })
+        ));
     }
 
     #[test]
