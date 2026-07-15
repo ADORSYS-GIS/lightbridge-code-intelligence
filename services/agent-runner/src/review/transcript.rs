@@ -101,19 +101,13 @@ pub(crate) fn append_transcript(
                 // The model's visible answer for this turn (the text it would post / reason from next).
                 // Distinct from reasoning and equally load-bearing for an operator — a maintainer needs
                 // to see *what* the model said, not only how long it thought.
-                if let Some(shown) = message
-                    .content
-                    .as_deref()
-                    .and_then(|c| bounded_for_log(c, content_cap))
-                {
+                let content = message.content.as_deref();
+                let content_chars = content.map(|c| c.chars().count()).unwrap_or(0);
+                if let Some(shown) = content.and_then(|c| bounded_for_log(c, content_cap)) {
                     tracing::info!(
                         task_id = %task_id,
                         turn,
-                        content_chars = message
-                            .content
-                            .as_deref()
-                            .map(|c| c.chars().count())
-                            .unwrap_or(0),
+                        content_chars,
                         content = %shown,
                         "agent content"
                     );
