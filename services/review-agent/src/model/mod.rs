@@ -22,6 +22,7 @@ mod client;
 mod completion;
 mod http;
 mod retry;
+mod serde_ext;
 mod stream;
 mod wire;
 
