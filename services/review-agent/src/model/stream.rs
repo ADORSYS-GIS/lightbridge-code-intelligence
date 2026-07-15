@@ -150,13 +150,16 @@ impl ChatClient {
                     let chunk = match serde_json::from_str::<StreamChunk>(data) {
                         Ok(chunk) => chunk,
                         Err(error) => {
-                            // A `data:` line that is neither `[DONE]` nor empty but still fails to
-                            // parse means we are DROPPING a delta (its content/reasoning/tool_calls).
-                            // This is exactly how the #411 null-`tool_calls` bug hid for months, so
-                            // surface it — bounded snippet, `debug` so legitimate keep-alives stay
-                            // quiet — instead of skipping silently. The next backend that introduces a
-                            // novel null shape is then caught immediately.
-                            if !data.is_empty() {
+                            // A `data:` line that fails to parse into a JSON *object* means we are
+                            // DROPPING a delta (its content/reasoning/tool_calls). This is exactly how
+                            // the #411 null-`tool_calls` bug hid for months, so surface it — bounded
+                            // snippet, `debug` — instead of skipping silently, and the next backend that
+                            // introduces a novel null shape is caught immediately. Gate on a leading `{`
+                            // (the payload is trimmed, and any valid `StreamChunk` is a JSON object): a
+                            // non-JSON heartbeat some gateways send as `data: ping` / `data: keep-alive`
+                            // could never deserialize anyway, so logging it would be pure noise that
+                            // drowns the real signal.
+                            if data.starts_with('{') {
                                 let snippet: String = data.chars().take(200).collect();
                                 tracing::debug!(
                                     %error,
