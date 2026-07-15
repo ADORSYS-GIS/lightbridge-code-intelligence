@@ -32,7 +32,14 @@ concurrency:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, vymalo-vps]
+    # The vymalo-vps hosts lack a C toolchain (native builds fail `linker 'cc' not found`). Run inside
+    # the org's ARC image (build-essential + rustup stable + sccache baked); `--user root` because the
+    # host user cannot sudo. The pgvector service below shares the job's container network and is
+    # reachable by its service name (`postgres`), not `localhost` — see DATABASE_URL.
+    container:
+      image: ghcr.io/vymalo/arc-runners:latest
+      options: --user root
     services:
       # pgvector/pgvector:pg17 mirrors compose.yaml: the migrations do `CREATE EXTENSION vector`
       # and create `vector(4096)` columns, so a stock postgres image would fail. `#[sqlx::test]`
@@ -52,10 +59,10 @@ jobs:
           --health-timeout 5s
           --health-retries 10
     env:
-      DATABASE_URL: postgres://lightbridge:lightbridge@localhost:5432/lightbridge
+      # Inside a `container:` job the service is reached by service name, not localhost.
+      DATABASE_URL: postgres://lightbridge:lightbridge@postgres:5432/lightbridge
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
       # Registry + git-dep download cache (the fetch side). sccache below caches compiler output.
       - uses: Swatinem/rust-cache@v2
         with:

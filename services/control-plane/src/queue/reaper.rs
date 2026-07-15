@@ -358,6 +358,7 @@ mod tests {
                 run_epoch: 0,
                 tier: "deep".to_string(),
                 trigger_comment_id: None,
+                trace_context: None,
             },
         )
         .await

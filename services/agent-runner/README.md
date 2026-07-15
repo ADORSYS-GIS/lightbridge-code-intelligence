@@ -12,8 +12,9 @@ does the heavy repository work, and reports results back — holding no standing
 3. **Semantic index**: tree-sitter chunking → embeddings (OpenAI-compatible,
    [ADR-0018](../../docs/adr/0018-openai-compatible-embeddings.md)) → `code_chunks` (pgvector), posted to
    the control plane.
-4. **Structural graph**: Graphify → the control plane writes Neo4j (best-effort / non-fatal,
-   [ADR-0019](../../docs/adr/0019-graphify-cli-structural-graph.md)).
+4. **Structural graph**: in-process **lci-codegraph** (tree-sitter) → the control plane writes Neo4j
+   (best-effort / non-fatal, [ADR-0086](../../docs/adr/0086-in-house-code-graph-crate.md), which
+   retired the Python Graphify CLI of [ADR-0019](../../docs/adr/0019-graphify-cli-structural-graph.md)).
 5. **SAST** (review tasks): a deterministic **opengrep** scan of the diff'd files
    ([ADR-0061](../../docs/adr/0061-sast-deterministic-finding-source.md)) — findings ride the *same*
    review channel (no second poster) and the LLM is made aware of them but never gated by them.
@@ -50,8 +51,10 @@ See [docs/jobs-and-lifecycle.md](../../docs/jobs-and-lifecycle.md).
 
 No GitHub App key, no datastore credentials: the agent's retrieval tools go through the control-plane
 API (the trust property from [ADR-0020](../../docs/adr/0020-mcp-servers-via-control-plane.md), now
-in-process rather than via stdio MCP servers). It holds only the short-lived install token, the shared
-`AGENT_RUNNER_TOKEN`, the embeddings key, and a mounted internal-CA cert.
+in-process rather than via stdio MCP servers). It holds only the short-lived install token, a per-task
+`AGENT_RUNNER_TOKEN` (minted for this Job alone and worthless against any other task's callbacks,
+[ADR-0092](../../docs/adr/0092-per-task-runner-tokens.md)), the embeddings key, and a mounted
+internal-CA cert.
 
 ## Cancellation
 

@@ -191,4 +191,50 @@ mod tests {
             "nothing left; a re-run is a no-op"
         );
     }
+
+    /// #400 (bug 2): `sweep_terminal_a2a_tasks`'s `ORDER BY t.created_at, t.a2a_task_id` must be
+    /// deterministic when several terminal mappings share the exact same `created_at` (a real case —
+    /// the sweeper ticks on a fixed interval and can catch several tasks that finished the same
+    /// moment). Without the `a2a_task_id` tie-break, which 2 of these 3 a `LIMIT 2` batch takes is
+    /// undefined; with it, the batch always takes the two lowest ids first.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn batch_selection_is_deterministic_on_created_at_ties(pool: PgPool) {
+        let mut ids = Vec::new();
+        for _ in 0..3 {
+            let id = seed_task(&pool, "TASK_STATE_COMPLETED", 40).await;
+            seed_event(&pool, id, 1, true).await;
+            ids.push(id);
+        }
+        // Force an exact tie: all three share one created_at value.
+        sqlx::query(
+            "UPDATE a2a_tasks SET created_at = now() - interval '40 days' \
+             WHERE a2a_task_id = ANY($1)",
+        )
+        .bind(&ids)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        ids.sort();
+        let (lowest, middle, highest) = (ids[0], ids[1], ids[2]);
+
+        let deleted = db::sweep_terminal_a2a_tasks(&pool, 30, 2).await.unwrap();
+        assert_eq!(deleted, 2);
+        assert!(
+            !task_exists(&pool, lowest).await,
+            "lowest id (tie-break winner) is swept first"
+        );
+        assert!(
+            !task_exists(&pool, middle).await,
+            "second-lowest id is swept next"
+        );
+        assert!(
+            task_exists(&pool, highest).await,
+            "highest id is retained — outside the batch"
+        );
+
+        // Repeating the call is deterministic too: the remaining (highest-id) row goes next.
+        assert_eq!(db::sweep_terminal_a2a_tasks(&pool, 30, 2).await.unwrap(), 1);
+        assert!(!task_exists(&pool, highest).await);
+    }
 }

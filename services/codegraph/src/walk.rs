@@ -15,9 +15,8 @@ use ignore::WalkBuilder;
 use crate::chunk::{self, Chunk, MAX_FILE_BYTES};
 use crate::graph::{self, FileSymbols, Graph};
 use crate::ignore_list::{IgnoreConfig, IgnoreList};
-use crate::language;
+use crate::lang;
 use crate::pdf::{self, PdfOutcome};
-use crate::ts;
 use crate::tuning::IndexTuning;
 
 /// Options for [`walk_checkout`]. `bon` builder (≥3 fields, ADR-0083 idiom).
@@ -30,7 +29,7 @@ pub struct WalkOptions {
     /// what makes the operator layer *compose with* rather than *replace* the repo ignores.
     #[builder(default = true)]
     pub respect_gitignore: bool,
-    /// Build the in-house structural graph (Rust only in slice 1). Default `false` so the crate is
+    /// Build the in-house structural graph (Rust, Python, TS/JS+TSX, Java). Default `false` so the crate is
     /// behavior-neutral until a host opts in (ADR-0086 migration shape).
     #[builder(default = false)]
     pub build_graph: bool,
@@ -118,7 +117,7 @@ pub fn walk_checkout(root: &Path, options: &WalkOptions) -> anyhow::Result<WalkO
             .replace('\\', "/");
 
         // ── PDFs: bounded text extraction → windowed chunks ──────────────────────────────────────
-        if options.extract_pdfs && language::is_pdf(path) {
+        if options.extract_pdfs && lang::is_pdf(path) {
             match pdf::extract_from_path(path) {
                 PdfOutcome::Text(text) => {
                     let file_chunks = chunk::chunk_text(&rel_path, &text, "pdf", options.tuning);
@@ -141,7 +140,7 @@ pub fn walk_checkout(root: &Path, options: &WalkOptions) -> anyhow::Result<WalkO
         }
 
         // ── Source / text files ─────────────────────────────────────────────────────────────────
-        let Some(lang) = language::from_path(path) else {
+        let Some(language) = lang::from_path(path) else {
             continue;
         };
         // Bound the read at the I/O level, not via `metadata().len()`: the file could grow (or be a
@@ -159,20 +158,20 @@ pub fn walk_checkout(root: &Path, options: &WalkOptions) -> anyhow::Result<WalkO
             continue; // over the byte cap
         }
 
-        let file_chunks = if options.build_graph && language::has_graph(lang) {
+        let file_chunks = if options.build_graph && lang::has_graph(language) {
             // Parse ONCE and feed both the chunker and the graph builder (ADR-0086 "parse once").
-            if let Some(tree) = ts::parse(&source, lang) {
-                file_symbols.push(graph::extract_file(&tree, &rel_path, &source, lang));
-                let mut cs = chunk::chunk_tree(&tree, &rel_path, &source, lang, options.tuning);
+            if let Some(tree) = lang::parse(&source, language) {
+                file_symbols.push(graph::extract_file(&tree, &rel_path, &source, language));
+                let mut cs = chunk::chunk_tree(&tree, &rel_path, &source, language, options.tuning);
                 if cs.is_empty() {
-                    cs = chunk::chunk_text(&rel_path, &source, lang, options.tuning);
+                    cs = chunk::chunk_text(&rel_path, &source, language, options.tuning);
                 }
                 cs
             } else {
-                chunk::chunk_file(&rel_path, &source, lang, options.tuning)
+                chunk::chunk_file(&rel_path, &source, language, options.tuning)
             }
         } else {
-            chunk::chunk_file(&rel_path, &source, lang, options.tuning)
+            chunk::chunk_file(&rel_path, &source, language, options.tuning)
         };
 
         if !file_chunks.is_empty() {
@@ -275,6 +274,47 @@ mod tests {
         assert!(
             out.stats.paths_ignored >= 1,
             "at least the target/ dir was pruned"
+        );
+    }
+
+    #[test]
+    fn walk_builds_cross_file_graph_for_python_and_ts() {
+        // Proves the full walk path — extension detection, `has_graph` gating, the parse-once branch —
+        // wires up for the new languages, not just the direct `extract_file` unit tests.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(root, "svc/a.py", "def caller():\n    target()\n");
+        write(root, "svc/b.py", "def target():\n    pass\n");
+        write(
+            root,
+            "web/a.ts",
+            "import { help } from './b';\nfunction run() { help(); }\n",
+        );
+        write(root, "web/b.ts", "export function help() {}\n");
+
+        let options = WalkOptions::builder().build_graph(true).build();
+        let out = walk_checkout(root, &options).unwrap();
+
+        let cross_file = |lang_dir: &str| {
+            out.graph.edges.iter().any(|e| {
+                e.relation == "calls"
+                    && out
+                        .graph
+                        .nodes
+                        .iter()
+                        .find(|n| n.node_id == e.source)
+                        .is_some_and(|n| n.source_file.starts_with(lang_dir))
+            })
+        };
+        assert!(
+            cross_file("svc/"),
+            "python cross-file call edge; edges = {:?}",
+            out.graph.edges
+        );
+        assert!(
+            cross_file("web/"),
+            "ts cross-file call edge; edges = {:?}",
+            out.graph.edges
         );
     }
 

@@ -40,14 +40,19 @@ pub struct PrDiffRef<'a> {
 const TOOL_PROTOCOL: &str = "\
 # How to act\n\
 Investigate with the search/graph tools before making any claim — never speculate about code you \
-have not looked up. As you find issues, record each one with `add_review_comment` (one call per \
-finding, on a line this diff adds or changes). Only set `start_line` when the finding's evidence \
-genuinely spans multiple contiguous lines — a multi-line problem, not a multi-line explanation of a \
-one-line problem — and if the finding also carries a `suggestion`, make it cover the full \
-start_line..line range. Use `add_comment` for a plain reply that isn't pinned to a diff line (e.g. \
-answering a question). Nothing you record is posted until you call `finish` with your overall verdict \
-— call `finish` exactly once when you are done, even if you found nothing. If you genuinely cannot \
-produce anything useful, call `abort` with a reason. You may not edit files or run commands.";
+have not looked up. If `run_sast` is available and this is a real review (not just answering a \
+question), call it EARLY — before you finish investigating — so its findings are recorded up front; do \
+not re-report what it returns as your own finding, but you may investigate one of its leads further \
+(confirm exploitability, trace a tainted input, note a false positive) if it's worth your budget. As \
+you find issues, record each one with `add_review_comment` (one call per finding, on a line this diff \
+adds or changes). Only set `start_line` when the finding's evidence genuinely spans multiple contiguous \
+lines — a multi-line problem, not a multi-line explanation of a one-line problem — and if the finding \
+also carries a `suggestion`, make it cover the full start_line..line range. Use `add_comment` for a \
+plain reply that isn't pinned to a diff line (e.g. answering a question). Nothing you record is posted \
+until you call `finish` with your overall verdict — call `finish` exactly once when you are done, even \
+if you found nothing. If you genuinely cannot produce anything useful, call `abort` with a reason — \
+that reason is posted verbatim as the public review note on the PR, so write one honest sentence for \
+the PR author, never an internal note or scratch reasoning. You may not edit files or run commands.";
 
 /// Conservative chars-per-token constant for the window-proportional block budgets (ADR-0070).
 const PROMPT_CHARS_PER_TOKEN: usize = 4;
@@ -59,11 +64,10 @@ const MIN_BLOCK_CHARS: usize = 1_000;
 
 /// Absolute ceilings for the injected static context blocks (ADR-0070). Each mirrors the bound its
 /// assembly side already enforces — the control plane caps the prior-reviews block at 8k
-/// (`PRIOR_BLOCK_CHAR_CAP`), the SAST digest is `sast.max_findings` (25) one-liners, repo memory is a
-/// `LIMIT 30` of one-liners, and the AGENTS.md ingest is 32 KiB (`instructions::TOTAL_CAP`) — so on
-/// today's large-window models nothing changes. The window-proportional share below can only SHRINK
-/// them, never grow them.
-const SAST_BLOCK_CHAR_CEIL: usize = 6_000;
+/// (`PRIOR_BLOCK_CHAR_CAP`), repo memory is a `LIMIT 30` of one-liners, and the AGENTS.md ingest is 32
+/// KiB (`instructions::TOTAL_CAP`) — so on today's large-window models nothing changes. The
+/// window-proportional share below can only SHRINK them, never grow them. (The SAST digest no longer has
+/// a ceiling here — ADR-0073 made it a `run_sast` tool result, not a static prompt block.)
 const PRIORS_BLOCK_CHAR_CEIL: usize = 8_000;
 const MEMORY_BLOCK_CHAR_CEIL: usize = 4_000;
 const INSTRUCTIONS_BLOCK_CHAR_CEIL: usize = 32 * 1024;
@@ -76,16 +80,15 @@ const INSTRUCTIONS_BLOCK_CHAR_CEIL: usize = 32 * 1024;
 /// [`MIN_BLOCK_CHARS`]; with no window configured the ceilings apply unchanged (legacy behaviour).
 struct PromptBudgets {
     diff: usize,
-    sast: usize,
     priors: usize,
     memory: usize,
     instructions: usize,
 }
 
 impl PromptBudgets {
-    /// Shares of the window: diff 25%, instructions 2%, priors 2%, SAST 1.5%, memory 1% — together
-    /// ≤ ~31.5% of the window for static context, leaving the rest for the system prompt, the
-    /// conversation, and the ADR-0045 wind-down headroom.
+    /// Shares of the window: diff 25%, instructions 2%, priors 2%, memory 1% — together ≤ ~30% of the
+    /// window for static context, leaving the rest for the system prompt, the conversation, and the
+    /// ADR-0045 wind-down headroom.
     fn for_config(config: &PromptConfig) -> Self {
         let share = |frac: f64, ceil: usize| -> usize {
             match config.context_window {
@@ -98,7 +101,6 @@ impl PromptBudgets {
         };
         Self {
             diff: share(0.25, config.max_diff_chars),
-            sast: share(0.015, SAST_BLOCK_CHAR_CEIL),
             priors: share(0.02, PRIORS_BLOCK_CHAR_CEIL),
             memory: share(0.01, MEMORY_BLOCK_CHAR_CEIL),
             instructions: share(0.02, INSTRUCTIONS_BLOCK_CHAR_CEIL),
@@ -159,7 +161,6 @@ pub fn build_messages(
     repo_instructions: Option<&str>,
     prior_reviews: Option<&str>,
     repo_memory: Option<&str>,
-    sast_digest: Option<&str>,
 ) -> Vec<ChatMessage> {
     let system = format!("{}\n\n{TOOL_PROTOCOL}", config.system_prompt);
 
@@ -168,7 +169,6 @@ pub fn build_messages(
     let budgets = PromptBudgets::for_config(config);
     if config.context_window.is_some()
         && (budgets.diff < config.max_diff_chars
-            || budgets.sast < SAST_BLOCK_CHAR_CEIL
             || budgets.priors < PRIORS_BLOCK_CHAR_CEIL
             || budgets.memory < MEMORY_BLOCK_CHAR_CEIL
             || budgets.instructions < INSTRUCTIONS_BLOCK_CHAR_CEIL)
@@ -176,7 +176,6 @@ pub fn build_messages(
         tracing::info!(
             context_window = config.context_window,
             diff_chars = budgets.diff,
-            sast_chars = budgets.sast,
             priors_chars = budgets.priors,
             memory_chars = budgets.memory,
             instructions_chars = budgets.instructions,
@@ -227,15 +226,6 @@ pub fn build_messages(
             "\n\nNo diff is available for this run; answer or review against the working tree and \
              keep every claim grounded in the tools.",
         ),
-    }
-
-    // Deterministic SAST findings (ADR-0061): what opengrep already flagged on this diff. Injected right
-    // after the diff because it's *about* the diff — the agent is made aware so it doesn't re-report
-    // those lines and can deepen a lead, but these findings post independently regardless (they're not
-    // gated by the model). `None` when SAST is off or found nothing, so a normal run reads as before.
-    if let Some(sast) = sast_digest {
-        user.push_str("\n\n");
-        user.push_str(&cap_prompt_block(sast, budgets.sast, "SAST digest"));
     }
 
     // Prior-review context (ADR-0040 + ADR-0065): the agent's own prior reviews of this target,
@@ -303,7 +293,6 @@ mod tests {
             None,
             None,
             None,
-            None,
         );
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0].role, "system");
@@ -326,8 +315,7 @@ mod tests {
         let config = prompt_config();
         let prior = "## Your previous review of this pull request\nPrior verdict: looks fine.";
 
-        let with_prior =
-            build_messages(&config, "review again", None, None, Some(prior), None, None);
+        let with_prior = build_messages(&config, "review again", None, None, Some(prior), None);
         let user = with_prior[1].content.as_deref().expect("user content");
         assert!(
             user.contains("Your previous review of this pull request"),
@@ -341,7 +329,6 @@ mod tests {
             None,
             None,
             Some("## Memory: findings rejected here before (👎)\n- a.rs:1 — bogus nit"),
-            None,
         );
         assert!(
             with_mem[1]
@@ -352,7 +339,7 @@ mod tests {
             "repo-memory block reaches prompt"
         );
 
-        let without = build_messages(&config, "review again", None, None, None, None, None);
+        let without = build_messages(&config, "review again", None, None, None, None);
         let user = without[1].content.as_deref().expect("user content");
         assert!(
             !user.contains("previous review"),
@@ -397,7 +384,6 @@ mod tests {
             None,
             None,
             None,
-            None,
         );
         let user = msgs[1].content.as_deref().expect("user content");
 
@@ -434,7 +420,7 @@ mod tests {
         );
 
         config.context_window = None;
-        let msgs = build_messages(&config, "review", None, None, Some(&long_prior), None, None);
+        let msgs = build_messages(&config, "review", None, None, Some(&long_prior), None);
         let user = msgs[1].content.as_deref().unwrap();
         assert!(
             user.contains(&long_prior),
@@ -442,7 +428,7 @@ mod tests {
         );
 
         config.context_window = Some(8_192);
-        let msgs = build_messages(&config, "review", None, None, Some(&long_prior), None, None);
+        let msgs = build_messages(&config, "review", None, None, Some(&long_prior), None);
         let user = msgs[1].content.as_deref().unwrap();
         assert!(
             !user.contains(&long_prior),

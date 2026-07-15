@@ -7,10 +7,11 @@
 #
 # Source of truth: https://adorsys-gis.github.io/ai-governance/
 #
-# The reusable workflow is pinned to an immutable commit SHA (the v1.0.0 release), not
-# @main or a movable tag, so a future push — or a moved tag — to ai-governance cannot
-# change what runs here with write access. Bump the SHA deliberately when adopting a new
-# governance release.
+# The reusable workflow is pinned to an immutable commit SHA (not @main or a movable tag), so
+# a future push — or a moved tag — to ai-governance cannot change what runs here with write
+# access. Bump the SHA deliberately when adopting a newer governance revision. Currently pinned
+# to the main commit that introduced the `runs-on` input (post-v1.0.0), so this check can run on
+# our self-hosted runners instead of GitHub-hosted ubuntu-latest.
 name: AI Governance
 
 on:
@@ -26,12 +27,13 @@ jobs:
     # check in branch protection, a skipped job reports no status — admin-merge the release
     # PR (sole-maintainer flow) or mark this check non-required.
     if: ${{ !startsWith(github.head_ref, 'release-please--') }}
-    # ADORSYS-GIS/ai-governance @ v1.0.0
-    uses: ADORSYS-GIS/ai-governance/.github/workflows/governance-check.yml@959d8565041ddef86d3a10001b64393a6d4a60a2
-    # Runs on GitHub-hosted ubuntu-latest by default. To run on your own runners,
-    # bump the pinned SHA to a release that supports the `runs-on` input and add:
-    #   with:
-    #     runs-on: <your-self-hosted-runner-label>
+    # ADORSYS-GIS/ai-governance @ main ac9e071 (adds the `runs-on` input; v1.0.0 predates it)
+    uses: ADORSYS-GIS/ai-governance/.github/workflows/governance-check.yml@ac9e07188e34ca435d97e57c910d7d4a29895683
+    # Run on our self-hosted vymalo-vps runners (org GitHub-hosted ubuntu-latest is billing-
+    # blocked). The check is a lightweight github-script PR-body validation — no toolchain or
+    # container needed, so the bare runner suffices.
+    with:
+      runs-on: vymalo-vps
     permissions:
       pull-requests: write
       contents: read

@@ -31,8 +31,9 @@ One control-plane binary runs in three roles (`serve`, `dispatcher`, and `reconc
 disposable per-task Jobs. `serve` handles the HTTP API + reads, `dispatcher` consumes the work queue
 and launches Jobs, and `reconciler` drains the GitHub-egress outbox (the single writer to GitHub) and
 polls feedback. A Job never receives the GitHub App key — it bootstraps a short-lived installation
-token at runtime — but it **is** injected with the shared runner bearer (`AGENT_RUNNER_TOKEN`) and the
-embeddings API key it needs to do its work (see [Secrets a Job holds](#secrets-a-job-holds)).
+token at runtime — but it **is** injected with a per-task, short-lived runner token
+(`AGENT_RUNNER_TOKEN`, minted per Job from `RUNNER_TOKEN_SIGNING_KEY`, [ADR-0092](docs/adr/0092-per-task-runner-tokens.md))
+and the embeddings API key it needs to do its work (see [Secrets a Job holds](#secrets-a-job-holds)).
 
 ```mermaid
 flowchart TD
@@ -54,7 +55,7 @@ flowchart TD
     subgraph job["Kubernetes Job (ephemeral, per task)"]
         RUNNER["agent-runner<br/>clone · index · review"]
         TS["tree-sitter chunker"]
-        GFY["Graphify"]
+        GFY["lci-codegraph<br/>(in-process, tree-sitter)"]
         AGENT["native review agent<br/>(in-process, ADR-0026/0037)<br/>SAST + LLM over mediated tools"]
     end
 
@@ -93,21 +94,23 @@ and [docs/INDEX.md](docs/INDEX.md) for the full picture.
 
 ---
 
-## Why two indexers? (tree-sitter chunker **and** Graphify)
+## Why two indexes? (semantic chunks **and** a structural graph)
 
-This is the most common point of confusion, so it's worth being explicit: the Rust tree-sitter
-chunker and Graphify are **not** doing the same job twice. They feed **two different stores that
-answer two different kinds of question** — the dual-retrieval design
+This is the most common point of confusion, so it's worth being explicit: the two index passes are
+**not** doing the same job twice. Both are driven from **one tree-sitter parse of the checkout** — the
+semantic **chunker** and the in-house **lci-codegraph** structural extractor — and they feed **two
+different stores that answer two different kinds of question** — the dual-retrieval design
 ([ADR-0003](docs/adr/0003-dual-retrieval-neo4j-pgvector.md),
-[ADR-0010](docs/adr/0010-graphify-treesitter-indexing-baseline.md)). A good code review needs both
-kinds of recall, and no single store does both well.
+[ADR-0010](docs/adr/0010-graphify-treesitter-indexing-baseline.md), superseded for the graph half by
+[ADR-0086](docs/adr/0086-in-house-code-graph-crate.md)). A good code review needs both kinds of recall,
+and no single store does both well.
 
 ```mermaid
 flowchart LR
     SRC["Repo checkout<br/>(one clone, in the runner)"]
 
     SRC --> TS["tree-sitter chunker<br/>splits into semantic units"]
-    SRC --> GFY["Graphify<br/>extracts symbols + relationships"]
+    SRC --> GFY["lci-codegraph<br/>extracts symbols + relationships<br/>(in-process, tree-sitter)"]
 
     TS --> VEC[("pgvector<br/>embedding per chunk")]
     GFY --> NEO[("Neo4j<br/>typed graph")]
@@ -116,14 +119,14 @@ flowchart LR
     NEO --> QG["Structural question:<br/>'what calls this? PR impact?'"]
 ```
 
-| | **tree-sitter chunker → pgvector** | **Graphify → Neo4j** |
+| | **tree-sitter chunker → pgvector** | **lci-codegraph → Neo4j** |
 |---|---|---|
 | Kind of recall | **Semantic** (vector similarity) | **Structural** (graph traversal) |
 | Question it answers | "where is similar code / behaviour?", natural-language search | "what calls this function?", "what does this PR touch?", containment, test ownership |
-| What it emits | embedding-sized chunks with stable source ranges | nodes (symbols, files) + edges (defines, calls, imports) |
-| Why this tool | purpose-built, lightweight, in-process Rust we control; chunk boundaries are a *chunking* concern | specialised multi-modal graph extractor; relationships are a *graph* concern |
+| What it emits | embedding-sized chunks with stable source ranges | nodes (symbols, files) + edges (contains, method, calls) |
+| Why this tool | purpose-built, lightweight, in-process Rust we control; chunk boundaries are a *chunking* concern | in-house Rust crate over the same tree-sitter parse — no Python subprocess, no separate image ([ADR-0086](docs/adr/0086-in-house-code-graph-crate.md)) |
 | Can the other store answer it? | ❌ a graph can't rank by semantic similarity | ❌ vector search can't enumerate exact callers |
-| Status | ✅ built (slice 2) | ✅ built (slice 3) |
+| Status | ✅ built (slice 2) | ✅ built (slice 3; in-house crate, ADR-0086) |
 
 Both run in the **same runner Job over the same checkout** — one indexes for *fuzzy* retrieval, the
 other for *exact* retrieval. The reasoning agent (slice 5) then queries each store via MCP for the
@@ -202,7 +205,7 @@ sequenceDiagram
         CP->>DB: upsert code_chunks (vector)
     end
     R->>CP: POST /internal/tasks/{id}/status = succeeded
-    Note over R,GH: A review task also runs Graphify→Neo4j + the review agent → validated write-back
+    Note over R,GH: A review task also runs lci-codegraph→Neo4j + the review agent → validated write-back
 ```
 
 ### Secrets a Job holds
@@ -215,13 +218,14 @@ is **not** credential-free, though. Today the dispatcher injects into every runn
 | Secret | Source | Lifetime | Notes |
 |---|---|---|---|
 | GitHub installation token | minted per task by `serve` | ~1h, auto-expires | the only GitHub credential a Job sees |
-| `AGENT_RUNNER_TOKEN` | plaintext env in the pod spec | long-lived, **shared** across all Jobs | bearer for the internal API; a hardening target (move to a `secretKeyRef`, per-task scoping) |
+| `AGENT_RUNNER_TOKEN` | plaintext env in the pod spec, but minted per task | scoped to ONE task, expires with its Job's `activeDeadlineSeconds` | signed by `RUNNER_TOKEN_SIGNING_KEY` (control-plane-only, never in a Job); bearer for the internal API — a leaked value authenticates only this task ([ADR-0092](docs/adr/0092-per-task-runner-tokens.md)) |
 | `EMBEDDINGS_API_KEY` | `secretKeyRef` → `lightbridge-agent-secrets` | long-lived, shared | the embeddings gateway key ([ADR-0018](docs/adr/0018-openai-compatible-embeddings.md)) |
 | internal-CA cert | mounted from a Secret | n/a | trusts the internal HTTPS embeddings gateway |
 
-So "no long-lived secrets in the Job" is **not** accurate — only the GitHub App key is withheld.
-Narrowing the shared `AGENT_RUNNER_TOKEN`'s exposure (secret ref + per-task scoping) is tracked as a
-follow-up.
+So "no long-lived secrets in the Job" is **not** accurate — only the GitHub App key is withheld, and
+`EMBEDDINGS_API_KEY` is still a standing shared secret. `AGENT_RUNNER_TOKEN` is no longer one of the
+long-lived ones, though: [ADR-0092](docs/adr/0092-per-task-runner-tokens.md) narrowed it to a per-task,
+short-lived signed token.
 
 ---
 
@@ -335,7 +339,7 @@ MIT — see [LICENSE](LICENSE).
 
 ## Acknowledgments
 
-- [Graphify](https://github.com/safishamsi/graphify) — multi-modal graph extraction
+- [Graphify](https://github.com/safishamsi/graphify) — multi-modal graph extraction (used in the original structural indexer; since retired for the in-house `lci-codegraph` crate, [ADR-0086](docs/adr/0086-in-house-code-graph-crate.md))
 - [tree-sitter](https://tree-sitter.github.io/) — syntax-aware parsing / chunking
 - [OpenCode](https://opencode.ai) — agent reasoning framework (used in the original review agent; since retired for the native loop, [ADR-0026](docs/adr/0026-native-review-agent.md))
 - [Neo4j](https://neo4j.com/) — graph database

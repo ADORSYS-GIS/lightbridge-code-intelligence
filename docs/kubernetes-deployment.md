@@ -118,9 +118,12 @@ The Job carries the task context and callback wiring as env (`job_manifest`):
 
 - `TASK_ID`, `REPOSITORY_ID`, `INSTALLATION_ID`, `COMMAND`, `TARGET_TYPE`, `TARGET_ID`, `ATTEMPT`,
   and `BASE_SHA` / `HEAD_SHA` (each omitted when absent).
-- `CONTROL_PLANE_URL` + `AGENT_RUNNER_TOKEN` — where the runner calls back and the shared bearer it
-  presents to that internal API ([ADR-0017](adr/0017-agent-runner-control-plane-bootstrap.md)). The
-  runner re-fetches full context from the internal API rather than trusting these for anything
+- `CONTROL_PLANE_URL` + `AGENT_RUNNER_TOKEN` — where the runner calls back and the per-task token it
+  presents to that internal API. The token is a fresh HS256 JWT minted for this Job's task id at
+  dispatch time, signed by the (never-injected) `RUNNER_TOKEN_SIGNING_KEY`
+  ([ADR-0017](adr/0017-agent-runner-control-plane-bootstrap.md) /
+  [ADR-0092](adr/0092-per-task-runner-tokens.md)) — it authenticates only this task, not every Job's.
+  The runner re-fetches full context from the internal API rather than trusting these for anything
   security-sensitive.
 - **Embeddings (required)** — `EMBEDDINGS_BASE_URL` / `EMBEDDINGS_API_KEY` / `EMBEDDINGS_MODEL` from
   Secret `lightbridge-agent-secrets`. Required (no defaults) so a misconfigured Job fails loud rather
@@ -132,17 +135,19 @@ The Job carries the task context and callback wiring as env (`job_manifest`):
 
 ### Image selection (`image_for`)
 
-The dispatcher picks the image per task kind:
+The dispatcher picks the image per task kind. Since Graphify was retired ([ADR-0086](adr/0086-in-house-code-graph-crate.md))
+both kinds share **one lean runtime image** (structural-graph extraction is now in-process via the
+`lci-codegraph` crate — no Python/Graphify venv), but the per-kind overrides remain so operators can
+still pin the kinds to different tags:
 
-- **`command_text == "index"`** → the **full** image (`indexer_runner_image`, falls back to
-  `runner_image`) — bundles Python + Graphify for structural-graph extraction.
-- **everything else (review/ask)** → the **leaner** image (`review_runner_image`, falls back to
-  `runner_image`) — no Graphify venv; the review path is LLM/network-bound and reuses the indexed
-  snapshot ([ADR-0050](adr/0050-retrieval-pins-to-latest-indexed-snapshot.md)).
+- **`command_text == "index"`** → `indexer_runner_image`, falls back to `runner_image` — the heavier
+  path (full tree-sitter parse + embeddings + structural graph), typically more CPU/RAM.
+- **everything else (review/ask)** → `review_runner_image`, falls back to `runner_image` — LLM/network-
+  bound and reuses the indexed snapshot ([ADR-0050](adr/0050-retrieval-pins-to-latest-indexed-snapshot.md)).
 
 A chart that sets only `runner_image` keeps single-image behaviour. (Caveat in the code: a *cold-repo*
-review still self-indexes; on the lean image Graphify is best-effort/non-fatal, so a cold review
-builds the pgvector index and defers the graph to the next `index` task.)
+review still self-indexes; the structural-graph step is in-process and best-effort/non-fatal, so a cold
+review builds the pgvector index and the graph inline.)
 
 ### Resources (`resources_for`)
 
@@ -201,21 +206,43 @@ state the review tiers read.
 ### GitLab configuration (ADR-0072)
 
 GitLab support is built behind the same `CodePlatform` trait as GitHub
-([ADR-0072](adr/0072-platform-abstraction-layer.md)). The control plane talks to GitLab through a
-static access token (no App/installation dance), and the reconciler dispatches each outbox row to the
-matching platform implementation. The following env vars configure GitLab (all optional — GitLab is
-disabled when `GITLAB_API_TOKEN` is unset/empty):
+([ADR-0072](adr/0072-platform-abstraction-layer.md)). GitLab is configured **only** through
+`control-plane.json`; the control plane no longer reads `GITLAB_API_TOKEN`, `GITLAB_API_URL`,
+`GITLAB_WEBHOOK_SECRET`, or `GITLAB_BOT_HANDLE`.
 
-| Env var | Default | Purpose |
-|---|---|---|
-| `GITLAB_API_TOKEN` | — | GitLab access token (PAT, project/group token). Sent as the `PRIVATE-TOKEN` header. Unset/empty → GitLab disabled. |
-| `GITLAB_API_URL` | `https://gitlab.com/api/v4` | Base API URL. Self-hosted instances set this to `https://<host>/api/v4`. |
-| `GITLAB_WEBHOOK_SECRET` | — | Shared secret for `X-Gitlab-Token` webhook verification (plain token comparison, not HMAC). |
-| `GITLAB_BOT_HANDLE` | `lightbridge-bot` | The bot's `@handle` on GitLab. An MR note starting with `@<handle>` triggers a deep review (the first review is automatic on MR open). |
+Each configured GitLab project has its own access token and webhook secret:
 
-The bot handle is **per-platform**: GitHub uses `GITHUB_APP_HANDLE` (default `lightbridge-assistant`),
-GitLab uses `GITLAB_BOT_HANDLE` (default `lightbridge-bot`). The fast-tier framing ("🅵 quick pass —
-mention @handle for a deeper review") renders the correct handle per platform at `finalize_review`.
+```json
+{
+  "gitlab": {
+    "enabled": true,
+    "default_api_url": "https://gitlab.com/api/v4",
+    "default_bot_handle": "lightbridge-bot",
+    "projects": [
+      {
+        "project_id": 1001,
+        "access_token": "<mounted-secret-value>",
+        "webhook_secret": "<mounted-secret-value>"
+      },
+      {
+        "project_id": 1002,
+        "api_url": "https://gitlab.internal.example/api/v4",
+        "access_token": "<mounted-secret-value>",
+        "webhook_secret": "<mounted-secret-value>",
+        "bot_handle": "lb-reviewer"
+      }
+    ]
+  }
+}
+```
+
+Recommended production delivery is an ExternalSecret-managed Kubernetes Secret mounted as
+`/etc/lightbridge/control-plane.json`, so GitLab credentials do not exist as process env vars.
+
+The bot handle is **per platform and per GitLab project**: GitHub uses `GITHUB_APP_HANDLE` (default
+`lightbridge-assistant`), while GitLab uses each project's `bot_handle` or `default_bot_handle`. The
+fast-tier framing ("🅵 quick pass — mention @handle for a deeper review") renders the correct handle
+per platform at `finalize_review`.
 
 GitLab notes are scoped to their parent MR/issue — there is no global `/projects/{id}/notes/{note_id}`
 endpoint. Both the outbound 👀 reaction and the inbound 👍/👎 feedback polling carry the parent `iid`
@@ -249,11 +276,11 @@ The trigger picks the tier, carried as a `tier` column to the runner:
   not 1) + job timeout (≲ 2 min). The
   fast-tier framing ("🅵 quick pass — mention @handle for a deeper review") is rendered control-plane-
   side at `finalize_review` (`render_fast_body`), where the real `GITHUB_APP_HANDLE` (GitHub) or
-  `GITLAB_BOT_HANDLE` (GitLab) lives.
+  per-project GitLab `bot_handle` from `control-plane.json` lives.
 - **`@mention` → deep** — manual. Full graph + vector retrieval, `read_file`, generous turns,
   streaming on, long job deadline (2h acceptable, since it is user-requested and async). On GitHub
-  the `@<GITHUB_APP_HANDLE>` mention on a PR comment triggers it; on GitLab the `@<GITLAB_BOT_HANDLE>`
-  mention on an MR note triggers it.
+  the `@<GITHUB_APP_HANDLE>` mention on a PR comment triggers it; on GitLab the configured
+  `@<bot_handle>` mention on an MR note triggers it.
 
 Both tiers post through the **single** review channel
 ([ADR-0056](adr/0056-control-plane-owns-the-posted-output.md)) via the egress outbox. SAST findings

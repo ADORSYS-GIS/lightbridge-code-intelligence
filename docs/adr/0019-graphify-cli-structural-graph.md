@@ -2,8 +2,8 @@
 
 | Field      | Value |
 |------------|-------|
-| Status     | Accepted |
-| Date       | 2026-06-19 |
+| Status     | **Superseded by [ADR-0086](0086-in-house-code-graph-crate.md)** (was: Accepted). Graphify has been fully removed — the structural graph is now built in-process by the in-house `lci-codegraph` crate; no Python/Graphify subprocess or venv remains in the runner image. |
+| Date       | 2026-06-19 (superseded 2026-07-13) |
 | Deciders   | @ssegning |
 | Epic       | #5 (indexer + agent, slice 3) |
 | Refines    | [ADR-0010](0010-graphify-treesitter-indexing-baseline.md), builds on [ADR-0003](0003-dual-retrieval-neo4j-pgvector.md) |

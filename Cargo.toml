@@ -6,12 +6,14 @@
 resolver = "3"
 members = [
     "services/config",
+    "services/observability",
     "services/control-plane",
     "services/agent-runner",
     "services/agent-types",
     "services/agent-step",
     "services/agent-tools",
     "services/agent-clients",
+    "services/agent-sast",
     "services/agent-loop",
     "services/agent-status",
     "services/codegraph",
@@ -53,6 +55,28 @@ tokio = { version = "1.52.3", features = ["full"] }
 mimalloc = "0.1.52"
 tracing = "0.1.31"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
+# Distributed tracing → Tempo (ADR pending, ticket #246). `tracing-opentelemetry` bridges any
+# `tracing::Span` into an OTel span once its layer is registered; `opentelemetry-otlp`'s `http-proto`
+# feature ships over plain `reqwest`/HTTP rather than `tonic`/gRPC so it reuses each binary's own
+# pinned rustls crypto provider instead of introducing a second TLS stack (see the `rustls` comment
+# below — this workspace has already been bitten once by two competing crypto providers).
+#
+# The tokio-integrated batch span processor (`experimental_trace_batch_span_processor_with_async_runtime`,
+# gated behind that name upstream but the only variant that actually works here) plus the ASYNC
+# `reqwest-client` exporter feature are both load-bearing, not a style choice: `opentelemetry_sdk`'s
+# DEFAULT `with_batch_exporter` runs the export on its own dedicated OS thread with no Tokio reactor,
+# so an async `reqwest::Client` there panics ("there is no reactor running") — and switching to the
+# *blocking* reqwest client instead (the seemingly obvious fix) does build and connect, but silently
+# never sends the request body (a real bug this workspace hit and diagnosed against a live OTLP
+# collector, not merely inferred — see `lci-observability`'s `build_tracer_provider` doc comment for
+# the trace-level evidence). Running the batch processor as a Tokio task (`runtime::Tokio`) via this
+# feature, paired with the ordinary async client, is the combination that was actually verified to
+# deliver spans end-to-end.
+opentelemetry = "0.32"
+opentelemetry_sdk = { version = "0.32", features = ["rt-tokio", "experimental_trace_batch_span_processor_with_async_runtime"] }
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["http-proto", "reqwest-client"] }
+opentelemetry-http = { version = "0.32", features = ["reqwest"] }
+tracing-opentelemetry = "0.33"
 # Ergonomic async generators — used by the a2a role's SSE replay-then-tail stream (ADR-0077).
 async-stream = "0.3.6"
 # rustls everywhere (no OpenSSL in the runtime images).
@@ -130,6 +154,7 @@ tree-sitter-rust = "0.24"
 tree-sitter-javascript = "0.25"
 tree-sitter-typescript = "0.23.2"
 tree-sitter-python = "0.25"
+tree-sitter-java = "0.23"
 # --- lci-codegraph: in-house code-graph crate (ADR-0086 / RFC-0007 slice 1) ---
 # ripgrep's ignore engine: honours the repo's own `.gitignore` (git_ignore) AND lets us layer an
 # operator-configurable glob list on top with the SAME gitignore semantics (`GitignoreBuilder`). This

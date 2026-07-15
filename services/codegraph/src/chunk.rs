@@ -7,8 +7,7 @@ use serde::Serialize;
 use tree_sitter::{Node, Tree};
 
 use crate::IndexTuning;
-use crate::language;
-use crate::ts;
+use crate::lang;
 
 /// Skip files larger than this (avoids embedding enormous generated files). The chunk-line ceiling
 /// and the windowed-fallback sizes are operator-tunable — see [`IndexTuning`].
@@ -44,8 +43,8 @@ pub fn chunk_file(
         return Vec::new();
     }
 
-    if language::has_grammar(language)
-        && let Some(tree) = ts::parse(source, language)
+    if lang::has_grammar(language)
+        && let Some(tree) = lang::parse(source, language)
     {
         let chunks = chunk_tree(&tree, file_path, source, language, tuning);
         if !chunks.is_empty() {

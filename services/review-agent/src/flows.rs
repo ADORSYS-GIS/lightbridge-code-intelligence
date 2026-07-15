@@ -17,8 +17,8 @@ use lci_agent_step::StepRuntime;
 use lci_agent_tools::{ToolCx, ToolRegistry, TurnFilter};
 
 use crate::policies::{
-    CoverageGate, FastTierGuard, FindingFinishNudge, RefuteGate, ScratchpadLoopGuard,
-    render_fast_refusal,
+    CoverageGate, FastTierGuard, FindingFinishNudge, RefuteGate, SastAnchorGate, SastLeadSink,
+    ScratchpadLoopGuard, render_fast_refusal,
 };
 pub use crate::tools::EagerWorkspace;
 use crate::tools::{RETRACT_FINDING, tool_defs};
@@ -60,6 +60,10 @@ pub struct ReviewRunParams {
     pub diff_present: bool,
     /// The changed-file set the coverage gate tracks engagement against.
     pub diff_files: Vec<String>,
+    /// The shared feed the `run_sast` tool pushes opengrep leads into as it scans (ADR-0073), so
+    /// [`SastAnchorGate`] can reject a triage verdict anchored to a different line (#305). Starts empty
+    /// and may never fill — SAST off, no diff, or the agent simply never calls the tool.
+    pub sast_leads: SastLeadSink,
 }
 
 /// Build a [`Workspace`](lci_agent_tools::Workspace) over an already-materialized checkout root, for
@@ -125,7 +129,7 @@ where
 
     // Policy order is a behavioural contract (registration order = evaluation order in the engine):
     // context trim → wind-down → read budgets → turn budget → fast guard → scratchpad guard → coverage
-    // gate → refute gate → finding-finish nudge.
+    // gate → refute gate → SAST anchor gate → finding-finish nudge.
     let policies: Vec<Box<dyn TurnPolicy>> = vec![
         Box::new(ContextWindowTrim::new(params.context_window)),
         Box::new(
@@ -141,6 +145,7 @@ where
         Box::new(ScratchpadLoopGuard::new()),
         Box::new(coverage),
         Box::new(RefuteGate::new(params.fast)),
+        Box::new(SastAnchorGate::new(params.sast_leads, params.fast)),
         Box::new(FindingFinishNudge::new(params.fast)),
     ];
 
@@ -181,7 +186,7 @@ where
 mod tests {
     use super::*;
 
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     use lci_agent_clients::{ControlPlaneClient, EmbeddingsClient};
     use lci_agent_loop::{ChatMessage, RequestOptions};
@@ -193,21 +198,29 @@ mod tests {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    use crate::tools::{FINISH, tool_registry};
+    use crate::tools::{
+        ADD_REVIEW_COMMENT, FINISH, GRAPH_FIND_SYMBOL, GRAPH_GET_CALLERS, READ_FILE,
+        REPORT_PROGRESS, VECTOR_SEMANTIC_SEARCH, tool_registry,
+    };
 
-    fn finish_turn() -> AssistantTurn {
+    fn call_turn(id: &str, name: &str, arguments: &str) -> AssistantTurn {
         AssistantTurn {
             content: None,
             tool_calls: vec![ToolCallReq {
-                id: "fin".into(),
+                id: id.into(),
                 kind: "function".into(),
                 function: FunctionCallReq {
-                    name: FINISH.into(),
-                    arguments: r#"{"summary":"done"}"#.into(),
+                    name: name.into(),
+                    arguments: arguments.into(),
                 },
                 extra_content: None,
             }],
+            ..Default::default()
         }
+    }
+
+    fn finish_turn() -> AssistantTurn {
+        call_turn("fin", FINISH, r#"{"summary":"done"}"#)
     }
 
     /// Drive `run_review` to a clean `finish` over the deterministic testkit. The finish tool records
@@ -231,6 +244,7 @@ mod tests {
             Arc::new(embedder),
             [],
             RuntimeCaps::default(),
+            None,
         )
         .unwrap();
         let workspace = eager_workspace(checkout.path().to_path_buf());
@@ -264,6 +278,7 @@ mod tests {
             } else {
                 Vec::new()
             },
+            sast_leads: Arc::new(Mutex::new(Vec::new())),
         };
         run_review(
             Passthrough,
@@ -293,5 +308,133 @@ mod tests {
     #[tokio::test]
     async fn fast_run_with_diff_converges_on_finish() {
         assert_eq!(drive_to_finish(true, true).await, LoopOutcome::Finished);
+    }
+
+    // Regression for #407: WindDown strips every ReadOnly tool once it converges, so if RefuteGate
+    // bounces a `finish` carrying a P0/P1 finding at or after that point, the bounce's own
+    // "re-verify" directive (which names read_file / the graph / vector tools) would otherwise land
+    // on a turn where none of them are offered — spending the one-shot bounce for nothing. Drives:
+    // turn 0 records a P1 finding, turns 1-2 are filler (pre-winddown), turn 3 is at the winddown
+    // boundary (`winddown_turn(5) == 3`) and attempts `finish` — RefuteGate bounces it — turn 4 is
+    // the bounce's follow-up and must still offer `read_file` (and the rest of the retrieval set)
+    // despite WindDown's narrowing still being in effect.
+    #[tokio::test]
+    async fn refute_bounce_forces_retrieval_tools_back_after_winddown_narrows_them_away() {
+        let cp = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(format!(
+                "/internal/tasks/{}/review/summary",
+                Uuid::nil()
+            )))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&cp)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(format!(
+                "/internal/tasks/{}/review/inline",
+                Uuid::nil()
+            )))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&cp)
+            .await;
+        let checkout = tempfile::tempdir().unwrap();
+        tokio::fs::write(checkout.path().join("a.rs"), "one\ntwo\nthree\n")
+            .await
+            .unwrap();
+        let client = ControlPlaneClient::new(cp.uri(), "tok");
+        let embedder = EmbeddingsClient::new("http://unused", "key", "model");
+        let registry = tool_registry(
+            Arc::new(client.clone()),
+            Arc::new(embedder),
+            [],
+            RuntimeCaps::default(),
+            None,
+        )
+        .unwrap();
+        let workspace = eager_workspace(checkout.path().to_path_buf());
+        let cx = ToolCx {
+            task_id: Uuid::nil(),
+            workspace: &workspace,
+        };
+        let conversation = Conversation::new(
+            vec![
+                ChatMessage::system("be a reviewer"),
+                ChatMessage::user("review"),
+            ],
+            RequestOptions {
+                model: "m".to_string(),
+                ..RequestOptions::default()
+            },
+        );
+        let params = ReviewRunParams {
+            max_turns: 5,
+            max_batch_size: 8,
+            max_batches: 6,
+            max_files_read: 30,
+            max_searches: 15,
+            // Isolate the RefuteGate bounce from CoverageGate's own bounce mechanism.
+            max_coverage_bounces: 0,
+            circuit_breaker_threshold: 3,
+            context_window: None,
+            fast: false,
+            diff_present: true,
+            diff_files: vec!["a.rs".to_string()],
+            sast_leads: Arc::new(Mutex::new(Vec::new())),
+        };
+        let model = ScriptedModel::new([
+            call_turn(
+                "finding",
+                ADD_REVIEW_COMMENT,
+                r#"{"file":"a.rs","line":2,"title":"t","priority":"P1","category":"quality","body":"b","evidence":"line 2"}"#,
+            ),
+            call_turn("p1", REPORT_PROGRESS, r#"{"note":"working"}"#),
+            call_turn("p2", REPORT_PROGRESS, r#"{"note":"working"}"#),
+            finish_turn(), // turn 3: at the winddown boundary — RefuteGate bounces this finish
+            finish_turn(), // turn 4: the bounce's follow-up turn
+        ]);
+        let model_handle = model.clone();
+        let outcome = run_review(
+            Passthrough,
+            model,
+            Box::new(CapturingSink::default()),
+            &cx,
+            registry,
+            conversation,
+            params,
+            &client,
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, LoopOutcome::Finished);
+
+        let requests = model_handle.requests();
+        assert_eq!(requests.len(), 5, "expected exactly 5 turns to have run");
+        let offered_names = |index: usize| -> Vec<String> {
+            requests[index]["tools"]
+                .as_array()
+                .expect("tools is a non-empty array")
+                .iter()
+                .map(|tool| tool["function"]["name"].as_str().unwrap().to_string())
+                .collect()
+        };
+        // Sanity check: winddown really did strip read-only tools by the bounce turn — otherwise
+        // this test would pass without ever exercising the fix.
+        assert!(
+            !offered_names(3).contains(&READ_FILE.to_string()),
+            "expected winddown to have already narrowed away read_file by turn 3, got {:?}",
+            offered_names(3)
+        );
+        let post_bounce = offered_names(4);
+        for tool in [
+            READ_FILE,
+            GRAPH_FIND_SYMBOL,
+            GRAPH_GET_CALLERS,
+            VECTOR_SEMANTIC_SEARCH,
+        ] {
+            assert!(
+                post_bounce.contains(&tool.to_string()),
+                "expected {tool} to be forced back onto the post-bounce turn, got {post_bounce:?}"
+            );
+        }
     }
 }

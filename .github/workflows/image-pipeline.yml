@@ -39,17 +39,24 @@ permissions:
 jobs:
   # ── Compile the Rust workspace natively → one static-musl binary per service ──────────────────────
   rust-build:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, vymalo-vps]
+    # The vymalo-vps hosts have no C toolchain (`linker 'cc' not found`). Run inside the org's ARC
+    # image (build-essential + rustup stable + sccache baked); `--user root` because the host user
+    # cannot sudo and the musl toolchain still needs an apt install.
+    container:
+      image: ghcr.io/vymalo/arc-runners:latest
+      options: --user root
     env:
       TARGET: x86_64-unknown-linux-musl
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-unknown-linux-musl
-      # musl-gcc (musl-tools) links the static target; cmake+clang build aws-lc-sys' C/asm for musl.
+      # musl-gcc (musl-tools) links the static target; cmake+clang (baked, reinstalled cheaply) build
+      # aws-lc-sys' C/asm for musl. Add the musl target to the image's baked stable toolchain. Running
+      # as root in-container, so plain apt-get (no sudo, which is password-gated on the host).
       - name: Install musl + C toolchain
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools cmake clang
+        run: |
+          apt-get update && apt-get install -y --no-install-recommends musl-tools cmake clang file
+          rustup target add x86_64-unknown-linux-musl
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: "."
@@ -81,7 +88,7 @@ jobs:
 
   # ── Compile the Next.js app natively → the standalone bundle ──────────────────────────────────────
   web-build:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, vymalo-vps]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -107,10 +114,10 @@ jobs:
           path: web
           key: web-bundle-${{ github.run_id }}
 
-  # ── Assemble images from the prebuilt artifacts, daemonless, with buildah ─────────────────────────
+  # ── Assemble images from the prebuilt artifacts, daemonless, with rootless podman ─────────────────
   images:
     needs: [rust-build, web-build]
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, vymalo-vps]
     permissions:
       contents: read
       packages: write # push (inputs.push only)
@@ -127,8 +134,9 @@ jobs:
             dockerfile: apps/web/Dockerfile
             target: ""
             artifact: web-bundle
-          # Two agent images from one Dockerfile: `indexer` (full) keeps the historical name;
-          # `review` is the leaner no-Python image. Both COPY the same runner binary from context.
+          # Two agent images from one Dockerfile. Since Graphify was retired (ADR-0086) both targets
+          # alias one lean runtime and build to the same image; kept as separate tags for the two Job
+          # kinds. Both COPY the same runner binary from context.
           - image: lightbridge-agent-runner
             dockerfile: services/agent-runner/Dockerfile
             target: indexer
@@ -144,15 +152,18 @@ jobs:
           path: ${{ matrix.artifact == 'rust-bins' && 'dist' || 'web' }}
           key: ${{ matrix.artifact }}-${{ github.run_id }}
           fail-on-cache-miss: true
-      - name: Install buildah
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends buildah
+      # These self-hosted hosts are rootless-podman hosts with no password-less sudo, so the images
+      # are assembled with rootless `podman build` (buildah's engine, daemonless) directly on the
+      # host — no buildah install, no sudo, no nested container.
       - uses: sigstore/cosign-installer@v3
         if: ${{ inputs.push }}
-      # Let buildah resolve bare base-image names (node:22-slim, python:…, debian:…) to Docker Hub
-      # non-interactively; gcr.io/distroless is already fully qualified.
-      - name: Configure buildah registries
+      # Let podman resolve bare base-image names (node:22-slim, python:…, debian:…) to Docker Hub
+      # non-interactively; gcr.io/distroless is already fully qualified. Written to the per-user
+      # config (no sudo); the host's registries.conf.d short-name aliases are still merged in.
+      - name: Configure podman registries
         run: |
-          sudo tee /etc/containers/registries.conf >/dev/null <<'EOF'
+          mkdir -p "$HOME/.config/containers"
+          cat > "$HOME/.config/containers/registries.conf" <<'EOF'
           unqualified-search-registries = ["docker.io"]
           short-name-mode = "permissive"
           EOF
@@ -178,7 +189,7 @@ jobs:
             type=semver,pattern={{version}},enable=${{ inputs.version == '' }}
             type=sha,prefix=sha-,enable=${{ inputs.version == '' }}
             type=raw,value=latest,enable=${{ inputs.version == '' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
-      - name: Build (buildah)
+      - name: Build (podman)
         env:
           DOCKERFILE: ${{ matrix.dockerfile }}
           TARGET: ${{ matrix.target }}
@@ -188,11 +199,11 @@ jobs:
           args=(--platform linux/amd64 -f "$DOCKERFILE")
           [ -n "$TARGET" ] && args+=(--target "$TARGET")
           while IFS= read -r tag; do [ -n "$tag" ] && args+=(-t "$tag"); done <<< "$TAGS"
-          sudo buildah bud "${args[@]}" "$CTX"
+          podman build "${args[@]}" "$CTX"
       - name: Report image size
         continue-on-error: true
         run: |
-          size=$(sudo buildah images --format '{{.Size}}' "ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}" | head -1)
+          size=$(podman images --format '{{.Size}}' "ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}" | head -1)
           printf '### 📦 %s\n\n**%s**\n' "${{ matrix.image }}" "$size" >> "$GITHUB_STEP_SUMMARY"
       # push=true only: push every tag, then cosign-sign the (single) digest they share.
       - name: Push + sign
@@ -201,23 +212,19 @@ jobs:
           IMAGE: ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}
           TAGS: ${{ steps.meta.outputs.tags }}
         run: |
-          # buildah (root) pushes the image; cosign (runner) pushes the signature — each needs its
-          # own GHCR login (separate auth stores).
-          sudo buildah login -u "${{ github.actor }}" -p "${{ secrets.GITHUB_TOKEN }}" ghcr.io
+          # podman pushes the image; cosign pushes the signature — each needs its own GHCR login.
+          podman login -u "${{ github.actor }}" -p "${{ secrets.GITHUB_TOKEN }}" ghcr.io
           cosign login ghcr.io -u "${{ github.actor }}" -p "${{ secrets.GITHUB_TOKEN }}"
-          # buildah runs the push in a mount/user namespace even under sudo, so --digestfile must land
-          # in a world-writable dir the namespaced uid can create into — a runner-owned mktemp file
-          # (mode 0600) is not writable by that uid ("permission denied"). Let buildah create the file.
-          dgdir="$(mktemp -d)"; chmod 777 "$dgdir"; digestfile="$dgdir/digest"
+          digestfile="$(mktemp)"
           first=1
           while IFS= read -r tag; do
             [ -z "$tag" ] && continue
             if [ "$first" = 1 ]; then
-              sudo buildah push --digestfile "$digestfile" "$tag" "docker://$tag"; first=0
+              podman push --digestfile "$digestfile" "$tag" "docker://$tag"; first=0
             else
-              sudo buildah push "$tag" "docker://$tag"
+              podman push "$tag" "docker://$tag"
             fi
           done <<< "$TAGS"
-          digest="$(sudo cat "$digestfile")"
+          digest="$(cat "$digestfile")"
           echo "signing ${IMAGE}@${digest}"
           cosign sign --yes "${IMAGE}@${digest}"

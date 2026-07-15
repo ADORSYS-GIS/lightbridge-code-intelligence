@@ -28,6 +28,7 @@ use lci_agent_loop::{TranscriptEvent, TranscriptSink};
 use serde::Serialize;
 use uuid::Uuid;
 
+mod auth;
 pub mod server;
 
 pub use server::{StatusServerConfig, serve, spawn};
@@ -44,9 +45,9 @@ pub enum Phase {
     Starting,
     /// Building the code graph + embeddings (`index` mode, or a cold repo before review).
     Indexing,
-    /// The deterministic SAST pass over the PR's changed files (ADR-0061), before the agent runs.
-    Sast,
-    /// The review agent loop is running (investigating + recording findings).
+    /// The review agent loop is running (investigating + recording findings). SAST (ADR-0061) is a tool
+    /// the agent calls from inside this phase (`run_sast`, ADR-0073) — it no longer has its own phase,
+    /// since it's no longer a discrete pre-agent step.
     Reviewing,
     /// Flushing buffered findings / posting the grouped review (finalize).
     Finalizing,
@@ -259,7 +260,9 @@ mod tests {
                 message: ChatMessage::assistant(lci_agent_types::AssistantTurn {
                     content: None,
                     tool_calls: Vec::new(),
+                    ..Default::default()
                 }),
+                telemetry: None,
             },
             &tools,
         );

@@ -39,6 +39,7 @@ mod mcp_client;
 mod outbox;
 mod restate_worker;
 mod review;
+mod runner_token;
 mod types;
 
 // Global allocator. The release images are static-musl (ADR-0080); musl's built-in malloc regresses
@@ -59,7 +60,6 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use metrics_exporter_prometheus::PrometheusHandle;
 use sqlx::PgPool;
-use tracing_subscriber::EnvFilter;
 
 use jwt::JwtValidator;
 // Bring the grouped modules into scope under their bare names. `crate::` is required to
@@ -72,9 +72,6 @@ use crate::queue::{dispatcher, tasks};
 pub struct AppState {
     /// Secret used to verify GitHub webhook signatures (`X-Hub-Signature-256`).
     pub github_webhook_secret: Arc<String>,
-    /// Secret used to verify GitLab webhook tokens (`X-Gitlab-Token`). Empty when GitLab is not
-    /// configured — the unified webhook route rejects GitLab traffic in that case.
-    pub gitlab_webhook_secret: Arc<String>,
     /// In-memory delivery-id dedup set — the fallback when no database is configured (dev). With a
     /// pool, the webhook dedups on the `webhook_deliveries` PRIMARY KEY instead.
     pub seen_deliveries: Arc<Mutex<HashSet<String>>>,
@@ -88,8 +85,9 @@ pub struct AppState {
     pub allow_no_db: bool,
     /// GitHub App auth (App JWT → installation tokens). `None` when the App env is unset.
     pub github: Option<github::GithubApp>,
-    /// GitLab API client (static `PRIVATE-TOKEN`). `None` when `GITLAB_API_TOKEN` is unset.
-    pub gitlab: Option<gitlab::GitlabClient>,
+    /// File-configured GitLab projects. `None` when `gitlab.enabled` is false in
+    /// `control-plane.json`. There is intentionally no `GITLAB_*` env fallback.
+    pub gitlab: Option<gitlab::GitlabRegistry>,
     /// Platform dispatch table (ADR-0072): maps each configured `Platform` to its `CodePlatform`
     /// implementation. Built once at startup from the configured GitHub App + GitLab client; shared
     /// by the HTTP handlers (e.g. `finalize_review`) and the reconciler so both pick the right
@@ -99,10 +97,12 @@ pub struct AppState {
         integrations::platform::Platform,
         Arc<dyn integrations::platform::CodePlatform>,
     >,
-    /// Shared bearer for the internal runner API (`AGENT_RUNNER_TOKEN`). `None` disables those
-    /// routes (they fail closed with 503) — the control plane injects the same value into each
-    /// agent Job so the runner can authenticate back (see internal.rs / ADR-0017).
-    pub runner_token: Option<Arc<String>>,
+    /// Mints/verifies per-task tokens for the internal runner API (`RUNNER_TOKEN_SIGNING_KEY`,
+    /// ADR-0092). `None` disables those routes (they fail closed with 503) — the dispatcher mints a
+    /// fresh, task-scoped token with the same signer and injects it into each agent Job's
+    /// `AGENT_RUNNER_TOKEN` env var; the signing key itself never leaves this process (see
+    /// internal.rs / integrations/k8s.rs / ADR-0017).
+    pub runner_token_signer: Option<Arc<runner_token::RunnerTokenSigner>>,
     /// Neo4j (Bolt) handle for the structural code graph (ADR-0019). `None` when `NEO4J_URI` is
     /// unset — the graph-ingest route then fails closed (503). Held here so the untrusted Job never
     /// gets Neo4j creds (it POSTs the graph through the internal API instead).
@@ -120,10 +120,6 @@ pub struct AppState {
     /// whose body starts with `@<handle>` triggers a re-review (the first review is automatic on PR
     /// open). Default `lightbridge-assistant`.
     pub app_handle: Arc<String>,
-    /// The GitLab bot's handle (e.g. `lightbridge-bot`), from `GITLAB_BOT_HANDLE`. A MR note whose
-    /// body starts with `@<handle>` triggers a deep review. Default `lightbridge-bot`. Used only
-    /// for GitLab webhook events; GitHub events continue to use `app_handle`.
-    pub gitlab_app_handle: Arc<String>,
     /// Dotted claim path the caller's **permissions** list is read from (ADR-0023), from
     /// `PERMISSIONS_CLAIM`. Default `permissions`. Endpoints authorize on permissions, not roles.
     pub permissions_claim: Arc<String>,
@@ -154,6 +150,10 @@ impl AppState {
         let knowledge_tools = file_config
             .as_ref()
             .map(|f| f.knowledge_tools.clone())
+            .unwrap_or_default();
+        let gitlab_config = file_config
+            .as_ref()
+            .map(|f| f.gitlab.clone())
             .unwrap_or_default();
         // Egress routing (RFC-0005 Phase A / ADR-0074). Absent config → `drain` (no behavior change).
         // Built once and shared by every producer; fails loud if `restate` mode lacks an ingress URL.
@@ -198,7 +198,17 @@ impl AppState {
             }
         }
         let github = github::GithubApp::from_env();
-        let gitlab = gitlab::GitlabClient::from_env();
+        // A bad GitLab config must not take down GitHub in the same process — degrade GitLab only.
+        let gitlab = match gitlab::GitlabRegistry::from_config(&gitlab_config) {
+            Ok(registry) => registry,
+            Err(error) => {
+                tracing::error!(
+                    %error,
+                    "invalid GitLab config in control-plane.json; GitLab integration disabled"
+                );
+                None
+            }
+        };
         // Build the platform dispatch table (ADR-0072) once, from the configured implementations.
         // Shared by the HTTP handlers and the reconciler so both pick the right implementation per task.
         let mut platforms: std::collections::HashMap<
@@ -211,19 +221,17 @@ impl AppState {
                 Arc::new(app) as Arc<dyn integrations::platform::CodePlatform>,
             );
         }
-        if let Some(client) = gitlab.clone() {
+        if let Some(registry) = gitlab.clone() {
             platforms.insert(
                 integrations::platform::Platform::GitLab,
-                Arc::new(client) as Arc<dyn integrations::platform::CodePlatform>,
+                Arc::new(gitlab::GitlabPlatformRouter::new(registry))
+                    as Arc<dyn integrations::platform::CodePlatform>,
             );
         }
 
         Ok(Self {
             github_webhook_secret: Arc::new(
                 std::env::var("GITHUB_WEBHOOK_SECRET").unwrap_or_default(),
-            ),
-            gitlab_webhook_secret: Arc::new(
-                std::env::var("GITLAB_WEBHOOK_SECRET").unwrap_or_default(),
             ),
             seen_deliveries: Arc::new(Mutex::new(HashSet::new())),
             jwt: jwt::from_env(),
@@ -232,10 +240,7 @@ impl AppState {
             github,
             gitlab,
             platforms,
-            runner_token: std::env::var("AGENT_RUNNER_TOKEN")
-                .ok()
-                .filter(|token| !token.is_empty())
-                .map(Arc::new),
+            runner_token_signer: runner_token::RunnerTokenSigner::from_env().map(Arc::new),
             neo4j,
             metrics,
             review: Arc::new(review),
@@ -245,12 +250,6 @@ impl AppState {
                     .ok()
                     .filter(|h| !h.trim().is_empty())
                     .unwrap_or_else(|| "lightbridge-assistant".to_string()),
-            ),
-            gitlab_app_handle: Arc::new(
-                std::env::var("GITLAB_BOT_HANDLE")
-                    .ok()
-                    .filter(|h| !h.trim().is_empty())
-                    .unwrap_or_else(|| "lightbridge-bot".to_string()),
             ),
             permissions_claim: Arc::new(
                 std::env::var("PERMISSIONS_CLAIM")
@@ -304,10 +303,16 @@ fn app(state: AppState) -> Router {
         .route("/readyz", get(readiness))
         .route("/metrics", get(metrics_endpoint))
         // Unified webhook route — detects the platform (GitHub/GitLab) from headers.
-        .route("/webhook", post(webhook::webhook_router))
+        .route(
+            "/webhook",
+            post(webhook::webhook_router).layer(DefaultBodyLimit::max(webhook::MAX_BODY_BYTES)),
+        )
         // Legacy GitHub webhook route — forwards to the unified handler. Kept during the
         // transition so existing webhook configurations don't break.
-        .route("/github/webhook", post(webhook::github_webhook_legacy))
+        .route(
+            "/github/webhook",
+            post(webhook::github_webhook_legacy).layer(DefaultBodyLimit::max(webhook::MAX_BODY_BYTES)),
+        )
         .route("/me", get(jwt::me))
         .route("/tasks", get(tasks::list))
         .route("/tasks/{id}", get(tasks::get))
@@ -332,7 +337,7 @@ fn app(state: AppState) -> Router {
             "/internal/tasks/{id}/chunks",
             post(internal::ingest_chunks).layer(DefaultBodyLimit::max(16 * 1024 * 1024)),
         )
-        // The structural graph (Graphify → Neo4j, ADR-0019). A whole-repo graph.json can be large,
+        // The structural graph (lci-codegraph → Neo4j, ADR-0086). A whole-repo graph can be large,
         // so raise the body limit here too.
         .route(
             "/internal/tasks/{id}/graph",
@@ -472,17 +477,20 @@ async fn track_http_metrics(req: Request, next: Next) -> Response {
 }
 
 /// Readiness fails closed when required configuration is missing or a dependency is unreachable, so
-/// a misconfigured pod is not handed traffic it would only reject: no webhook secret for ANY
-/// platform, missing OIDC issuer / unreachable JWKS, or a configured-but-unreachable database.
+/// a misconfigured pod is not handed traffic it would only reject: no webhook platform configured,
+/// missing OIDC issuer / unreachable JWKS, or a configured-but-unreachable database.
 async fn readiness(State(state): State<AppState>) -> impl IntoResponse {
-    // At least one platform's webhook secret must be configured. A pod with no secret at all
-    // would accept no traffic, so it's not ready.
+    // At least one webhook platform must be configured. GitHub still uses an env secret; GitLab is
+    // configured only through `control-plane.json`.
     let github_configured = !state.github_webhook_secret.is_empty();
-    let gitlab_configured = !state.gitlab_webhook_secret.is_empty();
+    let gitlab_configured = state
+        .gitlab
+        .as_ref()
+        .is_some_and(gitlab::GitlabRegistry::is_configured);
     if !github_configured && !gitlab_configured {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
-            "no webhook secret configured (set GITHUB_WEBHOOK_SECRET or GITLAB_WEBHOOK_SECRET)",
+            "no webhook platform configured (set GITHUB_WEBHOOK_SECRET or configure gitlab.projects[] in control-plane.json)",
         );
     }
     match &state.jwt {
@@ -526,28 +534,16 @@ async fn readiness(State(state): State<AppState>) -> impl IntoResponse {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .json()
-        .init();
-
-    // Pin the process-default rustls crypto provider before anything builds a TLS client. This
-    // workspace links *two* providers — `ring` (via sqlx's `tls-rustls-ring-webpki`) and `aws-lc-rs`
-    // (pulled transitively by `rmcp` → reqwest 0.13 → rustls-platform-verifier) — and with both
-    // present rustls 0.23 can't auto-select a default and panics on the first handshake ("Could not
-    // automatically determine the process-level CryptoProvider"). That bit the `dispatcher` role at
-    // startup when it builds its kube client. Installing one explicitly makes selection deterministic
-    // regardless of which provider features the dependency graph enables. `ring` matches sqlx's
-    // pinned choice and is always present (Postgres core). Idempotent: a benign `Err` means a
-    // provider is already installed (e.g. a re-entrant test), which we leave in place.
-    if rustls::crypto::ring::default_provider()
-        .install_default()
-        .is_err()
-    {
-        tracing::warn!("a rustls CryptoProvider was already installed; keeping the existing one");
-    }
+    // Pin the process-default rustls crypto provider before anything builds a TLS client — including
+    // the OTel OTLP exporter's own client, set up below. This workspace links *two* providers — `ring`
+    // (via sqlx's `tls-rustls-ring-webpki`) and `aws-lc-rs` (pulled transitively by `rmcp` → reqwest
+    // 0.13 → rustls-platform-verifier) — and with both present rustls 0.23 can't auto-select a default
+    // and panics on the first handshake ("Could not automatically determine the process-level
+    // CryptoProvider"). That bit the `dispatcher` role at startup when it builds its kube client.
+    // Installing one explicitly makes selection deterministic regardless of which provider features the
+    // dependency graph enables. Shared with `agent-runner` via `lci-observability` (ticket #246) so
+    // there's one audited call site instead of two independently-maintained copies.
+    lci_observability::install_default_crypto_provider();
 
     // One binary, several roles (RFC-0001): `serve` (HTTP) and `dispatcher` (queue consumer),
     // selected by the first CLI arg or `CONTROL_PLANE_ROLE`. Deployed as separate Deployments off
@@ -563,8 +559,24 @@ async fn main() -> anyhow::Result<()> {
         .or_else(|| std::env::var("CONTROL_PLANE_ROLE").ok())
         .unwrap_or_else(|| "serve".to_string());
 
+    // Tracing/OTel init (ticket #246), after role resolution so `service.name` is role-aware
+    // (`control-plane-serve`, `control-plane-dispatcher`, ...) — Tempo's service list otherwise can't
+    // tell the roles apart. Still before anything that could emit a log line worth correlating.
+    let otel_guard = lci_observability::init_tracing(&format!("control-plane-{role}"));
+
+    // `mint-runner-token` is a local-dev/ops utility (ADR-0092), not a long-running role: it prints one
+    // token to stdout and exits. It needs only `RUNNER_TOKEN_SIGNING_KEY` from env, so it's handled
+    // before `AppState::from_env()` (which would otherwise require a database). Without it, running the
+    // agent-runner manually (docs/local-setup.md) has no way to obtain a token now that the internal API
+    // rejects anything but a validly-signed, task-scoped one — there is no shared dev bearer anymore.
+    if role == "mint-runner-token" {
+        let result = mint_runner_token_cli();
+        otel_guard.shutdown().await;
+        return result;
+    }
+
     let state = AppState::from_env().await?;
-    match role.as_str() {
+    let result = match role.as_str() {
         "serve" => serve(state).await,
         "dispatcher" => run_dispatcher(state).await,
         // `poller` is the legacy alias for `reconciler` (ADR-0058); accept both so the binary and the
@@ -578,9 +590,40 @@ async fn main() -> anyhow::Result<()> {
         // The durable-replay store lifecycle owner (ADR-0087): TTL-sweeps the `durable_step` journal.
         "replay" => run_replay(state).await,
         other => anyhow::bail!(
-            "unknown role {other:?} (expected: serve | dispatcher | reconciler | restate-worker | a2a | notifier | replay [| poller])"
+            "unknown role {other:?} (expected: serve | dispatcher | reconciler | restate-worker | a2a | notifier | replay | mint-runner-token [| poller])"
         ),
-    }
+    };
+    // Flush any still-batched spans before exit — covers every role's graceful (SIGTERM-triggered)
+    // shutdown path. A SIGKILL loses at most one batch-export interval, not the whole trace, since the
+    // batch processor also flushes periodically on its own; that residual gap is an accepted tradeoff,
+    // not engineered around.
+    otel_guard.shutdown().await;
+    result
+}
+
+/// `control-plane mint-runner-token <task-id>` — mint one per-task runner token from
+/// `RUNNER_TOKEN_SIGNING_KEY` and print it to stdout, for exercising the internal API by hand
+/// (docs/local-setup.md) or debugging a stuck task in prod. `<task-id>` may also come from `TASK_ID`.
+/// TTL matches the dispatcher's own default (`AGENT_JOB_DEADLINE_SECONDS`, else 3600s).
+fn mint_runner_token_cli() -> anyhow::Result<()> {
+    use anyhow::Context;
+
+    let signer = runner_token::RunnerTokenSigner::from_env()
+        .ok_or_else(|| anyhow::anyhow!("RUNNER_TOKEN_SIGNING_KEY is not set"))?;
+    let task_id: uuid::Uuid = std::env::args()
+        .nth(2)
+        .or_else(|| std::env::var("TASK_ID").ok())
+        .ok_or_else(|| anyhow::anyhow!("usage: control-plane mint-runner-token <task-id>"))?
+        .parse()
+        .context("task id is not a valid UUID")?;
+    let deadline_seconds = std::env::var("AGENT_JOB_DEADLINE_SECONDS")
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .filter(|&secs| secs > 0)
+        .unwrap_or(3600);
+    let token = signer.mint(task_id, deadline_seconds)?;
+    println!("{token}");
+    Ok(())
 }
 
 /// The reconciler role (ADR-0058): a single replica that owns **all platform egress** — it drains
@@ -604,7 +647,7 @@ async fn run_reconciler(state: AppState) -> anyhow::Result<()> {
         anyhow::bail!(
             "reconciler requires at least one platform implementation \
              (set GITHUB_APP_ID + GITHUB_APP_PRIVATE_KEY for GitHub, \
-             or GITLAB_API_TOKEN + GITLAB_API_URL for GitLab)"
+             or configure gitlab.projects[] in control-plane.json for GitLab)"
         );
     }
     spawn_metrics_server(state.metrics.clone());

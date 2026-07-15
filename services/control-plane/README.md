@@ -37,8 +37,8 @@ cargo run -p control-plane reconciler   # reconciler (GitHub egress + feedback p
 - **Postgres (+pgvector)** — the work queue, repositories, reviews, and the `code_chunks` semantic index.
   Schema via hand-written SQLx migrations (cratestack deferred,
   [ADR-0005](../../docs/adr/0005-cratestack-schema-first-control-plane.md)).
-- **Neo4j** — the structural graph (the control plane writes;
-  [ADR-0019](../../docs/adr/0019-graphify-cli-structural-graph.md)).
+- **Neo4j** — the structural graph (the control plane writes; built in-process by the runner's
+  **lci-codegraph** crate, [ADR-0086](../../docs/adr/0086-in-house-code-graph-crate.md)).
 - **GitHub** — webhooks in; minted installation tokens used by runners to clone; all write-back
   (validated reviews, replies, reactions, notices) flows **out through the `reconciler`'s
   `github_outbox`** — one writer ([ADR-0022](../../docs/adr/0022-review-writeback-control-plane.md) →
@@ -49,15 +49,21 @@ cargo run -p control-plane reconciler   # reconciler (GitHub egress + feedback p
 ## Trust boundary
 
 The GitHub App key never leaves this service. A Job receives only a short-lived (~1h) installation token
-plus the shared `AGENT_RUNNER_TOKEN` and embeddings key — never datastore credentials
-([ADR-0020](../../docs/adr/0020-mcp-servers-via-control-plane.md)). The runner *proposes*; the control
-plane *validates and writes back*.
+plus a per-task `AGENT_RUNNER_TOKEN` and the embeddings key — never datastore credentials
+([ADR-0020](../../docs/adr/0020-mcp-servers-via-control-plane.md)). `AGENT_RUNNER_TOKEN` is minted fresh
+per Job from `RUNNER_TOKEN_SIGNING_KEY` — a signing key that, unlike the token it produces, never itself
+leaves this service ([ADR-0092](../../docs/adr/0092-per-task-runner-tokens.md)). The runner *proposes*;
+the control plane *validates and writes back*.
 
 ## Configuration
 
-Read from `/etc/lightbridge/control-plane.json` (mounted ConfigMap) or env. Key knobs: `agent.*`
-(runner image, namespace, service account, resources, deadline, CA secret), `dispatcher.*` (lease /
-poll / reap cadences), the OIDC issuer/audience + `PERMISSIONS_CLAIM`, and `AGENT_RUNNER_TOKEN`. See
+Read from `/etc/lightbridge/control-plane.json` (mounted ConfigMap/Secret) plus the remaining
+process env for non-file knobs. Key file knobs: `agent.*` (runner image, namespace, service account,
+resources, deadline, CA secret), `dispatcher.*` (lease / poll / reap cadences), `review.*`,
+`embeddings.*`, `knowledge_tools.*`, `egress.*`, and file-only `gitlab.projects[]`. Remaining env
+knobs include the OIDC issuer/audience, `PERMISSIONS_CLAIM`, and `RUNNER_TOKEN_SIGNING_KEY` (the
+per-task runner-token signing key, ADR-0092). GitLab no longer uses `GITLAB_*` env vars; configure
+GitLab projects in `control-plane.json`. See
 [`src/config.rs`](src/config.rs) and [docs/kubernetes-deployment.md](../../docs/kubernetes-deployment.md).
 
 ## Tests

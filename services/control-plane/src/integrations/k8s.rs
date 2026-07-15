@@ -10,8 +10,11 @@ use k8s_openapi::api::core::v1::ServiceAccount;
 use kube::api::{DeleteParams, PostParams};
 use kube::{Api, Client};
 use serde_json::{Value, json};
+use tracing::Instrument;
+use uuid::Uuid;
 
 use crate::db::ClaimedTask;
+use crate::runner_token::RunnerTokenSigner;
 
 /// Liveness of a task's Kubernetes Job, as the reaper reads it (RFC-0001 Phase 2). The Job — not a
 /// timer — is the source of truth for whether a `running` task is still doing work.
@@ -43,18 +46,19 @@ pub struct KubeLauncher {
     jobs: Api<Job>,
     /// The agent-runner image. Shared fallback for both kinds when a per-kind image below is unset.
     image: String,
-    /// Image for **index** Jobs (`command_text == "index"`) — the full image bundling Python +
-    /// Graphify; falls back to `image`. See [`image_for`].
+    /// Image for **index** Jobs (`command_text == "index"`); falls back to `image`. Shares the one
+    /// lean runtime with review now that Graphify is retired (ADR-0086). See [`image_for`].
     indexer_image: Option<String>,
-    /// Image for **review** Jobs (everything else) — the leaner image without the Python/Graphify
-    /// venv; falls back to `image`. See [`image_for`].
+    /// Image for **review** Jobs (everything else); falls back to `image`. Same lean runtime as the
+    /// index image (ADR-0086); override kept so operators can pin the kinds separately. See [`image_for`].
     review_image: Option<String>,
     service_account: String,
     /// In-cluster URL the runner calls back for context + status (the control plane's own Service).
     control_plane_url: String,
-    /// Shared bearer the runner presents to that internal API (ADR-0017). Injected into the Job so
-    /// the runner can authenticate; empty when unset (the internal API is then disabled anyway).
-    runner_token: String,
+    /// Mints the per-task token each Job presents to the internal API (ADR-0092, hardening ADR-0017).
+    /// `None` when `RUNNER_TOKEN_SIGNING_KEY` is unset — Jobs then get an empty `AGENT_RUNNER_TOKEN`
+    /// (the internal API is disabled anyway in that case, so there's nothing to authenticate).
+    token_signer: Option<RunnerTokenSigner>,
     /// Secret (in the agents namespace) holding the internal CA (`ca.crt`) the runner must trust to
     /// reach the eaig gateway's HTTPS embeddings endpoint. `None` → no CA volume mounted.
     ca_secret: Option<String>,
@@ -150,7 +154,7 @@ impl KubeLauncher {
             "CONTROL_PLANE_INTERNAL_URL",
             "http://lightbridge-ci-control-plane:8080",
         );
-        let runner_token = std::env::var("AGENT_RUNNER_TOKEN").unwrap_or_default();
+        let token_signer = RunnerTokenSigner::from_env();
         let ca_secret = pick_opt(
             agent.and_then(|a| a.ca_secret.as_deref()),
             "AGENT_CA_SECRET",
@@ -183,7 +187,7 @@ impl KubeLauncher {
             review_image,
             service_account,
             control_plane_url,
-            runner_token,
+            token_signer,
             ca_secret,
             active_deadline_seconds,
             review_system_prompt,
@@ -223,61 +227,80 @@ async fn fetch_owner_reference(sa: &Api<ServiceAccount>, sa_name: &str) -> anyho
 
 impl TaskLauncher for KubeLauncher {
     async fn launch(&self, task: &ClaimedTask) -> anyhow::Result<String> {
-        let name = job_name(task);
-        // Resolve the SA ownerReference lazily + cached via `OnceCell`: fetched on first launch (when
-        // the SA exists), retried each launch until it succeeds, then reused — so a startup race or
-        // transient API error doesn't permanently leave Jobs un-owned. The internal lock is held only
-        // during the one-time init, never across every launch's `.await`.
-        let owner_reference = match self
-            .owner_reference
-            .get_or_try_init(|| fetch_owner_reference(&self.sa, &self.service_account))
-            .await
-        {
-            Ok(owner) => Some(owner),
-            Err(error) => {
-                tracing::warn!(%error, "could not resolve agent SA ownerReference; Job created un-owned");
-                None
+        // Ticket #246: this Job dispatch is one span in the webhook→task→Job→turns→egress trace.
+        // Re-parented from the task's stored `trace_context` (the webhook-receipt span's traceparent,
+        // read back here since dispatch can happen an arbitrary time after task creation); its OWN
+        // traceparent — not the task's — is what `job_manifest` pushes into the Job's env below, so the
+        // runner's root span becomes a child of THIS span, not a sibling of it.
+        let span = tracing::info_span!("job.dispatch", task_id = %task.id);
+        lci_observability::set_remote_parent(&span, task.trace_context.as_deref());
+        async move {
+            let name = job_name(task);
+            // Resolve the SA ownerReference lazily + cached via `OnceCell`: fetched on first launch (when
+            // the SA exists), retried each launch until it succeeds, then reused — so a startup race or
+            // transient API error doesn't permanently leave Jobs un-owned. The internal lock is held only
+            // during the one-time init, never across every launch's `.await`.
+            let owner_reference = match self
+                .owner_reference
+                .get_or_try_init(|| fetch_owner_reference(&self.sa, &self.service_account))
+                .await
+            {
+                Ok(owner) => Some(owner),
+                Err(error) => {
+                    tracing::warn!(%error, "could not resolve agent SA ownerReference; Job created un-owned");
+                    None
+                }
+            };
+            // A fresh token scoped to THIS task, valid no longer than the Job's own runtime cap (ADR-0092):
+            // a leaked value from this Job's env authenticates nothing for any other task, and stops
+            // working close to when Kubernetes would have killed this Job anyway.
+            let runner_token = resolve_runner_token(
+                self.token_signer.as_ref(),
+                task.id,
+                self.active_deadline_seconds,
+            )?;
+            let manifest = job_manifest(
+                &name,
+                JobConfig {
+                    image: image_for(
+                        task,
+                        self.indexer_image.as_deref(),
+                        self.review_image.as_deref(),
+                        &self.image,
+                    ),
+                    service_account: &self.service_account,
+                    control_plane_url: &self.control_plane_url,
+                    runner_token: &runner_token,
+                    ca_secret: self.ca_secret.as_deref(),
+                    active_deadline_seconds: self.active_deadline_seconds,
+                    review_system_prompt: self.review_system_prompt.as_deref(),
+                    agent_config_map: self.agent_config_map.as_deref(),
+                    resources: resources_for(
+                        task,
+                        self.indexer_resources.as_ref(),
+                        self.review_resources.as_ref(),
+                        self.resources.as_ref(),
+                    ),
+                    owner_reference,
+                },
+                task,
+            );
+            let job: Job = serde_json::from_value(manifest)?;
+            match self.jobs.create(&PostParams::default(), &job).await {
+                Ok(_) => Ok(name),
+                // The Job name is derived from the unique task id, so a 409 means *our own* Job already
+                // exists — e.g. a previous attempt created it but we crashed before recording job_name,
+                // or the create timed out after the apiserver accepted it. Adopt it instead of erroring,
+                // which would requeue and 409 forever (dispatch is at-least-once).
+                Err(kube::Error::Api(error)) if error.code == 409 => {
+                    tracing::warn!(job_name = %name, task_id = %task.id, "job already exists; adopting it");
+                    Ok(name)
+                }
+                Err(error) => Err(error.into()),
             }
-        };
-        let manifest = job_manifest(
-            &name,
-            JobConfig {
-                image: image_for(
-                    task,
-                    self.indexer_image.as_deref(),
-                    self.review_image.as_deref(),
-                    &self.image,
-                ),
-                service_account: &self.service_account,
-                control_plane_url: &self.control_plane_url,
-                runner_token: &self.runner_token,
-                ca_secret: self.ca_secret.as_deref(),
-                active_deadline_seconds: self.active_deadline_seconds,
-                review_system_prompt: self.review_system_prompt.as_deref(),
-                agent_config_map: self.agent_config_map.as_deref(),
-                resources: resources_for(
-                    task,
-                    self.indexer_resources.as_ref(),
-                    self.review_resources.as_ref(),
-                    self.resources.as_ref(),
-                ),
-                owner_reference,
-            },
-            task,
-        );
-        let job: Job = serde_json::from_value(manifest)?;
-        match self.jobs.create(&PostParams::default(), &job).await {
-            Ok(_) => Ok(name),
-            // The Job name is derived from the unique task id, so a 409 means *our own* Job already
-            // exists — e.g. a previous attempt created it but we crashed before recording job_name,
-            // or the create timed out after the apiserver accepted it. Adopt it instead of erroring,
-            // which would requeue and 409 forever (dispatch is at-least-once).
-            Err(kube::Error::Api(error)) if error.code == 409 => {
-                tracing::warn!(job_name = %name, task_id = %task.id, "job already exists; adopting it");
-                Ok(name)
-            }
-            Err(error) => Err(error.into()),
         }
+        .instrument(span)
+        .await
     }
 
     async fn job_liveness(&self, job_name: &str) -> anyhow::Result<JobLiveness> {
@@ -321,6 +344,21 @@ fn job_name(task: &ClaimedTask) -> String {
     format!("lightbridge-agent-{}", task.id)
 }
 
+/// The token to inject as this Job's `AGENT_RUNNER_TOKEN` (ADR-0092): a fresh, task-scoped mint when
+/// a signer is configured, else empty — matching the pre-#243 degrade where an absent signing secret
+/// left the internal API disabled (503) regardless of what the Job carries. Pure so the "two tasks
+/// get different tokens" property is unit-tested without a cluster.
+fn resolve_runner_token(
+    signer: Option<&RunnerTokenSigner>,
+    task_id: Uuid,
+    active_deadline_seconds: i64,
+) -> anyhow::Result<String> {
+    match signer {
+        Some(signer) => signer.mint(task_id, active_deadline_seconds),
+        None => Ok(String::new()),
+    }
+}
+
 /// The launcher-derived inputs to a Job manifest — everything that isn't the task itself. Grouped so
 /// `job_manifest` takes a handful of args, and so a test can build one explicitly without a cluster.
 struct JobConfig<'a> {
@@ -337,7 +375,7 @@ struct JobConfig<'a> {
 }
 
 /// Pick the resource block for a task's kind. **Index** Jobs (`command_text == "index"`) are the heavy
-/// path — full tree-sitter parse + embeddings + Graphify — and want more CPU/RAM; **review** Jobs are
+/// path — full tree-sitter parse + embeddings + in-process lci-codegraph — and want more CPU/RAM; **review** Jobs are
 /// read-mostly (they reuse the latest indexed snapshot, ADR-0050, and are LLM/network-bound) so they
 /// run leaner. Each kind falls back to the shared `resources` when its own block is unset, so a chart
 /// that sets only `resources` keeps today's behaviour.
@@ -361,19 +399,18 @@ fn resources_for<'a>(
     }
 }
 
-/// Pick the container image for a task's kind (runner-differentiation, RFC-0001). **Index** Jobs
-/// (`command_text == "index"`) run the *full* image — Python + Graphify bundled — to build the
-/// structural graph; **review** Jobs (everything else) run a *leaner* image without the Graphify
-/// venv, since the review path is LLM/network-bound and never spawns Graphify. Each kind falls back
-/// to the shared `shared` image when its own override is unset, so a chart that sets only
-/// `runner_image` keeps today's single-image behaviour.
+/// Pick the container image for a task's kind (runner-differentiation, RFC-0001). Since the structural
+/// graph is now built in-process by `lci-codegraph` (ADR-0086, retiring the Python Graphify CLI), the
+/// **index** and **review** images share one lean runtime — the split image (index bundled Python +
+/// Graphify) is gone. The per-kind overrides remain so operators can still pin the two Job kinds to
+/// different tags/digests; each falls back to the shared `shared` image when its override is unset, so
+/// a chart that sets only `runner_image` keeps single-image behaviour.
 ///
 /// CAVEAT: a *cold-repo* review still self-indexes (ADR-0050 only makes *warm* reviews reuse the
-/// snapshot). On the leaner review image Graphify is absent, but the structural-graph step
-/// (`index_graph` in services/agent-runner/src/indexer/graph.rs) is best-effort/non-fatal — it logs
-/// and skips when `graphify` can't run. So a first cold review still builds the semantic (pgvector)
-/// index and merely defers the graph until the next `index` task (on the indexer image) builds it.
-/// The proper fix — review never self-indexes — is a separate runner-differentiation slice.
+/// snapshot), including the structural-graph step — now in-process, so no separate image is needed for
+/// it. That step is best-effort/non-fatal (`index_graph` in services/agent-runner/src/indexer/graph.rs):
+/// it logs and skips on failure. So a first cold review still builds the semantic (pgvector) index and
+/// the graph inline. The proper fix — review never self-indexes — is a separate runner-differentiation slice.
 fn image_for<'a>(
     task: &ClaimedTask,
     indexer: Option<&'a str>,
@@ -434,6 +471,14 @@ fn job_manifest(name: &str, cfg: JobConfig, task: &ClaimedTask) -> Value {
         json!({ "name": "LLM_MODEL",
             "valueFrom": { "secretKeyRef": { "name": "lightbridge-agent-secrets", "key": "llm-model", "optional": true } } }),
     ];
+    // Ticket #246: the ONE cross-process trace-context handoff. `current_traceparent()` reads the
+    // "job.dispatch" span this manifest is built inside of (see `KubeLauncher::launch`), NOT the
+    // task's raw stored `trace_context` — so the Job's root span becomes a child of "job.dispatch",
+    // not a sibling of it. Absent when no OTel layer is active (no Tempo endpoint configured) or the
+    // dispatch span itself had no upstream trace to continue.
+    if let Some(traceparent) = lci_observability::current_traceparent() {
+        env.push(json!({ "name": "TRACEPARENT", "value": traceparent }));
+    }
     if !is_open {
         // Embeddings config (ADR-0018): required for index/review — a misconfigured Job fails loud
         // rather than silently embedding with the wrong model. `open` never gets these: it does not
@@ -515,7 +560,7 @@ fn job_manifest(name: &str, cfg: JobConfig, task: &ClaimedTask) -> Value {
         },
         "spec": {
             "backoffLimit": 1,
-            // Runtime cap: clone + tree-sitter chunk + embed + Graphify can legitimately run for
+            // Runtime cap: clone + tree-sitter chunk + embed + lci-codegraph can legitimately run for
             // tens of minutes on a large repo (observed >15min in prod purely on indexing). Operator-
             // tunable via AGENT_JOB_DEADLINE_SECONDS (default 3600 = 1h) rather than killing healthy
             // long indexers. `ttlSecondsAfterFinished` below is a separate post-completion cleanup.
@@ -608,6 +653,7 @@ mod tests {
             base_sha: None,
             head_sha: Some("deadbeef".to_string()),
             attempts: 1,
+            trace_context: None,
         }
     }
 
@@ -999,6 +1045,28 @@ mod tests {
         assert!(
             !env.iter().any(|e| e.name == "REVIEW_SYSTEM_PROMPT"),
             "no override → the env var is absent (runner uses its default)"
+        );
+    }
+
+    // ADR-0092 (issue #243): the Job's AGENT_RUNNER_TOKEN is now a fresh, task-scoped mint rather than
+    // one shared secret — pin that two tasks never get the same value, and that an unconfigured
+    // signer degrades to empty (matching the old "internal API disabled" behavior) rather than an error.
+    #[test]
+    fn resolve_runner_token_mints_distinct_tokens_per_task() {
+        let signer = RunnerTokenSigner::new(b"test-signing-key");
+        let a = resolve_runner_token(Some(&signer), Uuid::new_v4(), 3600).expect("mint a");
+        let b = resolve_runner_token(Some(&signer), Uuid::new_v4(), 3600).expect("mint b");
+        assert_ne!(a, b, "two different tasks must never share a token");
+        assert!(!a.is_empty());
+    }
+
+    #[test]
+    fn resolve_runner_token_is_empty_without_a_configured_signer() {
+        let token =
+            resolve_runner_token(None, Uuid::new_v4(), 3600).expect("no signer still succeeds");
+        assert_eq!(
+            token, "",
+            "no signing key → empty, same as the pre-#243 unset case"
         );
     }
 

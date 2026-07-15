@@ -79,10 +79,12 @@ and performs every write.
 
 Concretely, the agent runs as a **one-shot Kubernetes Job** with no GitHub credentials. It talks to
 the control plane's **internal API** (`services/control-plane/src/http/internal.rs`), which is not
-OIDC-protected (the caller is a pod, not a user) but authenticated by a **shared bearer**
-(`AGENT_RUNNER_TOKEN`) compared in **constant time** (`subtle::ConstantTimeEq`) so a wrong token
-cannot be recovered byte-by-byte via timing. Absent that secret in-process, the whole internal
-surface fails closed (503), never open.
+OIDC-protected (the caller is a pod, not a user) but authenticated by a **per-task signed token**
+(`AGENT_RUNNER_TOKEN`, minted per Job from `RUNNER_TOKEN_SIGNING_KEY`, [ADR-0092](adr/0092-per-task-runner-tokens.md)):
+HS256 signature + expiry checked, and its `tid` claim must match the request's own task id — a
+validly-signed token minted for a *different* task is rejected (403), so a leaked Job env
+authenticates only that one task, not every task. Absent the signing key in-process, the whole
+internal surface fails closed (503), never open.
 
 #### Mediated write tools
 
@@ -123,7 +125,7 @@ is **emergent** from which tools fired — there is no up-front keyword classifi
 |------------------------|--------------------------------------------------------------------------------|
 | GitHub ingress         | Constant-time HMAC-SHA256 signature verify, delivery-UUID dedupe               |
 | Web → control plane    | OIDC bearer JWT (RS256/JWKS), per-capability permission gate, fail-closed      |
-| Runner → control plane | Shared-bearer (`AGENT_RUNNER_TOKEN`) constant-time compare, fail-closed 503    |
+| Runner → control plane | Per-task signed token (`AGENT_RUNNER_TOKEN`), cross-task rejection, fail-closed 503 |
 | Control plane          | Diff validation of writes, dedupe, single-channel buffer, all writes mediated  |
 | Agent pod              | One-shot Job, **no GitHub key**, read-mostly callbacks only                    |
 | GitHub egress          | Single `github_outbox` drained by the lone reconciler replica                  |
@@ -140,8 +142,8 @@ same pinned rules ⇒ same findings, every run, at CPU cost with no tokens.
 Implementation in `services/agent-runner/src/sast/mod.rs`:
 
 - **opengrep** (the LGPL fork of Semgrep CE) runs **in the runner** as a best-effort, non-fatal
-  subprocess — the same pattern as Graphify. A missing binary, scan error, or timeout logs and
-  continues; it never fails a review.
+  subprocess — the same best-effort pattern as the structural-graph step. A missing binary, scan error,
+  or timeout logs and continues; it never fails a review.
 - **Scoped to the PR's changed files** (filtered to paths that still exist on disk), so findings land
   on the change rather than dumping every pre-existing repo finding into the out-of-scope section.
   The ruleset is **language-scoped** to the changed files (plus `generic` for secrets) as a perf

@@ -2,6 +2,7 @@
 //! navigation; no regex engine (keeps it dependency-free and predictable). Walks only within the
 //! workdir and never follows symlinks out of it.
 
+use std::ops::ControlFlow;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -12,7 +13,8 @@ use lci_agent_tools::{
 use lci_agent_types::{ToolCallReq, ToolOutcome, ToolSpec};
 use serde::Deserialize;
 
-use super::parse;
+use super::walk::walk_files;
+use super::{parse, resolve_root};
 
 pub const GREP: &str = "grep";
 const MAX_HITS: usize = 100;
@@ -62,13 +64,9 @@ impl Tool for GrepTool {
             if args.query.is_empty() {
                 return ToolOutcome::Continue("error: query must not be empty.".into());
             }
-            let root = match cx.workspace.root().await {
+            let root = match resolve_root(cx).await {
                 Ok(root) => root.to_path_buf(),
-                Err(error) => {
-                    return ToolOutcome::Continue(format!(
-                        "error: could not materialize the sandbox workdir: {error}"
-                    ));
-                }
+                Err(error) => return ToolOutcome::Continue(error),
             };
             let query = args.query.clone();
             let hits = tokio::task::spawn_blocking(move || search(&root, &query))
@@ -83,51 +81,31 @@ impl Tool for GrepTool {
     }
 }
 
-/// Walk the workdir (never following directory symlinks) and collect literal matches. Bounded by
-/// [`MAX_HITS`] and a per-file byte cap so a huge/binary file can't blow the budget.
+/// Walk the workdir (via [`walk_files`], which never follows directory symlinks) and collect literal
+/// matches. Bounded by [`MAX_HITS`] and a per-file byte cap so a huge/binary file can't blow the budget.
 fn search(root: &Path, query: &str) -> Vec<String> {
     let mut hits = Vec::new();
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
+    walk_files(root, |path, meta| {
+        if hits.len() >= MAX_HITS {
+            return ControlFlow::Break(());
+        }
+        if meta.len() > MAX_FILE_BYTES {
+            return ControlFlow::Continue(());
+        }
+        let Ok(content) = std::fs::read_to_string(path) else {
+            return ControlFlow::Continue(()); // binary / non-UTF8 → skip
         };
-        for entry in entries.flatten() {
-            if hits.len() >= MAX_HITS {
-                return hits;
-            }
-            let path = entry.path();
-            // `symlink_metadata` does NOT follow the link, so a symlinked directory is treated as a
-            // leaf and never descended — the walk cannot leave the workdir.
-            let Ok(meta) = std::fs::symlink_metadata(&path) else {
-                continue;
-            };
-            if meta.file_type().is_symlink() {
-                continue;
-            }
-            if meta.is_dir() {
-                if path.file_name().and_then(|n| n.to_str()) != Some(".git") {
-                    stack.push(path);
-                }
-                continue;
-            }
-            if !meta.is_file() || meta.len() > MAX_FILE_BYTES {
-                continue;
-            }
-            let Ok(content) = std::fs::read_to_string(&path) else {
-                continue; // binary / non-UTF8 → skip
-            };
-            let rel = path.strip_prefix(root).unwrap_or(&path);
-            for (index, line) in content.lines().enumerate() {
-                if line.contains(query) {
-                    hits.push(format!("{}:{}: {}", rel.display(), index + 1, line.trim()));
-                    if hits.len() >= MAX_HITS {
-                        return hits;
-                    }
+        let rel = path.strip_prefix(root).unwrap_or(path);
+        for (index, line) in content.lines().enumerate() {
+            if line.contains(query) {
+                hits.push(format!("{}:{}: {}", rel.display(), index + 1, line.trim()));
+                if hits.len() >= MAX_HITS {
+                    return ControlFlow::Break(());
                 }
             }
         }
-    }
+        ControlFlow::Continue(())
+    });
     hits
 }
 

@@ -68,13 +68,14 @@ flowchart TD
 A good review needs two different kinds of recall, and no single store does both well
 ([ADR-0003](adr/0003-dual-retrieval-neo4j-pgvector.md)):
 
-| | tree-sitter chunks → **pgvector** | Graphify → **Neo4j** |
+| | tree-sitter chunks → **pgvector** | lci-codegraph → **Neo4j** |
 |---|---|---|
 | Kind of recall | **Semantic** (vector similarity) | **Structural** (graph traversal) |
 | Answers | "where is similar code/behaviour?" | "what calls this? what does this PR touch?" |
 
-Both run in the **same Job over the same checkout** ([ADR-0010](adr/0010-graphify-treesitter-indexing-baseline.md),
-[ADR-0019](adr/0019-graphify-cli-structural-graph.md)). Embeddings are produced through an
+Both run in the **same Job over the same checkout** ([ADR-0010](adr/0010-graphify-treesitter-indexing-baseline.md);
+the structural graph is now the in-house `lci-codegraph` crate, [ADR-0086](adr/0086-in-house-code-graph-crate.md),
+superseding [ADR-0019](adr/0019-graphify-cli-structural-graph.md)). Embeddings are produced through an
 OpenAI-compatible internal gateway ([ADR-0018](adr/0018-openai-compatible-embeddings.md)). Reviews
 **reuse the base index** rather than re-indexing each time
 ([ADR-0025](adr/0025-review-reuses-base-index.md)), pinned to the latest indexed snapshot

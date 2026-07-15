@@ -24,6 +24,9 @@ anyhow.workspace = true
 clap.workspace = true
 lci-agent-clients = { path = "../agent-clients" }
 lci-agent-loop = { path = "../agent-loop" }
+# SAST (opengrep) scan/buffer/digest, invoked as the `run_sast` tool (ADR-0073); the bootstrap config
+# resolver here builds its `SastConfig` value from env/file, then hands it to the tool registry.
+lci-agent-sast = { path = "../agent-sast" }
 # Host-agnostic live per-review status projection + read-only HTTP surface (RFC-0007 slice 5,
 # ADR-0085). Flag-gated (`LCI_STATUS_API`, default off) so it is prod-neutral until an operator
 # enables it; the loop runs identically whether or not the status server is on.
@@ -33,9 +36,12 @@ lci-agent-tools = { path = "../agent-tools" }
 lci-agent-types = { path = "../agent-types" }
 lci-review-agent = { path = "../review-agent" }
 lci-config = { path = "../config" }
-# In-house code-graph crate (ADR-0086 / RFC-0007 slice 1). Wired behind a default-off flag
-# (`LCI_CODEGRAPH_GRAPH`) so this is behavior-neutral in prod until the Graphify parity cutover.
+# In-house code-graph crate (ADR-0086 / RFC-0007 slice 1). The sole structural-graph engine, built
+# in-process (tree-sitter); replaced the retired Python Graphify CLI (ADR-0019).
 lci-codegraph = { path = "../codegraph" }
+# Shared tracing/OTel bootstrap (ticket #246): JSON logs (as before) + optional OTLP→Tempo export, plus
+# the crypto-provider pin this binary needs but never had (see lci-observability's doc comment).
+lci-observability = { path = "../observability" }
 mimalloc.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -43,6 +49,7 @@ tokio.workspace = true
 futures.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+tracing-opentelemetry.workspace = true
 reqwest.workspace = true
 uuid.workspace = true
 # Regex selectors for the per-tier `mcp__<server>__<tool>` tool allowlist (ADR-0066).

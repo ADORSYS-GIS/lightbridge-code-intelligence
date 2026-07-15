@@ -16,10 +16,19 @@
 //! all three so buffered findings are never discarded. The transcript is reconstructed from the loop's
 //! sink + the model client's telemetry side-channel and submitted by the caller regardless of outcome
 //! (a failed run's reasoning is the most useful to inspect).
+//!
+//! [`run_native_agent`] is a thin **host** over four extracted concerns (quality pass, no behaviour
+//! change): [`model_client`] (building the LLM client + its starting log), [`tool_surface`] (resolving
+//! what's offered — diff gate, per-tier allowlist, MCP discovery), [`telemetry`] (the run-start
+//! snapshot + token-usage summation), and [`transcript`] (reconstructing the ADR-0034 transcript).
 
 pub mod instructions;
 
-use std::collections::HashSet;
+mod model_client;
+mod telemetry;
+mod tool_surface;
+mod transcript;
+
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -31,19 +40,15 @@ use lci_agent_clients::{
     CheckpointRuntime, ControlPlaneClient, ControlPlaneStepStore, EmbeddingsClient, TranscriptEntry,
 };
 use lci_agent_loop::{Conversation, LoopOutcome, RequestOptions, TranscriptEvent, TranscriptSink};
+use lci_agent_sast::SastConfig;
 use lci_agent_status::StatusHandle;
 use lci_agent_step::Passthrough;
 use lci_agent_tools::{RuntimeCaps, ToolCx, TurnFilter};
-use lci_agent_types::{ToolOutcome, ToolSpec};
 use lci_review_agent::flows::{self, ReviewRunParams};
-use lci_review_agent::model::{ChatClient, RetryPolicy, TurnTelemetry};
 use lci_review_agent::prompt::{self, PrDiffRef, PromptConfig};
-use lci_review_agent::tools::{
-    ABORT, ADD_COMMENT, ADD_REVIEW_COMMENT, FINISH, MCP_TOOL_PREFIX, RETRACT_FINDING, tool_defs,
-    tool_registry,
-};
+use lci_review_agent::tools::{ADD_REVIEW_COMMENT, SastToolConfig, tool_registry};
 
-use crate::bootstrap::config::{McpToolPattern, ReviewConfig, ReviewToolSelector};
+use crate::bootstrap::config::ReviewConfig;
 use crate::clone::PrDiff;
 
 /// How the agent loop ended (#137). Distinct from `Err`, which is reserved for a transport/loop failure
@@ -77,19 +82,31 @@ fn durable_replay_enabled() -> bool {
 
 /// A [`TranscriptSink`] that captures the loop's events so the host can reconstruct the ADR-0034
 /// transcript afterwards (even on error). Cloneable handle: grab a clone before boxing it into the
-/// loop, read [`entries`](Self::entries) once the run returns.
+/// loop, then lock `.0` directly to read the events once the run returns — cloning the whole
+/// (possibly still-growing) transcript via [`entries`](Self::entries) is test-only; production reads
+/// hold the lock in place instead (the live status poller ticks every second on it).
 #[derive(Clone, Default)]
 struct JobSink(Arc<Mutex<Vec<TranscriptEvent>>>);
 
 impl JobSink {
+    #[cfg(test)]
     fn entries(&self) -> Vec<TranscriptEvent> {
-        self.0.lock().expect("job sink mutex").clone()
+        // Recover from a poisoned mutex instead of panicking (consistent with `StatusHandle::with`
+        // and the telemetry mutex below): a panic elsewhere holding this lock must not also crash
+        // every subsequent read of the transcript-so-far.
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 }
 
 impl TranscriptSink for JobSink {
     fn record(&mut self, entry: TranscriptEvent) {
-        self.0.lock().expect("job sink mutex").push(entry);
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(entry);
     }
 }
 
@@ -103,13 +120,14 @@ pub async fn run_native_agent(
     review: &ReviewConfig,
     command: &str,
     diff: Option<&PrDiff>,
-    // Repo-native agent instructions (ADR-0036), prior reviews (A, #137), per-repo feedback memory (M1,
-    // ADR-0044), and the deterministic SAST digest (ADR-0061) — all injected into the prompt as
-    // untrusted context; `None` when absent.
+    // Repo-native agent instructions (ADR-0036), prior reviews (A, #137), and per-repo feedback memory
+    // (M1, ADR-0044) — all injected into the prompt as untrusted context; `None` when absent.
     repo_instructions: Option<&str>,
     prior_reviews: Option<&str>,
     repo_memory: Option<&str>,
-    sast_digest: Option<&str>,
+    // The resolved SAST config (ADR-0061), handed to the `run_sast` tool (ADR-0073) instead of driving a
+    // pre-agent pass. `None` when SAST is off — the tool then simply isn't registered/offered.
+    sast_config: Option<&SastConfig>,
     attribution: &[(String, String)],
     client: &ControlPlaneClient,
     embedder: &EmbeddingsClient,
@@ -126,140 +144,22 @@ pub async fn run_native_agent(
     status: Option<&StatusHandle>,
 ) -> anyhow::Result<ReviewOutcome> {
     // ── Model client (ADR-0039) ──────────────────────────────────────────────────────────────────
-    // Streaming (ADR-0039 / #206): opt-in via `review.stream`. `with_extra` strips reserved structural
-    // keys; the sanitized map is carried into the conversation's `RequestOptions` below (the engine
-    // flattens the request `extra` from there). `with_retry_policy` preserves the per-turn retry the
-    // legacy `complete_with_retry` applied before the loop's circuit breaker sees a transient failure.
-    let chat = ChatClient::with_timeout(
-        &review.base_url,
-        &review.api_key,
-        &review.model,
-        Duration::from_secs(review.resilience.request_timeout_secs),
-    )
-    .with_attribution(attribution)
-    .with_extra(review.extra.clone())
-    .with_stream(review.stream)
-    .with_retry_policy(RetryPolicy {
-        max_retries: review.resilience.max_retries,
-        ..RetryPolicy::default()
-    });
+    let chat = model_client::build_chat_client(review, attribution, task_id);
     let request_extra = chat.extra().clone();
 
-    tracing::info!(
-        task_id = %task_id,
-        model = %review.model,
-        base_url_host = %base_url_host(&review.base_url),
-        request_timeout_secs = review.resilience.request_timeout_secs,
-        max_retries = review.resilience.max_retries,
-        circuit_breaker_threshold = review.resilience.circuit_breaker_threshold,
-        stream = review.stream,
-        tier = if review.fast { "fast" } else { "deep" },
-        extra = %serde_json::Value::Object(review.extra.clone()),
-        "review agent starting"
-    );
-
     // ── Offered tool surface: diff gate + per-tier allowlist + ADR-0066 MCP discovery ───────────────
-    // Without a diff an inline finding has no line to anchor to, so `add_review_comment` isn't offered.
     let diff_present = diff.is_some();
-    let mut offered = tool_defs();
-    if !diff_present {
-        offered.retain(|spec| spec.function.name != ADD_REVIEW_COMMENT);
-    }
-    // Per-tier tool allowlist (ADR-0062): its BUILT-IN entries are the authoritative offered set.
-    if let Some(allow) = review.tools.as_ref() {
-        let builtins: HashSet<&str> = allow
-            .iter()
-            .filter_map(|selector| match selector {
-                ReviewToolSelector::Builtin(builtin) => Some(builtin.as_str()),
-                ReviewToolSelector::Mcp(_) => None,
-            })
-            .collect();
-        offered.retain(|spec| builtins.contains(spec.function.name.as_str()));
-    }
-    // External-knowledge MCP tools (ADR-0066): discovered dynamically. An UNSET allowlist offers ALL
-    // discovered; a SET allowlist offers a discovered tool iff some `mcp__` selector matches, and skips
-    // discovery entirely when it has none. A discovery failure degrades to "no external tools".
-    let mcp_selectors: Option<Vec<&McpToolPattern>> = review.tools.as_ref().map(|allow| {
-        allow
-            .iter()
-            .filter_map(|selector| match selector {
-                ReviewToolSelector::Mcp(pattern) => Some(pattern),
-                ReviewToolSelector::Builtin(_) => None,
-            })
-            .collect()
-    });
-    let discover = match &mcp_selectors {
-        None => true,
-        Some(selectors) => !selectors.is_empty(),
-    };
-    let mut dispatch_discovered: Vec<ToolSpec> = Vec::new();
-    if discover {
-        match client.list_knowledge_tools(task_id).await {
-            Ok(discovered) => {
-                let matched: Vec<_> = discovered
-                    .into_iter()
-                    .filter(|tool| match &mcp_selectors {
-                        None => true,
-                        Some(selectors) => {
-                            selectors.iter().any(|pattern| pattern.is_match(&tool.name))
-                        }
-                    })
-                    .collect();
-                if !matched.is_empty() {
-                    tracing::info!(task_id = %task_id, count = matched.len(), "offering discovered external-knowledge tools");
-                    let specs: Vec<ToolSpec> = matched
-                        .into_iter()
-                        .map(|tool| {
-                            ToolSpec::function(tool.name, tool.description, tool.input_schema)
-                        })
-                        .collect();
-                    dispatch_discovered.extend(specs.iter().cloned());
-                    offered.extend(specs);
-                }
-            }
-            Err(error) => {
-                tracing::warn!(%error, task_id = %task_id, "knowledge-tool discovery failed; continuing without external-knowledge tools");
-            }
-        }
-    }
+    let (offered, dispatch_discovered) = tool_surface::resolve_offered_tools(
+        review,
+        diff_present,
+        sast_config.is_some(),
+        client,
+        task_id,
+    )
+    .await;
 
     // ── Run-start telemetry (ADR-0034/0062/0066), recorded at run START ─────────────────────────────
-    // Snapshot what turn 0 will ACTUALLY offer: a FAST run without an allowlist runs every turn on the
-    // wind-down write/finish set (the `FastTierGuard` narrows to it), so snapshotting the full surface
-    // there would claim retrieval/read_file tools the model is never given.
-    let winddown_defs = winddown_tool_defs(&offered, diff_present);
-    let start_defs = run_start_tool_defs(review, &offered, &winddown_defs);
-    let offered_tools_json = serde_json::Value::Array(
-        start_defs
-            .iter()
-            .map(|spec| {
-                let source = if spec.function.name.starts_with(MCP_TOOL_PREFIX) {
-                    "mcp"
-                } else {
-                    "builtin"
-                };
-                serde_json::json!({ "name": spec.function.name, "source": source })
-            })
-            .collect(),
-    );
-    let offered_tool_names: Vec<&str> = start_defs
-        .iter()
-        .map(|spec| spec.function.name.as_str())
-        .collect();
-    tracing::info!(
-        task_id = %task_id,
-        tier = if review.fast { "fast" } else { "deep" },
-        model = %review.model,
-        tool_count = offered_tool_names.len(),
-        tools = ?offered_tool_names,
-        "review run: offered tools"
-    );
-    if let Err(error) = client
-        .submit_review_telemetry(task_id, &offered_tools_json, &review.redacted_config_b64())
-        .await
-    {
-        tracing::warn!(%error, task_id = %task_id, "submitting review telemetry failed (non-fatal)");
-    }
+    telemetry::submit_run_start_telemetry(client, task_id, review, &offered, diff_present).await;
 
     // ── Seed the conversation ────────────────────────────────────────────────────────────────────
     let prompt_config = PromptConfig {
@@ -278,7 +178,6 @@ pub async fn run_native_agent(
         repo_instructions,
         prior_reviews,
         repo_memory,
-        sast_digest,
     );
     let initial_names: Vec<String> = offered
         .iter()
@@ -310,12 +209,22 @@ pub async fn run_native_agent(
         RuntimeCaps::default()
     };
 
-    // ── Tool registry (built-ins + discovered) ──────────────────────────────────────────────────
+    // ── Tool registry (built-ins + discovered + run_sast) ───────────────────────────────────────
+    // Shared feed the `run_sast` tool pushes leads into as it scans (ADR-0073); `SastAnchorGate` (#305)
+    // drains it mid-loop. Built once here so the same handle reaches both the tool (via `tool_registry`)
+    // and the gate (via `params.sast_leads`, below).
+    let sast_leads: lci_review_agent::policies::SastLeadSink = Arc::new(Mutex::new(Vec::new()));
+    let sast_tool_config = sast_config.map(|config| SastToolConfig {
+        config: config.clone(),
+        changed_files: diff.map(|pr| pr.files.clone()).unwrap_or_default(),
+        leads: Arc::clone(&sast_leads),
+    });
     let registry = tool_registry(
         Arc::new(client.clone()),
         Arc::new(embedder.clone()),
         dispatch_discovered,
         runtime_caps,
+        sast_tool_config,
     )
     .context("assembling review tool registry")?;
 
@@ -331,6 +240,7 @@ pub async fn run_native_agent(
         fast: review.fast,
         diff_present,
         diff_files: diff.map(|pr| pr.files.clone()).unwrap_or_default(),
+        sast_leads,
     };
     let workspace = flows::eager_workspace(checkout_root.to_path_buf());
     let cx = ToolCx {
@@ -341,7 +251,6 @@ pub async fn run_native_agent(
     // ── Drive the loop, capturing the transcript even on error ───────────────────────────────────
     let sink = JobSink::default();
     let sink_handle = sink.clone();
-    let telemetry = chat.telemetry_handle();
     // Live status projection (RFC-0007 slice 5): when the status API is on, tee the loop's events into
     // the shared status handle (turn / current tool / findings) via a `StatusSink` that forwards every
     // event UNCHANGED to `JobSink` — so the transcript reconstructed below is byte-identical whether or
@@ -354,12 +263,13 @@ pub async fn run_native_agent(
         )),
         None => Box::new(sink),
     };
-    // Token usage is NOT in the transcript events, so feed it from the model telemetry side-channel:
-    // a lightweight poller mirrors the running totals into the status handle while the loop runs, so
-    // "tokens so far" is live. Spawned only when the status API is on; aborted right after the loop.
+    // Each `Assistant` sink event carries its own turn's telemetry (ADR-0087: on the `AssistantTurn`
+    // itself, not a side-channel — #411/#417), so a lightweight poller sums it straight off
+    // `sink_handle` to mirror "tokens so far" into the status handle while the loop runs. Spawned only
+    // when the status API is on; aborted right after the loop.
     let usage_poller = status.map(|handle| {
         let handle = handle.clone();
-        let telemetry = telemetry.clone();
+        let sink_handle = sink_handle.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_secs(1));
             // After a stall don't fire a burst of catch-up ticks — one usage mirror per second is
@@ -367,13 +277,13 @@ pub async fn run_native_agent(
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 tick.tick().await;
-                // Recover from a poisoned mutex instead of panicking (consistent with
-                // `StatusHandle::with`): a panic elsewhere holding this lock must not also kill the
-                // best-effort usage poller — the totals it reads are advisory telemetry.
-                let guard = telemetry
+                // Lock and read in place rather than `entries()` — this ticks every second for the
+                // life of the run, so cloning the whole (growing) transcript each time is wasteful.
+                let guard = sink_handle
+                    .0
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                let (prompt, completion) = sum_usage(&guard);
+                let (prompt, completion) = telemetry::sum_usage(&guard);
                 drop(guard);
                 handle.observe_usage(prompt, completion);
             }
@@ -416,20 +326,21 @@ pub async fn run_native_agent(
     if let Some(poller) = usage_poller {
         poller.abort();
     }
+    // One lock for both reads below instead of `entries()` cloning the whole transcript twice.
+    let final_events = sink_handle
+        .0
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     if let Some(handle) = status {
-        let (prompt, completion) = sum_usage(&telemetry.lock().expect("telemetry mutex"));
+        let (prompt, completion) = telemetry::sum_usage(&final_events);
         handle.observe_usage(prompt, completion);
     }
 
-    // Reconstruct the ADR-0034 transcript from the sink events + the model client's per-turn telemetry
-    // side-channel BEFORE propagating any loop error, so the caller still submits a failed run's
-    // reasoning.
-    append_transcript(
-        transcript,
-        &sink_handle.entries(),
-        &telemetry.lock().expect("telemetry mutex"),
-        task_id,
-    );
+    // Reconstruct the ADR-0034 transcript from the sink events BEFORE propagating any loop error, so
+    // the caller still submits a failed run's reasoning. Each `Assistant` event carries its own
+    // telemetry (ADR-0087) — no separate side-channel to zip against.
+    transcript::append_transcript(transcript, &final_events, task_id);
+    drop(final_events);
 
     Ok(match outcome? {
         LoopOutcome::Finished => ReviewOutcome::Finished,
@@ -438,139 +349,41 @@ pub async fn run_native_agent(
     })
 }
 
-/// Sum the running (prompt, completion) token totals across the per-turn telemetry for the live status
-/// projection (RFC-0007 slice 5). Tokens are not carried in the transcript events, so they come from the
-/// model client's telemetry side-channel. A negative/absent count clamps to `0` — a status metric must
-/// never be a nonsense number.
-fn sum_usage(telemetry: &[TurnTelemetry]) -> (u64, u64) {
-    let clamp = |value: Option<i64>| u64::try_from(value.unwrap_or(0).max(0)).unwrap_or(0);
-    telemetry
-        .iter()
-        .fold((0, 0), |(prompt, completion), entry| {
-            (
-                prompt + clamp(entry.prompt_tokens),
-                completion + clamp(entry.completion_tokens),
-            )
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Panic while holding `mutex`'s lock, on a background thread, then join it (discarding the
+    /// panic) — leaves the mutex poisoned exactly as a real panic-while-locked would.
+    fn poison<T: Send + 'static>(mutex: &Arc<Mutex<T>>) {
+        let for_thread = Arc::clone(mutex);
+        let _ = std::thread::spawn(move || {
+            let _guard = for_thread.lock().unwrap();
+            panic!("intentional poisoning for test");
         })
-}
-
-/// Reconstruct the ADR-0034 transcript rows from the loop's sink events + the model client's per-turn
-/// telemetry (sequential model calls ⇒ index == the Nth assistant event). Assistant turns carry their
-/// tokens/model from the telemetry side-channel; tool results carry the (bounded) outcome text — the
-/// finish/abort terminal outcomes record no tool row, matching the legacy loop. Policy events are not
-/// transcript rows.
-fn append_transcript(
-    transcript: &mut Vec<TranscriptEntry>,
-    events: &[TranscriptEvent],
-    telemetry: &[TurnTelemetry],
-    task_id: Uuid,
-) {
-    let mut assistant_index = 0usize;
-    for event in events {
-        match event {
-            TranscriptEvent::Assistant { turn, message } => {
-                let telemetry = telemetry.get(assistant_index);
-                assistant_index += 1;
-                // Proof-of-work (epic #137): one concise per-turn line, including the chain-of-thought
-                // length (the reliable "how far did it think" signal even when the gateway folds
-                // reasoning into `completion_tokens`).
-                tracing::info!(
-                    task_id = %task_id,
-                    turn,
-                    model = telemetry.map(|entry| entry.model.as_str()).unwrap_or("?"),
-                    prompt_tokens = telemetry.and_then(|entry| entry.prompt_tokens).unwrap_or(-1),
-                    completion_tokens = telemetry
-                        .and_then(|entry| entry.completion_tokens)
-                        .unwrap_or(-1),
-                    reasoning_tokens = telemetry
-                        .and_then(|entry| entry.reasoning_tokens)
-                        .unwrap_or(-1),
-                    reasoning_chars = telemetry
-                        .and_then(|entry| entry.reasoning.as_deref())
-                        .map(|reasoning| reasoning.chars().count())
-                        .unwrap_or(0),
-                    "agent turn complete"
-                );
-                transcript.push(TranscriptEntry {
-                    role: "assistant".to_string(),
-                    content: message.content.clone(),
-                    tool_calls: (!message.tool_calls.is_empty())
-                        .then(|| serde_json::to_value(&message.tool_calls).unwrap_or_default()),
-                    tool_name: None,
-                    prompt_tokens: telemetry.and_then(|entry| entry.prompt_tokens),
-                    completion_tokens: telemetry.and_then(|entry| entry.completion_tokens),
-                    reasoning_tokens: telemetry.and_then(|entry| entry.reasoning_tokens),
-                    model: telemetry.map(|entry| entry.model.clone()),
-                });
-            }
-            TranscriptEvent::Tool { call, outcome, .. } => {
-                if let ToolOutcome::Continue(result) = outcome {
-                    transcript.push(TranscriptEntry {
-                        role: "tool".to_string(),
-                        content: Some(truncate_on_boundary(result, 2048).to_string()),
-                        tool_calls: None,
-                        tool_name: Some(call.function.name.clone()),
-                        prompt_tokens: None,
-                        completion_tokens: None,
-                        reasoning_tokens: None,
-                        model: None,
-                    });
-                }
-            }
-            TranscriptEvent::Policy { .. } => {}
-        }
+        .join();
+        assert!(mutex.is_poisoned(), "the mutex should now be poisoned");
     }
-}
 
-/// The reduced tool set offered once a run enters wind-down (#137), used ONLY for the run-start
-/// telemetry snapshot of a FAST run: the write tools + `finish`/`abort`, dropping retrieval/read_file.
-/// `add_review_comment`/`retract_finding` are kept only when a diff is present (an inline tool can't
-/// anchor without one). Mirrors the engine's convergence narrowing.
-fn winddown_tool_defs(base: &[ToolSpec], diff_present: bool) -> Vec<ToolSpec> {
-    base.iter()
-        .filter(|spec| match spec.function.name.as_str() {
-            ADD_REVIEW_COMMENT | RETRACT_FINDING => diff_present,
-            ADD_COMMENT | FINISH | ABORT => true,
-            _ => false,
-        })
-        .cloned()
-        .collect()
-}
+    #[test]
+    fn job_sink_recovers_from_a_poisoned_mutex() {
+        let mut sink = JobSink::default();
+        sink.record(TranscriptEvent::Policy {
+            turn: 0,
+            name: "pre-poison",
+            detail: serde_json::Value::Null,
+        });
 
-/// The tool set turn 0 will ACTUALLY offer for the telemetry snapshot: a FAST run WITHOUT an explicit
-/// allowlist runs every turn on the wind-down write/finish set (the `FastTierGuard` narrows to it), so
-/// snapshotting the full surface there would record retrieval/read_file/MCP tools the model never gets.
-fn run_start_tool_defs<'a>(
-    review: &ReviewConfig,
-    defs: &'a [ToolSpec],
-    winddown_defs: &'a [ToolSpec],
-) -> &'a [ToolSpec] {
-    if review.fast && review.tools.is_none() {
-        winddown_defs
-    } else {
-        defs
+        poison(&sink.0);
+
+        // Both `record` (via `TranscriptSink`) and `entries` must recover instead of panicking, and
+        // the state recorded before the poisoning must still be there.
+        sink.record(TranscriptEvent::Policy {
+            turn: 1,
+            name: "post-poison",
+            detail: serde_json::Value::Null,
+        });
+        let entries = sink.entries();
+        assert_eq!(entries.len(), 2);
     }
-}
-
-/// Host of a base URL for logging (never the path/key). Falls back to the whole string when there's no
-/// scheme separator, so a schemeless URL still logs its host rather than "(unparseable)".
-fn base_url_host(base_url: &str) -> String {
-    let without_scheme = base_url.split("://").nth(1).unwrap_or(base_url);
-    without_scheme
-        .split(['/', '?', '#'])
-        .next()
-        .map(|hostport| hostport.to_string())
-        .unwrap_or_else(|| "(unparseable)".to_string())
-}
-
-/// `s` truncated to at most `max` bytes, never slicing through a multi-byte char.
-fn truncate_on_boundary(s: &str, max: usize) -> &str {
-    if s.len() <= max {
-        return s;
-    }
-    let mut end = max;
-    while !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    &s[..end]
 }

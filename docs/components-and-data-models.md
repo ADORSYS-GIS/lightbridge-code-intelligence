@@ -123,7 +123,7 @@ CREATE TABLE github_deliveries (
 
 The PK + `ON CONFLICT` gives exactly-once delivery handling with no in-process dedup set.
 
-### `repo_index` — index snapshot bookkeeping
+### `repo_index` — index snapshot bookkeeping (reserved, no writer yet)
 
 ```sql
 CREATE TABLE repo_index (
@@ -133,6 +133,16 @@ CREATE TABLE repo_index (
     UNIQUE (repository_id, branch, commit_sha, graph_version, vector_version)
 );
 ```
+
+Confirmed by code search (#245): no `INSERT`/`UPDATE` exists anywhere in `services/control-plane/src`.
+Snapshot readiness today is tracked purely via `code_chunks` / `latest_indexed_commit`
+([ADR-0050](adr/0050-retrieval-pins-to-latest-indexed-snapshot.md)). The only live references are
+defensive purge cleanup — `delete_repo_index_rows` and the `EXISTS` leftover-data check in
+[`db/code_chunks.rs`](../services/control-plane/src/db/code_chunks.rs). The table is intentionally
+kept, not dead: [ADR-0055](adr/0055-review-waits-for-index-readiness.md)'s "Failed/partial index"
+consequence names `status`/`completed_at` here as the fix for gating `latest_indexed_commit` on a
+`ready` row per commit (closing the reuse-a-failed-index and mid-review-reindex-race gaps), tied to
+[RFC-0002](rfc/0002-incremental-layered-indexing.md)'s layered-indexing model.
 
 ### `tasks` — system of record + work queue
 
@@ -354,12 +364,13 @@ created_at DESC, id DESC)` (`0018`). Old snapshots are pruned by the index sweep
 
 ## Neo4j structural graph
 
-The structural graph is produced by Graphify/tree-sitter
-([ADR-0010](adr/0010-graphify-treesitter-indexing-baseline.md),
-[ADR-0019](adr/0019-graphify-cli-structural-graph.md)): the runner spawns Graphify to emit a
-`graph.json` (symbols + `contains`/`method`/`calls` edges), persisted over Bolt by
-`src/integrations/neo4j.rs`. Retrieval is server-side scoped to the task's repo snapshot. The graph
-holds code topology; Postgres remains the system of record.
+The structural graph is produced in-process by the in-house `lci-codegraph` crate (tree-sitter)
+([ADR-0086](adr/0086-in-house-code-graph-crate.md), which retired the Graphify path of
+[ADR-0010](adr/0010-graphify-treesitter-indexing-baseline.md) /
+[ADR-0019](adr/0019-graphify-cli-structural-graph.md)): the runner walks the checkout and submits
+symbols + `contains`/`method`/`calls` edges, persisted over Bolt by `src/integrations/neo4j.rs`.
+Retrieval is server-side scoped to the task's repo snapshot. The graph holds code topology; Postgres
+remains the system of record.
 
 ## Authorization context
 

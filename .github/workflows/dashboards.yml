@@ -21,12 +21,14 @@ permissions:
 
 jobs:
   generate-and-verify:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, vymalo-vps]
+    # `actions/setup-python` has no prebuilt interpreter for the runner host's Debian 13 (trixie), so
+    # it errors "version '3.12' … was not found for Debian 13". Run inside the official Python 3.12
+    # image instead — it ships `python`, `pip` (no PEP-668 marker) and `git` (buildpack-deps), which
+    # the stale-check `git diff` needs.
+    container: python:3.12-bookworm
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
       - name: Install generator
         run: pip install -r tools/dashboard-gen/requirements.txt
       - name: Regenerate dashboards
@@ -40,7 +42,7 @@ jobs:
           fi
 
   helm-lint:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, vymalo-vps]
     steps:
       - uses: actions/checkout@v4
       - uses: azure/setup-helm@v4

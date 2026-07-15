@@ -27,10 +27,17 @@ tree-sitter-rust.workspace = true
 tree-sitter-javascript.workspace = true
 tree-sitter-typescript.workspace = true
 tree-sitter-python.workspace = true
+# Java grammar (ADR-0086 language expansion): the org ships Java backends (webank). Same tree-sitter
+# ABI as the other grammars; adds no C-runtime beyond the shared `cc` build path already in use.
+tree-sitter-java.workspace = true
 # Configurable ignore-list that composes with the repo `.gitignore` (ADR-0086 §4 / R3).
 ignore.workspace = true
 # Bounded PDF text extraction over untrusted repo input (ADR-0086 §3 / R2).
 pdf-extract.workspace = true
+# Pre-flight, *bounded* inflate of a PDF's content streams to catch a decompression bomb BEFORE
+# `pdf-extract` (which wraps `lopdf`/`flate2`) inflates them unbounded. Already in the tree
+# transitively via `pdf-extract`; pinned direct for the guard. Untrusted-input code (ADR-0086 R2).
+flate2 = "1"
 
 [dev-dependencies]
 tempfile.workspace = true

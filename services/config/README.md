@@ -20,8 +20,10 @@ single JSON config file (mounted from a Helm ConfigMap) instead of a sprawl of i
 JSON keeps the dependency surface at zero beyond `serde` — and templates are *separate mounted files*,
 so the config itself stays scalars and paths only.
 
-The loader, the substitution grammar, and the design rationale live in
-[`src/lib.rs`](src/lib.rs) (crate-level `//!` docs).
+The design rationale lives in [`src/lib.rs`](src/lib.rs) (crate-level `//!` docs); the
+implementation is split by responsibility into [`src/substitute.rs`](src/substitute.rs) (the
+`{env:…}` grammar), [`src/loader.rs`](src/loader.rs) (reading + deserializing config/template
+files), and [`src/de.rs`](src/de.rs) (the numeric/bool serde coercions).
 
 ## Tests
 

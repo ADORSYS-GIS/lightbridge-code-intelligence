@@ -25,6 +25,126 @@ pub struct FileConfig {
     pub embeddings: EmbeddingsSection,
     pub knowledge_tools: KnowledgeToolsSection,
     pub egress: EgressSection,
+    pub gitlab: GitlabSection,
+}
+
+/// GitLab projects configured from the mounted control-plane file only. There is intentionally no
+/// `GITLAB_*` env fallback: each project carries its own API token, webhook secret, API URL, and
+/// optional bot handle so multi-project routing is explicit and fail-closed.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct GitlabSection {
+    /// Explicit opt-in. When true, at least one valid project must be configured.
+    pub enabled: bool,
+    /// Shared default for projects that omit `api_url`.
+    pub default_api_url: Option<String>,
+    /// Shared default for projects that omit `bot_handle`.
+    pub default_bot_handle: Option<String>,
+    #[serde(default)]
+    pub projects: Vec<GitlabProjectConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GitlabProjectConfig {
+    /// Numeric GitLab project id; also used as `tasks.installation_id` for GitLab.
+    pub project_id: i64,
+    /// Optional per-project API URL, e.g. `https://gitlab.example.com/api/v4`.
+    pub api_url: Option<String>,
+    /// Project/group/PAT token sent as `PRIVATE-TOKEN`.
+    pub access_token: String,
+    /// Plain token expected in `X-Gitlab-Token` for this project.
+    pub webhook_secret: String,
+    /// Optional per-project bot handle for @mention deep-review requests.
+    pub bot_handle: Option<String>,
+}
+
+impl GitlabSection {
+    pub fn default_api_url(&self) -> &str {
+        self.default_api_url
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or("https://gitlab.com/api/v4")
+    }
+
+    pub fn default_bot_handle(&self) -> &str {
+        self.default_bot_handle
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or("lightbridge-bot")
+    }
+
+    pub fn resolved_api_url<'a>(&'a self, project: &'a GitlabProjectConfig) -> &'a str {
+        project
+            .api_url
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| self.default_api_url())
+    }
+
+    pub fn resolved_bot_handle<'a>(&'a self, project: &'a GitlabProjectConfig) -> &'a str {
+        project
+            .bot_handle
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| self.default_bot_handle())
+    }
+
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+        if self.projects.is_empty() {
+            anyhow::bail!("gitlab.enabled=true requires at least one gitlab.projects[] entry");
+        }
+
+        let mut seen = std::collections::HashSet::new();
+        for project in &self.projects {
+            if !seen.insert(project.project_id) {
+                anyhow::bail!("duplicate GitLab project_id {}", project.project_id);
+            }
+            let api_url = self.resolved_api_url(project);
+            let parsed_api_url = reqwest::Url::parse(api_url).map_err(|error| {
+                anyhow::anyhow!(
+                    "GitLab project {} api_url is not a valid URL: {}",
+                    project.project_id,
+                    error
+                )
+            })?;
+            if !matches!(parsed_api_url.scheme(), "http" | "https") {
+                anyhow::bail!(
+                    "GitLab project {} api_url must use http or https",
+                    project.project_id
+                );
+            }
+            if project.access_token.trim().is_empty() {
+                anyhow::bail!(
+                    "GitLab project {} has empty access_token",
+                    project.project_id
+                );
+            }
+            if project.webhook_secret.trim().is_empty() {
+                anyhow::bail!(
+                    "GitLab project {} has empty webhook_secret",
+                    project.project_id
+                );
+            }
+            if reqwest::header::HeaderValue::from_str(&project.access_token).is_err() {
+                anyhow::bail!(
+                    "GitLab project {} access_token is not a valid header value",
+                    project.project_id
+                );
+            }
+            if reqwest::header::HeaderValue::from_str(&project.webhook_secret).is_err() {
+                anyhow::bail!(
+                    "GitLab project {} webhook_secret is not a valid header value",
+                    project.project_id
+                );
+            }
+        }
+
+        Ok(())
+    }
 }
 
 /// Which path delivers `outbox` intents (RFC-0005 Phase A / ADR-0074). **Defaults to `Drain`** — the
@@ -158,11 +278,12 @@ pub struct AgentSection {
     /// The agent-runner container image. Acts as the shared fallback when a per-kind override below
     /// is unset.
     pub runner_image: Option<String>,
-    /// Per-kind override for **index** Jobs (`command_text == "index"`) — the full image that
-    /// bundles Python + Graphify for structural-graph extraction. Falls back to `runner_image`.
+    /// Per-kind override for **index** Jobs (`command_text == "index"`). Falls back to `runner_image`.
+    /// Since Graphify was retired (ADR-0086) the index and review images share one lean runtime, but
+    /// the override stays so operators can still pin the two Job kinds to different tags if needed.
     pub indexer_runner_image: Option<String>,
-    /// Per-kind override for **review** Jobs (everything else) — the leaner image without the
-    /// Python/Graphify venv (the review path never spawns Graphify). Falls back to `runner_image`.
+    /// Per-kind override for **review** Jobs (everything else). Falls back to `runner_image`. Same
+    /// lean runtime as the index image now that Graphify is gone (ADR-0086); override kept for pinning.
     pub review_runner_image: Option<String>,
     pub service_account: Option<String>,
     pub control_plane_url: Option<String>,
@@ -183,7 +304,7 @@ pub struct AgentSection {
     /// shared fallback when a per-kind override below is unset.
     pub resources: Option<serde_json::Value>,
     /// Per-kind override for **index** Jobs (`command_text == "index"`) — the heavy path (full
-    /// tree-sitter parse + embeddings + Graphify), wants more CPU/RAM. Falls back to `resources`.
+    /// tree-sitter parse + embeddings + in-process lci-codegraph), wants more CPU/RAM. Falls back to `resources`.
     pub indexer_resources: Option<serde_json::Value>,
     /// Per-kind override for **review** Jobs (everything else) — read-mostly (reuses the indexed
     /// snapshot, ADR-0050; LLM/network-bound), so it can run leaner. Falls back to `resources`.
@@ -254,5 +375,119 @@ mod tests {
         let json = r#"{"knowledge_tools":{"mcp_servers":[{"name":"context7","url":"http://x"}]}}"#;
         let config: FileConfig = serde_json::from_str(json).expect("valid name parses");
         assert_eq!(config.knowledge_tools.mcp_servers[0].name, "context7");
+    }
+
+    #[test]
+    fn gitlab_disabled_allows_no_projects() {
+        let config: FileConfig =
+            serde_json::from_str(r#"{"gitlab":{"enabled":false}}"#).expect("config parses");
+        config
+            .gitlab
+            .validate()
+            .expect("disabled GitLab needs no project config");
+    }
+
+    #[test]
+    fn gitlab_enabled_requires_at_least_one_project() {
+        let config: FileConfig =
+            serde_json::from_str(r#"{"gitlab":{"enabled":true,"projects":[]}}"#)
+                .expect("config parses");
+        let err = config.gitlab.validate().expect_err("empty projects fail");
+        assert!(err.to_string().contains("requires at least one"));
+    }
+
+    #[test]
+    fn gitlab_rejects_duplicate_project_ids() {
+        let json = r#"{
+          "gitlab": {
+            "enabled": true,
+            "projects": [
+              {
+                "project_id": 1,
+                "access_token": "token-a",
+                "webhook_secret": "secret-a"
+              },
+              {
+                "project_id": 1,
+                "access_token": "token-b",
+                "webhook_secret": "secret-b"
+              }
+            ]
+          }
+        }"#;
+        let config: FileConfig = serde_json::from_str(json).expect("config parses");
+        let err = config
+            .gitlab
+            .validate()
+            .expect_err("duplicate project id fails");
+        assert!(err.to_string().contains("duplicate"));
+    }
+
+    #[test]
+    fn gitlab_rejects_empty_project_secret_fields() {
+        let json = r#"{
+          "gitlab": {
+            "enabled": true,
+            "projects": [
+              {
+                "project_id": 1,
+                "access_token": "",
+                "webhook_secret": "secret-a"
+              }
+            ]
+          }
+        }"#;
+        let config: FileConfig = serde_json::from_str(json).expect("config parses");
+        let err = config
+            .gitlab
+            .validate()
+            .expect_err("empty access token fails");
+        assert!(err.to_string().contains("empty access_token"));
+    }
+
+    #[test]
+    fn gitlab_rejects_invalid_api_url() {
+        let json = r#"{
+          "gitlab": {
+            "enabled": true,
+            "projects": [
+              {
+                "project_id": 7,
+                "api_url": "htps://gitlab.example.com/api/v4",
+                "access_token": "token",
+                "webhook_secret": "secret"
+              }
+            ]
+          }
+        }"#;
+        let config: FileConfig = serde_json::from_str(json).expect("config parses");
+        let err = config.gitlab.validate().expect_err("invalid api_url fails");
+        assert!(err.to_string().contains("api_url must use http or https"));
+    }
+
+    #[test]
+    fn gitlab_resolves_project_defaults() {
+        let json = r#"{
+          "gitlab": {
+            "enabled": true,
+            "default_api_url": "https://gitlab.example.com/api/v4",
+            "default_bot_handle": "lb",
+            "projects": [
+              {
+                "project_id": 7,
+                "access_token": "token",
+                "webhook_secret": "secret"
+              }
+            ]
+          }
+        }"#;
+        let config: FileConfig = serde_json::from_str(json).expect("config parses");
+        config.gitlab.validate().expect("valid project config");
+        let project = &config.gitlab.projects[0];
+        assert_eq!(
+            config.gitlab.resolved_api_url(project),
+            "https://gitlab.example.com/api/v4"
+        );
+        assert_eq!(config.gitlab.resolved_bot_handle(project), "lb");
     }
 }
