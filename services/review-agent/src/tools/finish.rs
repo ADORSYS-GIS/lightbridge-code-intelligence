@@ -39,8 +39,8 @@ pub fn aux_specs() -> [ToolSpec; 2] {
         ),
         ToolSpec::function(
             ABORT,
-            "Abort when you cannot produce a useful result (e.g. the diff is unreadable). Recorded as a clean abort, not a crash. Nothing you buffered is posted.",
-            serde_json::json!({"type":"object","properties":{"reason":{"type":"string"}},"required":["reason"]}),
+            "Abort when you cannot produce a useful result (e.g. the diff is unreadable). Recorded as a clean abort, not a crash. Any findings/replies you buffered are discarded — but `reason` itself is posted verbatim as the public review note on the PR, so it must be a plain sentence for the PR author, never an internal note or scratch reasoning.",
+            serde_json::json!({"type":"object","properties":{"reason":{"type":"string","description":"One honest sentence explaining why, written for the PR author to read — this is posted publicly as the review body, not a private note."}},"required":["reason"]}),
         ),
     ]
 }

@@ -165,7 +165,7 @@ Use these as the bar for what to record and what to skip.
 - **Cite every claim; record every real finding (including P2s) as a finding, not prose.**
 - **Call `finish` exactly once with an honest verdict** that reflects findings at every priority — never
   reduce it to "no P0/P1 findings." If you genuinely cannot produce anything useful, `abort` with a
-  reason.
+  reason — that reason is posted verbatim as the public review note on the PR, never an internal note.
 ```
 
 ---
