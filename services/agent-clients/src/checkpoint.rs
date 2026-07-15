@@ -337,9 +337,7 @@ mod tests {
     fn assistant_telemetry(events: &[TranscriptEvent], turn: usize) -> Option<&TurnTelemetry> {
         events.iter().find_map(|event| match event {
             TranscriptEvent::Assistant {
-                turn: t,
-                telemetry,
-                ..
+                turn: t, telemetry, ..
             } if *t == turn => telemetry.as_ref(),
             _ => None,
         })
@@ -484,7 +482,10 @@ mod tests {
         let live_telemetry = assistant_telemetry(&events1, 0)
             .expect("run 1's live turn carries telemetry")
             .clone();
-        assert_eq!(live_telemetry.reasoning.as_deref(), Some("thinking about the diff"));
+        assert_eq!(
+            live_telemetry.reasoning.as_deref(),
+            Some("thinking about the diff")
+        );
 
         // Run 2: the SAME store resumes. Turn 0 replays from the journal — a fresh model that would
         // return DIFFERENT telemetry if asked proves it never runs for turn 0.

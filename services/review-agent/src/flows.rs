@@ -330,7 +330,10 @@ mod tests {
             .mount(&cp)
             .await;
         Mock::given(method("POST"))
-            .and(path(format!("/internal/tasks/{}/review/inline", Uuid::nil())))
+            .and(path(format!(
+                "/internal/tasks/{}/review/inline",
+                Uuid::nil()
+            )))
             .respond_with(ResponseTemplate::new(204))
             .mount(&cp)
             .await;
