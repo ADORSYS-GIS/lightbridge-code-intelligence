@@ -58,14 +58,16 @@ impl TurnFilter {
         }
         self.blocked_kinds
             .extend(other.blocked_kinds.iter().copied());
-        self.forced_names
-            .extend(other.forced_names.iter().cloned());
+        self.forced_names.extend(other.forced_names.iter().cloned());
     }
 
     pub(crate) fn offers(&self, tool: &dyn Tool) -> bool {
         let name = tool.spec().name();
         self.forced_names.contains(name)
             || (!self.blocked_kinds.contains(&tool.kind())
-                && self.allowed_names.as_ref().is_none_or(|names| names.contains(name)))
+                && self
+                    .allowed_names
+                    .as_ref()
+                    .is_none_or(|names| names.contains(name)))
     }
 }
