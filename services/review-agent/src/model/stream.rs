@@ -15,6 +15,7 @@ use lci_agent_types::{FunctionCall, ToolCall};
 use super::client::ChatClient;
 use super::completion::{Completion, Usage};
 use super::retry::ChatError;
+use super::serde_ext::null_as_default;
 
 #[derive(Deserialize)]
 struct StreamChunk {
@@ -46,7 +47,11 @@ struct StreamDelta {
     /// without it a streamed reasoning model logs `reasoning_chars: 0` (the deep-tier GLM-5.2 symptom).
     #[serde(default, alias = "reasoning")]
     reasoning_content: Option<String>,
-    #[serde(default)]
+    /// Null-tolerant: several backends stream reasoning/content deltas carrying an explicit
+    /// `"tool_calls": null` (GLM-5.2, MiMo). `#[serde(default)]` alone rejects that null and fails the
+    /// whole chunk, silently dropping the delta's reasoning/content — the `reasoning_chars: 0` bug
+    /// (#411). `null_as_default` collapses both an absent key and an explicit `null` to an empty vec.
+    #[serde(default, deserialize_with = "null_as_default")]
     tool_calls: Vec<StreamToolCall>,
 }
 
@@ -142,8 +147,25 @@ impl ChatClient {
                         done = true;
                         continue;
                     }
-                    let Ok(chunk) = serde_json::from_str::<StreamChunk>(data) else {
-                        continue; // keep-alive / unparseable fragment — skip
+                    let chunk = match serde_json::from_str::<StreamChunk>(data) {
+                        Ok(chunk) => chunk,
+                        Err(error) => {
+                            // A `data:` line that is neither `[DONE]` nor empty but still fails to
+                            // parse means we are DROPPING a delta (its content/reasoning/tool_calls).
+                            // This is exactly how the #411 null-`tool_calls` bug hid for months, so
+                            // surface it — bounded snippet, `debug` so legitimate keep-alives stay
+                            // quiet — instead of skipping silently. The next backend that introduces a
+                            // novel null shape is then caught immediately.
+                            if !data.is_empty() {
+                                let snippet: String = data.chars().take(200).collect();
+                                tracing::debug!(
+                                    %error,
+                                    snippet = %snippet,
+                                    "dropping unparseable stream chunk"
+                                );
+                            }
+                            continue;
+                        }
                     };
                     // A mid-stream provider error (no `choices`) must fail the turn, not finish empty.
                     if let Some(err) = chunk.error {
@@ -225,5 +247,112 @@ impl ChatClient {
                 tool_call_id: None,
             },
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Parse one full `data:` chunk and return its first choice's `(content, reasoning_content)`.
+    /// Panics (fails the test) if the chunk does not deserialize — which is the whole point of the
+    /// #411 corpus: the null-`tool_calls` backends used to fail here.
+    fn delta_of(data: &str) -> (Option<String>, Option<String>) {
+        let chunk: StreamChunk = serde_json::from_str(data)
+            .unwrap_or_else(|e| panic!("chunk failed to parse: {e}\n{data}"));
+        let delta = chunk.choices.into_iter().next().expect("a choice").delta;
+        (delta.content, delta.reasoning_content)
+    }
+
+    // --- Backends that OMIT `tool_calls` when there are none: must keep parsing (no regression). ---
+
+    #[test]
+    fn ministral_absent_tool_calls_still_parse() {
+        // Mistral: first delta then a content delta, neither carries a `tool_calls` key.
+        let (c, r) = delta_of(
+            r#"{"choices":[{"index":0,"delta":{"role":"assistant","content":""},"logprobs":null,"finish_reason":null}]}"#,
+        );
+        assert_eq!(c.as_deref(), Some(""));
+        assert_eq!(r, None);
+
+        let (c, r) =
+            delta_of(r#"{"choices":[{"index":0,"delta":{"content":"H"},"finish_reason":null}]}"#);
+        assert_eq!(c.as_deref(), Some("H"));
+        assert_eq!(r, None);
+    }
+
+    #[test]
+    fn qwen_absent_tool_calls_reasoning_captured() {
+        // Fireworks qwen3p7-plus: reasoning delta, then an empty delta — no `tool_calls` key.
+        let (c, r) = delta_of(
+            r#"{"choices":[{"index":0,"delta":{"reasoning_content":"Thinking"},"finish_reason":null}]}"#,
+        );
+        assert_eq!(c, None);
+        assert_eq!(r.as_deref(), Some("Thinking"));
+
+        let (c, r) = delta_of(r#"{"choices":[{"index":0,"delta":{},"finish_reason":null}]}"#);
+        assert_eq!(c, None);
+        assert_eq!(r, None);
+    }
+
+    // --- Backends that send explicit `"tool_calls": null`: used to drop the WHOLE chunk (#411). ---
+
+    #[test]
+    fn glm_null_tool_calls_reasoning_now_captured() {
+        // zai-org GLM-5.2 (the deep tier). Extra top-level fields (`service_tier`, `usage`) are
+        // unknown to `StreamChunk`/`StreamChoice` and must be ignored, not fail the parse.
+        let (c, r) = delta_of(
+            r#"{"service_tier":"default","choices":[{"index":0,"delta":{"role":"assistant","content":"","reasoning_content":"alyze","tool_calls":null},"logprobs":null,"finish_reason":null}],"usage":null}"#,
+        );
+        assert_eq!(c.as_deref(), Some(""));
+        assert_eq!(r.as_deref(), Some("alyze"));
+    }
+
+    #[test]
+    fn mimo_null_tool_calls_and_null_role_reasoning_captured() {
+        // XiaomiMiMo mimo-v2p5: also `"role": null` (harmless — `StreamDelta` has no `role` field).
+        let (c, r) = delta_of(
+            r#"{"service_tier":"default","choices":[{"index":0,"delta":{"role":null,"content":"","reasoning_content":"The user is","tool_calls":null},"logprobs":null,"finish_reason":null}],"usage":null}"#,
+        );
+        assert_eq!(c.as_deref(), Some(""));
+        assert_eq!(r.as_deref(), Some("The user is"));
+    }
+
+    #[test]
+    fn mimo_pro_null_tool_calls_content_now_captured() {
+        // XiaomiMiMo mimo-v2p5-pro: content deltas ALSO carry `"tool_calls": null` and
+        // `"reasoning_content": null`, so before the fix even the answer TEXT was lost.
+        let (c, r) = delta_of(
+            r#"{"choices":[{"index":0,"delta":{"role":null,"content":"Hello","reasoning_content":null,"tool_calls":null},"logprobs":null,"finish_reason":null}]}"#,
+        );
+        assert_eq!(c.as_deref(), Some("Hello"));
+        assert_eq!(r, None);
+    }
+
+    #[test]
+    fn null_tool_calls_leaves_tool_calls_empty() {
+        // The null must collapse to an empty vec, not a phantom tool call.
+        let chunk: StreamChunk = serde_json::from_str(
+            r#"{"choices":[{"index":0,"delta":{"content":"x","tool_calls":null},"finish_reason":null}]}"#,
+        )
+        .expect("parses");
+        assert!(chunk.choices[0].delta.tool_calls.is_empty());
+    }
+
+    #[test]
+    fn real_tool_call_array_still_reassembles() {
+        // A genuine tool-call delta (non-null array) must still deserialize its index/id/function.
+        let chunk: StreamChunk = serde_json::from_str(
+            r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"read_file","arguments":"{\"p\":"}}]},"finish_reason":null}]}"#,
+        )
+        .expect("parses");
+        let tc = &chunk.choices[0].delta.tool_calls;
+        assert_eq!(tc.len(), 1);
+        assert_eq!(tc[0].index, 0);
+        assert_eq!(tc[0].id.as_deref(), Some("call_1"));
+        assert_eq!(
+            tc[0].function.as_ref().unwrap().name.as_deref(),
+            Some("read_file")
+        );
     }
 }

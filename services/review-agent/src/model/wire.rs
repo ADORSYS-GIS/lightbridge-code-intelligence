@@ -7,6 +7,7 @@ use serde::Deserialize;
 use lci_agent_types::ToolCall;
 
 use super::completion::Usage;
+use super::serde_ext::null_as_default;
 
 #[derive(Deserialize)]
 pub(super) struct ChatResponse {
@@ -34,6 +35,54 @@ pub(super) struct ResponseMessage {
     /// thinking (#220 / ADR-0060).
     #[serde(default, alias = "reasoning")]
     pub(super) reasoning_content: Option<String>,
-    #[serde(default)]
+    /// Null-tolerant for the same reason as the streaming path (#411): a backend that sends an
+    /// explicit `"tool_calls": null` on a text-only response would otherwise hard-fail the whole
+    /// non-stream body. `null_as_default` collapses an absent key and an explicit `null` to an empty
+    /// vec alike.
+    #[serde(default, deserialize_with = "null_as_default")]
     pub(super) tool_calls: Vec<ToolCall>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn absent_tool_calls_still_parse() {
+        // Backend that omits the key on a text answer — must keep working (no regression).
+        let resp: ChatResponse = serde_json::from_str(
+            r#"{"choices":[{"index":0,"message":{"role":"assistant","content":"hi","reasoning_content":"think"},"finish_reason":"stop"}]}"#,
+        )
+        .expect("parses");
+        let msg = &resp.choices[0].message;
+        assert_eq!(msg.content.as_deref(), Some("hi"));
+        assert_eq!(msg.reasoning_content.as_deref(), Some("think"));
+        assert!(msg.tool_calls.is_empty());
+    }
+
+    #[test]
+    fn null_tool_calls_no_longer_hard_fail() {
+        // Explicit `"tool_calls": null` on a text answer used to fail the WHOLE response
+        // ("invalid type: null, expected a sequence"); it must now collapse to an empty vec.
+        let resp: ChatResponse = serde_json::from_str(
+            r#"{"choices":[{"index":0,"message":{"role":"assistant","content":"Hello","reasoning_content":"reasoned","tool_calls":null},"finish_reason":"stop"}],"usage":null}"#,
+        )
+        .expect("parses");
+        let msg = &resp.choices[0].message;
+        assert_eq!(msg.content.as_deref(), Some("Hello"));
+        assert_eq!(msg.reasoning_content.as_deref(), Some("reasoned"));
+        assert!(msg.tool_calls.is_empty());
+    }
+
+    #[test]
+    fn real_tool_calls_still_deserialize() {
+        let resp: ChatResponse = serde_json::from_str(
+            r#"{"choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"read_file","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}"#,
+        )
+        .expect("parses");
+        let calls = &resp.choices[0].message.tool_calls;
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, "call_1");
+        assert_eq!(calls[0].function.name, "read_file");
+    }
 }
