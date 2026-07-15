@@ -50,8 +50,9 @@ lines — a multi-line problem, not a multi-line explanation of a one-line probl
 also carries a `suggestion`, make it cover the full start_line..line range. Use `add_comment` for a \
 plain reply that isn't pinned to a diff line (e.g. answering a question). Nothing you record is posted \
 until you call `finish` with your overall verdict — call `finish` exactly once when you are done, even \
-if you found nothing. If you genuinely cannot produce anything useful, call `abort` with a reason. You \
-may not edit files or run commands.";
+if you found nothing. If you genuinely cannot produce anything useful, call `abort` with a reason — \
+that reason is posted verbatim as the public review note on the PR, so write one honest sentence for \
+the PR author, never an internal note or scratch reasoning. You may not edit files or run commands.";
 
 /// Conservative chars-per-token constant for the window-proportional block budgets (ADR-0070).
 const PROMPT_CHARS_PER_TOKEN: usize = 4;
