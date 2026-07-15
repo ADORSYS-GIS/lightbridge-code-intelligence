@@ -14,6 +14,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
+use tracing::Instrument;
 
 use crate::AppState;
 use crate::integrations::platform::{CodePlatform, Platform, RepoRef};
@@ -37,11 +38,29 @@ fn detect_platform(headers: &HeaderMap) -> Option<Platform> {
 }
 
 /// Unified webhook receiver. Detects the platform from headers and dispatches.
+///
+/// Ticket #246: this is the ROOT span of the webhook→task→Job→turns→egress trace — the sampling
+/// decision made here (an unparented span; no incoming `traceparent` to continue) is what every
+/// downstream span inherits. A thin wrapper around [`webhook_router_body`] so the span covers every
+/// early return in the body (invalid signature, dup delivery, persistence error, ...) via
+/// `.instrument()`, not just the happy path.
 pub async fn webhook_router(
     State(state): State<AppState>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    let span = tracing::info_span!(
+        "webhook.receive",
+        platform = tracing::field::Empty,
+        event = tracing::field::Empty,
+        delivery_id = tracing::field::Empty,
+    );
+    webhook_router_body(state, headers, body)
+        .instrument(span)
+        .await
+}
+
+async fn webhook_router_body(state: AppState, headers: HeaderMap, body: Bytes) -> Response {
     let platform = match detect_platform(&headers) {
         Some(p) => p,
         None => {
@@ -53,6 +72,7 @@ pub async fn webhook_router(
     };
 
     tracing::info!(%platform, "webhook received");
+    tracing::Span::current().record("platform", tracing::field::display(&platform));
 
     // GitLab needs the payload's `project.id` to select the configured per-project webhook secret.
     // The helper returns the verified payload, making ownership explicit.
@@ -93,12 +113,14 @@ pub async fn webhook_router(
     if delivery_id.is_empty() {
         return (StatusCode::BAD_REQUEST, "missing delivery id").into_response();
     }
+    tracing::Span::current().record("delivery_id", &delivery_id);
 
     // Event type — platform-specific header.
     let event = match platform {
         Platform::GitHub => header(&headers, "x-github-event"),
         Platform::GitLab => header(&headers, "x-gitlab-event"),
     };
+    tracing::Span::current().record("event", &event);
 
     // Parse the payload up front: reject non-JSON bodies (never persist `null`).
     let payload: serde_json::Value = match gitlab_payload {
@@ -442,6 +464,7 @@ async fn handle_gitlab_merge_request(
                 run_epoch: 0,
                 tier: "fast".to_string(),
                 trigger_comment_id: None,
+                trace_context: lci_observability::current_traceparent(),
             };
             create_review_task(pool, task, delivery_id).await;
         }
@@ -654,6 +677,7 @@ async fn handle_gitlab_note(
         run_epoch: 0,
         tier: "deep".to_string(),
         trigger_comment_id,
+        trace_context: lci_observability::current_traceparent(),
     };
     tracing::info!(
         delivery_id,
@@ -790,6 +814,7 @@ async fn handle_pull_request(
                 // ADR-0068: no trigger comment on the automatic review → the lifecycle reactions land on
                 // the PR body itself.
                 trigger_comment_id: None,
+                trace_context: lci_observability::current_traceparent(),
             };
             create_review_task(pool, task, delivery_id).await;
         }
@@ -1008,6 +1033,7 @@ async fn handle_issue_comment(
         // the target is a PR (deep review) or an issue (conversational answer).
         tier: "deep".to_string(),
         trigger_comment_id,
+        trace_context: lci_observability::current_traceparent(),
     };
     tracing::info!(
         delivery_id,
@@ -1021,6 +1047,7 @@ async fn handle_issue_comment(
 /// Insert an **explicit @mention** task (always lands a row, never content-deduped). The auto open path
 /// uses [`create_review_task`] instead, which keeps content-idempotency. No reaction is enqueued here:
 /// ADR-0068 moves 👀 to *work-started* (the dispatcher launching the Job), so receipt no longer reacts.
+#[tracing::instrument(name = "task.create", skip_all, fields(pr = task.target_id))]
 async fn create_explicit_review_task(
     pool: &sqlx::PgPool,
     task: crate::db::NewTask,
@@ -1038,6 +1065,7 @@ async fn create_explicit_review_task(
 
 /// Insert a review task. Shared by the auto-open and manual-mention paths. No reaction is enqueued here:
 /// ADR-0068 moves 👀 to *work-started* (the dispatcher launching the Job), so receipt no longer reacts.
+#[tracing::instrument(name = "task.create", skip_all, fields(pr = task.target_id))]
 async fn create_review_task(pool: &sqlx::PgPool, task: crate::db::NewTask, delivery_id: &str) {
     let (pr, run_epoch) = (task.target_id, task.run_epoch);
     match crate::db::create_task(pool, &task).await {

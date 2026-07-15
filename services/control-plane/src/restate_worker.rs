@@ -419,6 +419,7 @@ mod tests {
             payload: serde_json::json!({ "issue": 1, "content": "eyes" }),
             attempts: 0,
             platform,
+            trace_context: None,
         }
     }
 

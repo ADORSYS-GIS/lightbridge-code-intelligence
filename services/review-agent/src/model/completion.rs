@@ -1,7 +1,8 @@
-//! Per-turn output types: the assembled [`Completion`] the transport returns, its [`Usage`]
-//! breakdown, and the [`TurnTelemetry`] side-channel row recorded per [`ModelClient::complete`] call
-//! (ADR-0034). Kept apart from the transport (`client`/`stream`) and wire (`wire`) modules — these are
-//! the shapes callers actually consume, independent of how the reply was parsed.
+//! Per-turn output types: the assembled [`Completion`] the transport returns and its [`Usage`]
+//! breakdown. Kept apart from the transport (`client`/`stream`) and wire (`wire`) modules — these are
+//! the shapes callers actually consume, independent of how the reply was parsed. Per-turn telemetry
+//! (`lci_agent_types::TurnTelemetry`) rides `AssistantTurn::telemetry` instead of a type here — see
+//! `client.rs`'s `ModelClient` impl.
 
 use lci_agent_clients::ratelimit::RateLimitSnapshot;
 use lci_agent_loop::ChatMessage;
@@ -70,16 +71,4 @@ impl Usage {
             .and_then(|d| d.reasoning_tokens)
             .or(self.reasoning_tokens)
     }
-}
-
-/// One turn's model telemetry captured by `ModelClient::complete` (ADR-0034). The engine's
-/// `AssistantTurn` carries only the model-visible content + tool calls, so the token/reasoning fields
-/// ride this side-channel and are re-joined with the transcript host-side.
-#[derive(Debug, Clone)]
-pub struct TurnTelemetry {
-    pub model: String,
-    pub prompt_tokens: Option<i64>,
-    pub completion_tokens: Option<i64>,
-    pub reasoning_tokens: Option<i64>,
-    pub reasoning: Option<String>,
 }

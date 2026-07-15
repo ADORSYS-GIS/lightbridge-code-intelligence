@@ -847,10 +847,11 @@ fn engine_request<'a>(
     }
 }
 
-// The engine path returns the model-visible `AssistantTurn` and records the turn's token/reasoning
-// telemetry on the side-channel (ADR-0034), keyed positionally to the turn.
+// The engine path returns the model-visible `AssistantTurn` carrying this turn's token/reasoning
+// telemetry ON the turn itself (ADR-0034/ADR-0087) — not a side-channel — so it journals/replays with
+// the turn under `CheckpointRuntime` instead of going missing on a resumed turn (#411/#417).
 #[tokio::test]
-async fn model_client_complete_returns_turn_and_records_telemetry() {
+async fn model_client_complete_returns_turn_with_telemetry_attached() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
@@ -875,7 +876,6 @@ async fn model_client_complete_returns_turn_and_records_telemetry() {
         .await;
 
     let client = ChatClient::new(&format!("{}/v1", server.uri()), "key", "m");
-    let telemetry = client.telemetry_handle();
     let messages = [ChatMessage::user("hi")];
     let tools = [search_tool()];
     let extra = serde_json::Map::new();
@@ -887,17 +887,17 @@ async fn model_client_complete_returns_turn_and_records_telemetry() {
     assert_eq!(turn.tool_calls.len(), 1);
     assert_eq!(turn.tool_calls[0].function.name, "read_file");
 
-    let recorded = telemetry.lock().unwrap();
-    assert_eq!(recorded.len(), 1, "one turn ⇒ one telemetry row");
-    assert_eq!(recorded[0].model, "m");
-    assert_eq!(recorded[0].prompt_tokens, Some(11));
-    assert_eq!(recorded[0].completion_tokens, Some(7));
-    assert_eq!(recorded[0].reasoning_tokens, Some(3));
-    assert_eq!(recorded[0].reasoning.as_deref(), Some("thinking..."));
+    let telemetry = turn.telemetry.expect("telemetry attached to the turn");
+    assert_eq!(telemetry.model, "m");
+    assert_eq!(telemetry.prompt_tokens, Some(11));
+    assert_eq!(telemetry.completion_tokens, Some(7));
+    assert_eq!(telemetry.reasoning_tokens, Some(3));
+    assert_eq!(telemetry.reasoning.as_deref(), Some("thinking..."));
 }
 
 // A deterministic 4xx maps to a TERMINAL StepError with the response body folded into the reason —
-// the exact text the loop's context-overflow detection matches on. No telemetry is recorded.
+// the exact text the loop's context-overflow detection matches on. No turn (and so no telemetry) is
+// ever produced.
 #[tokio::test]
 async fn model_client_maps_deterministic_failure_to_terminal_error_with_body() {
     let server = MockServer::start().await;
@@ -911,7 +911,6 @@ async fn model_client_maps_deterministic_failure_to_terminal_error_with_body() {
         .await;
 
     let client = ChatClient::new(&format!("{}/v1", server.uri()), "key", "m");
-    let telemetry = client.telemetry_handle();
     let messages = [ChatMessage::user("hi")];
     let extra = serde_json::Map::new();
     let err = ModelClient::complete(&client, engine_request(&messages, &[], &extra))
@@ -921,10 +920,6 @@ async fn model_client_maps_deterministic_failure_to_terminal_error_with_body() {
     assert!(
         err.to_string().to_lowercase().contains("context length"),
         "body folded into the terminal reason for overflow detection: {err}"
-    );
-    assert!(
-        telemetry.lock().unwrap().is_empty(),
-        "a failed turn records no telemetry"
     );
 }
 

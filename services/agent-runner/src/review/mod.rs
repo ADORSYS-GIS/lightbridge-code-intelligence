@@ -82,11 +82,14 @@ fn durable_replay_enabled() -> bool {
 
 /// A [`TranscriptSink`] that captures the loop's events so the host can reconstruct the ADR-0034
 /// transcript afterwards (even on error). Cloneable handle: grab a clone before boxing it into the
-/// loop, read [`entries`](Self::entries) once the run returns.
+/// loop, then lock `.0` directly to read the events once the run returns — cloning the whole
+/// (possibly still-growing) transcript via [`entries`](Self::entries) is test-only; production reads
+/// hold the lock in place instead (the live status poller ticks every second on it).
 #[derive(Clone, Default)]
 struct JobSink(Arc<Mutex<Vec<TranscriptEvent>>>);
 
 impl JobSink {
+    #[cfg(test)]
     fn entries(&self) -> Vec<TranscriptEvent> {
         // Recover from a poisoned mutex instead of panicking (consistent with `StatusHandle::with`
         // and the telemetry mutex below): a panic elsewhere holding this lock must not also crash
@@ -248,7 +251,6 @@ pub async fn run_native_agent(
     // ── Drive the loop, capturing the transcript even on error ───────────────────────────────────
     let sink = JobSink::default();
     let sink_handle = sink.clone();
-    let telemetry_handle = chat.telemetry_handle();
     // Live status projection (RFC-0007 slice 5): when the status API is on, tee the loop's events into
     // the shared status handle (turn / current tool / findings) via a `StatusSink` that forwards every
     // event UNCHANGED to `JobSink` — so the transcript reconstructed below is byte-identical whether or
@@ -261,12 +263,13 @@ pub async fn run_native_agent(
         )),
         None => Box::new(sink),
     };
-    // Token usage is NOT in the transcript events, so feed it from the model telemetry side-channel:
-    // a lightweight poller mirrors the running totals into the status handle while the loop runs, so
-    // "tokens so far" is live. Spawned only when the status API is on; aborted right after the loop.
+    // Each `Assistant` sink event carries its own turn's telemetry (ADR-0087: on the `AssistantTurn`
+    // itself, not a side-channel — #411/#417), so a lightweight poller sums it straight off
+    // `sink_handle` to mirror "tokens so far" into the status handle while the loop runs. Spawned only
+    // when the status API is on; aborted right after the loop.
     let usage_poller = status.map(|handle| {
         let handle = handle.clone();
-        let telemetry_handle = telemetry_handle.clone();
+        let sink_handle = sink_handle.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_secs(1));
             // After a stall don't fire a burst of catch-up ticks — one usage mirror per second is
@@ -274,10 +277,10 @@ pub async fn run_native_agent(
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 tick.tick().await;
-                // Recover from a poisoned mutex instead of panicking (consistent with
-                // `StatusHandle::with`): a panic elsewhere holding this lock must not also kill the
-                // best-effort usage poller — the totals it reads are advisory telemetry.
-                let guard = telemetry_handle
+                // Lock and read in place rather than `entries()` — this ticks every second for the
+                // life of the run, so cloning the whole (growing) transcript each time is wasteful.
+                let guard = sink_handle
+                    .0
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 let (prompt, completion) = telemetry::sum_usage(&guard);
@@ -323,29 +326,21 @@ pub async fn run_native_agent(
     if let Some(poller) = usage_poller {
         poller.abort();
     }
+    // One lock for both reads below instead of `entries()` cloning the whole transcript twice.
+    let final_events = sink_handle
+        .0
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     if let Some(handle) = status {
-        // Recover from a poisoned mutex instead of panicking (consistent with `StatusHandle::with`
-        // and the usage poller above): a panic elsewhere holding this lock must not also crash the
-        // final usage snapshot.
-        let (prompt, completion) = telemetry::sum_usage(
-            &telemetry_handle
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()),
-        );
+        let (prompt, completion) = telemetry::sum_usage(&final_events);
         handle.observe_usage(prompt, completion);
     }
 
-    // Reconstruct the ADR-0034 transcript from the sink events + the model client's per-turn telemetry
-    // side-channel BEFORE propagating any loop error, so the caller still submits a failed run's
-    // reasoning.
-    transcript::append_transcript(
-        transcript,
-        &sink_handle.entries(),
-        &telemetry_handle
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()),
-        task_id,
-    );
+    // Reconstruct the ADR-0034 transcript from the sink events BEFORE propagating any loop error, so
+    // the caller still submits a failed run's reasoning. Each `Assistant` event carries its own
+    // telemetry (ADR-0087) — no separate side-channel to zip against.
+    transcript::append_transcript(transcript, &final_events, task_id);
+    drop(final_events);
 
     Ok(match outcome? {
         LoopOutcome::Finished => ReviewOutcome::Finished,
@@ -357,7 +352,6 @@ pub async fn run_native_agent(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lci_review_agent::model::TurnTelemetry;
 
     /// Panic while holding `mutex`'s lock, on a background thread, then join it (discarding the
     /// panic) — leaves the mutex poisoned exactly as a real panic-while-locked would.
@@ -391,27 +385,5 @@ mod tests {
         });
         let entries = sink.entries();
         assert_eq!(entries.len(), 2);
-    }
-
-    #[test]
-    fn telemetry_mutex_recovers_from_a_poisoned_mutex() {
-        let telemetry_handle: Arc<Mutex<Vec<TurnTelemetry>>> =
-            Arc::new(Mutex::new(vec![TurnTelemetry {
-                model: "test-model".to_string(),
-                prompt_tokens: Some(10),
-                completion_tokens: Some(5),
-                reasoning_tokens: None,
-                reasoning: None,
-            }]));
-
-        poison(&telemetry_handle);
-
-        // Same recovery pattern used in `run_native_agent`: `lock()` on a poisoned mutex must still
-        // yield the guard (via `unwrap_or_else(PoisonError::into_inner)`), not panic.
-        let guard = telemetry_handle
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let (prompt, completion) = telemetry::sum_usage(&guard);
-        assert_eq!((prompt, completion), (10, 5));
     }
 }

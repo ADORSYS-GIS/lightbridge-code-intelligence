@@ -2,8 +2,8 @@
 //! and summing the model client's per-turn token telemetry for the live status projection.
 
 use lci_agent_clients::ControlPlaneClient;
+use lci_agent_loop::TranscriptEvent;
 use lci_agent_types::ToolSpec;
-use lci_review_agent::model::TurnTelemetry;
 use lci_review_agent::tools::MCP_TOOL_PREFIX;
 use uuid::Uuid;
 
@@ -57,18 +57,80 @@ pub(crate) async fn submit_run_start_telemetry(
     }
 }
 
-/// Sum the running (prompt, completion) token totals across the per-turn telemetry for the live status
-/// projection (RFC-0007 slice 5). Tokens are not carried in the transcript events, so they come from the
-/// model client's telemetry side-channel. A negative/absent count clamps to `0` — a status metric must
-/// never be a nonsense number.
-pub(crate) fn sum_usage(telemetry: &[TurnTelemetry]) -> (u64, u64) {
+/// Sum the running (prompt, completion) token totals across the loop's sink events so far, for the
+/// live status projection (RFC-0007 slice 5). Each `Assistant` event carries its own turn's telemetry
+/// (ADR-0087: on the turn, not a side-channel — see `transcript::append_transcript`), so this reads
+/// directly off the events already being recorded. A negative/absent count clamps to `0` — a status
+/// metric must never be a nonsense number.
+pub(crate) fn sum_usage(events: &[TranscriptEvent]) -> (u64, u64) {
     let clamp = |value: Option<i64>| u64::try_from(value.unwrap_or(0).max(0)).unwrap_or(0);
-    telemetry
+    events
         .iter()
+        .filter_map(|event| match event {
+            TranscriptEvent::Assistant { telemetry, .. } => telemetry.as_ref(),
+            _ => None,
+        })
         .fold((0, 0), |(prompt, completion), entry| {
             (
                 prompt + clamp(entry.prompt_tokens),
                 completion + clamp(entry.completion_tokens),
             )
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use lci_agent_loop::ChatMessage;
+    use lci_agent_types::{AssistantTurn, TurnTelemetry};
+
+    use super::*;
+
+    fn assistant_event(turn: usize, telemetry: Option<TurnTelemetry>) -> TranscriptEvent {
+        TranscriptEvent::Assistant {
+            turn,
+            message: ChatMessage::assistant(AssistantTurn::default()),
+            telemetry,
+        }
+    }
+
+    fn telemetry(prompt_tokens: Option<i64>, completion_tokens: Option<i64>) -> TurnTelemetry {
+        TurnTelemetry {
+            model: "m".into(),
+            prompt_tokens,
+            completion_tokens,
+            reasoning_tokens: None,
+            reasoning: None,
+        }
+    }
+
+    #[test]
+    fn sums_prompt_and_completion_tokens_across_assistant_events() {
+        let events = vec![
+            assistant_event(0, Some(telemetry(Some(10), Some(5)))),
+            assistant_event(1, Some(telemetry(Some(7), Some(3)))),
+        ];
+        assert_eq!(sum_usage(&events), (17, 8));
+    }
+
+    #[test]
+    fn ignores_non_assistant_events_and_turns_with_no_telemetry() {
+        // A replayed turn (ADR-0087 `CheckpointRuntime`) or one whose model client reported no usage
+        // carries `telemetry: None` — it must be skipped, not treated as a zero that still counts.
+        let events = vec![
+            assistant_event(0, Some(telemetry(Some(10), Some(5)))),
+            assistant_event(1, None),
+            TranscriptEvent::Policy {
+                turn: 1,
+                name: "wind_down",
+                detail: serde_json::json!({}),
+            },
+        ];
+        assert_eq!(sum_usage(&events), (10, 5));
+    }
+
+    #[test]
+    fn clamps_negative_or_absent_counts_to_zero() {
+        let events = vec![assistant_event(0, Some(telemetry(Some(-5), None)))];
+        assert_eq!(sum_usage(&events), (0, 0));
+    }
 }

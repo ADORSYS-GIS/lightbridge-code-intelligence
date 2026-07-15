@@ -1,6 +1,6 @@
 //! Loop outcome and transcript recording seam.
 
-use lci_agent_types::{ToolCallReq, ToolOutcome};
+use lci_agent_types::{ToolCallReq, ToolOutcome, TurnTelemetry};
 use serde::{Deserialize, Serialize};
 
 use crate::chat::ChatMessage;
@@ -20,6 +20,11 @@ pub enum TranscriptEvent {
     Assistant {
         turn: usize,
         message: ChatMessage,
+        /// This turn's model telemetry (tokens/reasoning), `None` when the model client didn't
+        /// report any. Carried alongside `message` (never inside it — `ChatMessage` is what gets
+        /// echoed back to the model) so a durable-replay host can journal/restore it with the turn.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        telemetry: Option<TurnTelemetry>,
     },
     Tool {
         turn: usize,

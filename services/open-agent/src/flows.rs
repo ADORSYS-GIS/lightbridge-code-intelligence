@@ -90,6 +90,7 @@ mod tests {
                 },
                 extra_content: None,
             }],
+            ..Default::default()
         }
     }
 

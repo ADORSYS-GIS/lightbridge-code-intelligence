@@ -86,6 +86,7 @@ fn call_turn(id: &str, name: &str, arguments: &str) -> AssistantTurn {
             },
             extra_content: None,
         }],
+        ..Default::default()
     }
 }
 

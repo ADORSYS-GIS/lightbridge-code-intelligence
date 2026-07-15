@@ -60,7 +60,6 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use metrics_exporter_prometheus::PrometheusHandle;
 use sqlx::PgPool;
-use tracing_subscriber::EnvFilter;
 
 use jwt::JwtValidator;
 // Bring the grouped modules into scope under their bare names. `crate::` is required to
@@ -535,28 +534,16 @@ async fn readiness(State(state): State<AppState>) -> impl IntoResponse {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .json()
-        .init();
-
-    // Pin the process-default rustls crypto provider before anything builds a TLS client. This
-    // workspace links *two* providers — `ring` (via sqlx's `tls-rustls-ring-webpki`) and `aws-lc-rs`
-    // (pulled transitively by `rmcp` → reqwest 0.13 → rustls-platform-verifier) — and with both
-    // present rustls 0.23 can't auto-select a default and panics on the first handshake ("Could not
-    // automatically determine the process-level CryptoProvider"). That bit the `dispatcher` role at
-    // startup when it builds its kube client. Installing one explicitly makes selection deterministic
-    // regardless of which provider features the dependency graph enables. `ring` matches sqlx's
-    // pinned choice and is always present (Postgres core). Idempotent: a benign `Err` means a
-    // provider is already installed (e.g. a re-entrant test), which we leave in place.
-    if rustls::crypto::ring::default_provider()
-        .install_default()
-        .is_err()
-    {
-        tracing::warn!("a rustls CryptoProvider was already installed; keeping the existing one");
-    }
+    // Pin the process-default rustls crypto provider before anything builds a TLS client — including
+    // the OTel OTLP exporter's own client, set up below. This workspace links *two* providers — `ring`
+    // (via sqlx's `tls-rustls-ring-webpki`) and `aws-lc-rs` (pulled transitively by `rmcp` → reqwest
+    // 0.13 → rustls-platform-verifier) — and with both present rustls 0.23 can't auto-select a default
+    // and panics on the first handshake ("Could not automatically determine the process-level
+    // CryptoProvider"). That bit the `dispatcher` role at startup when it builds its kube client.
+    // Installing one explicitly makes selection deterministic regardless of which provider features the
+    // dependency graph enables. Shared with `agent-runner` via `lci-observability` (ticket #246) so
+    // there's one audited call site instead of two independently-maintained copies.
+    lci_observability::install_default_crypto_provider();
 
     // One binary, several roles (RFC-0001): `serve` (HTTP) and `dispatcher` (queue consumer),
     // selected by the first CLI arg or `CONTROL_PLANE_ROLE`. Deployed as separate Deployments off
@@ -572,17 +559,24 @@ async fn main() -> anyhow::Result<()> {
         .or_else(|| std::env::var("CONTROL_PLANE_ROLE").ok())
         .unwrap_or_else(|| "serve".to_string());
 
+    // Tracing/OTel init (ticket #246), after role resolution so `service.name` is role-aware
+    // (`control-plane-serve`, `control-plane-dispatcher`, ...) — Tempo's service list otherwise can't
+    // tell the roles apart. Still before anything that could emit a log line worth correlating.
+    let otel_guard = lci_observability::init_tracing(&format!("control-plane-{role}"));
+
     // `mint-runner-token` is a local-dev/ops utility (ADR-0092), not a long-running role: it prints one
     // token to stdout and exits. It needs only `RUNNER_TOKEN_SIGNING_KEY` from env, so it's handled
     // before `AppState::from_env()` (which would otherwise require a database). Without it, running the
     // agent-runner manually (docs/local-setup.md) has no way to obtain a token now that the internal API
     // rejects anything but a validly-signed, task-scoped one — there is no shared dev bearer anymore.
     if role == "mint-runner-token" {
-        return mint_runner_token_cli();
+        let result = mint_runner_token_cli();
+        otel_guard.shutdown().await;
+        return result;
     }
 
     let state = AppState::from_env().await?;
-    match role.as_str() {
+    let result = match role.as_str() {
         "serve" => serve(state).await,
         "dispatcher" => run_dispatcher(state).await,
         // `poller` is the legacy alias for `reconciler` (ADR-0058); accept both so the binary and the
@@ -598,7 +592,13 @@ async fn main() -> anyhow::Result<()> {
         other => anyhow::bail!(
             "unknown role {other:?} (expected: serve | dispatcher | reconciler | restate-worker | a2a | notifier | replay | mint-runner-token [| poller])"
         ),
-    }
+    };
+    // Flush any still-batched spans before exit — covers every role's graceful (SIGTERM-triggered)
+    // shutdown path. A SIGKILL loses at most one batch-export interval, not the whole trace, since the
+    // batch processor also flushes periodically on its own; that residual gap is an accepted tradeoff,
+    // not engineered around.
+    otel_guard.shutdown().await;
+    result
 }
 
 /// `control-plane mint-runner-token <task-id>` — mint one per-task runner token from

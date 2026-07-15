@@ -34,6 +34,11 @@ enum Task {
     ValidateSchema,
     /// Check dependency hygiene across the workspace.
     DependencyHygiene,
+    /// Deep-tier review repeat-run severity/anchor variance tooling (issue #420).
+    ReviewVariance {
+        #[command(subcommand)]
+        action: commands::review_variance::Action,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -46,6 +51,7 @@ fn main() -> anyhow::Result<()> {
         Some(Task::Test) => commands::test::test(),
         Some(Task::ValidateSchema) => commands::schema::validate_schema(),
         Some(Task::DependencyHygiene) => commands::dependency_hygiene::dependency_hygiene(),
+        Some(Task::ReviewVariance { action }) => commands::review_variance::run(action),
         None => {
             Cli::parse_from(["xtask", "--help"]);
             Ok(())
