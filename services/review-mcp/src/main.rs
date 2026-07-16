@@ -20,6 +20,7 @@
 //!   LCI_MCP_EMBED_URL, LCI_MCP_EMBED_KEY, LCI_MCP_EMBED_MODEL
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use lci_agent_clients::{ControlPlaneClient, EmbeddingsClient};
@@ -29,8 +30,12 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use uuid::Uuid;
 
+/// Read a required env var, trimmed — a stray newline/space (e.g. from a here-doc or a k8s
+/// `stringData` value) must not break a UUID/URL parse downstream.
 fn env(key: &str) -> Result<String> {
-    std::env::var(key).with_context(|| format!("required env var {key} is not set"))
+    std::env::var(key)
+        .map(|value| value.trim().to_string())
+        .with_context(|| format!("required env var {key} is not set"))
 }
 
 fn build_tools() -> Result<Tools> {
@@ -119,9 +124,26 @@ async fn handle(tools: &Tools, req: &Value) -> Option<Value> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let tools = build_tools().context("initializing lci-review-mcp")?;
+    let tools = Arc::new(build_tools().context("initializing lci-review-mcp")?);
+
+    // Each request runs in its own task so batched tool calls (the review does parallel read-only
+    // tool batching, ADR-0042) don't serialize behind each other; a single writer task owns stdout
+    // so the concurrent responses never interleave. JSON-RPC correlates by `id`, so out-of-order
+    // responses are fine.
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let writer = tokio::spawn(async move {
+        let mut stdout = tokio::io::stdout();
+        while let Some(line) = rx.recv().await {
+            if stdout.write_all(line.as_bytes()).await.is_err()
+                || stdout.write_all(b"\n").await.is_err()
+                || stdout.flush().await.is_err()
+            {
+                break;
+            }
+        }
+    });
+
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
-    let mut stdout = tokio::io::stdout();
     while let Some(line) = lines.next_line().await? {
         if line.trim().is_empty() {
             continue;
@@ -129,14 +151,18 @@ async fn main() -> Result<()> {
         let Ok(req) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
-        if let Some(resp) = handle(&tools, &req).await {
-            stdout
-                .write_all(serde_json::to_string(&resp)?.as_bytes())
-                .await?;
-            stdout.write_all(b"\n").await?;
-            stdout.flush().await?;
-        }
+        let tools = Arc::clone(&tools);
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            if let Some(resp) = handle(&tools, &req).await
+                && let Ok(line) = serde_json::to_string(&resp)
+            {
+                let _ = tx.send(line);
+            }
+        });
     }
+    drop(tx); // close the channel so the writer drains and exits after stdin EOF
+    let _ = writer.await;
     Ok(())
 }
 
