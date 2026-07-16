@@ -114,8 +114,11 @@ flowchart LR
   ([ADR-0092](../adr/0092-per-task-runner-tokens.md)). No forge creds, no DB, no cluster identity.
   `propose_pr` still hands a patch to the egress plane; nothing agent-side pushes.
 - **A per-mode OpenCode config** (`integrations/opencode/config/`) defines the primary agent, its
-  **subagents** (research, capture/scribe, …), tool permissions (e.g. `edit`/`bash` denied for
-  review-shaped agents, allowed for `open`), and the plugin list.
+  **subagents**, tool permissions, and the plugin list. The agent/subagent split is organized by
+  **capability tier, not by role**: one primary owns every write + terminal tool, and subagents are
+  least-privilege read-only helpers for context isolation (the open mode starts with a single
+  `explore`). Terminal/write tools are denied on subagents via the per-agent `tools` map so the
+  gate-interlock and recorder always see them on the primary.
 - **Two first-party plugins** under `integrations/opencode/plugins/*` carry the properties we
   refuse to lose: the **recorder** (full-fidelity tool args/results + reasoning parts → JSONL →
   the ADR-0034 transcript store) and the **gate-interlock** (terminal tool blocked until gate

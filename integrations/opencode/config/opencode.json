@@ -1,14 +1,13 @@
 {
   "$schema": "https://opencode.ai/config.json",
-  "//": "Rendered per task by the agent-plane supervisor: {env:*} placeholders are filled from the task env; the plugin entries resolve to the vendored integrations/opencode/plugins/* packages (loading mechanics = RFC-0009 probe item). This file is the `open`-mode shape; other modes get their own rendering.",
+  "//": "Open-mode OpenCode config, rendered per task by the agent-plane supervisor ({env:*} filled from the task env). Structure = capability tiers, NOT role-play: ONE primary (`lci-open`) owns every write + both terminal tools (propose_pr/abort); subagents are least-privilege READ-ONLY helpers for context isolation. The terminal path is primary-only on purpose — the gate-interlock and recorder plugins key off the primary's terminal call, so a subagent must never be able to reach it. Other modes get their own rendering.",
   "plugin": [
     "@lightbridge/opencode-plugin-recorder",
     "@lightbridge/opencode-plugin-gate-interlock",
     "@lightbridge/opencode-plugin-logger"
   ],
   "permission": {
-    "edit": "allow",
-    "bash": "allow",
+    "//": "Global invariant for every agent in open mode: no direct web egress (defense-in-depth over the ADR-0088 network allowlist). edit/bash are decided per-agent below, not here — so this baseline is NOT a duplicate of the primary's block.",
     "webfetch": "deny"
   },
   "mcp": {
@@ -23,7 +22,8 @@
   },
   "agent": {
     "lci-open": {
-      "description": "Lightbridge open mode: reads the ticket, investigates, edits, builds and tests in the sandbox, then proposes a PR via the mediated lightbridge_propose_pr tool. Never pushes, never merges.",
+      "mode": "primary",
+      "description": "Lightbridge open mode: reads the ticket, investigates (delegating read-heavy digs to @explore), edits and builds/tests in the sandbox, then proposes a PR via the mediated lightbridge_propose_pr tool. Never pushes, never merges. The only agent that may write or call a terminal tool.",
       "prompt": "{file:./prompts/open.md}",
       "permission": {
         "edit": "allow",
@@ -31,22 +31,19 @@
         "webfetch": "deny"
       }
     },
-    "research": {
+    "explore": {
       "mode": "subagent",
-      "description": "Read-only investigation: navigate the checkout and the Lightbridge retrieval tools (semantic + graph search) to answer a focused question. Returns findings with file:line evidence; makes no edits and runs no commands.",
+      "description": "Read-only investigation & localization — customizes OpenCode's built-in `explore`. Use it to answer a focused codebase question (where does X live, how is this pattern implemented, who calls this symbol) via read/grep/glob + the Lightbridge retrieval tools (semantic + graph search). It burns its own context window and hands back a distilled answer with file:line evidence, keeping the primary lean. Cannot edit, run commands, fetch the web, or propose a PR.",
       "permission": {
         "edit": "deny",
         "bash": "deny",
         "webfetch": "deny"
-      }
-    },
-    "capture": {
-      "mode": "subagent",
-      "description": "Capture and structure context for the record: summarize decisions, evidence, and verification results into the structured payloads the mediated Lightbridge tools expect (findings, progress reports, PR body with the AI-usage declaration).",
-      "permission": {
-        "edit": "deny",
-        "bash": "deny",
-        "webfetch": "deny"
+      },
+      "tools": {
+        "//": "Deny the mediated write/terminal tools by name — the permission block above can only gate edit/bash/webfetch, so this map is what actually keeps propose_pr/abort off a subagent. Retrieval + read tools stay enabled (unlisted = allowed). Tool names carry the `lightbridge` MCP-server prefix; finalized when the control-plane MCP surface lands.",
+        "lightbridge_propose_pr": false,
+        "lightbridge_abort": false,
+        "lightbridge_submit_findings": false
       }
     }
   }

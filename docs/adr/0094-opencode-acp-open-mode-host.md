@@ -103,8 +103,15 @@ ADR gated on the RFC-0009 Phase-2 eval harness — this ADR decides `open` only.
   the engineering surface shrinks to a supervisor, a config, and two plugins.
 - **Good:** production evidence for the RFC-0009 direction accrues on a surface where a bad day
   costs a throwaway pod and a rejected PR, not review reputation.
-- **Good:** subagents (research, capture, …) and the TypeScript plugin ecosystem
-  (`vymalo/opencode-oauth2` lineage) come for free.
+- **Good:** subagents and the TypeScript plugin ecosystem (`vymalo/opencode-oauth2` lineage) come
+  for free. The subagent structure is **capability tiers, not role-play**: one primary owns every
+  write and both terminal tools (`propose_pr`/`abort`), and subagents are least-privilege read-only
+  helpers for context isolation — starting with a single `explore` (customizing OpenCode's built-in)
+  and adding more (e.g. a bash-only `verify` test-runner) on demonstrated need, not speculatively.
+  The terminal path stays primary-only by construction so the gate-interlock and recorder
+  ([ADR-0095](0095-opencode-plugins-recording-and-gates.md)) can key off it — enforced via the
+  per-agent `tools` map, since a subagent's tool calls are unrecorded until RFC-0009 probe item (d)
+  proves otherwise.
 - **Bad / accepted:** Bun in the `open` image; OpenCode version pinning + probe re-run per upgrade
   becomes an operational chore; a loop bug upstream is a wait-or-plugin, not a same-day Rust fix.
 - **Bad / accepted:** a long `open` run that crashes re-reasons from zero (restart-on-failure).
