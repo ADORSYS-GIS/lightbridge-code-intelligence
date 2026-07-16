@@ -14,8 +14,8 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::tools::{
-    ABORT, ADD_COMMENT, ADD_REVIEW_COMMENT, FINISH, GRAPH_FIND_SYMBOL, GRAPH_GET_CALLERS, READ_FILE,
-    REPORT_PROGRESS, RETRACT_FINDING, RUN_SAST, VECTOR_SEMANTIC_SEARCH,
+    ABORT, ADD_COMMENT, ADD_REVIEW_COMMENT, FINISH, GRAPH_FIND_SYMBOL, GRAPH_GET_CALLERS,
+    READ_FILE, REPORT_PROGRESS, RETRACT_FINDING, RUN_SAST, VECTOR_SEMANTIC_SEARCH,
 };
 
 /// Every review tool the gates key on, by its native canonical name. OpenCode exposes each mediated
@@ -175,7 +175,9 @@ pub fn cycle_turn_outcome(events: &[RecorderEvent]) -> TurnOutcome {
     let mut abort_reason = None;
     let mut results = Vec::with_capacity(pending.len());
     for call in pending {
-        let name = call.name.map_or_else(|| call.raw_name.clone(), str::to_string);
+        let name = call
+            .name
+            .map_or_else(|| call.raw_name.clone(), str::to_string);
         let arguments = if call.args.is_null() {
             "{}".to_string()
         } else {
@@ -228,7 +230,10 @@ mod tests {
     #[test]
     fn normalizes_prefixed_and_self_prefixed_tool_ids() {
         // A bare native name gets the server prefix.
-        assert_eq!(normalize_tool_name("lightbridge_read_file"), Some(READ_FILE));
+        assert_eq!(
+            normalize_tool_name("lightbridge_read_file"),
+            Some(READ_FILE)
+        );
         assert_eq!(normalize_tool_name("lightbridge_finish"), Some(FINISH));
         // A name already `lightbridge_`-prefixed natively → server double-prefix; strip one, match.
         assert_eq!(

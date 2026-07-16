@@ -6,7 +6,9 @@
 //! `after_turn_actions`. Only the *finish-time* gates live here — the per-turn budget/wind-down
 //! policies are OpenCode's own loop concern (see the module doc).
 
-use lci_agent_loop::{ChatMessage, LoopStats, Nudge, PolicyAction, TurnOutcome, TurnPolicy, TurnState};
+use lci_agent_loop::{
+    ChatMessage, LoopStats, Nudge, PolicyAction, TurnOutcome, TurnPolicy, TurnState,
+};
 use lci_agent_types::ToolSpec;
 
 use crate::policies::{CoverageGate, CoverageState, RefuteGate};
