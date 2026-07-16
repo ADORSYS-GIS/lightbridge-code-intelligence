@@ -319,7 +319,8 @@ async fn run(
         &context,
         &checkout,
         client,
-        &embedder,
+        config,
+        embeddings_config,
         &attribution,
         config.task_id,
         status.as_ref(),
@@ -420,15 +421,21 @@ async fn perform_indexing(
 async fn perform_review(
     is_index: bool,
     review_configs: &ReviewConfigs,
+    // ⚠️ SLICE-5 PARITY GAP (flagged, shadow-caught): the OpenCode host does not yet offer the
+    // `run_sast` tool (ADR-0073), so SAST findings are absent — they surface as only-native in the
+    // shadow, correctly blocking go-live until SAST is wired into `lci-review-mcp`. Kept in the
+    // signature so re-adding it is a one-line change, not a re-plumb.
     sast_config: Option<&SastConfig>,
     context: &TaskContext,
     checkout: &Path,
     client: &ControlPlaneClient,
-    embedder: &EmbeddingsClient,
+    config: &RunnerConfig,
+    embeddings_config: &EmbeddingsConfig,
     attribution: &[(String, String)],
     task_id: Uuid,
     status: Option<&StatusHandle>,
 ) -> anyhow::Result<(String, Option<String>)> {
+    let _ = sast_config; // parity gap above; referenced so intent is explicit.
     let Some(review) = (!is_index)
         .then(|| review_configs.for_tier(&context.tier))
         .flatten()
@@ -447,21 +454,30 @@ async fn perform_review(
     if let Some(status) = status {
         status.set_phase(Phase::Reviewing);
     }
-    let outcome = review::run_native_agent(
+    // ── The review runs on OpenCode (ADR-0097 slice 5 hard cutover) ──────────────────────────────
+    // The supervisor spawns `opencode acp`, reuses the tuned coverage/refute gates + mediated tools,
+    // and returns the same `ReviewOutcome` the native host did — so `finalize_review_outcome` below is
+    // unchanged. `run_native_agent` remains in the tree (retired on this merge, removed in a follow-up).
+    let mcp_env = review::opencode::McpEnv {
+        control_plane_url: &config.control_plane_url,
+        runner_token: &config.runner_token,
+        checkout_root: checkout,
+        embed_url: &embeddings_config.base_url,
+        embed_key: &embeddings_config.api_key,
+        embed_model: &embeddings_config.model,
+    };
+    let outcome = review::opencode::run_opencode_agent(
         review,
         &context.command,
         diff.as_ref(),
         repo_instructions.as_deref(),
         context.prior_reviews.as_deref(),
         context.repo_memory.as_deref(),
-        sast_config,
         attribution,
-        client,
-        embedder,
+        &mcp_env,
         task_id,
-        checkout,
+        client,
         &mut transcript,
-        status,
     )
     .await;
     if let Some(status) = status {

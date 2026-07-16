@@ -117,6 +117,9 @@ pub async fn run_opencode_agent(
     repo_instructions: Option<&str>,
     prior_reviews: Option<&str>,
     repo_memory: Option<&str>,
+    // Per-project billing attribution headers (epic #89) — forwarded to the eaig provider so
+    // OpenCode-hosted review bills the same as native.
+    attribution: &[(String, String)],
     mcp_env: &McpEnv<'_>,
     task_id: Uuid,
     client: &ControlPlaneClient,
@@ -154,7 +157,7 @@ pub async fn run_opencode_agent(
         .join("\n\n");
 
     // ── Render + write the config, and pick the recorder path ───────────────────────────────────
-    let config = render_review_config(&system_prompt, review.fast, review.temperature);
+    let config = render_review_config(&system_prompt, review.fast, review.temperature, attribution);
     let workdir = std::env::temp_dir().join(format!("lci-opencode-review-{task_id}"));
     tokio::fs::create_dir_all(&workdir)
         .await

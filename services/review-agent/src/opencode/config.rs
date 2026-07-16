@@ -56,8 +56,16 @@ const DISABLED_BUILTINS: &[&str] = &[
 /// reviewer guidance from [`crate::flows`]/`ReviewConfig`; `fast` selects the tier (deep enables the
 /// reasoning model per ADR-0069, fast does not); `temperature` is passed through to the provider when
 /// set (a best-effort — fine sampling params don't all map 1:1 once OpenCode owns the loop).
+/// `attribution` is the per-project billing header set (epic #89) — forwarded on every provider request
+/// via the openai-compatible provider's `headers` option, so OpenCode-hosted review bills the same as
+/// the native loop.
 #[must_use]
-pub fn render_review_config(system_prompt: &str, fast: bool, temperature: Option<f64>) -> Value {
+pub fn render_review_config(
+    system_prompt: &str,
+    fast: bool,
+    temperature: Option<f64>,
+    attribution: &[(String, String)],
+) -> Value {
     let mut model_options = json!({});
     if let Some(temperature) = temperature {
         model_options["temperature"] = json!(temperature);
@@ -68,6 +76,11 @@ pub fn render_review_config(system_prompt: &str, fast: bool, temperature: Option
         .map(|name| ((*name).to_string(), json!(false)))
         .collect();
 
+    let headers: serde_json::Map<String, Value> = attribution
+        .iter()
+        .map(|(key, value)| (key.clone(), json!(value)))
+        .collect();
+
     json!({
         "$schema": "https://opencode.ai/config.json",
         "provider": {
@@ -76,7 +89,9 @@ pub fn render_review_config(system_prompt: &str, fast: bool, temperature: Option
                 "name": "eaig",
                 "options": {
                     "baseURL": "{env:LCI_EAIG_BASE_URL}",
-                    "apiKey": "{env:LCI_EAIG_API_KEY}"
+                    "apiKey": "{env:LCI_EAIG_API_KEY}",
+                    // Per-project billing attribution (epic #89) — forwarded on every provider request.
+                    "headers": headers
                 },
                 "models": {
                     "reviewer": {
@@ -133,7 +148,7 @@ mod tests {
 
     #[test]
     fn wires_stdio_review_mcp_and_embeds_the_prompt() {
-        let config = render_review_config("be a careful reviewer", false, None);
+        let config = render_review_config("be a careful reviewer", false, None, &[]);
         assert_eq!(config["mcp"]["lightbridge"]["type"], "local");
         assert_eq!(config["mcp"]["lightbridge"]["command"][0], "lci-review-mcp");
         assert_eq!(config["agent"]["review"]["prompt"], "be a careful reviewer");
@@ -147,7 +162,7 @@ mod tests {
 
     #[test]
     fn disables_builtin_file_and_exec_tools_at_top_level_for_mediated_coverage() {
-        let config = render_review_config("p", false, None);
+        let config = render_review_config("p", false, None, &[]);
         // TOP-LEVEL, not per-agent (opencode-over-ACP runs its default `build` agent, so a per-agent
         // block is ignored — proven by the agent-runner e2e's advertised-tools assertion). Every
         // built-in that could read the tree off the mediated path is off, so all reads flow through
@@ -177,8 +192,8 @@ mod tests {
 
     #[test]
     fn deep_tier_enables_reasoning_fast_does_not() {
-        let deep = render_review_config("p", false, None);
-        let fast = render_review_config("p", true, None);
+        let deep = render_review_config("p", false, None, &[]);
+        let fast = render_review_config("p", true, None, &[]);
         assert_eq!(
             deep["provider"]["eaig"]["models"]["reviewer"]["reasoning"],
             true
@@ -190,9 +205,26 @@ mod tests {
     }
 
     #[test]
+    fn forwards_attribution_as_provider_headers() {
+        let config = render_review_config(
+            "p",
+            false,
+            None,
+            &[("x-project".to_string(), "acme".to_string())],
+        );
+        assert_eq!(
+            config["provider"]["eaig"]["options"]["headers"]["x-project"],
+            "acme"
+        );
+        // Empty attribution → empty headers object, never missing.
+        let none = render_review_config("p", false, None, &[]);
+        assert!(none["provider"]["eaig"]["options"]["headers"].is_object());
+    }
+
+    #[test]
     fn threads_temperature_only_when_set() {
-        let with = render_review_config("p", false, Some(0.2));
-        let without = render_review_config("p", false, None);
+        let with = render_review_config("p", false, Some(0.2), &[]);
+        let without = render_review_config("p", false, None, &[]);
         assert_eq!(
             with["provider"]["eaig"]["models"]["reviewer"]["options"]["temperature"],
             0.2

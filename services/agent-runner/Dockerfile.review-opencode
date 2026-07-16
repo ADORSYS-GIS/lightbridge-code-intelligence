@@ -1,0 +1,72 @@
+# Lightbridge review-on-OpenCode image (ADR-0097 slice 5). Assembly only (ADR-0080) — nothing is
+# compiled here; the Rust binaries arrive prebuilt in the build context (dist/).
+#
+# This is the combined `lightbridge-agent-review` image AFTER the cutover: the agent-runner Job binary
+# (carrying the ADR-0097 `perform_review` → `run_opencode_agent` swap) spawns `opencode acp`, which in
+# turn spawns the stdio `lci-review-mcp` (the reused tuned review tools) and loads the first-party
+# recorder/gate/logger plugins. All three are vendored here.
+#
+# BASE = Alpine (deliberate divergence from the repo's debian house base, like integrations/opencode /
+# ADR-0094): the OpenCode release binary is musl-DYNAMIC (`interpreter /lib/ld-musl-x86_64.so.1`), so it
+# needs the musl loader + libgcc/libstdc++ and cannot run on glibc/debian. The agent-runner +
+# lci-review-mcp binaries are fully-STATIC musl (ADR-0080), so they run on Alpine unchanged.
+#
+# ⚠️ SAST (opengrep, ADR-0073) is intentionally ABSENT: `run_sast` is not wired into the OpenCode review
+# path yet (a flagged parity gap the shadow surfaces), and opengrep is glibc — so it is not needed here
+# and would fight the musl base. Re-add it (via gcompat, tested) when SAST lands in `lci-review-mcp`.
+#
+# Assemble (buildah, context = repo root with the binaries at dist/ → context root):
+#   buildah bud -f services/agent-runner/Dockerfile.review-opencode -t lightbridge-agent-review <ctx>
+
+# ── Stage 1: fetch + verify the pinned OpenCode release binary (musl) ──────────────────────────────
+# SHAs pinned per integrations/opencode/Dockerfile (verified 2026-07-16 against the v1.18.2 releases);
+# the version tracks the `@opencode-ai/plugin` line the plugins compile against.
+FROM alpine:3.24 AS fetch
+ARG OPENCODE_VERSION=v1.18.2
+ARG OPENCODE_SHA256_AMD64=36cb91ee3b6493f38bc50aa49bb241f3dbc620fcea938eb0776069213d0bb5ee
+ARG OPENCODE_SHA256_ARM64=1defc1e42ffb6cb0fd2fc345e714f516398162ca49e1f7b165e99eceae32742f
+ARG TARGETARCH
+RUN set -eux; \
+  apk add --no-cache curl; \
+  case "$TARGETARCH" in \
+    amd64) asset="opencode-linux-x64-musl.tar.gz";   sha="$OPENCODE_SHA256_AMD64" ;; \
+    arm64) asset="opencode-linux-arm64-musl.tar.gz"; sha="$OPENCODE_SHA256_ARM64" ;; \
+    *) echo "unsupported TARGETARCH: $TARGETARCH" >&2; exit 1 ;; \
+  esac; \
+  curl -fsSL -o /tmp/opencode.tar.gz \
+    "https://github.com/anomalyco/opencode/releases/download/${OPENCODE_VERSION}/${asset}"; \
+  echo "${sha}  /tmp/opencode.tar.gz" | sha256sum -c -; \
+  tar xzf /tmp/opencode.tar.gz -C /usr/local/bin opencode; \
+  chmod +x /usr/local/bin/opencode
+
+# ── Stage 2: the review-on-opencode runtime ────────────────────────────────────────────────────────
+FROM alpine:3.24 AS runtime
+# libgcc/libstdc++: OpenCode links them. ripgrep: opencode shells out to it. git + ca-certificates:
+# clone the target repo over HTTPS + TLS to the control plane / eaig.
+RUN set -eux; \
+  apk add --no-cache libgcc libstdc++ ripgrep git ca-certificates; \
+  adduser -D -u 1000 app; \
+  mkdir -p /workspace; chown 1000:1000 /workspace
+
+# OpenCode (musl-dynamic). `--version` at build is a smoke test: a broken fetch / missing lib fails the
+# BUILD loudly rather than at task time.
+COPY --from=fetch /usr/local/bin/opencode /usr/local/bin/opencode
+RUN opencode --version
+
+# The static-musl Rust binaries from the build context (dist/, ADR-0080): the Job ENTRYPOINT host and
+# the stdio review MCP opencode is pointed at (config `mcp.lightbridge.command = ["lci-review-mcp"]`).
+COPY agent-runner /usr/local/bin/agent-runner
+COPY lci-review-mcp /usr/local/bin/lci-review-mcp
+
+# First-party plugins (ADR-0095) at the path render_review_config's PLUGIN_PATHS expect. node_modules is
+# excluded by the root .dockerignore; the plugins are `import type` only, so OpenCode's bundled Bun
+# transpiles the .ts in place with no deps.
+COPY integrations/opencode/plugins /opt/lightbridge/opencode/plugins
+
+USER 1000
+ENV WORKDIR=/workspace \
+    RUST_LOG=info \
+    OPENCODE_DISABLE_AUTOUPDATE=1 \
+    OPENCODE_DISABLE_MODELS_FETCH=1
+WORKDIR /workspace
+ENTRYPOINT ["/usr/local/bin/agent-runner"]
