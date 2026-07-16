@@ -2856,6 +2856,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "lci-review-mcp"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "lci-agent-clients",
+ "lci-agent-types",
+ "lci-review-agent",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "left-right"
 version = "0.11.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"

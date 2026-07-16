@@ -187,6 +187,15 @@ impl Tools {
             DispatchResult::Refused(refusal) => render_refusal(refusal),
         }
     }
+
+    /// The specs of every registered review tool. Public so a host that presents these tools over a
+    /// different protocol than the native loop — the OpenCode ACP host's MCP surface (RFC-0009) —
+    /// can advertise the exact same tuned schemas (e.g. `add_review_comment`'s P0/P1/P2 rubric)
+    /// instead of re-declaring them and risking drift.
+    #[must_use]
+    pub fn specs(&self) -> Vec<ToolSpec> {
+        self.registry.view(&TurnFilter::all()).specs().to_vec()
+    }
 }
 
 fn render_refusal(refusal: DispatchRefusal) -> ToolOutcome {

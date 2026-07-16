@@ -21,6 +21,7 @@ members = [
     "services/review-agent",
     "services/open-agent",
     "services/acp-host",
+    "services/review-mcp",
     "clients/lci",
     "xtask",
 ]
