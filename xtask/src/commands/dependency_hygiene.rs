@@ -34,13 +34,9 @@ struct DependencyOwner {
     manifest: &'static str,
 }
 
-// Transitional R1 ownership. `agent-worker` is deliberately an R2 crate; until it exists, the
-// control plane remains the one Restate SDK host for the already-live egress worker (ADR-0074).
+// Architecture-owned heavyweight dependencies: `kube` (K8s Job launch) and `sqlx` (Postgres) live in
+// the control plane only, so no agent crate can silently pull them into an untrusted context.
 const SINGLE_MANIFEST_DEPENDENCIES: &[DependencyOwner] = &[
-    DependencyOwner {
-        dependency: "restate-sdk",
-        manifest: "services/control-plane/Cargo.toml",
-    },
     DependencyOwner {
         dependency: "kube",
         manifest: "services/control-plane/Cargo.toml",
@@ -171,7 +167,6 @@ members = [
     "services/review-agent",
 ]
 exclude = [
-    "deps/restate-sdk",
     "deps/kube",
     "deps/sqlx",
     "deps/lci-agent-testkit",
@@ -183,7 +178,6 @@ test-support = { package = "lci-agent-testkit", path = "deps/lci-agent-testkit" 
 "#,
             );
 
-            write_package(root.path(), "deps/restate-sdk", "restate-sdk", "");
             write_package(root.path(), "deps/kube", "kube", "");
             write_package(root.path(), "deps/sqlx", "sqlx", "");
             write_package(
@@ -198,9 +192,6 @@ test-support = { package = "lci-agent-testkit", path = "deps/lci-agent-testkit" 
                 "services/control-plane",
                 "control-plane",
                 r#"
-[dependencies]
-durable-host = { package = "restate-sdk", path = "../../deps/restate-sdk" }
-
 [target.'cfg(unix)'.dev-dependencies]
 database.workspace = true
 
@@ -305,7 +296,7 @@ publish = false
                 package(
                     "control-plane",
                     "services/control-plane/Cargo.toml",
-                    &["restate-sdk", "kube", "sqlx"],
+                    &["kube", "sqlx"],
                 ),
                 package(
                     "lci-agent-loop",
@@ -335,7 +326,7 @@ publish = false
     fn heavyweight_dev_or_target_dependency_cannot_bypass_ownership() {
         let mut metadata = valid_metadata();
         metadata.packages[1].dependencies.push(CargoDependency {
-            name: "restate-sdk".to_string(),
+            name: "kube".to_string(),
             kind: Some("dev".to_string()),
         });
 
@@ -414,11 +405,6 @@ publish = false
                     .ends_with("services/control-plane/Cargo.toml")
             })
             .unwrap();
-        assert!(
-            control_plane.dependencies.iter().any(|dependency| {
-                dependency.name == "restate-sdk" && dependency.kind.is_none()
-            })
-        );
         assert!(control_plane.dependencies.iter().any(|dependency| {
             dependency.name == "sqlx" && dependency.kind.as_deref() == Some("dev")
         }));
@@ -468,7 +454,7 @@ cluster-client = { package = "kube", path = "../../deps/kube" }
                 "inactive target dependency",
                 r#"
 [target.'cfg(windows)'.dependencies]
-durable-host = { package = "restate-sdk", path = "../../deps/restate-sdk" }
+database-client = { package = "sqlx", path = "../../deps/sqlx" }
 "#,
             ),
         ];

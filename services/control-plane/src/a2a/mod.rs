@@ -14,7 +14,7 @@
 //! - creates deep-tier review tasks through the SAME path as the webhook handler
 //!   ([`crate::db::create_task`]), enforcing the repo-approval gate and a per-identity quota, and
 //!   answering an unapproved/unauthorized/over-quota submission with `TASK_STATE_REJECTED`;
-//! - holds **no forge credentials** — egress stays on the reconciler/Restate path.
+//! - holds **no forge credentials** — egress stays on the reconciler drain (ADR-0059).
 //!
 //! The role's k8s Deployment/Ingress is an ai-helm follow-up; this module adds the role + logic.
 
