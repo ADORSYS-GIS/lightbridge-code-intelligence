@@ -21,6 +21,8 @@
 //!   ones the ACP client is never shown* (so coverage counts an `explore` subagent's `read_file`s).
 //! - [`gates`] — drive the reused coverage/refute quality gates over each observed cycle.
 //! - [`driver`] — the pure re-prompt / finalize control loop over those gates.
+//! - [`drive`] — the review loop abstracted over a `ReviewSession` (prompt → recorder delta), so the
+//!   orchestration is unit-testable with a scripted fake and the host is a thin spawn/tail shell.
 //! - [`transcript`] — reconstruct the ADR-0034 run transcript from the same recorder JSONL.
 //!
 //! The async transport (spawning OpenCode, tailing the recorder, sending `session/prompt`) is the
@@ -28,6 +30,7 @@
 //! `lci_review_agent::opencode::{…}` unchanged.
 
 mod config;
+mod drive;
 mod driver;
 mod gates;
 mod recorder;
@@ -37,6 +40,7 @@ mod transcript;
 mod test_support;
 
 pub use config::render_review_config;
+pub use drive::{ReviewSession, run_review_loop};
 pub use driver::{DriveAction, ReviewDriver, ReviewResolution};
 pub use gates::{GateDecision, ReviewGates};
 pub use recorder::{
