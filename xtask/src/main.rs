@@ -39,6 +39,11 @@ enum Task {
         #[command(subcommand)]
         action: commands::review_variance::Action,
     },
+    /// OpenCode↔native review shadow parity: diff two engines' findings (RFC-0009 slice 4 gate).
+    Shadow {
+        #[command(subcommand)]
+        action: commands::shadow::Action,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -52,6 +57,7 @@ fn main() -> anyhow::Result<()> {
         Some(Task::ValidateSchema) => commands::schema::validate_schema(),
         Some(Task::DependencyHygiene) => commands::dependency_hygiene::dependency_hygiene(),
         Some(Task::ReviewVariance { action }) => commands::review_variance::run(action),
+        Some(Task::Shadow { action }) => commands::shadow::run(action),
         None => {
             Cli::parse_from(["xtask", "--help"]);
             Ok(())
