@@ -184,7 +184,7 @@ async function main(): Promise<void> {
   console.log(`stopReason: ${String(prompt.result?.stopReason)}\n`);
   verdict(
     "(a) client-passed mcpServers honored",
-    existsSync(markerPath) || seen.probeEchoToolCalls > 0 ? true : false,
+    existsSync(markerPath) || seen.probeEchoToolCalls > 0,
     existsSync(markerPath)
       ? `marker written by probe MCP server (${markerPath})`
       : `${seen.probeEchoToolCalls} probe_echo tool_call updates, no marker`,

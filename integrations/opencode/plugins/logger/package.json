@@ -1,0 +1,20 @@
+{
+  "name": "@lightbridge/opencode-plugin-logger",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "build": "tsc --noEmit",
+    "lint": "biome check .",
+    "test": "echo \"@lightbridge/opencode-plugin-logger: exercised by integrations/opencode/probe\""
+  },
+  "devDependencies": {
+    "@lightbridge/tsconfig": "workspace:*",
+    "@opencode-ai/plugin": "1.18.2",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.6.0"
+  }
+}

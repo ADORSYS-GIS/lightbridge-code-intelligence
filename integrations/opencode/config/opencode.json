@@ -3,7 +3,8 @@
   "//": "Rendered per task by the agent-plane supervisor: {env:*} placeholders are filled from the task env; the plugin entries resolve to the vendored integrations/opencode/plugins/* packages (loading mechanics = RFC-0009 probe item). This file is the `open`-mode shape; other modes get their own rendering.",
   "plugin": [
     "@lightbridge/opencode-plugin-recorder",
-    "@lightbridge/opencode-plugin-gate-interlock"
+    "@lightbridge/opencode-plugin-gate-interlock",
+    "@lightbridge/opencode-plugin-logger"
   ],
   "permission": {
     "edit": "allow",

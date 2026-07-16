@@ -10,6 +10,7 @@ Everything Lightbridge ships *into* OpenCode when it hosts an agent loop
 | [`config/`](config/) | Per-mode OpenCode config: primary agent + subagents, permissions, MCP servers, plugin list. Rendered per task by the agent-plane supervisor (env placeholders filled in). |
 | [`plugins/recorder/`](plugins/recorder/) | `@lightbridge/opencode-plugin-recorder` — right-bytes JSONL transcript of every tool call (args + results, subagent-internal included) and every reasoning part. |
 | [`plugins/gate-interlock/`](plugins/gate-interlock/) | `@lightbridge/opencode-plugin-gate-interlock` — blocks the terminal tool (`submit_findings` / `propose_pr`) until gate preconditions (refute pass, …) have mechanically happened in the session. |
+| [`plugins/logger/`](plugins/logger/) | `@lightbridge/opencode-plugin-logger` — operational logs (lifecycle, coarse tool timing, errors, permission decisions) as winston-shaped JSON to **stderr** (stdout is the ACP channel). Zero-dependency, not the transcript — that's the recorder. |
 | [`probe/`](probe/) | The RFC-0009 **Phase-0 fidelity probe** — a scripted ACP client + minimal MCP server that answers checklist items (a)–(f) against a pinned OpenCode version. Run it before adopting, and again on every OpenCode bump. |
 
 ## Invariants (do not relax in config)
