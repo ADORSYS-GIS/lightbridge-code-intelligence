@@ -79,7 +79,9 @@ export const LoggerPlugin: Plugin = async ({ project, directory, worktree }) => 
         callID: input.callID,
         sessionID: input.sessionID,
         durationMs: startedAt === undefined ? undefined : Date.now() - startedAt,
-        // A one-line title only — the full output is the recorder's territory, not the operational log.
+        // ok reflects the MCP result flag ({content,isError} at runtime for mediated tools); `title`
+        // is populated for built-in tools. The full output is the recorder's territory, not this log.
+        ok: (output as { isError?: boolean }).isError !== true,
         title: output.title,
       });
     },

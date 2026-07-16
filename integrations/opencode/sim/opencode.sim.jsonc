@@ -1,0 +1,39 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  // Offline loop-simulation config (RFC-0009). Custom OpenAI-compatible provider -> the mock server;
+  // the mediated MCP is the local stdio mock; the three real plugins load from the bind-mounted
+  // /plugins. Paths assume the sim bind-mounts: integrations/opencode/sim->/sim, plugins->/plugins.
+  "model": "sim/sim-model",
+  "provider": {
+    "sim": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Sim",
+      "options": {
+        "baseURL": "http://127.0.0.1:8899/v1",
+        "apiKey": "sim"
+      },
+      "models": {
+        "sim-model": { "name": "Sim Model" }
+      }
+    }
+  },
+  "plugin": [
+    "/plugins/recorder/src/index.ts",
+    "/plugins/gate-interlock/src/index.ts",
+    "/plugins/logger/src/index.ts"
+  ],
+  "mcp": {
+    "lightbridge": {
+      "type": "local",
+      "command": ["node", "/sim/mock-mcp.mjs"],
+      "enabled": true
+    }
+  },
+  "agent": {
+    "sim-agent": {
+      "mode": "primary",
+      "description": "Sim primary: reviews, refutes P0/P1 findings, then submits.",
+      "prompt": "Review the change. Refute any P0/P1 finding before submitting. When done, call submit_findings."
+    }
+  }
+}

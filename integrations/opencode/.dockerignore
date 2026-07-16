@@ -3,5 +3,8 @@
 # Baking the local pnpm install would bloat the image and leak host-resolved deps.
 **/node_modules
 **/dist
+# Test/sim harnesses are not part of the runtime image (the Dockerfile only COPYs config + plugins).
+probe/
+sim/
 probe/probe-output.jsonl
 *.log

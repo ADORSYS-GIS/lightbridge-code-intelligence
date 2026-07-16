@@ -42,14 +42,17 @@ export const RecorderPlugin: Plugin = async () => {
       });
     },
     "tool.execute.after": async (input, output) => {
+      // Record the FULL output verbatim (right-bytes). The plugin's TS type declares
+      // {title, output, metadata}, but that only holds for BUILT-IN tools — MCP tools (the mediated
+      // Lightbridge tools: submit_findings/propose_pr/…) deliver {content: [{type,text}], isError}
+      // at runtime (verified against 1.18.2 via the sim). Cherry-picking the typed fields silently
+      // dropped every mediated tool's RESULT; recording the whole object captures either shape.
       record({
         kind: "tool.after",
         tool: input.tool,
         callID: input.callID,
         sessionID: input.sessionID,
-        title: output.title,
-        output: output.output,
-        metadata: output.metadata,
+        result: output,
       });
     },
     event: async ({ event }) => {

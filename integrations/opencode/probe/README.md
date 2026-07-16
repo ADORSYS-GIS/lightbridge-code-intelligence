@@ -82,9 +82,15 @@ bind-mounts (no eaig, no MCP). Caught real bugs and validated the load-bearing m
   from real opencode events, so hooks fire on live events (partial evidence for probe item (d)/(f);
   full tool-call capture still needs the mock-provider harness below).
 
-Still pending (needs a provider): driving real tool calls to exercise `tool.execute.before/after`
-(recorder tool-I/O capture, gate-interlock block-until, logger tool timing) — a mock OpenAI-compatible
-provider + a mock mediated MCP, offline. And (c) reasoning fidelity needs a real reasoning model.
+**Loop simulation — 2026-07-16 (offline, `../sim/`):** the mock-provider + mock-MCP harness now
+drives the full tool-call loop and closes the model-driven items **(b) tool fidelity, (d) subagent/
+tool visibility, (e) interlock, (f) recorder completeness** — all PASS (`sim/run-sim.sh`):
+gate-interlock blocked a premature `submit_findings` (it never reached the tool), forced
+`refute_finding` first, then allowed the retry; recorder captured tool args + **results**; logger
+emitted `tool.done` with `durationMs`. MCP tool naming is `lightbridge_<tool>` (matches the gate +
+`explore` denies). **Caught + fixed a recorder right-bytes bug**: MCP results arrive as
+`{content,isError}` at runtime, not the typed `{title,output,metadata}` — the recorder now records
+the full output. Only **(c) reasoning fidelity** still needs a real reasoning model (eaig).
 
 ## Evidence record
 
