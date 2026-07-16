@@ -4,9 +4,13 @@
 - **Author(s):** @stephane-segning
 - **Date:** 2026-07-16
 - **Resulting ADRs:** [ADR-0094](../adr/0094-opencode-acp-open-mode-host.md) (open-mode host),
-  [ADR-0095](../adr/0095-opencode-plugins-recording-and-gates.md) (plugins own recording + gates).
-  A future ADR decides the `review`-mode cutover; it is deliberately **not** part of this RFC's
-  resulting set (see [Phasing](#phasing)).
+  [ADR-0095](../adr/0095-opencode-plugins-recording-and-gates.md) (plugins own recording + gates),
+  [ADR-0096](../adr/0096-mediated-forge-read-tools.md) (mediated forge reads), and
+  [ADR-0097](../adr/0097-review-runs-on-opencode.md) (the `review`-mode cutover).
+- **⚠️ Amended 2026-07-16:** the [Phasing](#phasing) below is **superseded by
+  [ADR-0097](../adr/0097-review-runs-on-opencode.md)**. The owner reversed Phase 2/3: rather than
+  block the `review` cutover on the (still-unbuilt) #252 eval harness, the review host was built ahead
+  of it and gated on a **shadow parity run** instead. The phasing text is kept for historical intent.
 
 ## Summary
 
@@ -191,6 +195,13 @@ required.
 - **Phase 3 — `review`/`index` hard cutover**, its own ADR, evidence = Phase 2. One cut, no
   parallel path, per repo doctrine. Until then the native loop remains the review host — that is
   *sequencing*, not a dormant flag: each phase is fully live for its surface when it ships.
+
+> **⚠️ Reversed 2026-07-16 — see [ADR-0097](../adr/0097-review-runs-on-opencode.md).** Phase 2/3 did
+> not run in this order. The owner directed building the `review` host ahead of the eval harness and
+> gating the cutover on a **shadow parity run** (`cargo xtask shadow diff`, procedure in
+> [`integrations/opencode/sim/SHADOW.md`](../../integrations/opencode/sim/SHADOW.md)) instead of #252.
+> The review core + transport host are built and proven against real OpenCode; the live dispatch
+> cutover (ADR-0097 slice 5) remains the one gated step. #252 stays the durable quality instrument.
 
 ### Repository layout
 

@@ -6,6 +6,12 @@ the posted output, and finally egress to GitHub. It is the companion to
 [github-app-and-control-plane.md](github-app-and-control-plane.md) (the App + trust boundary) and
 [indexing-and-storage.md](indexing-and-storage.md) (the retrieval substrate the deep tier reads from).
 
+> **Note (2026-07-16):** this describes the **current live** review path (the native in-process loop).
+> A cutover to hosting the review loop on **OpenCode** — reusing these same coverage/refute gates and
+> mediated tools supervisor-side — is built and proven against real OpenCode, with the live dispatch
+> swap the one pending step (shadow-gated). See [ADR-0097](adr/0097-review-runs-on-opencode.md). Until
+> that cut lands, everything below is the running system.
+
 The review agent is a **native, in-process Rust loop** ([ADR-0026](adr/0026-native-review-agent.md))
 acting via **mediated write tools** through the control plane
 ([ADR-0037](adr/0037-agent-acts-via-mediated-tools.md)). There is no OpenCode/ACP/MCP subprocess and
