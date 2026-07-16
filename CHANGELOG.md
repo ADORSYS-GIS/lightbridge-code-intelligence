@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.1](https://github.com/vymalo/lightbridge-code-intelligence/compare/v0.5.0...v0.5.1) (2026-07-16)
+
+
+### Documentation
+
+* **adr-0093:** Restate egress pilot no-go — revert to reconciler drain ([#432](https://github.com/vymalo/lightbridge-code-intelligence/issues/432)) ([7bfe42d](https://github.com/vymalo/lightbridge-code-intelligence/commit/7bfe42d5ed5a2fe5f85b6af4c4e63934c4fa3998))
+
 ## [0.5.0](https://github.com/vymalo/lightbridge-code-intelligence/compare/v0.4.0...v0.5.0) (2026-07-15)
 
 
