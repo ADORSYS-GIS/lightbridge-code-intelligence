@@ -38,7 +38,9 @@ cd /tmp
 timeout 90 opencode run --agent reasoner "Is 91 prime? Reason step by step, then answer." >/tmp/out 2>/tmp/err || true
 echo "================ RFC-0009 probe item (c): reasoning fidelity (eaig) ================"
 echo "--- assistant output ---"; sed "s/\x1b\[[0-9;]*m//g" /tmp/out | tail -4
-REASONING=$(grep -c "\"kind\":\"reasoning.part\"" /tmp/rec.jsonl 2>/dev/null || echo 0)
+# grep -c prints "0" AND exits non-zero on no matches; `|| echo 0` would then DOUBLE it ("0\n0")
+# and break the integer test. Capture grep stdout, and fall back to 0 only when grep itself failed.
+REASONING=$(grep -c "\"kind\":\"reasoning.part\"" /tmp/rec.jsonl 2>/dev/null) || REASONING=0
 echo ""
 echo "recorder reasoning.part entries: $REASONING"
 if [ "$REASONING" -gt 0 ]; then
@@ -47,6 +49,8 @@ if [ "$REASONING" -gt 0 ]; then
 else
   echo "FAIL/UNKNOWN  no reasoning.part captured — check: (1) LCI_EAIG_MODEL is reasoning-capable,"
   echo "  (2) eaig forwards reasoning on the chat-completions path, (3) opencode maps it to a"
-  echo "  reasoning message part. Inspect /tmp/err and the raw stream before calling this a hard FAIL."
+  echo "  reasoning message part. Raw opencode stderr follows (the container is --rm, so it is"
+  echo "  printed here rather than left in /tmp):"
+  sed "s/\x1b\[[0-9;]*m//g" /tmp/err | tail -20
 fi
 '
