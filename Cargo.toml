@@ -90,18 +90,15 @@ rustls = { version = "0.23.41", default-features = false, features = ["ring"] }
 uuid = { version = "1.23.4", features = ["v4", "serde"] }
 # Concurrent joins for batched read-only tool dispatch (ADR-0042).
 futures = "0.3.32"
-# Durable orchestration (RFC-0005 / ADR-0074): the Restate SDK serves a discoverable HTTP endpoint
-# the Restate server invokes. Pinned exactly while the sdk-rust 0.10 ↔ server compat is being
-# validated (ticket #296). Default features give `http_server` (hyper/hyper-util, plain h2c — NO
-# TLS) + `rust_crypto` for request-identity verification. We deliberately do NOT enable `aws_lc_rs`:
-# it would link a second rustls crypto provider next to sqlx's `ring` and reintroduce the
-# process-default-provider panic that `main` guards against.
-restate-sdk = "=0.10.0"
 
 # --- control-plane: HTTP + auth ---
 async-trait = "0.1.89"
 axum = "0.8.9"
-jsonwebtoken = "10"
+# `rust_crypto` (ring) is jsonwebtoken's crypto backend — NOT a default feature. It used to be
+# switched on transitively by restate-sdk; with the Restate egress path removed (ADR-0093) the sole
+# jsonwebtoken user (control-plane) must enable it explicitly, else v10 panics with "exactly one of
+# 'rust_crypto' and 'aws_lc_rs'". ring matches the process-level provider `main` installs.
+jsonwebtoken = { version = "10", features = ["rust_crypto"] }
 hmac = "0.13"
 sha2 = "0.11"
 hex = "0.4.3"

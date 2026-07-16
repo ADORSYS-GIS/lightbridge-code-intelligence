@@ -9,7 +9,6 @@ use serde_json::json;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::egress::PlatformEgressRouter;
 use crate::integrations::platform::Platform;
 
 /// Who to post as and where — shared by every intent.
@@ -21,10 +20,6 @@ pub struct Target<'a> {
     pub installation_id: i64,
     pub owner: &'a str,
     pub repo: &'a str,
-    /// Egress router (RFC-0005 Phase A / ADR-0074). After the intent row is enqueued, each helper calls
-    /// [`PlatformEgressRouter::announce`] on this — a **no-op in the default `drain` mode** (so the
-    /// enqueue path is unchanged), or a `send` to the `PlatformEgress` virtual object in `restate` mode.
-    pub egress: &'a PlatformEgressRouter,
 }
 
 impl Target<'_> {
@@ -92,9 +87,6 @@ pub async fn enqueue_review(
         &key,
     )
     .await?;
-    t.egress
-        .announce(pool, t.platform, t.installation_id, &key)
-        .await?;
     Ok(inserted)
 }
 
@@ -120,9 +112,6 @@ pub async fn enqueue_reply(
         &key,
     )
     .await?;
-    t.egress
-        .announce(pool, t.platform, t.installation_id, &key)
-        .await?;
     Ok(inserted)
 }
 
@@ -154,9 +143,6 @@ pub async fn enqueue_reaction(
         &key,
     )
     .await?;
-    t.egress
-        .announce(pool, t.platform, t.installation_id, &key)
-        .await?;
     Ok(inserted)
 }
 
@@ -187,9 +173,6 @@ pub async fn enqueue_verdict_reaction(
         &key,
     )
     .await?;
-    t.egress
-        .announce(pool, t.platform, t.installation_id, &key)
-        .await?;
     Ok(inserted)
 }
 
@@ -232,9 +215,6 @@ pub async fn enqueue_failure_notice(
         &key,
     )
     .await?;
-    t.egress
-        .announce(pool, t.platform, t.installation_id, &key)
-        .await?;
     Ok(inserted)
 }
 
@@ -290,9 +270,6 @@ pub async fn enqueue_pr_open(
         &key,
     )
     .await?;
-    t.egress
-        .announce(pool, t.platform, t.installation_id, &key)
-        .await?;
     Ok(inserted)
 }
 

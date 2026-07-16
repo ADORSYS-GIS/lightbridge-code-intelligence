@@ -24,8 +24,14 @@ pub struct FileConfig {
     pub review: ReviewSection,
     pub embeddings: EmbeddingsSection,
     pub knowledge_tools: KnowledgeToolsSection,
-    pub egress: EgressSection,
     pub gitlab: GitlabSection,
+    /// Back-compat tombstone (ADR-0093): the Restate egress pilot (ADR-0074) is gone — the reconciler
+    /// `outbox` drain is the sole egress again. This field exists ONLY to absorb a leftover `egress:`
+    /// block from a ConfigMap not yet updated, so `deny_unknown_fields` can't brick control-plane boot
+    /// mid-rollout. It is never read. Delete once ai-helm-values drops the `egress:` block.
+    #[serde(default, rename = "egress")]
+    #[allow(dead_code)]
+    egress_removed: Option<serde_json::Value>,
 }
 
 /// GitLab projects configured from the mounted control-plane file only. There is intentionally no
@@ -145,37 +151,6 @@ impl GitlabSection {
 
         Ok(())
     }
-}
-
-/// Which path delivers `outbox` intents (RFC-0005 Phase A / ADR-0074). **Defaults to `Drain`** — the
-/// pre-existing reconciler drain (ADR-0059) stays the active egress path, so merging the pilot changes
-/// no production behavior. Flip to `Restate` to route egress through the `PlatformEgress` virtual object
-/// (the pilot). The mode is read once at startup — it is deploy-scoped, not live-reloadable (a flip
-/// takes effect on the next boot, like every other config knob). Both modes share the `outbox` table as
-/// the ledger, so switching direction **across a deploy** is safe: any row not yet `posted` is picked up
-/// by whichever consumer the new deploy runs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum EgressMode {
-    /// The reconciler's `outbox` drain posts every intent (today's behavior). Default.
-    #[default]
-    Drain,
-    /// Producers additionally `send` `PlatformEgress::post(outbox_id)` to Restate, which posts each
-    /// intent through the per-`platform:installation` virtual object; the reconciler drain is disabled.
-    Restate,
-}
-
-/// Egress routing (RFC-0005 Phase A / ADR-0074). Absent → `Drain` (no behavior change). When `mode =
-/// restate`, `restate_ingress_url` must resolve (config or the `RESTATE_INGRESS_URL` env fallback) — the
-/// base URL of the Restate server's HTTP ingress the producer `send`s invocations to.
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct EgressSection {
-    /// `drain` (default) | `restate`. See [`EgressMode`].
-    pub mode: EgressMode,
-    /// Base URL of the Restate ingress (e.g. `http://restate.converse.svc.cluster.local:8080`). Only
-    /// read in `restate` mode; falls back to the `RESTATE_INGRESS_URL` env var when unset.
-    pub restate_ingress_url: Option<String>,
 }
 
 /// External-knowledge MCP servers (ADR-0066) the review agent can dynamically discover and call as
@@ -368,6 +343,22 @@ mod tests {
             err.to_string().contains("__"),
             "error names the problem: {err}"
         );
+    }
+
+    #[test]
+    fn leftover_egress_block_is_absorbed_not_rejected() {
+        // ADR-0093 cutover safety: the Restate egress config is gone, but a ConfigMap not yet
+        // updated may still carry an `egress:` block. `deny_unknown_fields` would otherwise reject the
+        // whole file and brick control-plane boot mid-rollout — the tombstone field absorbs it. Both
+        // the old shapes (a bare mode, and mode + ingress url) must parse cleanly.
+        for json in [
+            r#"{"egress":{"mode":"restate","restate_ingress_url":"http://restate:8080"}}"#,
+            r#"{"egress":{"mode":"drain"}}"#,
+        ] {
+            serde_json::from_str::<FileConfig>(json).unwrap_or_else(|e| {
+                panic!("a leftover egress block must parse, not brick boot: {e}")
+            });
+        }
     }
 
     #[test]
