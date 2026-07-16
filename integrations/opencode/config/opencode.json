@@ -40,7 +40,7 @@
         "webfetch": "deny"
       },
       "tools": {
-        "//": "Deny the mediated write/terminal tools by name — the permission block above can only gate edit/bash/webfetch, so this map is what actually keeps propose_pr/abort off a subagent. Retrieval + read tools stay enabled (unlisted = allowed). Tool names carry the `lightbridge` MCP-server prefix; finalized when the control-plane MCP surface lands.",
+        "//": "explore's read surface is ALREADY complete without bash: OpenCode ships `read`, `grep`, `glob` (find-by-pattern) and `list` (ls) as DEDICATED tools, distinct from `bash` — so denying bash (above) costs explore nothing for grep/ls/find. Those + the mediated retrieval and forge-READ tools (ADR-0096: get_issue/list_branches/read_file_at_ref/…) stay enabled here (unlisted = allowed). This map only DENIES the mediated write/terminal tools — the permission block can gate edit/bash/webfetch but not specific MCP tools, so this is what keeps propose_pr/abort off a subagent. Tool names carry the `lightbridge` MCP-server prefix; finalized when the control-plane MCP surface lands.",
         "lightbridge_propose_pr": false,
         "lightbridge_abort": false,
         "lightbridge_submit_findings": false
