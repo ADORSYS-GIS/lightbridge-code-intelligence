@@ -14,6 +14,7 @@ pub(super) fn before(tool: &str, call_id: &str, args: Value) -> RecorderEvent {
         call_id: Some(call_id.into()),
         args: Some(args),
         result: None,
+        part: None,
     }
 }
 
@@ -30,5 +31,18 @@ pub(super) fn after(tool: &str, call_id: &str, text: &str) -> RecorderEvent {
             "content": [{ "type": "text", "text": text }],
             "isError": false,
         })),
+        part: None,
+    }
+}
+
+/// A `reasoning.part` event (ADR-0060) carrying one reasoning slice.
+pub(super) fn reasoning(text: &str) -> RecorderEvent {
+    RecorderEvent {
+        kind: "reasoning.part".into(),
+        tool: None,
+        call_id: None,
+        args: None,
+        result: None,
+        part: Some(serde_json::json!({ "type": "reasoning", "text": text })),
     }
 }
