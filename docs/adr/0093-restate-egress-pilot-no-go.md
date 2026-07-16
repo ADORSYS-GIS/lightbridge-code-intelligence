@@ -63,7 +63,7 @@ It works. It just does not **earn its keep**:
 - **Neutral:** the config disable ships via ai-helm-values (`egress.mode: drain`, `restate-worker`
   off, `restate` server `replicaCount: 0`) — reversible; the server is *scaled to 0, not deleted*, so
   its PVC (durable log + registered endpoint) survives for a future re-enable.
-- **Bad (tracked):** until the code-removal ticket lands, the Restate code path stays dormant in the
+- **Bad (tracked):** until the code-removal ticket (#433) lands, the Restate code path stays dormant in the
   image behind `egress.mode: drain` (the code default). This violates the "no dormant code" posture
   and is why the removal is tracked, not deferred indefinitely.
 - **RFC-0005 Phase B** (task lifecycle on Restate) is **not** pursued on this evidence. Reopen only if
