@@ -179,7 +179,15 @@ jobs:
         run: |
           ctx="$(mktemp -d)"
           case "${{ matrix.artifact }}" in
-            rust-bins)  cp dist/* "$ctx"/ && chmod +x "$ctx"/* ;;
+            rust-bins)
+              cp dist/* "$ctx"/ && chmod +x "$ctx"/*
+              # The review-opencode image also needs the first-party plugins (ADR-0095) — the buildah
+              # context is dist/-only, so stage them here from the checkout under a context-relative
+              # name. node_modules is gitignored (absent from the checkout); pruned defensively.
+              mkdir -p "$ctx"/opencode-plugins
+              cp -r integrations/opencode/plugins/. "$ctx"/opencode-plugins/
+              find "$ctx"/opencode-plugins -type d -name node_modules -prune -exec rm -rf {} +
+              ;;
             web-bundle) cp -a web/standalone web/static web/public "$ctx"/ ;;
           esac
           echo "dir=$ctx" >> "$GITHUB_OUTPUT"

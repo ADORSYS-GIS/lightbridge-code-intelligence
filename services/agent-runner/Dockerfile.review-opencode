@@ -58,10 +58,12 @@ RUN opencode --version
 COPY agent-runner /usr/local/bin/agent-runner
 COPY lci-review-mcp /usr/local/bin/lci-review-mcp
 
-# First-party plugins (ADR-0095) at the path render_review_config's PLUGIN_PATHS expect. node_modules is
-# excluded by the root .dockerignore; the plugins are `import type` only, so OpenCode's bundled Bun
-# transpiles the .ts in place with no deps.
-COPY integrations/opencode/plugins /opt/lightbridge/opencode/plugins
+# First-party plugins (ADR-0095) at the path render_review_config's PLUGIN_PATHS expect. Staged into the
+# build context as `opencode-plugins/` by the pipeline's "Stage build context" step — the buildah
+# context is dist/-only (the binaries), NOT the repo tree, so this is copied by a context-relative name,
+# not `integrations/opencode/plugins`. The plugins are `import type` only (no node_modules needed at
+# runtime; OpenCode's bundled Bun transpiles the .ts in place).
+COPY opencode-plugins /opt/lightbridge/opencode/plugins
 
 USER 1000
 ENV WORKDIR=/workspace \
