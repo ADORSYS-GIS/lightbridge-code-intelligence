@@ -20,6 +20,7 @@ members = [
     "services/agent-testkit",
     "services/review-agent",
     "services/open-agent",
+    "services/acp-host",
     "clients/lci",
     "xtask",
 ]
