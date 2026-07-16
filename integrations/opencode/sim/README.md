@@ -40,6 +40,24 @@ PASS  logger emitted tool.done with durationMs
 - The gate throws in `tool.execute.before`; opencode feeds the error back to the model, which then
   satisfies the precondition and retries — block-until enforcement (ADR-0095) end-to-end.
 
+## Probe item (c) — reasoning fidelity against real eaig
+
+The one probe item the offline sim can't fake (it needs a real reasoning model). `opencode.eaig.jsonc`
+points the provider at the eaig OpenAI-compatible gateway; `run-eaig-reasoning.sh` runs the image,
+asks a reasoning-inducing prompt, and reports whether the recorder captured `reasoning.part` entries.
+
+**Run it in your environment** (eaig is internal — HTTPS + a mounted CA — so this was *not* verified
+from the build sandbox; the config shape *was* validated: opencode 1.18.2 accepts the provider/agent):
+
+```
+LCI_EAIG_BASE_URL=https://eaig.internal/.../v1 \
+LCI_EAIG_API_KEY=... LCI_EAIG_MODEL=<reasoning-capable-model> LCI_EAIG_CA=/path/to/internal-ca.pem \
+  integrations/opencode/sim/run-eaig-reasoning.sh
+```
+
+A PASS (≥1 `reasoning.part`) closes item (c) and, with the offline sim's b/d/e/f, completes the
+RFC-0009 Phase-0 gate.
+
 ## Bug this harness caught
 
 The recorder originally read `output.title/output/metadata` on `tool.execute.after` (the plugin's
