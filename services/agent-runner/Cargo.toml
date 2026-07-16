@@ -35,6 +35,8 @@ lci-agent-step = { path = "../agent-step" }
 lci-agent-tools = { path = "../agent-tools" }
 lci-agent-types = { path = "../agent-types" }
 lci-review-agent = { path = "../review-agent" }
+# ACP transport for the OpenCode review host (RFC-0009 / ADR-0094): spawns + drives `opencode acp`.
+lci-acp-host = { path = "../acp-host" }
 lci-config = { path = "../config" }
 # In-house code-graph crate (ADR-0086 / RFC-0007 slice 1). The sole structural-graph engine, built
 # in-process (tree-sitter); replaced the retired Python Graphify CLI (ADR-0019).

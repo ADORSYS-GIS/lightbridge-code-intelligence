@@ -23,6 +23,7 @@
 //! snapshot + token-usage summation), and [`transcript`] (reconstructing the ADR-0034 transcript).
 
 pub mod instructions;
+pub mod opencode;
 
 mod model_client;
 mod telemetry;

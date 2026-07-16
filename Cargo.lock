@@ -106,6 +106,7 @@ dependencies = [
  "base64",
  "clap",
  "futures",
+ "lci-acp-host",
  "lci-agent-clients",
  "lci-agent-loop",
  "lci-agent-sast",
