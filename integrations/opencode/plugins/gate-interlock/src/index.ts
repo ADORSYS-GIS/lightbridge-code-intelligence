@@ -27,6 +27,9 @@ export const GateInterlockPlugin: Plugin = async () => {
 
   return {
     "tool.execute.after": async (input) => {
+      // Defensive: a malformed hook input must not poison the per-session counters. (We intentionally
+      // do NOT try/catch the before hook below — its throw IS the enforcement mechanism.)
+      if (!input?.sessionID || !input?.tool) return;
       let counts = completedCalls.get(input.sessionID);
       if (!counts) {
         counts = new Map();
@@ -35,7 +38,9 @@ export const GateInterlockPlugin: Plugin = async () => {
       counts.set(input.tool, (counts.get(input.tool) ?? 0) + 1);
     },
     "tool.execute.before": async (input) => {
-      if (input.tool !== terminalTool) return;
+      // Optional-chained so a missing tool name simply doesn't match the terminal tool (no block),
+      // rather than throwing a TypeError that would masquerade as a gate block.
+      if (input?.tool !== terminalTool) return;
       const counts = completedCalls.get(input.sessionID);
       const missing = requiredTools.filter((tool) => (counts?.get(tool) ?? 0) < minCalls);
       if (missing.length === 0) return;

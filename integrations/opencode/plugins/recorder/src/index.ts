@@ -31,15 +31,28 @@ export const RecorderPlugin: Plugin = async () => {
   }
   record({ kind: "recorder.start", pid: process.pid });
 
+  // A hook must NEVER throw into the agent loop (the recorder's contract). record() already guards
+  // its own I/O; `guard` additionally contains any error from the hook body (e.g. unexpected field
+  // shapes) so a malformed event can never take the loop down.
+  const guard = (fn: () => void): void => {
+    try {
+      fn();
+    } catch (error) {
+      console.error("[lci-recorder] hook error (swallowed):", error);
+    }
+  };
+
   return {
     "tool.execute.before": async (input, output) => {
-      record({
-        kind: "tool.before",
-        tool: input.tool,
-        callID: input.callID,
-        sessionID: input.sessionID,
-        args: output.args,
-      });
+      guard(() =>
+        record({
+          kind: "tool.before",
+          tool: input?.tool,
+          callID: input?.callID,
+          sessionID: input?.sessionID,
+          args: output?.args,
+        }),
+      );
     },
     "tool.execute.after": async (input, output) => {
       // Record the FULL output verbatim (right-bytes). The plugin's TS type declares
@@ -47,27 +60,31 @@ export const RecorderPlugin: Plugin = async () => {
       // Lightbridge tools: submit_findings/propose_pr/…) deliver {content: [{type,text}], isError}
       // at runtime (verified against 1.18.2 via the sim). Cherry-picking the typed fields silently
       // dropped every mediated tool's RESULT; recording the whole object captures either shape.
-      record({
-        kind: "tool.after",
-        tool: input.tool,
-        callID: input.callID,
-        sessionID: input.sessionID,
-        result: output,
-      });
+      guard(() =>
+        record({
+          kind: "tool.after",
+          tool: input?.tool,
+          callID: input?.callID,
+          sessionID: input?.sessionID,
+          result: output,
+        }),
+      );
     },
     event: async ({ event }) => {
       // Reasoning capture (the ADR-0060 requirement) plus session lifecycle markers. Everything
       // else on the bus is intentionally not persisted — tool fidelity comes from the hooks above.
-      if (event.type === "message.part.updated") {
-        const part = (event.properties as { part?: { type?: string } } | undefined)?.part;
-        if (part?.type === "reasoning") {
-          record({ kind: "reasoning.part", part });
+      guard(() => {
+        if (event?.type === "message.part.updated") {
+          const part = (event.properties as { part?: { type?: string } } | undefined)?.part;
+          if (part?.type === "reasoning") {
+            record({ kind: "reasoning.part", part });
+          }
+          return;
         }
-        return;
-      }
-      if (event.type === "session.idle" || event.type === "session.error") {
-        record({ kind: event.type, properties: event.properties });
-      }
+        if (event?.type === "session.idle" || event?.type === "session.error") {
+          record({ kind: event.type, properties: event.properties });
+        }
+      });
     },
   };
 };

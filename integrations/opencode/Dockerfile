@@ -58,9 +58,8 @@ RUN opencode --version
 # transpiles them in place. The exact load path (config `plugin` entry vs a .opencode/plugin dir) is
 # an RFC-0009 probe finding; both source trees are staged so either wiring works. .dockerignore keeps
 # the host node_modules out so the image stays hermetic.
-COPY config /opt/lightbridge/opencode/config
-COPY plugins /opt/lightbridge/opencode/plugins
-RUN chown -R 1000:1000 /opt/lightbridge
+COPY --chown=1000:1000 config /opt/lightbridge/opencode/config
+COPY --chown=1000:1000 plugins /opt/lightbridge/opencode/plugins
 
 # NOTE (next slice): the agent-plane supervisor binary (ACP client; ADR-0094) is not built yet. When
 # it lands it is COPY'd in here from the build context (fully-static musl, like agent-runner) and

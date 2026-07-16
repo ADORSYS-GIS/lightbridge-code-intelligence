@@ -48,6 +48,14 @@ const child = spawn(opencodeBin, ["acp"], {
   stdio: ["pipe", "pipe", "inherit"],
 });
 
+const cleanup = (): void => rmSync(scratch, { recursive: true, force: true });
+
+child.on("error", (error) => {
+  console.error(`failed to spawn '${opencodeBin} acp' (is it on PATH?):`, error);
+  cleanup();
+  process.exit(1);
+});
+
 let nextId = 1;
 const pending = new Map<number | string, (message: JsonRpcMessage) => void>();
 
@@ -135,6 +143,7 @@ async function main(): Promise<void> {
   const timer = setTimeout(() => {
     console.error(`probe timed out after ${timeoutMs}ms`);
     child.kill();
+    cleanup();
     process.exit(2);
   }, timeoutMs);
 
@@ -206,10 +215,12 @@ async function main(): Promise<void> {
       `\n  full wire evidence: ${evidencePath}` +
       "\n  items (d)-(f) are plugin-side: run a session with the recorder + gate-interlock plugins loaded and compare (see README).",
   );
+  cleanup();
 }
 
 main().catch((error) => {
   console.error("probe failed:", error);
   child.kill();
+  cleanup();
   process.exit(1);
 });
