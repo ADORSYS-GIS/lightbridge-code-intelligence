@@ -188,7 +188,7 @@ pub async fn run_opencode_agent(
     let recorder_path = workdir.join("recording.jsonl");
 
     // ── Env for the opencode child (config placeholders + recorder + the review MCP server) ──────
-    let env: Vec<(String, String)> = vec![
+    let mut env: Vec<(String, String)> = vec![
         ("OPENCODE_CONFIG".into(), config_path.display().to_string()),
         ("OPENCODE_DISABLE_AUTOUPDATE".into(), "1".into()),
         ("OPENCODE_DISABLE_MODELS_FETCH".into(), "1".into()),
@@ -230,6 +230,15 @@ pub async fn run_opencode_agent(
         ("LCI_GATE_TERMINAL_TOOL".into(), "lightbridge_finish".into()),
         ("LCI_GATE_REQUIRED_TOOLS".into(), String::new()),
     ];
+    // ⚠️ Internal-CA trust for opencode's HTTPS to the eaig gateway. The native Rust clients
+    // `add_root_certificate` the mounted CA (via EMBEDDINGS_CA_CERT, ADR-0018); opencode (bun) does
+    // NOT read that — without NODE_EXTRA_CA_CERTS its session/prompt fails "unable to verify the first
+    // certificate" and the whole review errors (observed in prod on the cutover). Bun honors
+    // NODE_EXTRA_CA_CERTS; point it at the same mounted CA. (lci-review-mcp is Rust and inherits
+    // EMBEDDINGS_CA_CERT from this same env, so its embeddings/CP TLS is already covered.)
+    if let Ok(ca_path) = std::env::var("EMBEDDINGS_CA_CERT") {
+        env.push(("NODE_EXTRA_CA_CERTS".into(), ca_path));
+    }
 
     // ── Spawn + handshake ───────────────────────────────────────────────────────────────────────
     let bin = std::env::var("OPENCODE_BIN").unwrap_or_else(|_| "opencode".to_string());
