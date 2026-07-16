@@ -441,7 +441,10 @@ mod tests {
             "installation_id": 42
         }]"#;
         let rows_legacy: Vec<RepositoryRow> = serde_json::from_str(json_legacy).unwrap();
-        assert_eq!(rows_legacy[0].platform_repo_id, 999001, "alias backward compat");
+        assert_eq!(
+            rows_legacy[0].platform_repo_id, 999001,
+            "alias backward compat"
+        );
     }
 
     #[test]
