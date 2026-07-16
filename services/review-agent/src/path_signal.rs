@@ -105,7 +105,8 @@ fn is_generated(path: &str, name: &str) -> bool {
     // from the SQL in the handlers, never hand-edited. Without this they classified as reviewable
     // source, so the coverage gate (ADR-0041) bounced `finish` and trapped the agent re-"reviewing"
     // generated JSON for turns on end (observed: a deep review burned 9 of 14 turns on `.sqlx/*.json`).
-    if path.contains(".sqlx/") && name.ends_with(".json") {
+    // Exact `.sqlx` PATH SEGMENT (not a substring) so a directory like `foo.sqlx/` doesn't false-match.
+    if name.ends_with(".json") && path.split('/').any(|seg| seg == ".sqlx") {
         return true;
     }
     const GENERATED_SUFFIXES: &[&str] = &[
@@ -231,6 +232,11 @@ mod tests {
         );
         assert_ne!(
             classify_path("apps/api/config/roles.json"),
+            FileSignal::Generated
+        );
+        // A directory whose name merely ends in `.sqlx` must NOT match — segment match, not substring.
+        assert_ne!(
+            classify_path("apps/api/foo.sqlx/data.json"),
             FileSignal::Generated
         );
     }
