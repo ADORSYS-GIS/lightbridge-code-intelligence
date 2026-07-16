@@ -14,6 +14,8 @@
 //!   crediting, or the ADR-0091 absence-claim directive.
 //!
 //! Split by responsibility (SRP-by-file), all host-independent and offline-testable:
+//! - [`config`] — render the per-task OpenCode config (mediated stdio MCP, built-in file tools
+//!   disabled for coverage parity, read-only posture, the dynamic reviewer prompt embedded).
 //! - [`recorder`] — reconstruct a review `TurnOutcome` from the OpenCode recorder JSONL (ADR-0095),
 //!   the in-process completeness authority that sees every tool call, *including subagent-internal
 //!   ones the ACP client is never shown* (so coverage counts an `explore` subagent's `read_file`s).
@@ -24,6 +26,7 @@
 //! host's job and layers over this core. Public paths are re-exported so callers use
 //! `lci_review_agent::opencode::{…}` unchanged.
 
+mod config;
 mod driver;
 mod gates;
 mod recorder;
@@ -31,6 +34,7 @@ mod recorder;
 #[cfg(test)]
 mod test_support;
 
+pub use config::render_review_config;
 pub use driver::{DriveAction, ReviewDriver, ReviewResolution};
 pub use gates::{GateDecision, ReviewGates};
 pub use recorder::{
