@@ -2641,6 +2641,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "lci-acp-host"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "lci-agent-clients"
 version = "0.1.0"
 dependencies = [
