@@ -48,10 +48,19 @@ pub struct AcpClient {
 
 impl AcpClient {
     /// Spawn `<bin> acp` in `cwd` and start the background reader. `bin` is typically `opencode`.
-    pub async fn spawn(bin: &str, cwd: &Path, policy: PermissionPolicy) -> Result<Self> {
+    /// `env` is layered on top of the inherited environment (additive, not cleared) — the host uses it
+    /// to pass `OPENCODE_CONFIG` (the rendered per-task config path) plus the `LCI_*`/`LCI_EAIG_*` vars
+    /// the config's `{env:…}` placeholders and the stdio MCP server resolve from.
+    pub async fn spawn(
+        bin: &str,
+        cwd: &Path,
+        policy: PermissionPolicy,
+        env: &[(String, String)],
+    ) -> Result<Self> {
         let mut child = Command::new(bin)
             .arg("acp")
             .current_dir(cwd)
+            .envs(env.iter().map(|(key, value)| (key.as_str(), value.as_str())))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
