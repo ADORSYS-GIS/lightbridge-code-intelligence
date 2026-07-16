@@ -213,7 +213,7 @@ async fn drain_once(
 
 /// Post one intent. Returns the platform id to record (review/comment) or `None`. An `Err` backs the
 /// row off for retry. The single posting path the `outbox` drain uses (ADR-0059).
-pub(crate) async fn deliver(
+async fn deliver(
     pool: &PgPool,
     platform: &dyn CodePlatform,
     repo: &RepoRef,
