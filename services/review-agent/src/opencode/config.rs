@@ -28,6 +28,14 @@ const PLUGIN_PATHS: &[&str] = &[
 /// OpenCode built-in tools disabled for review so every investigation goes through the mediated
 /// `lightbridge_*` tools (unlisted MCP tools stay enabled). `task` is disabled too: native review is a
 /// single loop with no subagents, and a subagent's built-in reads would escape coverage accounting.
+///
+/// ⚠️ These are disabled at the CONFIG TOP LEVEL, not per-agent: opencode-over-ACP runs its built-in
+/// `build` agent (not a custom `review` agent), so a per-agent `tools` block is ignored — verified
+/// against 1.18.3 via the e2e's advertised-tools log (a per-agent block left `read`/`grep`/`glob`/…
+/// advertised to the model, which would let it read off the mediated path and escape coverage; the
+/// top-level block leaves only the four `lightbridge_*` tools). The full built-in set is listed so a
+/// future opencode addition doesn't silently re-open the hole — keep it in sync with what the model is
+/// actually offered.
 const DISABLED_BUILTINS: &[&str] = &[
     "read",
     "grep",
@@ -40,6 +48,8 @@ const DISABLED_BUILTINS: &[&str] = &[
     "webfetch",
     "websearch",
     "task",
+    "skill",
+    "todowrite",
 ];
 
 /// Render the OpenCode config (`opencode.json` shape) for one review run. `system_prompt` is the
@@ -81,12 +91,15 @@ pub fn render_review_config(system_prompt: &str, fast: bool, temperature: Option
         },
         "model": "eaig/reviewer",
         "plugin": PLUGIN_PATHS,
-        // Global read-only posture (defense-in-depth over the per-agent block below).
+        // Global read-only posture.
         "permission": {
             "edit": "deny",
             "bash": "deny",
             "webfetch": "deny"
         },
+        // TOP-LEVEL tool disables (see DISABLED_BUILTINS) — agent-independent, so they hold even though
+        // opencode-over-ACP runs its default `build` agent rather than the `review` agent below.
+        "tools": disabled_tools,
         // The review write/terminal tools over stdio MCP (ADR-0095 / #440). opencode-over-ACP honors
         // stdio MCP only via the config `mcp` block (NOT `session/new.mcpServers`), so it is wired here;
         // the host sets LCI_MCP_* in the process env the spawned server inherits.
@@ -108,8 +121,7 @@ pub fn render_review_config(system_prompt: &str, fast: bool, temperature: Option
                     "edit": "deny",
                     "bash": "deny",
                     "webfetch": "deny"
-                },
-                "tools": disabled_tools
+                }
             }
         }
     })
@@ -134,17 +146,33 @@ mod tests {
     }
 
     #[test]
-    fn disables_builtin_file_and_exec_tools_for_mediated_coverage() {
+    fn disables_builtin_file_and_exec_tools_at_top_level_for_mediated_coverage() {
         let config = render_review_config("p", false, None);
-        let tools = &config["agent"]["review"]["tools"];
-        // Every built-in that could read the tree off the mediated path is off, so all reads flow
-        // through lightbridge_read_file (exact coverage accounting).
-        for builtin in ["read", "grep", "glob", "list", "edit", "bash", "task"] {
-            assert_eq!(tools[builtin], false, "{builtin} must be disabled");
+        // TOP-LEVEL, not per-agent (opencode-over-ACP runs its default `build` agent, so a per-agent
+        // block is ignored — proven by the agent-runner e2e's advertised-tools assertion). Every
+        // built-in that could read the tree off the mediated path is off, so all reads flow through
+        // lightbridge_read_file (exact coverage accounting).
+        let tools = &config["tools"];
+        for builtin in [
+            "read",
+            "grep",
+            "glob",
+            "list",
+            "edit",
+            "write",
+            "bash",
+            "task",
+            "skill",
+            "todowrite",
+        ] {
+            assert_eq!(
+                tools[builtin], false,
+                "{builtin} must be disabled top-level"
+            );
         }
         // Read-only posture.
-        assert_eq!(config["agent"]["review"]["permission"]["edit"], "deny");
-        assert_eq!(config["agent"]["review"]["permission"]["bash"], "deny");
+        assert_eq!(config["permission"]["edit"], "deny");
+        assert_eq!(config["permission"]["bash"], "deny");
     }
 
     #[test]

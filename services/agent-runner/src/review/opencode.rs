@@ -341,6 +341,7 @@ mod e2e {
         std::fs::create_dir_all(&xdg).unwrap();
         let recorder_path = workdir.join("recording.jsonl");
         let config_path = workdir.join("opencode.json");
+        let tools_log = workdir.join("tools.log");
 
         // Config: sim provider -> node mock; stdio MCP -> node review mock; the real plugins.
         let plugin = |name: &str| {
@@ -365,13 +366,16 @@ mod e2e {
                 "command": ["node", sim.join("review-mock-mcp.mjs").display().to_string()],
                 "enabled": true
             }},
+            // TOP-LEVEL tool disables (agent-independent) — the per-agent block was ignored because
+            // opencode runs its default `build` agent, not a custom one.
+            "tools": { "read": false, "grep": false, "glob": false, "list": false,
+                       "edit": false, "write": false, "patch": false, "bash": false,
+                       "webfetch": false, "websearch": false, "task": false, "todowrite": false,
+                       "skill": false },
             "agent": { "review": {
                 "mode": "primary",
                 "description": "Review the change via the mediated tools; read-only.",
-                "prompt": "Review the changed file a.rs. Read it, record findings with add_review_comment, then call finish.",
-                "tools": { "read": false, "grep": false, "glob": false, "list": false,
-                           "edit": false, "write": false, "bash": false, "webfetch": false,
-                           "websearch": false, "task": false }
+                "prompt": "Review the changed file a.rs. Read it, record findings with add_review_comment, then call finish."
             }}
         });
         std::fs::write(&config_path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
@@ -380,6 +384,7 @@ mod e2e {
         let mut provider = tokio::process::Command::new("node")
             .arg(sim.join("review-mock-provider.mjs"))
             .env("LCI_SIM_PROVIDER_PORT", port.to_string())
+            .env("LCI_SIM_TOOLS_LOG", tools_log.display().to_string())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .kill_on_drop(true)
@@ -437,6 +442,29 @@ mod e2e {
         let resolution = resolution.unwrap_or_else(|error| {
             panic!("review loop errored: {error}\n--- recorder ---\n{recorder}")
         });
+
+        // Coverage-parity guard (agent-selection fix): opencode must advertise ONLY the mediated tools
+        // to the model — no built-in read/grep/glob/bash/edit that could let it investigate off the
+        // mediated path and escape the recorder-driven coverage accounting. This asserts the top-level
+        // `tools` disable actually took effect against the real binary (a per-agent block did NOT).
+        let advertised = std::fs::read_to_string(&tools_log).unwrap_or_default();
+        let mut all_tools: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for line in advertised.lines() {
+            if let Ok(names) = serde_json::from_str::<Vec<String>>(line) {
+                all_tools.extend(names);
+            }
+        }
+        for builtin in ["read", "grep", "glob", "bash", "edit", "write", "task"] {
+            assert!(
+                !all_tools.contains(builtin),
+                "built-in `{builtin}` was advertised to the model — coverage guard broken. \
+                 Advertised: {all_tools:?}"
+            );
+        }
+        assert!(
+            all_tools.contains("lightbridge_read_file"),
+            "the mediated read_file was not advertised: {all_tools:?}"
+        );
 
         // The reused coverage gate accepted the finish because a.rs was read; the real opencode drove
         // read_file -> add_review_comment -> finish through the mediated MCP, and the recorder captured
