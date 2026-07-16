@@ -6,14 +6,22 @@
 // gate (a.rs gets read, so finish is accepted) end to end through the REAL host + gates. Node built-ins
 // only; serves /v1/models + /v1/chat/completions (streaming SSE + non-streaming).
 
+import { appendFileSync } from "node:fs";
 import { createServer } from "node:http";
 
 const port = Number(process.env.LCI_SIM_PROVIDER_PORT ?? "8899");
+const toolsLog = process.env.LCI_SIM_TOOLS_LOG;
 
 function decide(messages, tools) {
   const toolNames = (tools ?? [])
     .map((t) => t?.function?.name ?? t?.name)
     .filter((n) => typeof n === "string");
+  // Record every distinct tool opencode advertised, so a test can assert built-ins are disabled.
+  if (toolsLog) {
+    try {
+      appendFileSync(toolsLog, `${JSON.stringify(toolNames)}\n`);
+    } catch {}
+  }
   const find = (re) => toolNames.find((n) => re.test(n));
   const readFile = find(/read_file/i);
   const addComment = find(/add_review_comment/i);
