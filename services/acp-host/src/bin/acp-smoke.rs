@@ -23,7 +23,9 @@ async fn main() -> Result<()> {
         .unwrap_or(std::env::current_dir()?);
     let prompt = args.next();
 
-    let client = AcpClient::spawn(&bin, &cwd, PermissionPolicy::AllowFirst)
+    // The smoke bin inherits the ambient environment (so an OPENCODE_CONFIG set in the shell reaches
+    // opencode); it passes no extra vars of its own.
+    let client = AcpClient::spawn(&bin, &cwd, PermissionPolicy::AllowFirst, &[])
         .await
         .context("spawning opencode acp")?;
 
