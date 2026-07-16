@@ -131,7 +131,7 @@ flowchart LR
 - Agent-plane spawns `opencode acp` (stdio, newline-delimited JSON-RPC), performs `initialize`,
   then `session/new` with `cwd` = checkout root and — **if the probe confirms OpenCode honors it**
   — the task's MCP servers passed in `session/new.mcpServers`; otherwise they are rendered into
-  the per-task `opencode.json` (both shapes are supported config-side; the probe decides which is
+  the per-task `opencode.jsonc` (both shapes are supported config-side; the probe decides which is
   live).
 - `session/prompt` carries the same rendered task prompt the native loop uses today. `session/update`
   notifications stream message parts, thoughts, and tool-call state; `permission.ask` requests are
@@ -242,8 +242,14 @@ Biome + `tsc --noEmit` gate them like every other TS package.
 
 - The Phase-0 probe checklist (a)–(f) — each item is an open question this RFC refuses to assume.
 - Whether per-task MCP servers ride `session/new` or rendered config (probe item (a)).
-- Plugin loading mechanics for workspace-local packages (path entries in `plugin` vs. symlink into
-  `.opencode/plugins/`) — resolved during Phase 0.
+- ~~Plugin loading mechanics for workspace-local packages~~ **RESOLVED (offline, 1.18.2, 2026-07-16):**
+  bare `@lightbridge/...` package-name entries do NOT resolve in-image (plugins aren't installed as
+  node_modules); **absolute-path entries in the `plugin` array** and **`.opencode/plugin/*.ts`
+  auto-dir** both load and fire hooks (opencode's bundled Bun transpiles the `import type`-only `.ts`
+  in place). The config uses absolute `/opt/...` paths. Also found offline: opencode's config schema
+  rejects `"//"` comment KEYS (→ the config is `.jsonc` with real line comments); agent-level
+  `permission`/`tools` deep-merge over and override the built-in agents (last-match-wins), so the
+  `explore` denies take effect over the built-in `explore`'s allows.
 - The exact review-cutover bar (which harness metrics, what parity threshold) — owned by the
   Phase-3 ADR, explicitly out of scope here.
 - Restart-on-failure cost for long `open` runs (re-reasoning from zero on eviction) — accepted for

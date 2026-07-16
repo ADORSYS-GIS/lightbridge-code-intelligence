@@ -60,6 +60,32 @@ wired, so no model turn yet), but the ACP surface is validated:
   verdicts (b) reasoning/(c) fidelity require the eaig gateway wired into the container. That is the
   next run's prerequisite.
 
+## Offline validation — 2026-07-16 (no provider, no control plane)
+
+Run against the real 1.18.2 binary in the image via `opencode agent list` / `opencode run` +
+bind-mounts (no eaig, no MCP). Caught real bugs and validated the load-bearing mechanics:
+
+- **⚠️ BUG (fixed): the config was invalid.** opencode's schema rejects `"//"` comment KEYS
+  ("Unrecognized key: //"). Config is now `opencode.jsonc` with real `//` line comments.
+- **Config accepted; our agents load** — `opencode agent list` shows `lci-open (primary)` and
+  `explore (subagent)` beside the built-ins.
+- **Permission/tools semantics confirmed empirically** — agent-level `permission`/`tools` deep-merge
+  over and OVERRIDE the built-in agents (last-match-wins): `explore`'s `edit`/`bash`/`webfetch` denies
+  win over the built-in `explore`'s *allows*, and the `tools` map resolves into real
+  `lightbridge_propose_pr deny` entries. (Found + fixed a gap: built-in `explore` also had
+  `websearch: allow` → now denied.)
+- **⚠️ Plugin loading resolved.** Bare package-name `plugin` entries do NOT resolve in-image;
+  **absolute paths** and **`.opencode/plugin/*.ts` auto-dir** both work. Capstone in the built image:
+  all three plugins load from `/opt` absolute paths, the **logger + recorder init hooks fire**
+  (recorder wrote `recorder.start`, logger printed its startup line), zero resolve/import errors.
+- **The event bus reaches our plugins** — the logger's `event` hook emitted `session.updated` lines
+  from real opencode events, so hooks fire on live events (partial evidence for probe item (d)/(f);
+  full tool-call capture still needs the mock-provider harness below).
+
+Still pending (needs a provider): driving real tool calls to exercise `tool.execute.before/after`
+(recorder tool-I/O capture, gate-interlock block-until, logger tool timing) — a mock OpenAI-compatible
+provider + a mock mediated MCP, offline. And (c) reasoning fidelity needs a real reasoning model.
+
 ## Evidence record
 
 | Date | OpenCode version | (a) | (b) | (c) | (d) | (e) | (f) | Notes |
