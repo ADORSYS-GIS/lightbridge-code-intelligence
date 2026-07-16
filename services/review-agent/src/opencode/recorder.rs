@@ -77,6 +77,10 @@ pub struct RecorderEvent {
     /// built-ins). Recorded verbatim by the plugin.
     #[serde(default)]
     pub result: Option<Value>,
+    /// A reasoning slice (`kind:"reasoning.part"`, ADR-0060) — the recorder's `part` object, whose
+    /// `text` the transcript reconstruction folds into the assistant turn.
+    #[serde(default)]
+    pub part: Option<Value>,
 }
 
 /// Parse recorder JSONL, skipping blank or unparseable lines (the recorder must never take the loop
@@ -94,7 +98,7 @@ pub fn parse_recorder(jsonl: &str) -> Vec<RecorderEvent> {
 /// tool-result shape. The MCP shape (`{content:[{type,text}],isError}`) is what the mediated review
 /// tools return — its text is the dispatch message the gates match on (e.g. the RefuteGate keys off
 /// `add_review_comment` returning `"recorded finding at …"`).
-fn result_text(result: &Value) -> String {
+pub(super) fn result_text(result: &Value) -> String {
     if let Some(content) = result.get("content").and_then(Value::as_array) {
         let joined = content
             .iter()

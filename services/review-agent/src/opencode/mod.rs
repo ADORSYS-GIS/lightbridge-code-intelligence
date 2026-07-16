@@ -21,6 +21,7 @@
 //!   ones the ACP client is never shown* (so coverage counts an `explore` subagent's `read_file`s).
 //! - [`gates`] — drive the reused coverage/refute quality gates over each observed cycle.
 //! - [`driver`] — the pure re-prompt / finalize control loop over those gates.
+//! - [`transcript`] — reconstruct the ADR-0034 run transcript from the same recorder JSONL.
 //!
 //! The async transport (spawning OpenCode, tailing the recorder, sending `session/prompt`) is the
 //! host's job and layers over this core. Public paths are re-exported so callers use
@@ -30,6 +31,7 @@ mod config;
 mod driver;
 mod gates;
 mod recorder;
+mod transcript;
 
 #[cfg(test)]
 mod test_support;
@@ -40,3 +42,4 @@ pub use gates::{GateDecision, ReviewGates};
 pub use recorder::{
     KNOWN_REVIEW_TOOLS, RecorderEvent, cycle_turn_outcome, normalize_tool_name, parse_recorder,
 };
+pub use transcript::transcript_from_recorder;
