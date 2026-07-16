@@ -7,6 +7,7 @@ import { Card } from "@/components/ui/card";
 import { Pagination } from "@/components/ui/pagination";
 import { SearchInput } from "@/components/ui/search-input";
 import { Pill } from "@/components/ui/status-pill";
+import type { GitlabLinkConfig } from "@/lib/domain/gitlab-links";
 import { approvalVisual, type Repository, repoSlug, repoUrl } from "@/lib/domain/repos";
 import { relativeTime } from "@/lib/domain/tasks";
 import { usePagination } from "@/lib/hooks/use-pagination";
@@ -16,8 +17,16 @@ const PAGE_SIZE = 12;
 /** Connected repositories as cards with a search box + pagination (ADR-0024, daisyUI in ADR-0027).
  * Search + page live in the URL via nuqs; filtering/paging is client-side over the fetched list.
  * `now` is server-passed so relative times don't drift on hydration.
- * `gitlabBaseUrl` is passed from the Server Component for self-hosted GitLab links. */
-export function RepoList({ repos, now, gitlabBaseUrl }: { repos: Repository[]; now: number; gitlabBaseUrl: string }) {
+ * `gitlabLinks` is passed from the Server Component for self-hosted GitLab links. */
+export function RepoList({
+  repos,
+  now,
+  gitlabLinks,
+}: {
+  repos: Repository[];
+  now: number;
+  gitlabLinks: GitlabLinkConfig;
+}) {
   const [query, setQuery] = useQueryState("q", { defaultValue: "", clearOnDefault: true });
   const [page, setPage] = useQueryState("page", parseAsInteger.withDefault(0));
 
@@ -46,7 +55,7 @@ export function RepoList({ repos, now, gitlabBaseUrl }: { repos: Repository[]; n
       ) : (
         <div className="grid gap-3 sm:grid-cols-2">
           {rows.map((repo) => (
-            <RepoCard key={repo.id} repo={repo} now={now} gitlabBaseUrl={gitlabBaseUrl} />
+            <RepoCard key={repo.id} repo={repo} now={now} gitlabLinks={gitlabLinks} />
           ))}
         </div>
       )}
@@ -64,8 +73,17 @@ export function RepoList({ repos, now, gitlabBaseUrl }: { repos: Repository[]; n
   );
 }
 
-function RepoCard({ repo, now, gitlabBaseUrl }: { repo: Repository; now: number; gitlabBaseUrl: string }) {
+function RepoCard({
+  repo,
+  now,
+  gitlabLinks,
+}: {
+  repo: Repository;
+  now: number;
+  gitlabLinks: GitlabLinkConfig;
+}) {
   const approval = approvalVisual(repo);
+  const viewLabel = repo.platform === "gitlab" ? "View on GitLab" : "View on GitHub";
   return (
     <Card>
       <div className="flex items-start justify-between gap-3 px-4 py-3">
@@ -88,12 +106,12 @@ function RepoCard({ repo, now, gitlabBaseUrl }: { repo: Repository; now: number;
         {/* Index health (graph + vector freshness, ADR-0016) lands with the indexer — honest for now. */}
         <span className="text-base-content/60">Not indexed yet</span>
         <a
-          href={repoUrl(repo, gitlabBaseUrl)}
+          href={repoUrl(repo, gitlabLinks)}
           target="_blank"
           rel="noopener noreferrer"
           className="inline-flex items-center gap-1 text-primary transition-colors hover:underline"
         >
-          View on GitHub
+          {viewLabel}
           <ExternalLink className="size-3 shrink-0" />
         </a>
       </div>

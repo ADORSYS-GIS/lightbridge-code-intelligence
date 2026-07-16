@@ -43,7 +43,13 @@ function priorityBadge(priority: string): string {
 
 /** The agent's persisted review for a run (Epic #75, Milestone C): summary, a count line, and each
  * finding with its severity, location, body, and optional suggested replacement. */
-export function ReviewOutput({ review }: { review: Review }) {
+export function ReviewOutput({
+  review,
+  repoPlatform,
+}: {
+  review: Review;
+  repoPlatform?: "github" | "gitlab" | null;
+}) {
   const counts = [
     `${review.inline_count} inline`,
     `${review.deferred_count} deferred`,
@@ -62,7 +68,7 @@ export function ReviewOutput({ review }: { review: Review }) {
             rel="noopener noreferrer"
             className="inline-flex items-center gap-1 text-xs text-primary transition-colors hover:underline"
           >
-            View on GitHub
+            {repoPlatform === "gitlab" ? "View on GitLab" : "View on GitHub"}
             <ExternalLink className="size-3 shrink-0" />
           </a>
         )}

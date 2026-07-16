@@ -133,7 +133,7 @@ function RepoRow({
       <div className="min-w-0">
         <div className="truncate text-sm font-medium">{repoSlug(repo)}</div>
         <div className="mt-0.5 font-mono text-xs text-base-content/60">
-          github id {repo.github_repo_id}
+          {repo.platform} id {repo.platform_repo_id}
         </div>
       </div>
       <div className="flex shrink-0 items-center gap-2">

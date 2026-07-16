@@ -3,12 +3,14 @@
  * `/repositories` payload (`RepositoryRow` in `services/control-plane/src/db.rs`). Edge-safe.
  */
 
+import { type GitlabLinkConfig, gitlabBaseUrlForProject } from "@/lib/domain/gitlab-links";
 import type { StatusVariant } from "@/lib/domain/tasks";
 
 /** A connected repository plus its run-activity summary. */
 export interface Repository {
   id: number;
-  github_repo_id: number;
+  /** Platform-agnostic numeric repository ID. */
+  platform_repo_id: number;
   platform: "github" | "gitlab";
   owner: string;
   name: string;
@@ -29,10 +31,10 @@ export function repoSlug(repo: Repository): string {
 }
 
 /** Platform-specific URL of the repository. */
-export function repoUrl(repo: Repository, gitlabBaseUrl: string): string {
+export function repoUrl(repo: Repository, gitlab: GitlabLinkConfig): string {
   switch (repo.platform) {
     case "gitlab":
-      return `${gitlabBaseUrl}/${repo.owner}/${repo.name}`;
+      return `${gitlabBaseUrlForProject(gitlab, repo.platform_repo_id)}/${repo.owner}/${repo.name}`;
     default:
       return `https://github.com/${repo.owner}/${repo.name}`;
   }

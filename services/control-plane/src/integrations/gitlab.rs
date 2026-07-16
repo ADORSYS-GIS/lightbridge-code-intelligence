@@ -160,6 +160,7 @@ struct DiffRefs {
 pub struct GitlabProject {
     pub project_id: i64,
     pub bot_handle: String,
+    pub web_base_url: String,
     pub client: GitlabClient,
 }
 
@@ -167,6 +168,8 @@ pub struct GitlabProject {
 #[derive(Clone, Default)]
 pub struct GitlabRegistry {
     by_project_id: std::collections::HashMap<i64, GitlabProject>,
+    /// Default web (non-API) base URL for projects that omit `api_url`.
+    default_web_base_url: String,
 }
 
 impl GitlabRegistry {
@@ -180,6 +183,7 @@ impl GitlabRegistry {
         for project in &section.projects {
             let api_url = section.resolved_api_url(project).to_string();
             let bot_handle = section.resolved_bot_handle(project).to_string();
+            let web_base_url = web_base_url_from_api_url(&api_url);
             let client = GitlabClient::new(
                 api_url,
                 project.access_token.clone(),
@@ -190,6 +194,7 @@ impl GitlabRegistry {
                 GitlabProject {
                     project_id: project.project_id,
                     bot_handle,
+                    web_base_url,
                     client,
                 },
             );
@@ -199,11 +204,33 @@ impl GitlabRegistry {
             projects = by_project_id.len(),
             "configured GitLab projects from control-plane file config"
         );
-        Ok(Some(Self { by_project_id }))
+        Ok(Some(Self {
+            by_project_id,
+            default_web_base_url: web_base_url_from_api_url(section.default_api_url()),
+        }))
     }
 
     pub fn get(&self, project_id: i64) -> Option<&GitlabProject> {
         self.by_project_id.get(&project_id)
+    }
+
+    /// Default web (non-API) base URL for building repo/MR deep links when no project-specific host
+    /// applies. The frontend reads this via `GET /config` rather than carrying its own `GITLAB_URL`
+    /// env var.
+    pub fn web_base_url(&self) -> String {
+        self.default_web_base_url.clone()
+    }
+
+    pub fn web_base_url_for_project(&self, project_id: i64) -> Option<&str> {
+        self.get(project_id)
+            .map(|project| project.web_base_url.as_str())
+    }
+
+    pub fn project_web_base_urls(&self) -> std::collections::BTreeMap<String, String> {
+        self.by_project_id
+            .iter()
+            .map(|(project_id, project)| (project_id.to_string(), project.web_base_url.clone()))
+            .collect()
     }
 
     pub fn client_for_project(&self, project_id: i64) -> Option<&GitlabClient> {
@@ -241,6 +268,13 @@ impl GitlabPlatformRouter {
             anyhow::anyhow!("GitLab project {} is not configured", repo.installation_id)
         })
     }
+}
+
+fn web_base_url_from_api_url(api_url: &str) -> String {
+    api_url
+        .trim_end_matches('/')
+        .trim_end_matches("/api/v4")
+        .to_string()
 }
 
 #[async_trait]
@@ -807,6 +841,7 @@ mod tests {
             projects: vec![
                 project(1001, "token-a", "secret-a"),
                 GitlabProjectConfig {
+                    api_url: Some("https://gitlab.internal.example/api/v4".to_string()),
                     bot_handle: Some("lb-reviewer".to_string()),
                     ..project(1002, "token-b", "secret-b")
                 },
@@ -819,6 +854,21 @@ mod tests {
         assert!(registry.is_configured());
         assert_eq!(registry.bot_handle(1001), Some("lightbridge-bot"));
         assert_eq!(registry.bot_handle(1002), Some("lb-reviewer"));
+        assert_eq!(
+            registry.web_base_url_for_project(1001),
+            Some("https://gitlab.example.com")
+        );
+        assert_eq!(
+            registry.web_base_url_for_project(1002),
+            Some("https://gitlab.internal.example")
+        );
+        assert_eq!(
+            registry
+                .project_web_base_urls()
+                .get("1002")
+                .map(String::as_str),
+            Some("https://gitlab.internal.example")
+        );
         assert!(registry.client_for_project(1001).is_some());
         assert!(registry.client_for_project(9999).is_none());
 
@@ -833,6 +883,7 @@ mod tests {
             .expect("repo resolves through installation_id")
             .clone_url(&repo);
         assert!(clone_url.contains("oauth2:token-b@"));
+        assert!(clone_url.contains("@gitlab.internal.example/"));
         assert!(clone_url.ends_with("/group/service-b.git"));
     }
 }

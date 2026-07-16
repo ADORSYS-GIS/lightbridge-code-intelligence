@@ -151,7 +151,7 @@ fn sample_repos() -> Vec<RepositoryRow> {
     let mk = |id: i64, owner: &str, name: &str, status: &str, tasks: i64, by: Option<&str>| {
         RepositoryRow {
             id,
-            github_repo_id: 900_000 + id,
+            platform_repo_id: 900_000 + id,
             owner: owner.into(),
             name: name.into(),
             default_branch: "main".into(),

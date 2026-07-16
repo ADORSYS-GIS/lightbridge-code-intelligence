@@ -48,7 +48,7 @@ mod tests {
     fn repo(id: i64, status: &str) -> RepositoryRow {
         RepositoryRow {
             id,
-            github_repo_id: id,
+            platform_repo_id: id,
             owner: "o".into(),
             name: format!("r{id}"),
             default_branch: "main".into(),

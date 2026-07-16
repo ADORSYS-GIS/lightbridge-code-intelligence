@@ -2,13 +2,19 @@ import { RepoList } from "@/components/repos/repo-list";
 import { buttonClass } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { ApiErrorLine, EmptyState } from "@/components/ui/states";
-import { listRepositories } from "@/lib/server/api";
-import { githubAppInstallUrl, gitlabBaseUrl } from "@/lib/utils/config";
+import { gitlabLinkConfig } from "@/lib/domain/gitlab-links";
+import { getDeploymentConfig, listRepositories } from "@/lib/server/api";
+import { githubAppInstallUrl } from "@/lib/utils/config";
 
 export const dynamic = "force-dynamic";
 
 export default async function Repositories() {
   const result = await listRepositories();
+  const cfg = await getDeploymentConfig();
+  const gitlabLinks = gitlabLinkConfig(
+    cfg.ok ? cfg.data.gitlab_base_url : null,
+    cfg.ok ? cfg.data.gitlab_project_base_urls : null,
+  );
   const now = Date.now();
 
   return (
@@ -42,7 +48,7 @@ export default async function Repositories() {
           pull request).
         </EmptyState>
       ) : (
-        <RepoList repos={result.data} now={now} gitlabBaseUrl={gitlabBaseUrl()} />
+        <RepoList repos={result.data} now={now} gitlabLinks={gitlabLinks} />
       )}
     </div>
   );

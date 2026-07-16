@@ -321,6 +321,8 @@ fn app(state: AppState) -> Router {
         .route("/tasks/{id}/feedback", get(tasks::get_feedback))
         .route("/tasks/{id}/cancel", post(tasks::cancel))
         .route("/repositories", get(tasks::list_repositories))
+        // Deployment/config read for the web console (GitLab base URL, etc.) — no `GITLAB_URL` env.
+        .route("/config", get(http::config::deployment_config))
         // Admin API (approval gate, Epic #75) — gated by the `Admin` extractor (admin realm role).
         .route("/admin/repositories", get(admin::list_repositories))
         .route("/admin/repositories/{id}/approve", post(admin::approve))

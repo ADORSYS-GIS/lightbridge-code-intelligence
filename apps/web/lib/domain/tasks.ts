@@ -1,3 +1,5 @@
+import { type GitlabLinkConfig, gitlabBaseUrlForProject } from "@/lib/domain/gitlab-links";
+
 /**
  * Task-run domain types + presentation logic for the dashboard (ADR-0016). Mirrors the control
  * plane's `/tasks` payload (`TaskRow` in `services/control-plane/src/db.rs`). Pure + Edge-safe.
@@ -102,11 +104,11 @@ export function repoLabel(task: Task): string {
 }
 
 /** Platform-specific URL of the task's repository, or `null` when the repo identity join came back empty. */
-export function repoUrl(task: Task, gitlabBaseUrl: string): string | null {
+export function repoUrl(task: Task, gitlab: GitlabLinkConfig): string | null {
   if (!task.repo_owner || !task.repo_name) return null;
   switch (task.repo_platform) {
     case "gitlab":
-      return `${gitlabBaseUrl}/${task.repo_owner}/${task.repo_name}`;
+      return `${gitlabBaseUrlForProject(gitlab, task.installation_id)}/${task.repo_owner}/${task.repo_name}`;
     default:
       return `https://github.com/${task.repo_owner}/${task.repo_name}`;
   }
@@ -114,8 +116,8 @@ export function repoUrl(task: Task, gitlabBaseUrl: string): string | null {
 
 /** Platform-specific URL of the run's target — the PR or MR or issue — for a deep link; `null` when not applicable
  * (e.g. a `repository` index task, which has no PR/issue) or the repo identity is missing. */
-export function targetUrl(task: Task, gitlabBaseUrl: string): string | null {
-  const base = repoUrl(task, gitlabBaseUrl);
+export function targetUrl(task: Task, gitlab: GitlabLinkConfig): string | null {
+  const base = repoUrl(task, gitlab);
   if (!base) return null;
   switch (task.target_type) {
     case "pull_request":
