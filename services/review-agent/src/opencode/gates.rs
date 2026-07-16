@@ -88,9 +88,10 @@ impl ReviewGates {
     /// native registration order) or accepted it with any coverage disclosure to append.
     pub fn observe_cycle(&mut self, outcome: &TurnOutcome) -> GateDecision {
         let turn = self.cycle;
+        // One `TurnState` for both after-turn calls (gemini #442): it borrows nothing of `self`, and
+        // `after_turn_actions` takes it by shared ref, so the two gates can share it.
         let state = turn_state(turn, self.max_turns);
         let coverage_actions = self.coverage.after_turn_actions(&state, outcome);
-        let state = turn_state(turn, self.max_turns);
         let refute_actions = self.refute.after_turn_actions(&state, outcome);
         self.cycle += 1;
 

@@ -30,6 +30,23 @@ use crate::clone::PrDiff;
 /// it bounds gate bounces + keep-going nudges, not model turns (those are OpenCode's own budget).
 const MAX_REVIEW_CYCLES: usize = 8;
 
+/// Ceiling on how much of the recorder file to read into memory (gemini #447). The recorder logs tool
+/// RESULTS — including `read_file` output of arbitrary repo files — so a pathological repo could bloat
+/// it; cap the read so it can't OOM the runner. 32 MiB is far above any real review's recorder.
+const RECORDER_READ_CAP: u64 = 32 * 1024 * 1024;
+
+/// Read at most [`RECORDER_READ_CAP`] bytes of the recorder file, lossily decoded (a truncated tail /
+/// invalid UTF-8 just yields fewer parseable lines, never a panic). Missing file → empty.
+async fn read_recorder_capped(path: &Path) -> String {
+    use tokio::io::AsyncReadExt;
+    let Ok(file) = tokio::fs::File::open(path).await else {
+        return String::new();
+    };
+    let mut buffer = Vec::new();
+    let _ = file.take(RECORDER_READ_CAP).read_to_end(&mut buffer).await;
+    String::from_utf8_lossy(&buffer).into_owned()
+}
+
 /// A live OpenCode review session: one `ReviewSession::prompt` drives a single `session/prompt` cycle
 /// over ACP and returns the recorder events (ADR-0095) that cycle appended — the completeness
 /// authority the gates read (subagent-internal tool calls included).
@@ -65,9 +82,7 @@ impl ReviewSession for OpencodeReviewSession {
             .await
             .context("opencode session/prompt")?;
         // The recorder appends over the whole run; return only the events new since the last cycle.
-        let content = tokio::fs::read_to_string(&self.recorder_path)
-            .await
-            .unwrap_or_default();
+        let content = read_recorder_capped(&self.recorder_path).await;
         let mut all = parse_recorder(&content);
         let delta = if self.consumed < all.len() {
             all.split_off(self.consumed)
@@ -226,9 +241,7 @@ pub async fn run_opencode_agent(
     let resolution = run_review_loop(&mut session, &mut driver, &user_prompt).await;
 
     // ── Transcript from the full recorder file (ADR-0034), regardless of how the loop ended ──────
-    let recorder_content = tokio::fs::read_to_string(&recorder_path)
-        .await
-        .unwrap_or_default();
+    let recorder_content = read_recorder_capped(&recorder_path).await;
     transcript.extend(transcript_from_recorder(
         &parse_recorder(&recorder_content),
         &review.model,

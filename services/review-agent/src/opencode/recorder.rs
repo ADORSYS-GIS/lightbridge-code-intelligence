@@ -114,6 +114,11 @@ pub(super) fn result_text(result: &Value) -> String {
             return text.to_string();
         }
     }
+    // A bare JSON string result (gemini #442): return its content unquoted, so downstream substring
+    // matching (e.g. the refute gate's "recorded finding" check) isn't tripped by literal quotes.
+    if let Some(text) = result.as_str() {
+        return text.to_string();
+    }
     result.to_string()
 }
 

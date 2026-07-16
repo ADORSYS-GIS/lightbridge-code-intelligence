@@ -71,19 +71,22 @@ impl ReviewDriver {
             return DriveAction::Finalize(ReviewResolution::Aborted(reason.clone()));
         }
         match self.gates.observe_cycle(outcome) {
-            GateDecision::RejectFinish(nudge) => DriveAction::Prompt(nudge),
+            // A gate-accepted finish always wins — never turn a valid finish into exhaustion.
             GateDecision::Accept { disclosure } => {
                 DriveAction::Finalize(ReviewResolution::Finished { disclosure })
             }
-            GateDecision::Proceed => {
-                if self.cycles >= self.max_cycles {
-                    DriveAction::Finalize(ReviewResolution::Exhausted {
-                        disclosure: self.gates.exhausted(),
-                    })
-                } else {
-                    DriveAction::Prompt(CONTINUE_NUDGE.to_string())
-                }
+            // Otherwise `max_cycles` is the HARD ceiling on re-prompts, enforced for BOTH a gate
+            // bounce and a keep-going nudge (gemini #446): the gates are internally bounded today
+            // (coverage `max_bounces` + the refute one-shot), but the driver's own budget must be the
+            // authoritative backstop so a future unbounded gate — or a `max_cycles` set below the
+            // bounce budget — can never spin the loop / burn unbounded tokens.
+            _ if self.cycles >= self.max_cycles => {
+                DriveAction::Finalize(ReviewResolution::Exhausted {
+                    disclosure: self.gates.exhausted(),
+                })
             }
+            GateDecision::RejectFinish(nudge) => DriveAction::Prompt(nudge),
+            GateDecision::Proceed => DriveAction::Prompt(CONTINUE_NUDGE.to_string()),
         }
     }
 }
@@ -150,6 +153,34 @@ mod tests {
             driver.on_cycle(&abort),
             DriveAction::Finalize(ReviewResolution::Aborted("no PR diff".into()))
         );
+    }
+
+    /// Driver: repeated gate bounces are ALSO capped by `max_cycles` (gemini #446). With a generous
+    /// coverage bounce budget but `max_cycles = 2`, a model that keeps finishing without covering the
+    /// file is bounced once, then exhausted at the budget — the re-prompt loop can't overrun the ceiling.
+    #[tokio::test]
+    async fn repeated_bounces_are_capped_by_max_cycles() {
+        // Coverage bounce budget 10 ≫ max_cycles 2, so the gate would keep bouncing if unchecked.
+        let gates = ReviewGates::new(vec!["a.rs".into()], 10, 40, false);
+        let mut driver = ReviewDriver::new(gates, 2);
+        let premature = cycle_turn_outcome(&[
+            before(
+                "lightbridge_finish",
+                "f0",
+                serde_json::json!({"summary": "lgtm"}),
+            ),
+            after("lightbridge_finish", "f0", "finalize"),
+        ]);
+        // Cycle 1: bounce.
+        assert!(matches!(
+            driver.on_cycle(&premature),
+            DriveAction::Prompt(_)
+        ));
+        // Cycle 2: budget spent → exhausted, NOT another bounce.
+        assert!(matches!(
+            driver.on_cycle(&premature),
+            DriveAction::Finalize(ReviewResolution::Exhausted { .. })
+        ));
     }
 
     /// Driver: a model that keeps stopping without a terminal signal is re-prompted to keep going,

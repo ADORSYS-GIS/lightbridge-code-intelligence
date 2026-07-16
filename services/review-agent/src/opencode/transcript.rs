@@ -62,6 +62,22 @@ fn tool_entry(tool_name: Option<String>, content: Option<String>) -> TranscriptE
 pub fn transcript_from_recorder(events: &[RecorderEvent], model: &str) -> Vec<TranscriptEntry> {
     let mut entries = Vec::new();
     let mut reasoning = String::new();
+    // Buffer consecutive `tool.before`s so parallel calls (ADR-0042 batching) group into ONE assistant
+    // turn's `tool_calls`, flushed on the first following `tool.after` (gemini #444) — not one assistant
+    // entry per call.
+    let mut pending: Vec<Value> = Vec::new();
+    let flush =
+        |entries: &mut Vec<TranscriptEntry>, reasoning: &mut String, pending: &mut Vec<Value>| {
+            if pending.is_empty() {
+                return;
+            }
+            let content = (!reasoning.is_empty()).then(|| std::mem::take(reasoning));
+            entries.push(assistant_entry(
+                content,
+                Some(Value::Array(std::mem::take(pending))),
+                model,
+            ));
+        };
     for event in events {
         match event.kind.as_str() {
             "reasoning.part" => {
@@ -78,26 +94,36 @@ pub fn transcript_from_recorder(events: &[RecorderEvent], model: &str) -> Vec<Tr
                 }
             }
             "tool.before" => {
-                let tool_calls = json!([{
+                // `Some(Null)` args must serialize to `{}`, not `"null"` (parity with
+                // `cycle_turn_outcome`, gemini #444).
+                let arguments = match event.args.as_ref() {
+                    None | Some(Value::Null) => "{}".to_string(),
+                    Some(args) => args.to_string(),
+                };
+                pending.push(json!({
                     "id": event.call_id.clone().unwrap_or_default(),
                     "type": "function",
                     "function": {
                         "name": tool_display_name(event).unwrap_or_default(),
-                        "arguments": event.args.clone().unwrap_or_else(|| json!({})).to_string(),
+                        "arguments": arguments,
                     }
-                }]);
-                let content = (!reasoning.is_empty()).then(|| std::mem::take(&mut reasoning));
-                entries.push(assistant_entry(content, Some(tool_calls), model));
+                }));
             }
             "tool.after" => {
+                flush(&mut entries, &mut reasoning, &mut pending);
                 let content = event.result.as_ref().map(result_text);
                 entries.push(tool_entry(tool_display_name(event), content));
             }
             _ => {}
         }
     }
-    if !reasoning.is_empty() {
-        entries.push(assistant_entry(Some(reasoning), None, model));
+    // Trailing tool calls with no result (cycle cut), else a trailing reasoning block.
+    if pending.is_empty() {
+        if !reasoning.is_empty() {
+            entries.push(assistant_entry(Some(reasoning), None, model));
+        }
+    } else {
+        flush(&mut entries, &mut reasoning, &mut pending);
     }
     entries
 }
@@ -161,6 +187,46 @@ mod tests {
             Some("a closing reflection with no tool")
         );
         assert!(entries[2].tool_calls.is_none());
+    }
+
+    /// Parallel tool calls (two `tool.before`s before any `tool.after`) group into ONE assistant turn
+    /// with both `tool_calls` (gemini #444), not two consecutive assistant entries.
+    #[test]
+    fn groups_parallel_tool_calls_into_one_assistant_turn() {
+        let events = vec![
+            before(
+                "lightbridge_read_file",
+                "a",
+                serde_json::json!({"path": "a.rs"}),
+            ),
+            before(
+                "lightbridge_read_file",
+                "b",
+                serde_json::json!({"path": "b.rs"}),
+            ),
+            after("lightbridge_read_file", "a", "src a"),
+            after("lightbridge_read_file", "b", "src b"),
+        ];
+        let entries = transcript_from_recorder(&events, "m");
+        // One assistant turn (2 tool_calls) + two tool results.
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].role, "assistant");
+        let calls = entries[0].tool_calls.as_ref().unwrap().as_array().unwrap();
+        assert_eq!(calls.len(), 2, "both parallel calls in one turn: {calls:?}");
+        assert_eq!(entries[1].role, "tool");
+        assert_eq!(entries[2].role, "tool");
+    }
+
+    /// `Some(Value::Null)` args serialize to `{}`, not the string `"null"` (gemini #444).
+    #[test]
+    fn null_args_serialize_as_empty_object() {
+        let mut ev = before("lightbridge_finish", "c1", serde_json::json!(null));
+        ev.args = Some(Value::Null);
+        let entries = transcript_from_recorder(&[ev], "m");
+        let args = entries[0].tool_calls.as_ref().unwrap()[0]["function"]["arguments"]
+            .as_str()
+            .unwrap();
+        assert_eq!(args, "{}");
     }
 
     #[test]
