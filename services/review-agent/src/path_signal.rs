@@ -64,7 +64,7 @@ pub fn classify_path(path: &str) -> FileSignal {
 
     if is_lock_or_vendor(name) {
         FileSignal::LockOrVendor
-    } else if is_generated(name) {
+    } else if is_generated(p, name) {
         FileSignal::Generated
     } else if is_test(p, name) {
         FileSignal::Test
@@ -100,7 +100,14 @@ fn is_lock_or_vendor(name: &str) -> bool {
 
 /// Generator output: codegen conventions whose bytes are machine-produced, never a bare extension alone
 /// (a `.dart`/`.go` file is not generated just because of its extension).
-fn is_generated(name: &str) -> bool {
+fn is_generated(path: &str, name: &str) -> bool {
+    // sqlx's offline query cache (`cargo sqlx prepare`) — `.sqlx/query-<hash>.json`. Machine-produced
+    // from the SQL in the handlers, never hand-edited. Without this they classified as reviewable
+    // source, so the coverage gate (ADR-0041) bounced `finish` and trapped the agent re-"reviewing"
+    // generated JSON for turns on end (observed: a deep review burned 9 of 14 turns on `.sqlx/*.json`).
+    if path.contains(".sqlx/") && name.ends_with(".json") {
+        return true;
+    }
     const GENERATED_SUFFIXES: &[&str] = &[
         ".g.dart",
         ".freezed.dart",
@@ -207,9 +214,25 @@ mod tests {
             "lib/models/user.freezed.dart",
             "proto/gen/service.pb.go",
             "proto/gen/service_pb2.py",
+            // sqlx offline query cache — machine-produced by `cargo sqlx prepare`.
+            "apps/api/.sqlx/query-043bf9034ba196bbd569c9855ee67ccdc4e88ab1aa4f4e6ac75f7f10c576de4c.json",
+            ".sqlx/query-abc.json",
         ] {
             assert_eq!(classify_path(p), FileSignal::Generated, "{p}");
         }
+    }
+
+    #[test]
+    fn a_normal_json_outside_dot_sqlx_is_not_generated() {
+        // Only `.sqlx/*.json` is generated — a plain data/config JSON must not be swept in.
+        assert_ne!(
+            classify_path("apps/api/src/data/roles.json"),
+            FileSignal::Generated
+        );
+        assert_ne!(
+            classify_path("apps/api/config/roles.json"),
+            FileSignal::Generated
+        );
     }
 
     #[test]
