@@ -71,9 +71,10 @@ jobs:
           CC_x86_64_unknown_linux_musl: musl-gcc
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
         run: |
-          cargo build --release --locked --target "$TARGET" -p control-plane -p agent-runner
+          cargo build --release --locked --target "$TARGET" -p control-plane -p agent-runner -p lci-review-mcp
           mkdir -p dist
-          cp "target/$TARGET/release/control-plane" "target/$TARGET/release/agent-runner" dist/
+          cp "target/$TARGET/release/control-plane" "target/$TARGET/release/agent-runner" \
+             "target/$TARGET/release/lci-review-mcp" dist/
           file dist/*
       - name: sccache stats
         if: always()
@@ -141,9 +142,15 @@ jobs:
             dockerfile: services/agent-runner/Dockerfile
             target: indexer
             artifact: rust-bins
+          # ADR-0097 cutover: the review image is now OpenCode-based (the agent-runner Job binary
+          # spawns `opencode acp` + the stdio lci-review-mcp + the plugins). The image NAME is
+          # unchanged, so ai-helm-values needs NO edit — merging this rebuilds lightbridge-agent-review
+          # as the opencode image and argocd-image-updater promotes it (that promotion IS the go-live).
+          # The old debian `review` target in services/agent-runner/Dockerfile stays (unused) until the
+          # follow-up that removes run_native_agent.
           - image: lightbridge-agent-review
-            dockerfile: services/agent-runner/Dockerfile
-            target: review
+            dockerfile: services/agent-runner/Dockerfile.review-opencode
+            target: ""
             artifact: rust-bins
     steps:
       - uses: actions/checkout@v4 # the Dockerfiles
@@ -172,7 +179,15 @@ jobs:
         run: |
           ctx="$(mktemp -d)"
           case "${{ matrix.artifact }}" in
-            rust-bins)  cp dist/* "$ctx"/ && chmod +x "$ctx"/* ;;
+            rust-bins)
+              cp dist/* "$ctx"/ && chmod +x "$ctx"/*
+              # The review-opencode image also needs the first-party plugins (ADR-0095) — the buildah
+              # context is dist/-only, so stage them here from the checkout under a context-relative
+              # name. node_modules is gitignored (absent from the checkout); pruned defensively.
+              mkdir -p "$ctx"/opencode-plugins
+              cp -r integrations/opencode/plugins/. "$ctx"/opencode-plugins/
+              find "$ctx"/opencode-plugins -type d -name node_modules -prune -exec rm -rf {} +
+              ;;
             web-bundle) cp -a web/standalone web/static web/public "$ctx"/ ;;
           esac
           echo "dir=$ctx" >> "$GITHUB_OUTPUT"

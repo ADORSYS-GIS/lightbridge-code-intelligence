@@ -117,6 +117,9 @@ pub async fn run_opencode_agent(
     repo_instructions: Option<&str>,
     prior_reviews: Option<&str>,
     repo_memory: Option<&str>,
+    // Per-project billing attribution headers (epic #89) — forwarded to the eaig provider so
+    // OpenCode-hosted review bills the same as native.
+    attribution: &[(String, String)],
     mcp_env: &McpEnv<'_>,
     task_id: Uuid,
     client: &ControlPlaneClient,
@@ -154,11 +157,27 @@ pub async fn run_opencode_agent(
         .join("\n\n");
 
     // ── Render + write the config, and pick the recorder path ───────────────────────────────────
-    let config = render_review_config(&system_prompt, review.fast, review.temperature);
+    let config = render_review_config(&system_prompt, review.fast, review.temperature, attribution);
     let workdir = std::env::temp_dir().join(format!("lci-opencode-review-{task_id}"));
     tokio::fs::create_dir_all(&workdir)
         .await
         .context("creating the opencode review workdir")?;
+    // ⚠️ CONFIG ISOLATION (security): opencode MERGES config from its cwd's `opencode.json` and from
+    // the global HOME/XDG config over our `OPENCODE_CONFIG`. The checkout is UNTRUSTED (a PR from a
+    // fork could ship an `opencode.json` that re-enables built-in tools / bash, injects an MCP server
+    // that runs commands, or swaps the model — verified via `opencode debug config`). So opencode runs
+    // with a NEUTRAL cwd (this workdir, never the checkout) and an EMPTY HOME/XDG — its ONLY config is
+    // ours. File reads still reach the checkout via `lci-review-mcp` (LCI_MCP_CHECKOUT), so opencode
+    // never needs it as cwd. The config file is `opencode.review.json` (via OPENCODE_CONFIG), NOT
+    // `opencode.json`, so it isn't itself auto-loaded as a project config.
+    let fake_home = workdir.join("home");
+    let xdg_dir = workdir.join("xdg");
+    tokio::fs::create_dir_all(&fake_home)
+        .await
+        .context("creating the isolated opencode HOME")?;
+    tokio::fs::create_dir_all(&xdg_dir)
+        .await
+        .context("creating the isolated opencode XDG dir")?;
     let config_path = workdir.join("opencode.review.json");
     tokio::fs::write(
         &config_path,
@@ -173,6 +192,11 @@ pub async fn run_opencode_agent(
         ("OPENCODE_CONFIG".into(), config_path.display().to_string()),
         ("OPENCODE_DISABLE_AUTOUPDATE".into(), "1".into()),
         ("OPENCODE_DISABLE_MODELS_FETCH".into(), "1".into()),
+        // Config isolation (see above): empty HOME/XDG so no global opencode config merges in.
+        ("HOME".into(), fake_home.display().to_string()),
+        ("XDG_CONFIG_HOME".into(), xdg_dir.display().to_string()),
+        ("XDG_DATA_HOME".into(), xdg_dir.display().to_string()),
+        ("XDG_CACHE_HOME".into(), xdg_dir.display().to_string()),
         (
             "LCI_RECORDER_PATH".into(),
             recorder_path.display().to_string(),
@@ -211,7 +235,8 @@ pub async fn run_opencode_agent(
     let bin = std::env::var("OPENCODE_BIN").unwrap_or_else(|_| "opencode".to_string());
     // Deny every permission request: review is read-only, so edit/bash/webfetch are already denied in
     // the config and should never be asked — a cancel is the safe answer if one somehow arrives.
-    let client_acp = AcpClient::spawn(&bin, mcp_env.checkout_root, PermissionPolicy::Cancel, &env)
+    // cwd = the neutral workdir, NOT the untrusted checkout (config-isolation, see above).
+    let client_acp = AcpClient::spawn(&bin, &workdir, PermissionPolicy::Cancel, &env)
         .await
         .context("spawning opencode acp")?;
     client_acp
@@ -222,7 +247,8 @@ pub async fn run_opencode_agent(
     // wired via the config `mcp` block, not here, so this is empty — caught by the real-opencode e2e.
     let session_id = client_acp
         .new_session(
-            &mcp_env.checkout_root.to_string_lossy(),
+            // Session cwd = the neutral workdir too, NOT the untrusted checkout (config-isolation).
+            &workdir.to_string_lossy(),
             serde_json::json!([]),
         )
         .await

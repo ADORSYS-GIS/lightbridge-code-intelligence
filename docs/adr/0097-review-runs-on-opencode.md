@@ -72,6 +72,16 @@ calls) and returns once. So the native review policies split into two classes:
    compares the two engines' findings on the same PR; **only-native** (an issue native caught that
    OpenCode missed) is the regression that blocks the cutover. Procedure:
    [`integrations/opencode/sim/SHADOW.md`](../../integrations/opencode/sim/SHADOW.md).
+6. **Config isolation (security): opencode runs with a NEUTRAL cwd + empty HOME/XDG — never the
+   checkout.** opencode merges config from its cwd's `opencode.json` and from HOME/XDG over
+   `OPENCODE_CONFIG`. The checkout is **untrusted** (a PR from a fork could ship an `opencode.json`),
+   and `opencode debug config` confirmed such a file **fully overrides ours** — re-enabling built-in
+   `read`/`bash`, flipping `permission` to `allow`, injecting an MCP server that runs commands, and
+   swapping the model. So the host spawns opencode with cwd = a throwaway workdir (holding only our
+   `OPENCODE_CONFIG`, named `opencode.review.json` so it isn't itself auto-loaded as a project config)
+   and empty HOME/XDG. File reads still reach the checkout through `lci-review-mcp` (`LCI_MCP_CHECKOUT`),
+   so opencode never needs it as cwd. `OPENCODE_CONFIG_DIR` does **not** solve this — it locates our
+   config but doesn't stop the cwd project-config merge.
 
 ### Data flow
 
