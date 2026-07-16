@@ -1,0 +1,52 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "//": "Rendered per task by the agent-plane supervisor: {env:*} placeholders are filled from the task env; the plugin entries resolve to the vendored integrations/opencode/plugins/* packages (loading mechanics = RFC-0009 probe item). This file is the `open`-mode shape; other modes get their own rendering.",
+  "plugin": [
+    "@lightbridge/opencode-plugin-recorder",
+    "@lightbridge/opencode-plugin-gate-interlock"
+  ],
+  "permission": {
+    "edit": "allow",
+    "bash": "allow",
+    "webfetch": "deny"
+  },
+  "mcp": {
+    "lightbridge": {
+      "type": "remote",
+      "url": "{env:LCI_MCP_URL}",
+      "enabled": true,
+      "headers": {
+        "authorization": "Bearer {env:LCI_RUNNER_TOKEN}"
+      }
+    }
+  },
+  "agent": {
+    "lci-open": {
+      "description": "Lightbridge open mode: reads the ticket, investigates, edits, builds and tests in the sandbox, then proposes a PR via the mediated lightbridge_propose_pr tool. Never pushes, never merges.",
+      "prompt": "{file:./prompts/open.md}",
+      "permission": {
+        "edit": "allow",
+        "bash": "allow",
+        "webfetch": "deny"
+      }
+    },
+    "research": {
+      "mode": "subagent",
+      "description": "Read-only investigation: navigate the checkout and the Lightbridge retrieval tools (semantic + graph search) to answer a focused question. Returns findings with file:line evidence; makes no edits and runs no commands.",
+      "permission": {
+        "edit": "deny",
+        "bash": "deny",
+        "webfetch": "deny"
+      }
+    },
+    "capture": {
+      "mode": "subagent",
+      "description": "Capture and structure context for the record: summarize decisions, evidence, and verification results into the structured payloads the mediated Lightbridge tools expect (findings, progress reports, PR body with the AI-usage declaration).",
+      "permission": {
+        "edit": "deny",
+        "bash": "deny",
+        "webfetch": "deny"
+      }
+    }
+  }
+}
