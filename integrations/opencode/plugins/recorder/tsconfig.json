@@ -1,0 +1,4 @@
+{
+  "extends": "@lightbridge/tsconfig/base.json",
+  "include": ["src"]
+}

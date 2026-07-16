@@ -1,0 +1,77 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  // Open-mode OpenCode config, rendered per task by the agent-plane supervisor ({env:*} filled from
+  // the task env). Structure = capability tiers, NOT role-play: ONE primary (`lci-open`) owns every
+  // write + both terminal tools (propose_pr/abort); subagents are least-privilege READ-ONLY helpers
+  // for context isolation. The terminal path is primary-only on purpose — the gate-interlock and
+  // recorder plugins key off the primary's terminal call, so a subagent must never reach it. Other
+  // modes get their own rendering.
+  //
+  // NOTE: this file is `.jsonc` on purpose — opencode's config schema REJECTS unrecognized keys
+  // (verified against 1.18.2: a `"//"` comment KEY fails with "Unrecognized key: //"). Use real
+  // `//` line comments here, never `"//": "..."` string-keys.
+  // Plugins are referenced by ABSOLUTE PATH to their vendored source, NOT by package name:
+  // verified against 1.18.2 that a bare `@lightbridge/...` package-name entry does NOT resolve
+  // in-image (the plugins aren't installed as node_modules; opencode's bundled Bun transpiles the
+  // .ts in place). Absolute-path and `.opencode/plugin/*.ts` auto-dir both load and fire hooks;
+  // we use the absolute path so the plugins live under /opt and don't pollute the repo checkout.
+  "plugin": [
+    "/opt/lightbridge/opencode/plugins/recorder/src/index.ts",
+    "/opt/lightbridge/opencode/plugins/gate-interlock/src/index.ts",
+    "/opt/lightbridge/opencode/plugins/logger/src/index.ts"
+  ],
+  // Global invariant for every agent in open mode: no direct web egress (defense-in-depth over the
+  // ADR-0088 network allowlist). edit/bash are decided per-agent below, so this is NOT a duplicate
+  // of the primary's block.
+  "permission": {
+    "webfetch": "deny"
+  },
+  "mcp": {
+    "lightbridge": {
+      "type": "remote",
+      "url": "{env:LCI_MCP_URL}",
+      "enabled": true,
+      "headers": {
+        "authorization": "Bearer {env:LCI_RUNNER_TOKEN}"
+      }
+    }
+  },
+  "agent": {
+    "lci-open": {
+      "mode": "primary",
+      "description": "Lightbridge open mode: reads the ticket, investigates (delegating read-heavy digs to @explore), edits and builds/tests in the sandbox, then proposes a PR via the mediated lightbridge_propose_pr tool. Never pushes, never merges. The only agent that may write or call a terminal tool.",
+      "prompt": "{file:./prompts/open.md}",
+      "permission": {
+        "edit": "allow",
+        "bash": "allow",
+        "webfetch": "deny"
+      }
+    },
+    "explore": {
+      "mode": "subagent",
+      "description": "Read-only investigation & localization — customizes OpenCode's built-in `explore`. Use it to answer a focused codebase question (where does X live, how is this pattern implemented, who calls this symbol) via read/grep/glob + the Lightbridge retrieval tools (semantic + graph search). It burns its own context window and hands back a distilled answer with file:line evidence, keeping the primary lean. Cannot edit, run commands, fetch the web, or propose a PR.",
+      "permission": {
+        "edit": "deny",
+        "bash": "deny",
+        "webfetch": "deny"
+      },
+      // explore's read surface is ALREADY complete without bash: OpenCode ships `read`, `grep`,
+      // `glob` (find-by-pattern) and `list` (ls) as DEDICATED tools, distinct from `bash` — so
+      // denying bash (above) costs explore nothing for grep/ls/find. Those + the mediated retrieval
+      // and forge-READ tools (ADR-0096: get_issue/list_branches/read_file_at_ref/…) stay enabled
+      // (unlisted = allowed). This map only DENIES the mediated write/terminal tools — the permission
+      // block can gate edit/bash/webfetch but not specific MCP tools, so this is what keeps
+      // propose_pr/abort off a subagent. Tool names carry the `lightbridge` MCP-server prefix;
+      // finalized when the control-plane MCP surface lands.
+      "tools": {
+        "lightbridge_propose_pr": false,
+        "lightbridge_abort": false,
+        "lightbridge_submit_findings": false,
+        // The built-in `explore` ships `websearch: allow`; deny it here so the read-only helper
+        // can't reach the web (belt to the ADR-0088 egress deny). `webfetch` is already denied via
+        // the permission block above; websearch is a separate tool, hence this entry.
+        "websearch": false
+      }
+    }
+  }
+}
