@@ -55,6 +55,9 @@ impl AcpClient {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
+            // Kill the opencode child if this AcpClient is dropped without an explicit shutdown() —
+            // tokio does not reap the OS process on drop otherwise, which would orphan opencode.
+            .kill_on_drop(true)
             .spawn()
             .with_context(|| format!("spawning `{bin} acp` (is it on PATH?)"))?;
 
@@ -87,11 +90,16 @@ impl AcpClient {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         self.pending.lock().await.insert(id, tx);
-        send_message(
+        if let Err(err) = send_message(
             &self.stdin,
             json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}),
         )
-        .await?;
+        .await
+        {
+            // The write failed — don't leave a dangling waiter in the pending map.
+            self.pending.lock().await.remove(&id);
+            return Err(err.context(format!("sending acp `{method}` request")));
+        }
         let resp = rx
             .await
             .with_context(|| format!("acp `{method}` response channel closed (agent exited?)"))?;
@@ -152,11 +160,16 @@ impl AcpClient {
             .collect()
     }
 
-    /// Terminate the child. The supervisor calls this on budget exhaustion or task completion.
+    /// Terminate the child and reap it. The supervisor calls this on budget exhaustion or task
+    /// completion. `start_kill` only signals; `wait` reaps the process so it can't linger as a zombie.
     pub async fn shutdown(mut self) -> Result<()> {
         self.child
             .start_kill()
-            .context("killing opencode acp child")?;
+            .context("signalling opencode acp child to stop")?;
+        self.child
+            .wait()
+            .await
+            .context("waiting for opencode acp child to exit")?;
         Ok(())
     }
 }
@@ -183,10 +196,10 @@ async fn reader_loop(
 
         let Some(method) = method else {
             // No method → a response to one of our requests.
-            if let Some(id) = id {
-                if let Some(tx) = pending.lock().await.remove(&id) {
-                    let _ = tx.send(msg);
-                }
+            let Some(id) = id else { continue };
+            let waiter = pending.lock().await.remove(&id);
+            if let Some(tx) = waiter {
+                let _ = tx.send(msg);
             }
             continue;
         };
@@ -220,6 +233,11 @@ async fn reader_loop(
             }
         }
     }
+
+    // The reader is exiting — the child's stdout hit EOF (opencode exited or crashed). Drop every
+    // pending sender so any in-flight `request()` wakes with a channel-closed error instead of
+    // awaiting a response that will never come.
+    pending.lock().await.clear();
 }
 
 fn decide_permission(msg: &Value, policy: PermissionPolicy) -> Value {
