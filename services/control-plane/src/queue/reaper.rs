@@ -78,7 +78,6 @@ pub async fn reap_once<L: TaskLauncher>(
     pool: &PgPool,
     launcher: &L,
     review: &crate::config::ReviewSection,
-    egress: &crate::egress::PlatformEgressRouter,
 ) -> anyhow::Result<()> {
     let candidates = db::list_reapable_tasks(pool, REAP_BATCH).await?;
     if candidates.is_empty() {
@@ -139,7 +138,7 @@ pub async fn reap_once<L: TaskLauncher>(
                     // The uncatchable-kill notice (ADR-0057) + the 😕 lifecycle reaction (ADR-0068), both
                     // via the egress outbox (ADR-0059): the keyless dispatcher can't POST, but it CAN
                     // write intent rows — the reconciler delivers them. No sweep, no settle buffer.
-                    enqueue_reaper_failure_notice(pool, task.id, review, egress).await;
+                    enqueue_reaper_failure_notice(pool, task.id, review).await;
                 }
                 marked.map(|_| ())
             }
@@ -196,7 +195,6 @@ async fn enqueue_reaper_failure_notice(
     pool: &sqlx::PgPool,
     task_id: uuid::Uuid,
     review: &crate::config::ReviewSection,
-    egress: &crate::egress::PlatformEgressRouter,
 ) {
     let context = match db::get_task_context(pool, task_id).await {
         Ok(Some(c)) if c.target_type == "pull_request" => c,
@@ -208,7 +206,6 @@ async fn enqueue_reaper_failure_notice(
         installation_id: context.installation_id,
         owner: &context.owner,
         repo: &context.name,
-        egress,
     };
     if review.reactions_enabled() {
         // 😕 on the trigger: the @mention comment when mention-triggered, else the PR body.
@@ -393,14 +390,9 @@ mod tests {
         let id = stuck_running_task(&pool).await;
         let launcher = FakeLauncher::new(JobLiveness::Failed);
 
-        reap_once(
-            &pool,
-            &launcher,
-            &crate::config::ReviewSection::default(),
-            &crate::egress::PlatformEgressRouter::disabled(),
-        )
-        .await
-        .unwrap();
+        reap_once(&pool, &launcher, &crate::config::ReviewSection::default())
+            .await
+            .unwrap();
 
         assert_eq!(status_of(&pool, id).await, "queued", "requeued for retry");
         assert_eq!(
@@ -416,14 +408,9 @@ mod tests {
         let id = stuck_running_task(&pool).await;
         let launcher = FakeLauncher::new(JobLiveness::Active);
 
-        reap_once(
-            &pool,
-            &launcher,
-            &crate::config::ReviewSection::default(),
-            &crate::egress::PlatformEgressRouter::disabled(),
-        )
-        .await
-        .unwrap();
+        reap_once(&pool, &launcher, &crate::config::ReviewSection::default())
+            .await
+            .unwrap();
 
         assert_eq!(status_of(&pool, id).await, "running", "still running");
         assert!(
@@ -444,14 +431,9 @@ mod tests {
         let id = stuck_running_task(&pool).await;
         let launcher = FakeLauncher::new(JobLiveness::Succeeded);
 
-        reap_once(
-            &pool,
-            &launcher,
-            &crate::config::ReviewSection::default(),
-            &crate::egress::PlatformEgressRouter::disabled(),
-        )
-        .await
-        .unwrap();
+        reap_once(&pool, &launcher, &crate::config::ReviewSection::default())
+            .await
+            .unwrap();
 
         assert_eq!(
             status_of(&pool, id).await,

@@ -2,7 +2,15 @@ packages:
   - "apps/*"
   - "packages/*"
   - "services/*"
+  - "integrations/opencode/plugins/*"
+  - "integrations/opencode/probe"
 
 # sharp is Next.js's optional image-optimization native dep; not needed for this skeleton.
 allowBuilds:
+  # msgpackr-extract (via @opencode-ai/sdk) ships prebuilt binaries; its build script is optional.
+  msgpackr-extract: false
   sharp: false
+
+minimumReleaseAgeExclude:
+  - '@opencode-ai/plugin@1.18.2'
+  - '@opencode-ai/sdk@1.18.2'

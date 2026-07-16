@@ -1,5 +1,57 @@
 # Changelog
 
+## [0.5.1](https://github.com/vymalo/lightbridge-code-intelligence/compare/v0.5.0...v0.5.1) (2026-07-16)
+
+
+### Documentation
+
+* **adr-0093:** Restate egress pilot no-go — revert to reconciler drain ([#432](https://github.com/vymalo/lightbridge-code-intelligence/issues/432)) ([7bfe42d](https://github.com/vymalo/lightbridge-code-intelligence/commit/7bfe42d5ed5a2fe5f85b6af4c4e63934c4fa3998))
+
+## [0.5.0](https://github.com/vymalo/lightbridge-code-intelligence/compare/v0.4.0...v0.5.0) (2026-07-15)
+
+
+### ⚠ BREAKING CHANGES
+
+* **indexer:** purge Graphify — lci-codegraph is the sole graph engine (ADR-0086) ([#379](https://github.com/vymalo/lightbridge-code-intelligence/issues/379))
+
+### Features
+
+* **agent-runner:** log per-turn reasoning AND content text to the console (ADR-0060, [#411](https://github.com/vymalo/lightbridge-code-intelligence/issues/411)) ([#429](https://github.com/vymalo/lightbridge-code-intelligence/issues/429)) ([22613c4](https://github.com/vymalo/lightbridge-code-intelligence/commit/22613c4d24012feca3b88178c0d8f78ed607b9c1))
+* **indexer:** purge Graphify — lci-codegraph is the sole graph engine (ADR-0086) ([#379](https://github.com/vymalo/lightbridge-code-intelligence/issues/379)) ([71261f6](https://github.com/vymalo/lightbridge-code-intelligence/commit/71261f69c957b6b2f24c9fc91cbf7ab432510a90))
+* **observability:** OTel distributed tracing across control-plane + agent-runner ([#246](https://github.com/vymalo/lightbridge-code-intelligence/issues/246)) ([#419](https://github.com/vymalo/lightbridge-code-intelligence/issues/419)) ([7cb6f2c](https://github.com/vymalo/lightbridge-code-intelligence/commit/7cb6f2c6d2b272699359c6888383f69b1db3975d))
+* **review-agent:** add impact-anchored P0/P1/P2 rubric to add_review_comment ([#421](https://github.com/vymalo/lightbridge-code-intelligence/issues/421)) ([#424](https://github.com/vymalo/lightbridge-code-intelligence/issues/424)) ([0d017bb](https://github.com/vymalo/lightbridge-code-intelligence/commit/0d017bb025ea38ea043dbb1525a5fb929faaedc0))
+* **review:** make SAST an agent-called run_sast tool (ADR-0073) ([#413](https://github.com/vymalo/lightbridge-code-intelligence/issues/413)) ([c0aa378](https://github.com/vymalo/lightbridge-code-intelligence/commit/c0aa3785716dadd49a7ff9e1d0d862f0ab315fb4))
+* **xtask:** add review-variance harness for deep-tier severity stability ([#420](https://github.com/vymalo/lightbridge-code-intelligence/issues/420)) ([#422](https://github.com/vymalo/lightbridge-code-intelligence/issues/422)) ([73623ff](https://github.com/vymalo/lightbridge-code-intelligence/commit/73623ffa66d176bfac59815ee19fcdec86296d11))
+
+
+### Bug Fixes
+
+* **agent-loop,agent-types,review-agent,agent-runner:** make turn telemetry durable across replay ([#423](https://github.com/vymalo/lightbridge-code-intelligence/issues/423)) ([bc797dc](https://github.com/vymalo/lightbridge-code-intelligence/commit/bc797dce6e6ede6f0349bc95cf7be0664b8e1372))
+* **agent-status,agent-runner:** conservative status-server bind default + poison-recovery consistency ([#367](https://github.com/vymalo/lightbridge-code-intelligence/issues/367)) ([#409](https://github.com/vymalo/lightbridge-code-intelligence/issues/409)) ([81c43b3](https://github.com/vymalo/lightbridge-code-intelligence/commit/81c43b348cc7d6abc7fe9e18627b4d7e3a35d08b))
+* **agent-status:** fail closed when the status-server token is blank ([#399](https://github.com/vymalo/lightbridge-code-intelligence/issues/399)) ([45e78c8](https://github.com/vymalo/lightbridge-code-intelligence/commit/45e78c817dcc087a33fcfab51be34a132f6ab3a7))
+* **codegraph:** resolve same-file dup-name fan-out + bound PDF decompression; Graphify parity (gate [#360](https://github.com/vymalo/lightbridge-code-intelligence/issues/360)) ([#372](https://github.com/vymalo/lightbridge-code-intelligence/issues/372)) ([4f17998](https://github.com/vymalo/lightbridge-code-intelligence/commit/4f17998003249435a7f5be8f8bf41b24ac261e00))
+* **config:** correct opt_u64/opt_usize numeric deserializers ([#401](https://github.com/vymalo/lightbridge-code-intelligence/issues/401)) ([950aeba](https://github.com/vymalo/lightbridge-code-intelligence/commit/950aebad10619d2029693a99ed6211392fd0680e))
+* **control-plane:** replace shared AGENT_RUNNER_TOKEN with per-task signed tokens ([#243](https://github.com/vymalo/lightbridge-code-intelligence/issues/243)) ([#410](https://github.com/vymalo/lightbridge-code-intelligence/issues/410)) ([1c400b5](https://github.com/vymalo/lightbridge-code-intelligence/commit/1c400b53dd81f9d47f2e8711597b3897515170f3))
+* **control-plane:** restore migration 0028 to its applied bytes (unbreak startup) ([#377](https://github.com/vymalo/lightbridge-code-intelligence/issues/377)) ([681dad2](https://github.com/vymalo/lightbridge-code-intelligence/commit/681dad2a1c4d293dc21c67e0518e75f9d9b4cf71))
+* **control-plane:** restore recent-runs ordering in the list endpoint ([#373](https://github.com/vymalo/lightbridge-code-intelligence/issues/373)) ([5e6cf46](https://github.com/vymalo/lightbridge-code-intelligence/commit/5e6cf46dd255de391a96dd012be7aacca31d8c12))
+* **review-agent:** disclose that abort's reason is posted verbatim to the PR ([#428](https://github.com/vymalo/lightbridge-code-intelligence/issues/428)) ([c8591ef](https://github.com/vymalo/lightbridge-code-intelligence/commit/c8591efb480f984f6c3566210e56dd40445fa698))
+* **review-agent:** exclude low-signal files from coverage denominator, credit diff-cited findings ([#404](https://github.com/vymalo/lightbridge-code-intelligence/issues/404)) ([3dd87ca](https://github.com/vymalo/lightbridge-code-intelligence/commit/3dd87cabcc96e8f0b701282156fb9b014241953e))
+* **review-agent:** gate dropped-chunk log on a leading `{` not just non-empty ([#411](https://github.com/vymalo/lightbridge-code-intelligence/issues/411)) ([#427](https://github.com/vymalo/lightbridge-code-intelligence/issues/427)) ([4278500](https://github.com/vymalo/lightbridge-code-intelligence/commit/42785000a211e08b4f5e66ee88bb5169466144e2))
+* **review-agent:** refute pass searches outward for disconfirming evidence on absence claims ([#403](https://github.com/vymalo/lightbridge-code-intelligence/issues/403)) ([f46837b](https://github.com/vymalo/lightbridge-code-intelligence/commit/f46837b50545a7b0a566973b832dcb281a265bd8))
+* **review-agent:** tolerate explicit null tool_calls so reasoning deltas aren't dropped ([#411](https://github.com/vymalo/lightbridge-code-intelligence/issues/411)) ([#425](https://github.com/vymalo/lightbridge-code-intelligence/issues/425)) ([0a00281](https://github.com/vymalo/lightbridge-code-intelligence/commit/0a0028103bd550ab83a8a4a7218a05b9c669e9a9))
+* **sast:** anchor SAST triage verdicts to the exact opengrep-flagged line ([#406](https://github.com/vymalo/lightbridge-code-intelligence/issues/406)) ([d5fc628](https://github.com/vymalo/lightbridge-code-intelligence/commit/d5fc628a77c56badc2e694c979eebdd5e99c5f5b))
+* **xtask,control-plane:** don't mask genuine nextest failures; add ORDER BY tie-breaks ([#400](https://github.com/vymalo/lightbridge-code-intelligence/issues/400)) ([#405](https://github.com/vymalo/lightbridge-code-intelligence/issues/405)) ([ae26aab](https://github.com/vymalo/lightbridge-code-intelligence/commit/ae26aabeec10b3eb013c754c1b06071b4803e599))
+
+
+### Documentation
+
+* add working-methodology section to CLAUDE.md ([#402](https://github.com/vymalo/lightbridge-code-intelligence/issues/402)) ([496d4d1](https://github.com/vymalo/lightbridge-code-intelligence/commit/496d4d123871cdb9d02fc1d48a1a4e0e4cf2cd5c))
+* **adr-0060:** rule out request-shape causes for reasoning_chars:0 ([#411](https://github.com/vymalo/lightbridge-code-intelligence/issues/411)) ([#418](https://github.com/vymalo/lightbridge-code-intelligence/issues/418)) ([432ddc1](https://github.com/vymalo/lightbridge-code-intelligence/commit/432ddc1d95cb252d1ed792555d960edc854d9396))
+* **adr-0060:** verify streamed reasoning_content via raw SSE ([#247](https://github.com/vymalo/lightbridge-code-intelligence/issues/247)) ([#412](https://github.com/vymalo/lightbridge-code-intelligence/issues/412)) ([debcc43](https://github.com/vymalo/lightbridge-code-intelligence/commit/debcc43ac8f311fc08eb3f1f827c6a0bee2f4725))
+* **adr:** graph embeddings (0089) + hybrid retrieval tools (0090) ([#380](https://github.com/vymalo/lightbridge-code-intelligence/issues/380)) ([5f4ed2b](https://github.com/vymalo/lightbridge-code-intelligence/commit/5f4ed2bfff0d9ef1d83b6dc477d51c4d3cf9994d))
+* **control-plane:** document repo_index as reserved, not vestigial ([#245](https://github.com/vymalo/lightbridge-code-intelligence/issues/245)) ([#408](https://github.com/vymalo/lightbridge-code-intelligence/issues/408)) ([208a65e](https://github.com/vymalo/lightbridge-code-intelligence/commit/208a65e228e7b25f3877c6e350589ad86eda2c9a))
+* **rfc-0008:** GitLab / multi-forge — retrospective and gap analysis ([#415](https://github.com/vymalo/lightbridge-code-intelligence/issues/415)) ([f393c45](https://github.com/vymalo/lightbridge-code-intelligence/commit/f393c45919fa68cbc634da99ea3ceefc71f8d6be))
+
 ## [0.4.0](https://github.com/vymalo/lightbridge-code-intelligence/compare/v0.3.1...v0.4.0) (2026-07-12)
 
 

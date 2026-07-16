@@ -10,7 +10,7 @@
 //!
 //! The handler NEVER launches a Job or touches a forge — it creates a task row via the *same*
 //! path as the webhook handler ([`crate::db::create_task`], deep tier, `run_epoch = 0`) and returns
-//! a handle. Egress stays on the reconciler/Restate path; this role holds no forge credentials.
+//! a handle. Egress stays on the reconciler drain (ADR-0059); this role holds no forge credentials.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};

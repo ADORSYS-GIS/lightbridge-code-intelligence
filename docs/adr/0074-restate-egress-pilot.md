@@ -1,6 +1,6 @@
 # ADR-0074: Restate pilot — platform egress becomes a virtual object (RFC-0005 Phase A)
 
-- **Status:** Proposed
+- **Status:** Superseded by [ADR-0093](0093-restate-egress-pilot-no-go.md) (pilot no-go — reverted to the reconciler drain)
 - **Date:** 2026-07-09
 - **Deciders:** @stephane-segning
 

@@ -33,11 +33,9 @@ mod queue;
 // Foundational modules the groups above build on.
 mod config;
 mod db;
-mod egress;
 mod jwt;
 mod mcp_client;
 mod outbox;
-mod restate_worker;
 mod review;
 mod runner_token;
 mod types;
@@ -123,11 +121,6 @@ pub struct AppState {
     /// Dotted claim path the caller's **permissions** list is read from (ADR-0023), from
     /// `PERMISSIONS_CLAIM`. Default `permissions`. Endpoints authorize on permissions, not roles.
     pub permissions_claim: Arc<String>,
-    /// Egress router (RFC-0005 Phase A / ADR-0074). Default `drain` = today's reconciler drain owns
-    /// egress and this is a no-op; `restate` = producers additionally `send` `PlatformEgress::post` to
-    /// Restate. Shared by every producer (serve/finalize, dispatcher, reaper) so all egress routes the
-    /// same way.
-    pub egress: Arc<egress::PlatformEgressRouter>,
 }
 
 impl AppState {
@@ -155,15 +148,6 @@ impl AppState {
             .as_ref()
             .map(|f| f.gitlab.clone())
             .unwrap_or_default();
-        // Egress routing (RFC-0005 Phase A / ADR-0074). Absent config → `drain` (no behavior change).
-        // Built once and shared by every producer; fails loud if `restate` mode lacks an ingress URL.
-        let egress = egress::PlatformEgressRouter::from_config(
-            &file_config
-                .as_ref()
-                .map(|f| &f.egress)
-                .cloned()
-                .unwrap_or_default(),
-        )?;
         let db = db::connect_from_env().await?;
         // Embedding-dimension safety (ADR-0018): if configured and the live column differs, either
         // reindex-from-scratch (when allowed) or fail loud — never silently mismatch.
@@ -257,7 +241,6 @@ impl AppState {
                     .filter(|c| !c.trim().is_empty())
                     .unwrap_or_else(|| "permissions".to_string()),
             ),
-            egress: Arc::new(egress),
         })
     }
 }
@@ -549,13 +532,11 @@ async fn main() -> anyhow::Result<()> {
 
     // One binary, several roles (RFC-0001): `serve` (HTTP) and `dispatcher` (queue consumer),
     // selected by the first CLI arg or `CONTROL_PLANE_ROLE`. Deployed as separate Deployments off
-    // the same image so they scale independently. `scheduler` arrives in Phase 2. `restate-worker`
-    // (RFC-0005 / ADR-0074) serves the Restate SDK endpoint. `a2a` (RFC-0006 / #299) serves the A2A
-    // agent surface (review skill, polling) — a fourth ingress face, holding no forge credentials.
-    // `notifier` (RFC-0006 Phase 3 / ADR-0079) delivers A2A push-notification webhooks — the first
-    // untrusted-destination egress role, isolated so its restrictive NetworkPolicy is enforceable.
-    // All roles share the `ring` crypto provider installed above; `restate-worker` serves plain h2c
-    // and adds no TLS of its own.
+    // the same image so they scale independently. `scheduler` arrives in Phase 2. `a2a` (RFC-0006 /
+    // #299) serves the A2A agent surface (review skill, polling) — an ingress face holding no forge
+    // credentials. `notifier` (RFC-0006 Phase 3 / ADR-0079) delivers A2A push-notification webhooks —
+    // the first untrusted-destination egress role, isolated so its restrictive NetworkPolicy is
+    // enforceable. All roles share the `ring` crypto provider installed above.
     let role = std::env::args()
         .nth(1)
         .or_else(|| std::env::var("CONTROL_PLANE_ROLE").ok())
@@ -584,7 +565,6 @@ async fn main() -> anyhow::Result<()> {
         // `poller` is the legacy alias for `reconciler` (ADR-0058); accept both so the binary and the
         // Deployment's role string can be flipped in either order across the rename rollout.
         "poller" | "reconciler" => run_reconciler(state).await,
-        "restate-worker" => restate_worker::run(state).await,
         // The A2A ingress face (RFC-0006 / #299): serves the `review` skill over polling.
         "a2a" => a2a::run(state).await,
         // The A2A push-notification webhook-delivery actor (RFC-0006 Phase 3 / ADR-0079).
@@ -592,7 +572,7 @@ async fn main() -> anyhow::Result<()> {
         // The durable-replay store lifecycle owner (ADR-0087): TTL-sweeps the `durable_step` journal.
         "replay" => run_replay(state).await,
         other => anyhow::bail!(
-            "unknown role {other:?} (expected: serve | dispatcher | reconciler | restate-worker | a2a | notifier | replay | mint-runner-token [| poller])"
+            "unknown role {other:?} (expected: serve | dispatcher | reconciler | a2a | notifier | replay | mint-runner-token [| poller])"
         ),
     };
     // Flush any still-batched spans before exit — covers every role's graceful (SIGTERM-triggered)
@@ -679,25 +659,7 @@ async fn run_reconciler(state: AppState) -> anyhow::Result<()> {
     } else {
         within_days
     };
-    // RFC-0005 Phase A / ADR-0074: when egress routes through Restate, the reconciler keeps its inbound
-    // feedback poll (ADR-0035) but its outbound `outbox` drain is DISABLED — the `PlatformEgress` virtual
-    // object owns egress. Default `drain` mode keeps the drain on (no behavior change). The drain code is
-    // retained either way (the rollback path).
-    let drain_enabled = !state.egress.is_restate();
-    if !drain_enabled {
-        tracing::info!(
-            "reconciler: egress.mode = restate — outbound drain disabled; running feedback poll only"
-        );
-    }
-    queue::reconciler::run(
-        pool,
-        platforms,
-        state.review.clone(),
-        interval,
-        within_days,
-        drain_enabled,
-    )
-    .await
+    queue::reconciler::run(pool, platforms, state.review.clone(), interval, within_days).await
 }
 
 /// The `replay` role (ADR-0087): owns the `durable_step` journal's lifecycle. Runs the periodic TTL
@@ -755,7 +717,6 @@ async fn run_dispatcher(state: AppState) -> anyhow::Result<()> {
         dispatcher_config,
         state.neo4j.clone(),
         state.review.clone(),
-        state.egress.clone(),
     )
     .await
 }

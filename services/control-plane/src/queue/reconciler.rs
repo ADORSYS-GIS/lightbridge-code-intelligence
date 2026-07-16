@@ -36,18 +36,12 @@ const DRAIN_FALLBACK: Duration = Duration::from_secs(15);
 ///
 /// `platforms` maps each `Platform` variant to its `CodePlatform` implementation. GitHub uses
 /// `GithubApp`; GitLab uses `GitlabClient` (ADR-0072).
-///
-/// `drain_enabled` (RFC-0005 Phase A / ADR-0074) gates only the **outbound** drain: `true` (the default
-/// `drain` egress mode) runs it as today; `false` (`restate` mode) skips it — the `PlatformEgress`
-/// virtual object owns egress — while the inbound feedback poll runs unchanged in **both** modes. The
-/// drain code is retained regardless, as the rollback path.
 pub async fn run(
     pool: PgPool,
     platforms: HashMap<Platform, Arc<dyn CodePlatform>>,
     review: Arc<ReviewSection>,
     interval: Duration,
     within_days: i32,
-    drain_enabled: bool,
 ) -> anyhow::Result<()> {
     // Feedback poll (ADR-0035) on its own cadence, alongside the drain.
     {
@@ -71,14 +65,6 @@ pub async fn run(
                 }
             }
         });
-    }
-    if !drain_enabled {
-        // `restate` egress mode: the drain is off (PlatformEgress owns egress). Keep the role alive so
-        // the spawned feedback poll keeps running.
-        tracing::info!("reconciler: outbound drain disabled (egress.mode = restate); poll-only");
-        // Park forever so the spawned feedback poll keeps running. `pending` is typed to the fn's
-        // `Result` so it is the tail expression itself — no dead `return Ok(())` follows it.
-        return std::future::pending::<anyhow::Result<()>>().await;
     }
     run_outbox_drain(pool, platforms, review).await
 }
@@ -226,12 +212,8 @@ async fn drain_once(
 }
 
 /// Post one intent. Returns the platform id to record (review/comment) or `None`. An `Err` backs the
-/// row off for retry.
-///
-/// `pub(crate)` so the RFC-0005 `PlatformEgress` virtual object ([`crate::restate_worker`]) reuses the
-/// **exact** posting logic the drain uses — the two egress paths must deliver identically, differing only
-/// in what drives them (SKIP-LOCKED batch vs. per-key durable invocation).
-pub(crate) async fn deliver(
+/// row off for retry. The single posting path the `outbox` drain uses (ADR-0059).
+async fn deliver(
     pool: &PgPool,
     platform: &dyn CodePlatform,
     repo: &RepoRef,
