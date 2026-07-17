@@ -381,18 +381,39 @@ impl CodePlatform for GitlabClient {
     fn verify_webhook(&self, headers: &axum::http::HeaderMap, _body: &[u8]) -> bool {
         // GitLab sends the raw webhook secret in the `X-Gitlab-Token` header — no HMAC.
         if self.webhook_secret.is_empty() {
+            tracing::warn!("GitLab verify_webhook failed: configured webhook_secret is empty");
             return false; // fail-closed
         }
         let token = match headers.get("x-gitlab-token").and_then(|v| v.to_str().ok()) {
             Some(s) => s,
-            None => return false,
+            None => {
+                tracing::warn!(
+                    "GitLab verify_webhook failed: X-Gitlab-Token header is missing or invalid"
+                );
+                return false;
+            }
         };
         // Constant-time comparison.
         use subtle::ConstantTimeEq;
-        self.webhook_secret
+        let is_valid: bool = self
+            .webhook_secret
             .as_bytes()
             .ct_eq(token.as_bytes())
-            .into()
+            .into();
+
+        if !is_valid {
+            let expected_trimmed_len = self.webhook_secret.trim().len();
+            let token_trimmed_len = token.trim().len();
+            tracing::warn!(
+                "GitLab verify_webhook failed: token mismatch. Expected len {} (trimmed {}), got len {} (trimmed {})",
+                self.webhook_secret.len(),
+                expected_trimmed_len,
+                token.len(),
+                token_trimmed_len
+            );
+        }
+
+        is_valid
     }
 
     fn delivery_id(&self, headers: &axum::http::HeaderMap) -> Option<String> {
