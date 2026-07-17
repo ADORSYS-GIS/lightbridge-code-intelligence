@@ -18,15 +18,23 @@
 //! Env (set by the supervisor per task):
 //!   LCI_MCP_CP_URL, LCI_MCP_RUNNER_TOKEN, LCI_MCP_TASK_ID, LCI_MCP_CHECKOUT,
 //!   LCI_MCP_EMBED_URL, LCI_MCP_EMBED_KEY, LCI_MCP_EMBED_MODEL
+//!
+//! SAST (ADR-0073) is opt-in and off unless the supervisor sets the `LCI_MCP_SAST_*` group (the
+//! [`SastConfig`] round-trip) AND `LCI_MCP_SAST_CHANGED_FILES` (the diff's file set to scope a scan to).
+//! It only sets those when `run_sast` cleared the allowlist + diff-present + enabled gate, so their mere
+//! presence is the "offer `run_sast`" signal — absent, the tool isn't registered and never reaches
+//! `tools/list` or dispatch (the opt-in surface rule, enforced here structurally).
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use lci_agent_clients::{ControlPlaneClient, EmbeddingsClient};
+use lci_agent_sast::{ENV_CHANGED_FILES, SastConfig};
 use lci_agent_types::{FunctionCallReq, ToolCallReq, ToolOutcome, ToolSpec};
-use lci_review_agent::tools::Tools;
+use lci_review_agent::policies::SastLeadSink;
+use lci_review_agent::tools::{SastToolConfig, Tools};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use uuid::Uuid;
@@ -78,6 +86,40 @@ fn env(key: &str) -> Result<String> {
         .with_context(|| format!("required env var {key} is not set"))
 }
 
+/// Resolve the `run_sast` tool config (ADR-0073) from the SAST env group, or `None` when SAST wasn't
+/// offered this run. Returns `None` unless BOTH the [`SastConfig`] round-trip resolves ([`SastConfig::from_env`])
+/// AND the changed-file list is present — the supervisor only sets both together, past the opt-in gate.
+/// The changed-file list is the scan's scope (and the widen-guard) — the same `SastToolConfig::changed_files`
+/// the native path passes. The leads sink is a local throwaway: `run_sast` pushes into it, but the
+/// `SastAnchorGate` that reads leads lives supervisor-side and recovers them from this tool's result
+/// digest instead (the two processes don't share memory).
+fn resolve_sast_tool_config() -> Result<Option<SastToolConfig>> {
+    let Some(config) = SastConfig::from_env() else {
+        return Ok(None);
+    };
+    let Some(list_path) = std::env::var(ENV_CHANGED_FILES)
+        .ok()
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty())
+    else {
+        return Ok(None);
+    };
+    let raw = std::fs::read_to_string(&list_path)
+        .with_context(|| format!("reading the SAST changed-file list at {list_path}"))?;
+    let changed_files: Vec<String> = raw
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect();
+    let leads: SastLeadSink = Arc::new(Mutex::new(Vec::new()));
+    Ok(Some(SastToolConfig {
+        config,
+        changed_files,
+        leads,
+    }))
+}
+
 fn build_tools() -> Result<Tools> {
     let client = ControlPlaneClient::new(env("LCI_MCP_CP_URL")?, env("LCI_MCP_RUNNER_TOKEN")?);
     let embedder = EmbeddingsClient::new(
@@ -89,10 +131,18 @@ fn build_tools() -> Result<Tools> {
         .parse()
         .context("LCI_MCP_TASK_ID is not a valid UUID")?;
     let checkout = PathBuf::from(env("LCI_MCP_CHECKOUT")?);
+    let sast = resolve_sast_tool_config()?;
     // No discovered knowledge tools in slice 1 (the outbound brave-search/context7 MCP, ADR-0066,
     // is wired in a later slice); the empty iterator keeps the registry to the core review tools.
-    Tools::new(&client, &embedder, task_id, &checkout, std::iter::empty())
-        .map_err(|error| anyhow::anyhow!("building the review tool registry: {error}"))
+    Tools::with_sast(
+        &client,
+        &embedder,
+        task_id,
+        &checkout,
+        std::iter::empty(),
+        sast,
+    )
+    .map_err(|error| anyhow::anyhow!("building the review tool registry: {error}"))
 }
 
 /// Map a review `ToolSpec` to an MCP tool definition. The advertised name drops a leading

@@ -23,6 +23,10 @@ uuid.workspace = true
 lci-review-agent = { path = "../review-agent" }
 lci-agent-clients = { path = "../agent-clients" }
 lci-agent-types = { path = "../agent-types" }
+# The `run_sast` tool (ADR-0073) reuses this verbatim; also the SastConfig env round-trip the supervisor
+# hands us across the process boundary (ADR-0097).
+lci-agent-sast = { path = "../agent-sast" }
 
 [dev-dependencies]
 tempfile.workspace = true
+wiremock.workspace = true

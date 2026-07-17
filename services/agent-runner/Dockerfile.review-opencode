@@ -11,9 +11,11 @@
 # needs the musl loader + libgcc/libstdc++ and cannot run on glibc/debian. The agent-runner +
 # lci-review-mcp binaries are fully-STATIC musl (ADR-0080), so they run on Alpine unchanged.
 #
-# ⚠️ SAST (opengrep, ADR-0073) is intentionally ABSENT: `run_sast` is not wired into the OpenCode review
-# path yet (a flagged parity gap the shadow surfaces), and opengrep is glibc — so it is not needed here
-# and would fight the musl base. Re-add it (via gcompat, tested) when SAST lands in `lci-review-mcp`.
+# SAST (opengrep, ADR-0073) IS present: `run_sast` is now wired into the OpenCode review path via
+# `lci-review-mcp` (ADR-0097 parity port). opengrep ships a musl-NATIVE build (`opengrep_musllinux_*`),
+# so no gcompat is needed — it runs directly on this Alpine/musl base. The binary is pinned + SHA-verified
+# exactly like the opencode binary above, and the ruleset is vendored at `/opt/opengrep-rules` (the
+# `SAST_RULES` default) so scans are hermetic — mirroring the native `services/agent-runner/Dockerfile`.
 #
 # Assemble (buildah, context = repo root with the binaries at dist/ → context root):
 #   buildah bud -f services/agent-runner/Dockerfile.review-opencode -t lightbridge-agent-review <ctx>
@@ -39,6 +41,42 @@ RUN set -eux; \
   tar xzf /tmp/opencode.tar.gz -C /usr/local/bin opencode; \
   chmod +x /usr/local/bin/opencode
 
+# ── Stage 1b: opengrep (SAST engine + vendored rules, ADR-0073) ────────────────────────────────────
+# opengrep (the LGPL Semgrep fork) ships a musl-NATIVE standalone binary (`opengrep_musllinux_<arch>`),
+# so — unlike the native debian image, which uses the glibc `manylinux` build — it runs directly on this
+# Alpine/musl base with no gcompat. The version tracks the native `services/agent-runner/Dockerfile`
+# (keep both in sync); the SHA is pinned + verified per-arch like the opencode binary above. The asset
+# arch token is `x86`/`aarch64` (NOT Docker's `amd64`/`arm64`), so we map `TARGETARCH`.
+FROM alpine:3.24 AS opengrep
+ARG OPENGREP_VERSION=v1.23.0
+# sha256 of the musl binaries for OPENGREP_VERSION (verified against the published release assets).
+ARG OPENGREP_SHA256_AMD64=8e78a6774495ecf48a48c3c4e8beb4840229086a248687ac242e8fcee12732b4
+ARG OPENGREP_SHA256_ARM64=dd09f0842a643c6556b491b5f2bde42983ba8c10080b35ec72a1eb7e74dc47b4
+ARG TARGETARCH
+RUN set -eux; \
+  apk add --no-cache curl ca-certificates git; \
+  case "$TARGETARCH" in \
+    amd64) asset="opengrep_musllinux_x86";     sha="$OPENGREP_SHA256_AMD64" ;; \
+    arm64) asset="opengrep_musllinux_aarch64"; sha="$OPENGREP_SHA256_ARM64" ;; \
+    *) echo "unsupported TARGETARCH: $TARGETARCH" >&2; exit 1 ;; \
+  esac; \
+  curl -fsSL -o /usr/local/bin/opengrep \
+    "https://github.com/opengrep/opengrep/releases/download/${OPENGREP_VERSION}/${asset}"; \
+  echo "${sha}  /usr/local/bin/opengrep" | sha256sum -c -; \
+  chmod +x /usr/local/bin/opengrep; \
+  opengrep --version; \
+  # Vendor the ruleset (upstream is archived/frozen, so a shallow clone is a stable pin). PRUNE the
+  # repo's non-rule YAML — LOAD-BEARING, not cleanup: opengrep treats a SINGLE invalid config under
+  # `--config <dir>` as fatal to the WHOLE ruleset (it loads ZERO rules → every scan returns nothing).
+  # Rules live ONLY in the language subdirs, so drop every top-level FILE plus the non-rule YAML dirs.
+  # The `test -d` guard fails the build loudly if a future upstream layout change removes the rule dirs.
+  # Identical to the native `services/agent-runner/Dockerfile` — keep the two in sync.
+  git clone --depth 1 https://github.com/opengrep/opengrep-rules /opt/opengrep-rules; \
+  find /opt/opengrep-rules -maxdepth 1 -type f -delete; \
+  rm -rf /opt/opengrep-rules/.git /opt/opengrep-rules/.github \
+         /opt/opengrep-rules/stats /opt/opengrep-rules/scripts; \
+  test -d /opt/opengrep-rules/python && test -d /opt/opengrep-rules/rust
+
 # ── Stage 2: the review-on-opencode runtime ────────────────────────────────────────────────────────
 FROM alpine:3.24 AS runtime
 # libgcc/libstdc++: OpenCode links them. ripgrep: opencode shells out to it. git + ca-certificates:
@@ -52,6 +90,12 @@ RUN set -eux; \
 # BUILD loudly rather than at task time.
 COPY --from=fetch /usr/local/bin/opencode /usr/local/bin/opencode
 RUN opencode --version
+
+# opengrep (musl-native) + vendored rules for the `run_sast` tool (ADR-0073). `--version` here re-runs
+# the smoke test against the final runtime image (catches a missing runtime lib the build stage had).
+COPY --from=opengrep /usr/local/bin/opengrep /usr/local/bin/opengrep
+COPY --from=opengrep /opt/opengrep-rules /opt/opengrep-rules
+RUN opengrep --version
 
 # The static-musl Rust binaries from the build context (dist/, ADR-0080): the Job ENTRYPOINT host and
 # the stdio review MCP opencode is pointed at (config `mcp.lightbridge.command = ["lci-review-mcp"]`).

@@ -30,7 +30,7 @@ use std::path::{Path, PathBuf};
 
 use uuid::Uuid;
 
-pub use config::SastConfig;
+pub use config::{ENV_CHANGED_FILES, ENV_PREFIX, SastConfig};
 pub use finding::SastFinding;
 use process::is_safe_relative;
 
@@ -170,6 +170,66 @@ pub fn digest(findings: &[SastFinding]) -> Option<String> {
     Some(out)
 }
 
+/// One opengrep coordinate recovered from a [`digest`] string: the `(file, line, rule_id)` triple the
+/// `SastAnchorGate` anchors triage verdicts to (#305). Deliberately minimal — mirrors the gate's own
+/// `SastLead` without this crate depending on `lci-review-agent`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DigestLead {
+    pub file: String,
+    pub line: u32,
+    pub rule_id: String,
+}
+
+/// Recover the flagged coordinates from a [`digest`] string — the inverse of [`digest`]'s per-finding
+/// bullet format (`"- [PRIORITY] file:line — message (`rule_id`)"`).
+///
+/// This is the load-bearing seam for the OpenCode review path (ADR-0097): `run_sast` runs inside the
+/// separate `lci-review-mcp` process, so its in-memory `SastLeadSink` can't reach the supervisor's
+/// `SastAnchorGate`. The supervisor instead observes the tool's *result* (this digest) via the recorder
+/// and reconstructs the leads here — so the same gate anchors verdicts exactly as it does natively. The
+/// `digest_round_trips_through_parse_digest_leads` test pins this as a true inverse so the producer and
+/// parser can't drift apart. Header/prose lines and any malformed bullet are skipped, never guessed.
+#[must_use]
+pub fn parse_digest_leads(digest: &str) -> Vec<DigestLead> {
+    // The exact separator `digest` writes between `file:line` and the message: a U+2014 em dash with
+    // surrounding spaces. Spelled as an escape so a copy/reflow can't silently swap it for a hyphen.
+    const SEP: &str = concat!(" ", "\u{2014}", " ");
+    let mut leads = Vec::new();
+    for line in digest.lines() {
+        // Only the per-finding bullet lines: `- [PRIORITY] file:line — message (`rule_id`)`.
+        let Some(after_bracket) = line.trim_start().strip_prefix("- [") else {
+            continue;
+        };
+        let Some((_priority, rest)) = after_bracket.split_once("] ") else {
+            continue;
+        };
+        // `file:line` is everything before the FIRST separator — a repo-relative path never contains it.
+        let Some((coord, tail)) = rest.split_once(SEP) else {
+            continue;
+        };
+        // `line` is the final `:`-segment; the path itself may contain no colon (forward-slash relative).
+        let Some((file, line_str)) = coord.rsplit_once(':') else {
+            continue;
+        };
+        let Ok(line_no) = line_str.trim().parse::<u32>() else {
+            continue;
+        };
+        // `rule_id` is the LAST backtick group `(`…`)` — using the last occurrence so a message that
+        // itself contains a backtick group can't shadow the real trailing rule id.
+        let rule_id = tail
+            .rsplit_once("(`")
+            .and_then(|(_, r)| r.rsplit_once("`)"))
+            .map(|(id, _)| id.trim().to_string())
+            .unwrap_or_default();
+        leads.push(DigestLead {
+            file: file.trim().to_string(),
+            line: line_no,
+            rule_id,
+        });
+    }
+    leads
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -222,5 +282,62 @@ mod tests {
             d.to_ascii_lowercase().contains("nearby"),
             "the digest explicitly forbids reasoning about a nearby/similar line: {d}"
         );
+    }
+
+    // The OpenCode-path seam (ADR-0097): `parse_digest_leads` must be a TRUE inverse of `digest`'s
+    // per-finding format, because the supervisor's `SastAnchorGate` reconstructs its leads from the
+    // observed `run_sast` result across a process boundary. A format change in one without the other
+    // fails here.
+    #[test]
+    fn digest_round_trips_through_parse_digest_leads() {
+        let findings = vec![
+            SastFinding {
+                file: ".env.fullstack".into(),
+                line: 216,
+                rule_id: "generic.secrets.security.detected-generic-api-key".into(),
+                message: "Hardcoded MTN Mobile Money API key.".into(),
+                priority: "P1".into(),
+                help_uri: None,
+            },
+            SastFinding {
+                // A path with no colon, a message that itself contains an em dash and a backtick group,
+                // to prove the anchors (first separator, last rule group) survive adversarial content.
+                file: "src/http/handler.rs".into(),
+                line: 9,
+                rule_id: "rust.lang.security.unsafe-exec".into(),
+                message: "Tainted input — see `Command::new` — reaches exec.".into(),
+                priority: "P2".into(),
+                help_uri: Some("https://docs/rule".into()),
+            },
+        ];
+        let digest = digest(&findings).expect("some findings");
+        let leads = parse_digest_leads(&digest);
+        assert_eq!(
+            leads,
+            vec![
+                DigestLead {
+                    file: ".env.fullstack".into(),
+                    line: 216,
+                    rule_id: "generic.secrets.security.detected-generic-api-key".into(),
+                },
+                DigestLead {
+                    file: "src/http/handler.rs".into(),
+                    line: 9,
+                    rule_id: "rust.lang.security.unsafe-exec".into(),
+                },
+            ],
+            "parse_digest_leads must recover exactly the coordinates digest wrote"
+        );
+    }
+
+    // Header/prose lines (and anything not a well-formed finding bullet) are skipped, never guessed into
+    // a fabricated coordinate.
+    #[test]
+    fn parse_digest_leads_ignores_non_finding_lines() {
+        assert!(
+            parse_digest_leads("## Deterministic SAST findings (opengrep)\n\nsome prose")
+                .is_empty()
+        );
+        assert!(parse_digest_leads("- [P1] not-a-coordinate — no colon here (`r.id`)").is_empty());
     }
 }
