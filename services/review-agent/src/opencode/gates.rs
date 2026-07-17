@@ -6,12 +6,15 @@
 //! `after_turn_actions`. Only the *finish-time* gates live here — the per-turn budget/wind-down
 //! policies are OpenCode's own loop concern (see the module doc).
 
+use std::sync::{Arc, Mutex};
+
 use lci_agent_loop::{
     ChatMessage, LoopStats, Nudge, PolicyAction, TurnOutcome, TurnPolicy, TurnState,
 };
-use lci_agent_types::ToolSpec;
+use lci_agent_types::{ToolOutcome, ToolSpec};
 
-use crate::policies::{CoverageGate, CoverageState, RefuteGate};
+use crate::policies::{CoverageGate, CoverageState, RefuteGate, SastAnchorGate, SastLead, SastLeadSink};
+use crate::tools::RUN_SAST;
 
 /// A minimal `TurnState` for driving the finish-time gates. The reused gates read only `turn`
 /// (CoverageGate's wind-down guard) and `max_turns` off it; everything else is empty/default,
@@ -50,11 +53,20 @@ pub enum GateDecision {
 }
 
 /// The reused review quality gates, driven over OpenCode `session/prompt` cycles instead of native
-/// turns. Owns the same [`CoverageGate`] + [`RefuteGate`] the native flow composes.
+/// turns. Owns the same [`CoverageGate`] + [`RefuteGate`] + [`SastAnchorGate`] the native flow composes.
 pub struct ReviewGates {
     coverage: CoverageGate,
     coverage_state: CoverageState,
     refute: RefuteGate,
+    /// SAST anchor gate (#305/#406) — bounces a triage verdict recorded on a line opengrep never
+    /// flagged. Native feeds it via an in-process [`SastLeadSink`] the `run_sast` tool pushes into; in
+    /// the OpenCode path that tool runs in a separate process (`lci-review-mcp`), so we instead recover
+    /// its leads from the observed `run_sast` result digest and push them into `sast_leads` ourselves —
+    /// the gate then reads the sink and anchors verdicts identically to native.
+    sast_anchor: SastAnchorGate,
+    /// The shared feed [`Self::observe_cycle`] pushes recovered SAST leads into; the same `Arc` the
+    /// `sast_anchor` gate drains.
+    sast_leads: SastLeadSink,
     max_turns: usize,
     fast: bool,
     cycle: usize,
@@ -62,7 +74,10 @@ pub struct ReviewGates {
 
 impl ReviewGates {
     /// Compose the gates for one review, mirroring [`crate::flows::run_review`]'s construction (same
-    /// coverage denominator, bounce cap, and fast-tier disabling).
+    /// coverage denominator, bounce cap, and fast-tier disabling). The [`SastAnchorGate`] is always
+    /// composed — it stays inert (no leads) unless the model actually calls `run_sast`, so no separate
+    /// "is SAST on" flag is needed here; whether the tool is even offered is decided upstream where the
+    /// MCP surface is built.
     #[must_use]
     pub fn new(
         diff_files: Vec<String>,
@@ -72,13 +87,46 @@ impl ReviewGates {
     ) -> Self {
         let (coverage, coverage_state) =
             CoverageGate::new(diff_files, max_coverage_bounces, max_turns, fast);
+        let sast_leads: SastLeadSink = Arc::new(Mutex::new(Vec::new()));
+        let sast_anchor = SastAnchorGate::new(Arc::clone(&sast_leads), fast);
         Self {
             coverage,
             coverage_state,
             refute: RefuteGate::new(fast),
+            sast_anchor,
+            sast_leads,
             max_turns,
             fast,
             cycle: 0,
+        }
+    }
+
+    /// Recover the SAST leads a cycle's `run_sast` call(s) produced and push them into `sink`. The tool
+    /// ran in the separate `lci-review-mcp` process (ADR-0097), so its coordinates only reach us as the
+    /// tool *result* — the [`lci_agent_sast::digest`] text the recorder captured. Parsing it back
+    /// (`parse_digest_leads`, pinned as a true inverse of `digest`) reconstructs the exact `SastLead`s
+    /// the native tool would have pushed in-process.
+    fn ingest_sast_leads(outcome: &TurnOutcome, sink: &SastLeadSink) {
+        let mut recovered: Vec<SastLead> = Vec::new();
+        for result in &outcome.results {
+            if result.call.function.name != RUN_SAST {
+                continue;
+            }
+            let ToolOutcome::Continue(text) = &result.outcome else {
+                continue;
+            };
+            recovered.extend(lci_agent_sast::parse_digest_leads(text).into_iter().map(|lead| {
+                SastLead {
+                    file: lead.file,
+                    line: lead.line,
+                    rule_id: lead.rule_id,
+                }
+            }));
+        }
+        if !recovered.is_empty() {
+            sink.lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .extend(recovered);
         }
     }
 
@@ -88,11 +136,16 @@ impl ReviewGates {
     /// native registration order) or accepted it with any coverage disclosure to append.
     pub fn observe_cycle(&mut self, outcome: &TurnOutcome) -> GateDecision {
         let turn = self.cycle;
-        // One `TurnState` for both after-turn calls (gemini #442): it borrows nothing of `self`, and
-        // `after_turn_actions` takes it by shared ref, so the two gates can share it.
+        // Recover any SAST leads this cycle's `run_sast` produced, BEFORE the gate runs — the anchor
+        // gate drains the sink at the top of its `after_turn_actions`, so a same-cycle
+        // `run_sast` → misanchored `add_review_comment` sequence is still caught (native parity).
+        Self::ingest_sast_leads(outcome, &self.sast_leads);
+        // One `TurnState` for all after-turn calls (gemini #442): it borrows nothing of `self`, and
+        // `after_turn_actions` takes it by shared ref, so the gates can share it.
         let state = turn_state(turn, self.max_turns);
         let coverage_actions = self.coverage.after_turn_actions(&state, outcome);
         let refute_actions = self.refute.after_turn_actions(&state, outcome);
+        let sast_actions = self.sast_anchor.after_turn_actions(&state, outcome);
         self.cycle += 1;
 
         // Aborts aren't gated (the run ends with the model's reason); a non-finish cycle just
@@ -101,9 +154,11 @@ impl ReviewGates {
             return GateDecision::Proceed;
         }
 
+        // Native registration order = evaluation order (flows.rs): coverage → refute → SAST anchor.
         let nudges: Vec<String> = coverage_actions
             .iter()
             .chain(refute_actions.iter())
+            .chain(sast_actions.iter())
             .filter_map(|action| match action {
                 PolicyAction::RejectFinish(Nudge(text)) => Some(text.clone()),
                 _ => None,
@@ -293,6 +348,106 @@ mod tests {
         )]);
         assert_eq!(gates.observe_cycle(&idle), GateDecision::Proceed);
         assert_eq!(gates.exhausted(), None);
+    }
+
+    /// SAST anchor parity over observed OpenCode cycles (ADR-0097): a cycle where `run_sast` returns a
+    /// digest flagging `.env:216` and the model records a "false positive" verdict at the WRONG line
+    /// (`.env:60`) must bounce the follow-up finish, naming the real flagged coordinate — exactly as the
+    /// native `SastAnchorGate` does. This proves the digest → `SastLead` reconstruction feeds the reused
+    /// gate correctly across the process boundary (the tool ran in `lci-review-mcp`, not in-process).
+    #[test]
+    fn sast_anchor_bounces_a_misanchored_verdict_recovered_from_the_run_sast_digest() {
+        // No diff files → coverage never bounces, isolating the SAST anchor gate.
+        let mut gates = ReviewGates::new(vec![], 3, 40, false);
+
+        // A real `lci_agent_sast::digest` for one finding — the exact text `run_sast` returns as its MCP
+        // result, which the recorder captures and we parse back into a lead.
+        let digest = lci_agent_sast::digest(&[lci_agent_sast::SastFinding {
+            file: ".env".into(),
+            line: 216,
+            rule_id: "generic.secrets.security.detected-generic-api-key".into(),
+            message: "Hardcoded API key.".into(),
+            priority: "P1".into(),
+            help_uri: None,
+        }])
+        .expect("a non-empty digest");
+
+        // Cycle 1: run_sast flags :216, then a "false positive" verdict is recorded at :60 (never :216).
+        let scan_and_misanchor = cycle_turn_outcome(&[
+            before("lightbridge_run_sast", "s1", serde_json::json!({})),
+            after("lightbridge_run_sast", "s1", &digest),
+            before(
+                "lightbridge_add_review_comment",
+                "c1",
+                serde_json::json!({"file": ".env", "line": 60, "title": "False positive", "body": "just a dev password", "priority": "P2", "category": "security"}),
+            ),
+            after(
+                "lightbridge_add_review_comment",
+                "c1",
+                "recorded finding at .env:60",
+            ),
+        ]);
+        assert_eq!(gates.observe_cycle(&scan_and_misanchor), GateDecision::Proceed);
+
+        // Cycle 2: the model tries to finish — the anchor gate bounces it and names the real line :216.
+        let finish = cycle_turn_outcome(&[
+            before(
+                "lightbridge_finish",
+                "f1",
+                serde_json::json!({"summary": "lgtm"}),
+            ),
+            after("lightbridge_finish", "f1", "finalize"),
+        ]);
+        match gates.observe_cycle(&finish) {
+            GateDecision::RejectFinish(nudge) => {
+                assert!(nudge.contains(".env:216"), "names the real flagged line: {nudge}");
+                assert!(nudge.contains(".env:60"), "names the wrong line used: {nudge}");
+            }
+            other => panic!("expected a SAST-anchor RejectFinish, got {other:?}"),
+        }
+    }
+
+    /// A SAST verdict anchored to the REAL flagged line (recovered from the digest) is never bounced —
+    /// the gate targets misanchored triage, not every comment near a lead.
+    #[test]
+    fn sast_anchor_allows_a_verdict_on_the_real_flagged_line() {
+        let mut gates = ReviewGates::new(vec![], 3, 40, false);
+        let digest = lci_agent_sast::digest(&[lci_agent_sast::SastFinding {
+            file: ".env".into(),
+            line: 216,
+            rule_id: "generic.secrets.security.detected-generic-api-key".into(),
+            message: "Hardcoded API key.".into(),
+            priority: "P1".into(),
+            help_uri: None,
+        }])
+        .expect("a non-empty digest");
+        let scan_and_anchor = cycle_turn_outcome(&[
+            before("lightbridge_run_sast", "s1", serde_json::json!({})),
+            after("lightbridge_run_sast", "s1", &digest),
+            before(
+                "lightbridge_add_review_comment",
+                "c1",
+                serde_json::json!({"file": ".env", "line": 216, "title": "False positive", "body": "read it — placeholder", "priority": "P2", "category": "security"}),
+            ),
+            after(
+                "lightbridge_add_review_comment",
+                "c1",
+                "recorded finding at .env:216",
+            ),
+        ]);
+        assert_eq!(gates.observe_cycle(&scan_and_anchor), GateDecision::Proceed);
+        let finish = cycle_turn_outcome(&[
+            before(
+                "lightbridge_finish",
+                "f1",
+                serde_json::json!({"summary": "done"}),
+            ),
+            after("lightbridge_finish", "f1", "finalize"),
+        ]);
+        assert_eq!(
+            gates.observe_cycle(&finish),
+            GateDecision::Accept { disclosure: None }
+        );
     }
 
     /// Fast tier never bounces and never discloses (parity with `run_review`'s fast path).

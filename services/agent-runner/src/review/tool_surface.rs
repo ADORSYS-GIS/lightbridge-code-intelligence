@@ -13,6 +13,18 @@ use uuid::Uuid;
 
 use crate::bootstrap::config::{McpToolPattern, ReviewConfig, ReviewTool, ReviewToolSelector};
 
+/// Whether an operator EXPLICITLY listed `run_sast` in this tier's `review.tools` allowlist (ADR-0073).
+/// `run_sast` is opt-in per tier and never rides the "no allowlist" default surface, so this predicate
+/// gates it — on the native surface below AND, reused, on the OpenCode MCP surface
+/// ([`crate::review::opencode`]) so both paths honor the same rule.
+pub(crate) fn sast_explicitly_listed(review: &ReviewConfig) -> bool {
+    review.tools.as_ref().is_some_and(|allow| {
+        allow
+            .iter()
+            .any(|selector| matches!(selector, ReviewToolSelector::Builtin(ReviewTool::RunSast)))
+    })
+}
+
 /// Resolve the tools offered to the model for one run: built-in tools filtered by the diff gate + the
 /// per-tier allowlist, plus any discovered external-knowledge MCP tools that match it (ADR-0066).
 /// Returns `(offered, dispatch_discovered)` — `offered` is the full surface (for the turn-0 `TurnFilter`
@@ -37,11 +49,7 @@ pub(crate) async fn resolve_offered_tools(
     // this feature would have silently turned SAST on for any deep tier that already had
     // `sast.enabled=true` but no `review.deep.tools` allowlist configured, instead of "silently disabled
     // until the ai-helm-values change lands" as the ADR promises.
-    let sast_explicitly_listed = review.tools.as_ref().is_some_and(|allow| {
-        allow
-            .iter()
-            .any(|selector| matches!(selector, ReviewToolSelector::Builtin(ReviewTool::RunSast)))
-    });
+    let sast_explicitly_listed = sast_explicitly_listed(review);
     let mut offered = tool_defs();
     if !diff_present {
         offered.retain(|spec| spec.function.name != ADD_REVIEW_COMMENT);
