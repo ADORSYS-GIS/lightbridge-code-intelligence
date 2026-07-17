@@ -1,4 +1,4 @@
-# ADR-0098: Operator-supplied OpenCode config overlay for review (file-based base + full override)
+# ADR-0099: Operator-supplied OpenCode config overlay for review (file-based base + full override)
 
 - **Status:** Accepted (owner-directed 2026-07-17)
 - **Date:** 2026-07-17
@@ -76,7 +76,7 @@ overriding:
 | key | who sets it | can the overlay change it? |
 |---|---|---|
 | `model`, `provider.eaig.*` | base `{env:*}` from the ai-models chart | yes (point a tier elsewhere) |
-| `agent.review.prompt` | runtime `{file:*}` (per-task, dynamic) | yes, but it will be replaced each task unless the overlay sets a different agent |
+| `agent.review.prompt` | runtime `{file:*}` (per-task, dynamic) | yes, but it is replaced each task unless the overlay sets a different agent |
 | `provider.eaig.options.headers` | runtime (attribution #89) | yes |
 | `models.reviewer.reasoning` | runtime (tier: deep=true/fast=false) | yes |
 | `tools.{read,grep,glob,bash,…}=false` | base (coverage invariant, ADR-0097 #3) | **yes — but see the floor warning** |
@@ -138,7 +138,7 @@ flowchart LR
   read-only floor. Mitigated by the render-time WARNING + coverage disclosure, not prevented — this is
   the accepted cost of the owner's full-override choice.
 - **A malformed overlay fails the whole review** (opencode's strict schema). The failure is loud
-  (review won't start) rather than silent, but it is an operational footgun; the docs call it out.
+  (the review does not start) rather than silent, but it is an operational footgun; the docs call it out.
 - **Sub-agents with broader access interact with coverage accounting.** A sub-agent that reads via a
   built-in tool reads off the mediated path; coverage is measured from the recorder, so such reads may
   not count the way `lightbridge_read_file` does. Documented as a known interaction of custom access
