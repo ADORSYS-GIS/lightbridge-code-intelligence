@@ -2862,6 +2862,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "lci-agent-clients",
+ "lci-agent-sast",
  "lci-agent-types",
  "lci-review-agent",
  "serde",
@@ -2870,6 +2871,7 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+ "wiremock",
 ]
 
 [[package]]

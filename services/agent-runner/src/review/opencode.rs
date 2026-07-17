@@ -15,6 +15,7 @@ use uuid::Uuid;
 
 use lci_acp_host::{AcpClient, PermissionPolicy};
 use lci_agent_clients::{ControlPlaneClient, TranscriptEntry};
+use lci_agent_sast::{ENV_CHANGED_FILES, SastConfig};
 use lci_review_agent::opencode::{
     RecorderEvent, ReviewDriver, ReviewGates, ReviewResolution, ReviewSession, parse_recorder,
     render_review_config, run_review_loop, transcript_from_recorder,
@@ -117,6 +118,10 @@ pub async fn run_opencode_agent(
     repo_instructions: Option<&str>,
     prior_reviews: Option<&str>,
     repo_memory: Option<&str>,
+    // The resolved SAST config (ADR-0073), forwarded to the `run_sast` tool that runs inside
+    // `lci-review-mcp`. `None` when SAST is off; even when set, the tool is only offered if it also
+    // clears the diff-present + per-tier-allowlist gate (see below) — same rule as the native surface.
+    sast_config: Option<&SastConfig>,
     // Per-project billing attribution headers (epic #89) — forwarded to the eaig provider so
     // OpenCode-hosted review bills the same as native.
     attribution: &[(String, String)],
@@ -238,6 +243,32 @@ pub async fn run_opencode_agent(
     // EMBEDDINGS_CA_CERT from this same env, so its embeddings/CP TLS is already covered.)
     if let Ok(ca_path) = std::env::var("EMBEDDINGS_CA_CERT") {
         env.push(("NODE_EXTRA_CA_CERTS".into(), ca_path));
+    }
+
+    // ── SAST opt-in wiring for the review MCP (ADR-0073 / ADR-0097) ───────────────────────────────
+    // `run_sast` runs INSIDE `lci-review-mcp` (a separate process). Offer it there iff it clears the
+    // exact same gate the native surface applies (`tool_surface::resolve_offered_tools`): SAST enabled
+    // (a resolved config) + a diff to scope a scan to + an explicit `run_sast` allowlist entry for this
+    // tier. When offered, hand the MCP the resolved config (the `SastConfig` env round-trip) and the
+    // changed-file scan scope (written to a file — the same `SastToolConfig::changed_files` native
+    // passes, and the widen-guard). The presence of these env vars is the MCP's "offer run_sast" signal;
+    // their absence leaves the tool unregistered. The supervisor-side `SastAnchorGate` is already
+    // composed in `ReviewGates` and recovers its leads from the tool's result digest.
+    let diff_present = diff.is_some();
+    let sast_offered = sast_config.is_some()
+        && diff_present
+        && super::tool_surface::sast_explicitly_listed(review);
+    if let (true, Some(sast_config)) = (sast_offered, sast_config) {
+        let changed_files = diff.map(|pr| pr.files.clone()).unwrap_or_default();
+        let list_path = workdir.join("sast-changed-files.txt");
+        tokio::fs::write(&list_path, changed_files.join("\n"))
+            .await
+            .context("writing the SAST changed-file list for lci-review-mcp")?;
+        env.extend(sast_config.to_env_pairs());
+        env.push((
+            ENV_CHANGED_FILES.to_string(),
+            list_path.display().to_string(),
+        ));
     }
 
     // ── Spawn + handshake ───────────────────────────────────────────────────────────────────────

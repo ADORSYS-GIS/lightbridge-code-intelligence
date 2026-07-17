@@ -159,13 +159,30 @@ impl Tools {
         checkout_root: &Path,
         discovered: impl IntoIterator<Item = ToolSpec>,
     ) -> Result<Self, RegistryError> {
+        Self::with_sast(client, embedder, task_id, checkout_root, discovered, None)
+    }
+
+    /// Like [`Self::new`], but also registers the `run_sast` tool (ADR-0073) when `sast` is `Some`. Used
+    /// by the OpenCode review path's stdio MCP server (`lci-review-mcp`): `run_sast` runs in that
+    /// separate process exactly as it does in the native loop, reusing `lci-agent-sast` verbatim. `None`
+    /// leaves the tool unregistered — the opt-in surface rule (allowlisted + SAST enabled + a diff) is
+    /// enforced by the caller only passing `Some` when all three hold, so an un-offered `run_sast` never
+    /// reaches `tools/list` or dispatch.
+    pub fn with_sast(
+        client: &ControlPlaneClient,
+        embedder: &EmbeddingsClient,
+        task_id: Uuid,
+        checkout_root: &Path,
+        discovered: impl IntoIterator<Item = ToolSpec>,
+        sast: Option<SastToolConfig>,
+    ) -> Result<Self, RegistryError> {
         Ok(Self {
             registry: tool_registry(
                 Arc::new(client.clone()),
                 Arc::new(embedder.clone()),
                 discovered,
                 RuntimeCaps::default(),
-                None,
+                sast,
             )?,
             workspace: EagerWorkspace(checkout_root.to_path_buf()),
             task_id,

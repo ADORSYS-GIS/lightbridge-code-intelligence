@@ -421,10 +421,10 @@ async fn perform_indexing(
 async fn perform_review(
     is_index: bool,
     review_configs: &ReviewConfigs,
-    // ⚠️ SLICE-5 PARITY GAP (flagged, shadow-caught): the OpenCode host does not yet offer the
-    // `run_sast` tool (ADR-0073), so SAST findings are absent — they surface as only-native in the
-    // shadow, correctly blocking go-live until SAST is wired into `lci-review-mcp`. Kept in the
-    // signature so re-adding it is a one-line change, not a re-plumb.
+    // The resolved SAST config (ADR-0073), forwarded to the OpenCode host, which offers the `run_sast`
+    // tool inside `lci-review-mcp` when it also clears the diff + per-tier-allowlist gate. This closes
+    // the ADR-0097 slice-5 parity gap: SAST used to be native-only, so it surfaced as only-native in the
+    // shadow and blocked go-live; `run_sast` now runs on the live OpenCode path.
     sast_config: Option<&SastConfig>,
     context: &TaskContext,
     checkout: &Path,
@@ -435,7 +435,6 @@ async fn perform_review(
     task_id: Uuid,
     status: Option<&StatusHandle>,
 ) -> anyhow::Result<(String, Option<String>)> {
-    let _ = sast_config; // parity gap above; referenced so intent is explicit.
     let Some(review) = (!is_index)
         .then(|| review_configs.for_tier(&context.tier))
         .flatten()
@@ -473,6 +472,7 @@ async fn perform_review(
         repo_instructions.as_deref(),
         context.prior_reviews.as_deref(),
         context.repo_memory.as_deref(),
+        sast_config,
         attribution,
         &mcp_env,
         task_id,
