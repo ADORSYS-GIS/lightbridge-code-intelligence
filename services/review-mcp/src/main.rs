@@ -23,7 +23,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use lci_agent_clients::{ControlPlaneClient, EmbeddingsClient};
+use lci_agent_clients::{ControlPlaneClient, DiscoveredTool, EmbeddingsClient};
 use lci_agent_types::{FunctionCallReq, ToolCallReq, ToolOutcome, ToolSpec};
 use lci_review_agent::tools::Tools;
 use serde_json::{Value, json};
@@ -38,7 +38,15 @@ fn env(key: &str) -> Result<String> {
         .with_context(|| format!("required env var {key} is not set"))
 }
 
-fn build_tools() -> Result<Tools> {
+/// Map an ADR-0066 discovered MCP tool to a review `ToolSpec`. The control plane already reports it
+/// `mcp__<server>__<tool>`-prefixed, so it folds into the registry verbatim; dispatch of the result
+/// routes back through the control plane's `call_knowledge_tool` inside [`Tools`] — the runner never
+/// talks to an external MCP server directly.
+fn discovered_to_spec(tool: DiscoveredTool) -> ToolSpec {
+    ToolSpec::function(tool.name, tool.description, tool.input_schema)
+}
+
+async fn build_tools() -> Result<Tools> {
     let client = ControlPlaneClient::new(env("LCI_MCP_CP_URL")?, env("LCI_MCP_RUNNER_TOKEN")?);
     let embedder = EmbeddingsClient::new(
         &env("LCI_MCP_EMBED_URL")?,
@@ -49,10 +57,36 @@ fn build_tools() -> Result<Tools> {
         .parse()
         .context("LCI_MCP_TASK_ID is not a valid UUID")?;
     let checkout = PathBuf::from(env("LCI_MCP_CHECKOUT")?);
-    // No discovered knowledge tools in slice 1 (the outbound brave-search/context7 MCP, ADR-0066,
-    // is wired in a later slice); the empty iterator keeps the registry to the core review tools.
-    Tools::new(&client, &embedder, task_id, &checkout, std::iter::empty())
-        .map_err(|error| anyhow::anyhow!("building the review tool registry: {error}"))
+
+    // ADR-0066 external-knowledge MCP tools: discover whatever MCP servers the control plane is
+    // configured with (owner-managed in ai-helm-values) and fold them into the registry as mediated
+    // `mcp__<server>__<tool>` tools — the same surface the native review loop offered. RFC-0009
+    // slice 1 stubbed this with `std::iter::empty()` ("wired in a later slice"); this IS that slice,
+    // so a customer's configured MCP is reachable on the OpenCode review path with zero per-customer
+    // runner code. Dispatch routes back through the control plane (`call_knowledge_tool`) inside
+    // `Tools`, so the runner never talks to an external MCP directly — mediation preserved (the
+    // deliberate boundary of ADR-0097 #6), and the results are size-capped + untrusted-framed CP-side.
+    // Discovery is best-effort: a control-plane hiccup degrades to the core review tools rather than
+    // failing the review (a customer's flaky MCP must never wedge a review).
+    let discovered = client
+        .list_knowledge_tools(task_id)
+        .await
+        .unwrap_or_else(|error| {
+            // stderr only — stdout is the JSON-RPC channel and must carry nothing else.
+            eprintln!(
+                "lci-review-mcp: ADR-0066 knowledge-tool discovery failed; continuing with core review tools only: {error:#}"
+            );
+            Vec::new()
+        });
+
+    Tools::new(
+        &client,
+        &embedder,
+        task_id,
+        &checkout,
+        discovered.into_iter().map(discovered_to_spec),
+    )
+    .map_err(|error| anyhow::anyhow!("building the review tool registry: {error}"))
 }
 
 /// Map a review `ToolSpec` to an MCP tool definition.
@@ -124,7 +158,7 @@ async fn handle(tools: &Tools, req: &Value) -> Option<Value> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let tools = Arc::new(build_tools().context("initializing lci-review-mcp")?);
+    let tools = Arc::new(build_tools().await.context("initializing lci-review-mcp")?);
 
     // Each request runs in its own task so batched tool calls (the review does parallel read-only
     // tool batching, ADR-0042) don't serialize behind each other; a single writer task owns stdout
@@ -177,6 +211,23 @@ mod tests {
         assert_eq!(m["name"], "t");
         assert_eq!(m["description"], "desc");
         assert_eq!(m["inputSchema"]["type"], "object");
+    }
+
+    #[test]
+    fn folds_discovered_mcp_tool_into_the_registry_shape() {
+        // ADR-0066: a discovered tool arrives already `mcp__<server>__<tool>`-prefixed and is folded
+        // in verbatim (name/description/schema preserved) so opencode can offer it; its dispatch
+        // routing to `call_knowledge_tool` is covered by `lci_review_agent::tools`.
+        let spec = discovered_to_spec(DiscoveredTool {
+            name: "mcp__acme__search".into(),
+            description: "acme search".into(),
+            input_schema: json!({"type": "object", "properties": {"q": {"type": "string"}}}),
+        });
+        assert_eq!(spec.name(), "mcp__acme__search");
+        let m = mcp_tool(&spec);
+        assert_eq!(m["name"], "mcp__acme__search");
+        assert_eq!(m["description"], "acme search");
+        assert_eq!(m["inputSchema"]["properties"]["q"]["type"], "string");
     }
 
     #[test]
