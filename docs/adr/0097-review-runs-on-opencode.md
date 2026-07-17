@@ -121,7 +121,26 @@ the cutover.
 | 2–3 | the review core (recorder→`TurnOutcome` adapter, `ReviewGates`, `ReviewDriver`, config renderer, transcript, drive loop) + the transport host, proven against real OpenCode | merged (#442–#447) |
 | — | bot-review fixes + the top-level-tools coverage-parity fix | merged (#448, #449) |
 | 4 | shadow parity gate (`xtask shadow diff` + runbook) | merged (#450) |
-| 5 | **dispatch cutover** — thread CP/embed creds into `perform_review`, swap `run_native_agent → run_opencode_agent`, build the combined image, wire ai-helm-values, hard-cut | **pending, gated on the shadow** |
+| 5 | **dispatch cutover** — thread CP/embed creds into `perform_review`, swap `run_native_agent → run_opencode_agent`, build the combined image, wire ai-helm-values, hard-cut | merged (#452), live 2026-07-17 |
+| 6 | restore the ADR-0066 external-knowledge (customer) MCP surface in `lci-review-mcp` (slice 1 stubbed it with `std::iter::empty()`) | this ADR's follow-up |
+
+### External / customer MCP servers go through the mediated ADR-0066 path — NOT OpenCode config
+
+A customer adds their own MCP to the reviewer by declaring it in the **control-plane** config
+([`McpServerConfig`](../../services/control-plane/src/config.rs), owner-managed in ai-helm-values).
+The control plane connects to it, discovers its tools, and re-exposes them to the agent as mediated
+`mcp__<server>__<tool>` tools via `GET/POST /internal/tasks/{id}/knowledge/{tools,call}` (ADR-0066),
+size-capped and framed as untrusted. The runner **never** talks to the customer's server directly.
+
+This is the same mediation seam as `read_file`/retrieval, and it is deliberately **not** "let the
+customer add an entry to OpenCode's `mcp` block." Injecting customer MCP servers into the rendered
+OpenCode config would (a) run the customer's transport/credentials *inside our review Job pod* next to
+the eaig key, internal CA, and git token, and (b) reopen exactly the config surface decision #6 closes
+(the neutral-cwd/empty-HOME lockdown). The mediated path keeps the customer's server outside our pod,
+keeps the tool calls in the recorder/coverage/attribution accounting, and needs zero per-customer
+runner code. Slice 1 of this cutover shipped `lci-review-mcp` with that discovery iterator stubbed to
+`std::iter::empty()` ("wired in a later slice"); slice 6 restores it, so customer MCPs are reachable on
+the OpenCode review path with parity to the native loop.
 
 ## Consequences
 

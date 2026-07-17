@@ -30,7 +30,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
-use lci_agent_clients::{ControlPlaneClient, EmbeddingsClient};
+use lci_agent_clients::{ControlPlaneClient, DiscoveredTool, EmbeddingsClient};
 use lci_agent_sast::{ENV_CHANGED_FILES, SastConfig};
 use lci_agent_types::{FunctionCallReq, ToolCallReq, ToolOutcome, ToolSpec};
 use lci_review_agent::policies::SastLeadSink;
@@ -86,6 +86,43 @@ fn env(key: &str) -> Result<String> {
         .with_context(|| format!("required env var {key} is not set"))
 }
 
+/// Map an ADR-0066 discovered MCP tool to a review `ToolSpec`. The control plane already reports it
+/// `mcp__<server>__<tool>`-prefixed, so it folds into the registry verbatim; dispatch of the result
+/// routes back through the control plane's `call_knowledge_tool` inside [`Tools`] — the runner never
+/// talks to an external MCP server directly.
+fn discovered_to_spec(tool: DiscoveredTool) -> ToolSpec {
+    ToolSpec::function(tool.name, tool.description, tool.input_schema)
+}
+
+/// Defensively fold discovered ADR-0066 tools into specs so a malformed discovery result degrades
+/// instead of wedging the review. The registry rejects a repeated name with
+/// `RegistryError::DuplicateName`, and `Tools::with_sast` propagates it — a hard startup failure. The
+/// control plane already `mcp__`-prefixes discovered names (so a well-formed one can't collide with a
+/// built-in — none of which are `mcp__`), but a buggy or duplicate customer `tools/list` must be
+/// dropped, not fatal: keep only correctly-prefixed names, first occurrence of each wins.
+fn filter_discovered(tools: Vec<DiscoveredTool>) -> Vec<ToolSpec> {
+    let mut seen = std::collections::HashSet::new();
+    tools
+        .into_iter()
+        .filter(|tool| {
+            if !tool.name.starts_with(lci_review_agent::tools::MCP_TOOL_PREFIX) {
+                // stderr only — stdout is the JSON-RPC channel.
+                eprintln!(
+                    "lci-review-mcp: dropping discovered tool {:?} — not `mcp__`-prefixed (would risk a built-in collision)",
+                    tool.name
+                );
+                return false;
+            }
+            if !seen.insert(tool.name.clone()) {
+                eprintln!("lci-review-mcp: dropping duplicate discovered tool {:?}", tool.name);
+                return false;
+            }
+            true
+        })
+        .map(discovered_to_spec)
+        .collect()
+}
+
 /// Resolve the `run_sast` tool config (ADR-0073) from the SAST env group, or `None` when SAST wasn't
 /// offered this run. Returns `None` unless BOTH the [`SastConfig`] round-trip resolves ([`SastConfig::from_env`])
 /// AND the changed-file list is present — the supervisor only sets both together, past the opt-in gate.
@@ -120,7 +157,7 @@ fn resolve_sast_tool_config() -> Result<Option<SastToolConfig>> {
     }))
 }
 
-fn build_tools() -> Result<Tools> {
+async fn build_tools() -> Result<Tools> {
     let client = ControlPlaneClient::new(env("LCI_MCP_CP_URL")?, env("LCI_MCP_RUNNER_TOKEN")?);
     let embedder = EmbeddingsClient::new(
         &env("LCI_MCP_EMBED_URL")?,
@@ -132,14 +169,34 @@ fn build_tools() -> Result<Tools> {
         .context("LCI_MCP_TASK_ID is not a valid UUID")?;
     let checkout = PathBuf::from(env("LCI_MCP_CHECKOUT")?);
     let sast = resolve_sast_tool_config()?;
-    // No discovered knowledge tools in slice 1 (the outbound brave-search/context7 MCP, ADR-0066,
-    // is wired in a later slice); the empty iterator keeps the registry to the core review tools.
+
+    // ADR-0066 external-knowledge MCP tools: discover whatever MCP servers the control plane is
+    // configured with (owner-managed in ai-helm-values) and fold them into the registry as mediated
+    // `mcp__<server>__<tool>` tools — the same surface the native review loop offered. RFC-0009
+    // slice 1 stubbed this with `std::iter::empty()` ("wired in a later slice"); this IS that slice,
+    // so a customer's configured MCP is reachable on the OpenCode review path with zero per-customer
+    // runner code. Dispatch routes back through the control plane (`call_knowledge_tool`) inside
+    // `Tools`, so the runner never talks to an external MCP directly — mediation preserved (the
+    // deliberate boundary of ADR-0097 #6), and the results are size-capped + untrusted-framed CP-side.
+    // Discovery is best-effort: a control-plane hiccup degrades to the core review tools rather than
+    // failing the review (a customer's flaky MCP must never wedge a review).
+    let discovered = client
+        .list_knowledge_tools(task_id)
+        .await
+        .unwrap_or_else(|error| {
+            // stderr only — stdout is the JSON-RPC channel and must carry nothing else.
+            eprintln!(
+                "lci-review-mcp: ADR-0066 knowledge-tool discovery failed; continuing with core review tools only: {error:#}"
+            );
+            Vec::new()
+        });
+
     Tools::with_sast(
         &client,
         &embedder,
         task_id,
         &checkout,
-        std::iter::empty(),
+        filter_discovered(discovered),
         sast,
     )
     .map_err(|error| anyhow::anyhow!("building the review tool registry: {error}"))
@@ -222,7 +279,7 @@ async fn handle(tools: &Tools, name_map: &HashMap<String, String>, req: &Value) 
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let tools = Arc::new(build_tools().context("initializing lci-review-mcp")?);
+    let tools = Arc::new(build_tools().await.context("initializing lci-review-mcp")?);
     // Advertised (bare) → canonical name map, built once from the registered specs so `tools/call`
     // arriving under the advertised name dispatches to the right registry entry.
     let name_map = Arc::new(
@@ -282,6 +339,44 @@ mod tests {
         assert_eq!(m["name"], "t");
         assert_eq!(m["description"], "desc");
         assert_eq!(m["inputSchema"]["type"], "object");
+    }
+
+    #[test]
+    fn folds_discovered_mcp_tool_into_the_registry_shape() {
+        // ADR-0066: a discovered tool arrives already `mcp__<server>__<tool>`-prefixed and is folded
+        // in verbatim (name/description/schema preserved) so opencode can offer it; its dispatch
+        // routing to `call_knowledge_tool` is covered by `lci_review_agent::tools`.
+        let spec = discovered_to_spec(DiscoveredTool {
+            name: "mcp__acme__search".into(),
+            description: "acme search".into(),
+            input_schema: json!({"type": "object", "properties": {"q": {"type": "string"}}}),
+        });
+        assert_eq!(spec.name(), "mcp__acme__search");
+        let m = mcp_tool(&spec);
+        // A discovered `mcp__…` name has no leading `lightbridge_`, so it advertises unchanged.
+        assert_eq!(m["name"], "mcp__acme__search");
+        assert_eq!(m["description"], "acme search");
+        assert_eq!(m["inputSchema"]["properties"]["q"]["type"], "string");
+    }
+
+    #[test]
+    fn filter_discovered_drops_unprefixed_and_duplicate_tools() {
+        // A malformed/duplicate customer tools/list must degrade, not wedge the review: the registry
+        // rejects a duplicate name (and a non-`mcp__` name could collide with a built-in), which would
+        // otherwise be a hard startup failure. Keep only `mcp__`-prefixed names, first occurrence wins.
+        let tool = |name: &str| DiscoveredTool {
+            name: name.into(),
+            description: "d".into(),
+            input_schema: json!({"type": "object"}),
+        };
+        let out = filter_discovered(vec![
+            tool("mcp__acme__a"),
+            tool("read_file"), // non-mcp__: would collide with the built-in read_file → dropped
+            tool("mcp__acme__a"), // duplicate → dropped
+            tool("mcp__acme__b"),
+        ]);
+        let names: Vec<_> = out.iter().map(|s| s.name().to_string()).collect();
+        assert_eq!(names, vec!["mcp__acme__a", "mcp__acme__b"]);
     }
 
     #[test]
