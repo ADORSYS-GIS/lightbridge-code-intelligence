@@ -1,4 +1,4 @@
-This is **Lightbridge Code Intelligence**, a pnpm + Turborepo monorepo: `apps/web` (Next.js + better-auth), `packages/*` (shared TypeScript), and `services/control-plane` (a standalone Rust backend built on Axum and bound to cratestack), plus a Cargo `xtask`. See `docs/INDEX.md` and `docs/adr/` for architecture and decisions, and `CONTRIBUTING.md` for the contribution workflow.
+This is **Lightbridge Code Intelligence**, a pnpm + Turborepo monorepo: `apps/web` (Next.js + better-auth), `packages/*` (shared TypeScript), and `services/control-plane` (a standalone Rust backend built on Axum and bound to cratestack), plus a Cargo `xtask`. See `docs/INDEX.md` and `docs/adr/` for architecture and decisions, `ROADMAP.md` for the at-a-glance status of shipped/in-progress/planned work, and `CONTRIBUTING.md` for the contribution workflow.
 
 <!-- BEGIN: AI Governance stanza (managed by ADORSYS-GIS/ai-governance) -->
 ## AI Governance
@@ -16,3 +16,12 @@ When opening issues or pull requests in this repo:
 Source of truth and full doctrine: https://adorsys-gis.github.io/ai-governance/
 This stanza is intentionally thin — read the site; do not duplicate the doctrine here.
 <!-- END: AI Governance stanza -->
+
+## Keeping the roadmap current
+
+`ROADMAP.md` is the maintainer-facing status of the project. **Treat updating it as part of "done."**
+When a change meaningfully ships, unblocks, or retires a roadmap item — a feature going live, an epic
+advancing, a blocker cleared — move that item to its new section (or add it) in `ROADMAP.md` **in the same
+PR**, with the merge/issue reference and date. It is not the source of truth (decisions live in
+`docs/adr/`, tracked work in GitHub issues), so keep entries short and link out rather than duplicating
+detail. If a change touches nothing on the roadmap, leave it alone — don't churn the file for its own sake.
