@@ -966,9 +966,11 @@ async fn transitions_append_gapfree_events_and_non_a2a_appends_none(pool: PgPool
     assert_eq!(total, 2, "only the A2A-fronted task produced events");
 }
 
-/// A task already terminal at subscribe replays its full sequence in order and closes on `final`,
-/// with no tailing. The silent-clean ordering (review row present before succeeded) puts the
-/// artifact-update before the terminal status-update.
+/// A task already terminal at subscribe replays its full sequence in order and closes on `final`, with
+/// no tailing. The terminal transition itself carries ONLY the status-update: review artifacts are
+/// streamed earlier by [`append_review_stream`] (ADR-0098), never by the succeeded transition — so even
+/// with a review row persisted before `succeeded`, no artifact-update rides this transition (the caller
+/// reads the full combined artifact from `GetTask` polling instead).
 #[sqlx::test(migrations = "./migrations")]
 async fn terminal_task_replays_in_order_and_closes(pool: PgPool) {
     seed_approved_repo(&pool, "acme", "api", 111).await;
@@ -979,7 +981,8 @@ async fn terminal_task_replays_in_order_and_closes(pool: PgPool) {
     db::set_task_status(&pool, underlying, "running", None)
         .await
         .unwrap();
-    // Persist the review BEFORE succeeded (the silent-clean path) so the artifact rides the stream.
+    // Persist the review BEFORE succeeded (the silent-clean path). This no longer rides the stream —
+    // it's the polling artifact source only.
     let findings = json!([{ "path": "auth.rs", "severity": "P1" }]);
     db::insert_review_if_absent(&pool, underlying, "Found it", "body", 1, 0, 0, &findings)
         .await
@@ -994,23 +997,260 @@ async fn terminal_task_replays_in_order_and_closes(pool: PgPool) {
         .unwrap();
     let events = drain_stream(stream, Duration::from_secs(5)).await;
 
-    // Task snapshot, then WORKING, then the artifact-update, then the terminal COMPLETED — closed.
+    // Task snapshot, then WORKING, then the terminal COMPLETED — closed. No artifact-update rides the
+    // transition anymore (artifacts come from the finalize-time stream, not here).
     assert!(matches!(events[0], StreamResponse::Task(_)));
     assert_eq!(event_state(&events[0]), Some(TaskState::Completed));
     assert_eq!(event_state(&events[1]), Some(TaskState::Working));
-    assert!(matches!(events[2], StreamResponse::ArtifactUpdate(_)));
-    assert_eq!(event_state(&events[3]), Some(TaskState::Completed));
+    assert_eq!(event_state(&events[2]), Some(TaskState::Completed));
     assert_eq!(
         events.len(),
-        4,
-        "stream closed right after the terminal event"
+        3,
+        "stream closed right after the terminal event; no artifact on the transition"
     );
-    // The artifact carries the summary + findings the caller expects.
-    if let StreamResponse::ArtifactUpdate(update) = &events[2] {
-        assert_eq!(update.artifact.parts[0].as_text(), Some("Found it"));
-    } else {
-        panic!("expected an artifact-update at index 2");
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, StreamResponse::ArtifactUpdate(_))),
+        "the terminal transition carries no artifact-update (ADR-0098)"
+    );
+}
+
+/// Build a review [`Finding`](crate::review::Finding) for the streaming tests.
+fn finding(file: &str, line: u32, priority: &str, title: &str) -> crate::review::Finding {
+    crate::review::Finding {
+        file: file.to_string(),
+        line,
+        start_line: None,
+        priority: Some(priority.to_string()),
+        category: None,
+        severity: None,
+        title: title.to_string(),
+        body: format!("{title} body"),
+        suggestion: None,
+        resources: Vec::new(),
     }
+}
+
+/// Count the `artifact-update` rows in a task's event log.
+async fn artifact_update_count(pool: &PgPool, a2a_id: &str) -> usize {
+    event_rows(pool, a2a_id)
+        .await
+        .iter()
+        .filter(|(_, kind, ..)| kind == "artifact-update")
+        .count()
+}
+
+/// Finalize streams each confirmed finding as its own artifact-update, then the conclusion, BEFORE the
+/// terminal COMPLETED event that closes the stream (ADR-0098).
+#[sqlx::test(migrations = "./migrations")]
+async fn review_stream_emits_per_finding_then_conclusion_before_terminal(pool: PgPool) {
+    seed_approved_repo(&pool, "acme", "api", 111).await;
+    let h = handler(pool.clone(), 10);
+    let caller = params("svc-a", &["a2a:review"]);
+    let (a2a_id, underlying) = submit(&h, &caller, 7).await;
+
+    db::set_task_status(&pool, underlying, "running", None)
+        .await
+        .unwrap();
+
+    let findings = vec![
+        finding("auth.rs", 10, "P0", "SQL injection"),
+        finding("db.rs", 42, "P1", "Unbounded query"),
+    ];
+    let ctx = crate::a2a::mapping::ReviewContext {
+        repo: Some("acme/api".to_string()),
+        pr: Some(7),
+        base_sha: None,
+        head_sha: Some("abc".to_string()),
+        review_url: None,
+    };
+    crate::a2a::events::append_review_stream(
+        &pool,
+        underlying,
+        &findings,
+        "Two issues found.",
+        &ctx,
+    )
+    .await
+    .unwrap();
+
+    db::set_task_status(&pool, underlying, "succeeded", None)
+        .await
+        .unwrap();
+
+    // Raw log ordering: WORKING, then finding#1, finding#2, conclusion, then the terminal COMPLETED.
+    let rows = event_rows(&pool, &a2a_id).await;
+    let kinds: Vec<&str> = rows.iter().map(|(_, k, ..)| k.as_str()).collect();
+    assert_eq!(
+        kinds,
+        vec![
+            "status-update",
+            "artifact-update",
+            "artifact-update",
+            "artifact-update",
+            "status-update",
+        ],
+        "findings + conclusion stream BEFORE the terminal status-update"
+    );
+    assert!(rows.last().unwrap().3, "the last (terminal) event is final");
+
+    // Replayed stream: the three artifacts in order (two findings, then the conclusion).
+    let stream = h
+        .subscribe_to_task(&caller, subscribe_req(&a2a_id))
+        .await
+        .unwrap();
+    let events = drain_stream(stream, Duration::from_secs(5)).await;
+    let arts: Vec<&a2a::Artifact> = events
+        .iter()
+        .filter_map(|e| match e {
+            StreamResponse::ArtifactUpdate(u) => Some(&u.artifact),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(arts.len(), 3, "two findings + one conclusion");
+    assert_eq!(arts[0].artifact_id, "finding-auth.rs:10");
+    assert_eq!(arts[1].artifact_id, "finding-db.rs:42");
+    assert_eq!(arts[2].artifact_id, "review");
+    assert_eq!(
+        arts[2].parts[0].as_text(),
+        Some("Two issues found."),
+        "the conclusion carries the verdict text"
+    );
+    // The per-finding data part round-trips the finding JSON (ADR-0032 shape).
+    match &arts[0].parts[0].content {
+        a2a::PartContent::Data(v) => {
+            assert_eq!(v["file"], json!("auth.rs"));
+            assert_eq!(v["line"], json!(10));
+            assert_eq!(v["priority"], json!("P0"));
+        }
+        other => panic!("expected a finding data part, got {other:?}"),
+    }
+    // The stream still closes on the terminal COMPLETED status-update.
+    assert_eq!(
+        event_state(events.last().unwrap()),
+        Some(TaskState::Completed)
+    );
+    assert!(matches!(
+        events.last().unwrap(),
+        StreamResponse::StatusUpdate(_)
+    ));
+}
+
+/// A re-finalize (crash-after-finalize requeue) must not double-stream: a second `append_review_stream`
+/// no-ops once the stream already ran.
+#[sqlx::test(migrations = "./migrations")]
+async fn review_stream_is_idempotent_across_refinalize(pool: PgPool) {
+    seed_approved_repo(&pool, "acme", "api", 111).await;
+    let h = handler(pool.clone(), 10);
+    let caller = params("svc-a", &["a2a:review"]);
+    let (a2a_id, underlying) = submit(&h, &caller, 7).await;
+    db::set_task_status(&pool, underlying, "running", None)
+        .await
+        .unwrap();
+
+    let findings = vec![finding("auth.rs", 10, "P0", "SQL injection")];
+    let ctx = crate::a2a::mapping::ReviewContext {
+        repo: Some("acme/api".to_string()),
+        pr: Some(7),
+        base_sha: None,
+        head_sha: Some("abc".to_string()),
+        review_url: None,
+    };
+    for _ in 0..2 {
+        crate::a2a::events::append_review_stream(&pool, underlying, &findings, "One issue.", &ctx)
+            .await
+            .unwrap();
+    }
+
+    // One finding + one conclusion, exactly once — the second call no-ops.
+    assert_eq!(
+        artifact_update_count(&pool, &a2a_id).await,
+        2,
+        "re-finalize does not duplicate the finding/conclusion chunks"
+    );
+}
+
+/// A run with no A2A front (a webhook review) streams nothing — the finalize hook no-ops.
+#[sqlx::test(migrations = "./migrations")]
+async fn review_stream_noop_for_non_a2a_run(pool: PgPool) {
+    let repo = seed_approved_repo(&pool, "acme", "api", 111).await;
+    db::record_delivery(&pool, Platform::GitHub, "wh-1", "pull_request", &json!({}))
+        .await
+        .unwrap();
+    let plain = db::create_task(
+        &pool,
+        &db::NewTask {
+            repository_id: repo,
+            installation_id: 111,
+            webhook_delivery_id: "wh-1".to_string(),
+            target_type: "pull_request".to_string(),
+            target_id: 999,
+            command_text: "plain".to_string(),
+            base_sha: None,
+            head_sha: Some("zzz".to_string()),
+            run_epoch: 0,
+            tier: "deep".to_string(),
+            trigger_comment_id: None,
+            trace_context: None,
+        },
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    db::set_task_status(&pool, plain, "running", None)
+        .await
+        .unwrap();
+
+    let findings = vec![finding("auth.rs", 10, "P0", "SQL injection")];
+    crate::a2a::events::append_review_stream(
+        &pool,
+        plain,
+        &findings,
+        "Should not stream.",
+        &crate::a2a::mapping::ReviewContext::default(),
+    )
+    .await
+    .unwrap();
+
+    let total: i64 = sqlx::query_scalar("SELECT count(*) FROM a2a_task_events")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(total, 0, "a non-A2A run appends no stream events");
+}
+
+/// Once the log is frozen (a terminal event already exists), a late `append_review_stream` no-ops —
+/// it can never append after the terminal event (freeze-safe).
+#[sqlx::test(migrations = "./migrations")]
+async fn review_stream_noops_after_terminal(pool: PgPool) {
+    seed_approved_repo(&pool, "acme", "api", 111).await;
+    let h = handler(pool.clone(), 10);
+    let caller = params("svc-a", &["a2a:review"]);
+    let (a2a_id, underlying) = submit(&h, &caller, 7).await;
+    db::set_task_status(&pool, underlying, "running", None)
+        .await
+        .unwrap();
+    db::set_task_status(&pool, underlying, "succeeded", None)
+        .await
+        .unwrap();
+
+    let findings = vec![finding("auth.rs", 10, "P0", "SQL injection")];
+    crate::a2a::events::append_review_stream(
+        &pool,
+        underlying,
+        &findings,
+        "Too late.",
+        &crate::a2a::mapping::ReviewContext::default(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        artifact_update_count(&pool, &a2a_id).await,
+        0,
+        "no artifact appended after the stream froze on the terminal event"
+    );
 }
 
 /// Two subscribers on the same task see identical, identically-ordered event sequences.

@@ -9,6 +9,7 @@ use a2a::{Artifact, Part, Task, TaskState, TaskStatus};
 use serde_json::Value;
 
 use crate::integrations::platform::Platform;
+use crate::review::Finding;
 
 /// Map a Lightbridge `tasks.status` string onto the A2A wire [`TaskState`] (RFC-0006 state table):
 ///
@@ -294,11 +295,6 @@ impl ReviewContext {
 /// These are an ADDITIONAL output to the caller — the PR review itself still posts through the
 /// existing pipeline.
 pub fn review_artifacts(summary: &str, findings: &Value, context: &ReviewContext) -> Vec<Artifact> {
-    let summary_text = if summary.trim().is_empty() {
-        "Review completed with no summary.".to_string()
-    } else {
-        summary.to_string()
-    };
     vec![Artifact {
         artifact_id: "review".to_string(),
         name: Some("review".to_string()),
@@ -308,13 +304,75 @@ pub fn review_artifacts(summary: &str, findings: &Value, context: &ReviewContext
                 .to_string(),
         ),
         parts: vec![
-            Part::text(summary_text),
+            Part::text(summary_part_text(summary)),
             Part::data(findings.clone()).with_media_type("application/json"),
             Part::data(context.to_data()).with_media_type("application/json"),
         ],
         metadata: None,
         extensions: None,
     }]
+}
+
+/// The summary text for a review artifact, with the empty-summary placeholder applied — shared by the
+/// polling artifact ([`review_artifacts`]) and the streamed conclusion ([`conclusion_artifact`]) so
+/// the caller sees the same verdict text on both surfaces.
+fn summary_part_text(summary: &str) -> String {
+    if summary.trim().is_empty() {
+        "Review completed with no summary.".to_string()
+    } else {
+        summary.to_string()
+    }
+}
+
+/// One streamed A2A artifact carrying a single confirmed finding (ADR-0098). Emitted per-finding at
+/// finalize by [`crate::a2a::events::append_review_stream`], BEFORE the terminal `COMPLETED` event, so
+/// an A2A subscriber receives findings incrementally instead of one end-of-run blob. The `data` part
+/// is the finding's ADR-0032 JSON — byte-identical to one element of the `findings` array the polling
+/// artifact ([`review_artifacts`]) and `GetTask` return, so streaming and polling agree on content.
+///
+/// `artifact_id` is the finding's `finding-{file}:{line}` identity: stable within a run (the finalize
+/// buffer is last-write-wins per `(file, line)`), and distinct per finding so a subscriber can key on
+/// it. `last_chunk` is set by the emitter (each finding is delivered whole).
+pub fn finding_artifact(finding: &Finding) -> Artifact {
+    Artifact {
+        artifact_id: format!("finding-{}:{}", finding.file, finding.line),
+        name: Some("finding".to_string()),
+        description: Some(
+            "One confirmed review finding (ADR-0032 shape: file, line, priority, category, title, \
+             body, optional suggestion/resources)."
+                .to_string(),
+        ),
+        parts: vec![
+            Part::data(serde_json::to_value(finding).unwrap_or(Value::Null))
+                .with_media_type("application/json"),
+        ],
+        metadata: None,
+        extensions: None,
+    }
+}
+
+/// The streamed review **conclusion** artifact (ADR-0098): the model's verdict summary plus the review
+/// context (repo/pr/effective SHAs/scope; `reviewUrl` is null here — the review has not posted yet at
+/// finalize). It carries NO findings blob: the individual findings were already streamed as the prior
+/// `finding-*` artifacts, so duplicating them here would re-send the whole set. Reuses `artifact_id`
+/// `"review"` to align with the polling artifact's identity. The emitter marks it the last artifact
+/// chunk; the terminal `COMPLETED` status-update then closes the stream.
+pub fn conclusion_artifact(summary: &str, context: &ReviewContext) -> Artifact {
+    Artifact {
+        artifact_id: "review".to_string(),
+        name: Some("review".to_string()),
+        description: Some(
+            "Review conclusion: the verdict summary and review context. The individual findings were \
+             streamed as the preceding `finding-*` artifacts."
+                .to_string(),
+        ),
+        parts: vec![
+            Part::text(summary_part_text(summary)),
+            Part::data(context.to_data()).with_media_type("application/json"),
+        ],
+        metadata: None,
+        extensions: None,
+    }
 }
 
 /// Assemble an A2A [`Task`] view: id/context + a status carrying the mapped state, and (when
@@ -677,6 +735,74 @@ mod tests {
         let arts = review_artifacts("   ", &json!([]), &ReviewContext::default());
         assert_eq!(
             arts[0].parts[0].as_text(),
+            Some("Review completed with no summary.")
+        );
+    }
+
+    fn sample_finding(file: &str, line: u32) -> Finding {
+        Finding {
+            file: file.to_string(),
+            line,
+            start_line: None,
+            priority: Some("P0".to_string()),
+            category: Some("security".to_string()),
+            severity: None,
+            title: "SQL injection".to_string(),
+            body: "Unsanitized input reaches the query.".to_string(),
+            suggestion: None,
+            resources: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn finding_artifact_carries_the_finding_json_under_a_stable_id() {
+        let f = sample_finding("src/auth.rs", 12);
+        let art = finding_artifact(&f);
+        // `finding-{file}:{line}` identity — stable within a run, distinct per finding.
+        assert_eq!(art.artifact_id, "finding-src/auth.rs:12");
+        assert_eq!(art.parts.len(), 1, "one JSON data part");
+        match &art.parts[0].content {
+            a2a::PartContent::Data(v) => {
+                // Byte-identical to one element of the polling `findings` array (ADR-0032 shape).
+                assert_eq!(v, &serde_json::to_value(&f).unwrap());
+                assert_eq!(v["file"], json!("src/auth.rs"));
+                assert_eq!(v["line"], json!(12));
+                assert_eq!(v["priority"], json!("P0"));
+                assert_eq!(v["category"], json!("security"));
+            }
+            other => panic!("expected a finding data part, got {other:?}"),
+        }
+        assert_eq!(art.parts[0].media_type.as_deref(), Some("application/json"));
+    }
+
+    #[test]
+    fn conclusion_artifact_carries_summary_and_context_without_findings() {
+        let art = conclusion_artifact("Two issues found.", &ctx(None, Some("head9"), None));
+        // Reuses the polling artifact's `review` id, and carries NO findings blob (streamed separately).
+        assert_eq!(art.artifact_id, "review");
+        assert_eq!(
+            art.parts.len(),
+            2,
+            "summary text + context only — no findings"
+        );
+        assert_eq!(art.parts[0].as_text(), Some("Two issues found."));
+        match &art.parts[1].content {
+            a2a::PartContent::Data(v) => {
+                assert_eq!(v["repo"], json!("acme/api"));
+                assert_eq!(v["pr"], json!(42));
+                assert_eq!(v["scope"], json!("whole-tree"));
+                // review_url is unknown at finalize (not posted yet).
+                assert_eq!(v["reviewUrl"], json!(null));
+            }
+            other => panic!("expected a context data part, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn conclusion_artifact_empty_summary_gets_the_placeholder() {
+        let art = conclusion_artifact("  ", &ReviewContext::default());
+        assert_eq!(
+            art.parts[0].as_text(),
             Some("Review completed with no summary.")
         );
     }
