@@ -36,7 +36,7 @@ _Last updated: 2026-07-17._
 - **Remove the dead native review path** — now unblocked (SAST is ported); delete `run_native_agent` and
   its native-only modules.
 - **A2A per-finding review streaming** — stream findings as they are confirmed at finalize.
-  ([ADR-0098](docs/adr/), #458 — open)
+  ([ADR-0098](https://github.com/vymalo/lightbridge-code-intelligence/pull/458), #458 — open)
 - **OpenCode review observability** — capture the model's content and reasoning and tool I/O faithfully in
   the persisted transcript (part of the review-quality epic below).
 
