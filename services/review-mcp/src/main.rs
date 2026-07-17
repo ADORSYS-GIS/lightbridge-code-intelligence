@@ -50,16 +50,24 @@ fn advertised_name(canonical: &str) -> &str {
 
 /// Build the advertised→canonical map from the registered specs, so a `tools/call` arriving under the
 /// advertised (bare) name dispatches to the canonical registry entry. Stripping is only lossy if two
-/// canonical names collide on the same advertised name (e.g. both `read_file` and
-/// `lightbridge_read_file`); the review surface has no such pair, so the map is a clean bijection.
-fn advertised_to_canonical<I>(canonical_names: I) -> HashMap<String, String>
+/// canonical names collide on the same advertised name (e.g. both `read_file` and `lightbridge_read_file`);
+/// the review surface has no such pair today, but a future tool rename that introduced one would ALSO make
+/// `tools/list` advertise two tools under one name — so this fails fast at startup (the server won't run)
+/// rather than silently misrouting dispatch in production reviews.
+fn advertised_to_canonical<I>(canonical_names: I) -> Result<HashMap<String, String>>
 where
     I: IntoIterator<Item = String>,
 {
-    canonical_names
-        .into_iter()
-        .map(|canonical| (advertised_name(&canonical).to_string(), canonical))
-        .collect()
+    let mut map = HashMap::new();
+    for canonical in canonical_names {
+        let advertised = advertised_name(&canonical).to_string();
+        if let Some(existing) = map.insert(advertised.clone(), canonical.clone()) {
+            anyhow::bail!(
+                "tool-name collision: {existing:?} and {canonical:?} both advertise as {advertised:?}"
+            );
+        }
+    }
+    Ok(map)
 }
 
 /// Read a required env var, trimmed — a stray newline/space (e.g. from a here-doc or a k8s
@@ -167,9 +175,10 @@ async fn main() -> Result<()> {
     let tools = Arc::new(build_tools().context("initializing lci-review-mcp")?);
     // Advertised (bare) → canonical name map, built once from the registered specs so `tools/call`
     // arriving under the advertised name dispatches to the right registry entry.
-    let name_map = Arc::new(advertised_to_canonical(
-        tools.specs().into_iter().map(|spec| spec.function.name),
-    ));
+    let name_map = Arc::new(
+        advertised_to_canonical(tools.specs().into_iter().map(|spec| spec.function.name))
+            .context("building the review tool-name map")?,
+    );
 
     // Each request runs in its own task so batched tool calls (the review does parallel read-only
     // tool batching, ADR-0042) don't serialize behind each other; a single writer task owns stdout
@@ -258,7 +267,7 @@ mod tests {
             "add_review_comment",
             "finish",
         ];
-        let map = advertised_to_canonical(canonical.iter().map(|s| s.to_string()));
+        let map = advertised_to_canonical(canonical.iter().map(|s| s.to_string())).unwrap();
         // A call under the advertised (bare) name resolves to the canonical registry name.
         assert_eq!(
             map.get("vector_semantic_search").map(String::as_str),
@@ -273,6 +282,17 @@ mod tests {
         assert_eq!(map.get("finish").map(String::as_str), Some("finish"));
         // Every advertised key is distinct (clean bijection — no lossy collision).
         assert_eq!(map.len(), canonical.len());
+    }
+
+    #[test]
+    fn name_map_fails_fast_on_an_advertised_name_collision() {
+        // A bare tool and its `lightbridge_`-prefixed twin both advertise as `read_file` — that would
+        // shadow one tool in dispatch AND emit a duplicate in tools/list, so it must hard-error rather
+        // than silently drop one.
+        let clash = ["read_file", "lightbridge_read_file"];
+        let err = advertised_to_canonical(clash.iter().map(|s| s.to_string()))
+            .expect_err("colliding advertised names must fail");
+        assert!(err.to_string().contains("read_file"));
     }
 
     #[test]
