@@ -46,6 +46,35 @@ fn discovered_to_spec(tool: DiscoveredTool) -> ToolSpec {
     ToolSpec::function(tool.name, tool.description, tool.input_schema)
 }
 
+/// Defensively fold discovered ADR-0066 tools into specs so a malformed discovery result degrades
+/// instead of wedging the review. The registry rejects a repeated name with
+/// `RegistryError::DuplicateName`, and `Tools::new` propagates it — a hard startup failure. The
+/// control plane already `mcp__`-prefixes discovered names (so a well-formed one can't collide with a
+/// built-in — none of which are `mcp__`), but a buggy or duplicate customer `tools/list` must be
+/// dropped, not fatal: keep only correctly-prefixed names, first occurrence of each wins.
+fn filter_discovered(tools: Vec<DiscoveredTool>) -> Vec<ToolSpec> {
+    let mut seen = std::collections::HashSet::new();
+    tools
+        .into_iter()
+        .filter(|tool| {
+            if !tool.name.starts_with(lci_review_agent::tools::MCP_TOOL_PREFIX) {
+                // stderr only — stdout is the JSON-RPC channel.
+                eprintln!(
+                    "lci-review-mcp: dropping discovered tool {:?} — not `mcp__`-prefixed (would risk a built-in collision)",
+                    tool.name
+                );
+                return false;
+            }
+            if !seen.insert(tool.name.clone()) {
+                eprintln!("lci-review-mcp: dropping duplicate discovered tool {:?}", tool.name);
+                return false;
+            }
+            true
+        })
+        .map(discovered_to_spec)
+        .collect()
+}
+
 async fn build_tools() -> Result<Tools> {
     let client = ControlPlaneClient::new(env("LCI_MCP_CP_URL")?, env("LCI_MCP_RUNNER_TOKEN")?);
     let embedder = EmbeddingsClient::new(
@@ -84,7 +113,7 @@ async fn build_tools() -> Result<Tools> {
         &embedder,
         task_id,
         &checkout,
-        discovered.into_iter().map(discovered_to_spec),
+        filter_discovered(discovered),
     )
     .map_err(|error| anyhow::anyhow!("building the review tool registry: {error}"))
 }
@@ -228,6 +257,26 @@ mod tests {
         assert_eq!(m["name"], "mcp__acme__search");
         assert_eq!(m["description"], "acme search");
         assert_eq!(m["inputSchema"]["properties"]["q"]["type"], "string");
+    }
+
+    #[test]
+    fn filter_discovered_drops_unprefixed_and_duplicate_tools() {
+        // A malformed/duplicate customer tools/list must degrade, not wedge the review: the registry
+        // rejects a duplicate name (and a non-`mcp__` name could collide with a built-in), which would
+        // otherwise be a hard startup failure. Keep only `mcp__`-prefixed names, first occurrence wins.
+        let tool = |name: &str| DiscoveredTool {
+            name: name.into(),
+            description: "d".into(),
+            input_schema: json!({"type": "object"}),
+        };
+        let out = filter_discovered(vec![
+            tool("mcp__acme__a"),
+            tool("read_file"),    // non-mcp__: would collide with the built-in read_file → dropped
+            tool("mcp__acme__a"), // duplicate → dropped
+            tool("mcp__acme__b"),
+        ]);
+        let names: Vec<_> = out.iter().map(|s| s.name().to_string()).collect();
+        assert_eq!(names, vec!["mcp__acme__a", "mcp__acme__b"]);
     }
 
     #[test]
