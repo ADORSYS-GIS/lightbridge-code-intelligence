@@ -1,172 +1,407 @@
-//! Render the per-task OpenCode config for a review run.
+//! Render the per-task OpenCode config for a review run (ADR-0099).
 //!
-//! The review system prompt is dynamic (`prompt::build_messages` folds in the repo's agent
-//! instructions, prior reviews, and memory), so the config is rendered per task by the host rather
-//! than shipped as a static asset — which also avoids duplicating the authoritative reviewer prompt
-//! (it lives in `ReviewConfig::system_prompt`, from the ai-helm chart).
+//! The config is built in three layers, last-writer-wins, merged host-side:
 //!
-//! Two invariants the render enforces for **coverage parity** with the native loop:
+//! 1. **base** — the checked-in, human-readable [`integrations/opencode/config/review.jsonc`], baked in
+//!    via `include_str!`. It holds the invariants + defaults: the disabled built-ins (top-level
+//!    `tools`), the read-only `permission`, the mediated `lightbridge` MCP, the recorder/gate/logger
+//!    plugins, and the `eaig/reviewer` model wiring via `{env:*}`. Secrets ride `{env:*}` placeholders
+//!    (opencode resolves them at load); the reviewer prompt rides a `{file:*}` placeholder pointing at
+//!    a per-task file the host writes beside the config.
+//! 2. **runtime injection** — patched onto the parsed base per task: the attribution/billing headers
+//!    (#89, dynamic keys), the tier's `reasoning` flag (deep=true/fast=false, ADR-0069), and
+//!    `temperature` when set. These are the values that can't be a static `{env:*}`/`{file:*}`.
+//! 3. **operator overlay** — the trusted `review.opencode` object from ai-helm-values, deep-merged LAST
+//!    with **full override** (objects merge recursively; arrays and scalars from the overlay replace
+//!    ours). The merge is host-side so the untrusted checkout is never a config source (ADR-0097 #6).
+//!
+//! Two invariants the base enforces for **coverage parity** with the native loop:
 //! - **All file access is mediated.** OpenCode's built-in `read`/`grep`/`glob`/`list`/`edit`/`bash`
 //!   (and `task`, i.e. subagents) are disabled, so every read goes through `lightbridge_read_file` and
-//!   the retrieval tools — the same single mediated path the native review uses, which is what makes
-//!   the recorder-driven coverage accounting exact (a built-in `read` would be invisible to it).
+//!   the retrieval tools — the single mediated path that makes the recorder-driven coverage accounting
+//!   exact (a built-in `read` would be invisible to it).
 //! - **Read-only.** `edit`/`bash`/`webfetch` are denied; a review never mutates the tree or egresses.
 //!
-//! Secrets ride `{env:…}` placeholders (like the sim config), never written into the file — the host
-//! sets `LCI_EAIG_{BASE_URL,API_KEY,MODEL}` in OpenCode's environment.
+//! Because the overlay wins on every key (full override, the owner's chosen policy), it can WEAKEN
+//! those invariants. That is permitted by design; the system makes it *visible*, not impossible:
+//! [`render_review_config`] diffs the merged config against the base floor and returns a
+//! [`FloorBreach`] for each relaxation (a built-in re-enabled, a permission opened, the `lightbridge`
+//! MCP or a plugin dropped/replaced) so the host can WARN and note it on the review's coverage
+//! disclosure.
 
-use serde_json::{Value, json};
+use serde_json::{Map, Value};
 
-/// Absolute in-image paths to the vendored plugins (they live under `/opt`, not the checkout — see
-/// `integrations/opencode/config/opencode.jsonc`).
-const PLUGIN_PATHS: &[&str] = &[
-    "/opt/lightbridge/opencode/plugins/recorder/src/index.ts",
-    "/opt/lightbridge/opencode/plugins/gate-interlock/src/index.ts",
-    "/opt/lightbridge/opencode/plugins/logger/src/index.ts",
-];
+/// The checked-in base config (ADR-0099), baked in at compile time. It is `.jsonc` (real `//`
+/// comments, documented there) — [`strip_jsonc_comments`] removes them before parsing. The path
+/// reaches the repo-root `integrations/` tree, which is present at compile time (the release build
+/// compiles the whole checked-out workspace); the runtime image needs no copy of it.
+const BASE_REVIEW_JSONC: &str =
+    include_str!("../../../../integrations/opencode/config/review.jsonc");
 
-/// OpenCode built-in tools disabled for review so every investigation goes through the mediated
-/// `lightbridge_*` tools (unlisted MCP tools stay enabled). `task` is disabled too: native review is a
-/// single loop with no subagents, and a subagent's built-in reads would escape coverage accounting.
+/// The relative `{file:*}` reference the base uses for the reviewer prompt (opencode resolves it
+/// against the config file's directory at load). The host writes the per-task prompt to a file of this
+/// name **beside** the written config so the reference resolves — see the agent-runner review host.
+pub const REVIEW_PROMPT_FILE: &str = "review-prompt.md";
+
+/// One way the operator overlay relaxed a base review invariant (ADR-0099 §4). Full override is
+/// intentional — this is surfaced (logged + noted on the coverage disclosure), never prevented.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FloorBreach {
+    /// A human-readable one-liner naming what was relaxed — used both for the `tracing::warn!` and,
+    /// joined, for the coverage-disclosure note.
+    pub message: String,
+}
+
+/// The rendered per-task config plus any floor relaxations the overlay introduced.
+#[derive(Debug, Clone)]
+pub struct RenderedReviewConfig {
+    /// The final, merged config to write as `OPENCODE_CONFIG`.
+    pub config: Value,
+    /// Empty unless the operator overlay relaxed the base floor (built-in re-enabled, permission
+    /// opened, or the `lightbridge` MCP / a required plugin dropped or replaced). Never blocks the run.
+    pub floor_breaches: Vec<FloorBreach>,
+}
+
+impl RenderedReviewConfig {
+    /// A single coverage-disclosure sentence when the floor was breached, else `None`. Appended to the
+    /// review's coverage disclosure so a finding set produced under a custom operator config isn't
+    /// mistaken for the default (ADR-0099 §4).
+    #[must_use]
+    pub fn disclosure_note(&self) -> Option<String> {
+        if self.floor_breaches.is_empty() {
+            return None;
+        }
+        let relaxations = self
+            .floor_breaches
+            .iter()
+            .map(|b| b.message.as_str())
+            .collect::<Vec<_>>()
+            .join("; ");
+        Some(format!(
+            "A custom operator OpenCode config (review.opencode) was active and relaxed the review \
+             floor: {relaxations}. Coverage/read-only guarantees may differ from the default."
+        ))
+    }
+}
+
+/// Render the OpenCode config for one review run (ADR-0099): parse the checked-in base, apply the
+/// runtime injection, deep-merge the trusted operator `overlay` (full override), and diff the result
+/// against the base floor.
 ///
-/// ⚠️ These are disabled at the CONFIG TOP LEVEL, not per-agent: opencode-over-ACP runs its built-in
-/// `build` agent (not a custom `review` agent), so a per-agent `tools` block is ignored — verified
-/// against 1.18.3 via the e2e's advertised-tools log (a per-agent block left `read`/`grep`/`glob`/…
-/// advertised to the model, which would let it read off the mediated path and escape coverage; the
-/// top-level block leaves only the four `lightbridge_*` tools). The full built-in set is listed so a
-/// future opencode addition doesn't silently re-open the hole — keep it in sync with what the model is
-/// actually offered.
-const DISABLED_BUILTINS: &[&str] = &[
-    "read",
-    "grep",
-    "glob",
-    "list",
-    "edit",
-    "write",
-    "patch",
-    "bash",
-    "webfetch",
-    "websearch",
-    "task",
-    "skill",
-    "todowrite",
-];
-
-/// Render the OpenCode config (`opencode.json` shape) for one review run. `system_prompt` is the
-/// reviewer guidance from [`crate::flows`]/`ReviewConfig`; `fast` selects the tier (deep enables the
-/// reasoning model per ADR-0069, fast does not); `temperature` is passed through to the provider when
-/// set (a best-effort — fine sampling params don't all map 1:1 once OpenCode owns the loop).
-/// `attribution` is the per-project billing header set (epic #89) — forwarded on every provider request
-/// via the openai-compatible provider's `headers` option, so OpenCode-hosted review bills the same as
-/// the native loop.
+/// - `fast` selects the tier: deep enables the reasoning model (ADR-0069), fast does not.
+/// - `temperature` is patched into the provider model options when set (best-effort; fine sampling
+///   params don't all map 1:1 once OpenCode owns the loop).
+/// - `attribution` is the per-project billing header set (#89), forwarded on every provider request
+///   via the openai-compatible provider's `headers` option so OpenCode-hosted review bills as native.
+/// - `overlay` is the operator's `review.opencode` object (trusted); `None` (or an empty object) is a
+///   no-op, leaving the config byte-identical to the base+injection.
+///
+/// The reviewer prompt is NOT a parameter: the base references it via `{file:REVIEW_PROMPT_FILE}` and
+/// the host writes that file per task. Panics only on a corrupt *checked-in* base (a compile-time
+/// asset, guarded by [`tests`]); operator input can't reach the panic.
 #[must_use]
 pub fn render_review_config(
-    system_prompt: &str,
     fast: bool,
     temperature: Option<f64>,
     attribution: &[(String, String)],
-) -> Value {
-    let mut model_options = json!({});
-    if let Some(temperature) = temperature {
-        model_options["temperature"] = json!(temperature);
+    overlay: Option<&Value>,
+) -> RenderedReviewConfig {
+    let mut config = parse_base();
+    inject_runtime(&mut config, fast, temperature, attribution);
+
+    // Snapshot the floor from the injected base BEFORE the overlay — the floor items (tools /
+    // permission / mcp.lightbridge / plugin) are all base-owned, untouched by injection.
+    let floor = Floor::capture(&config);
+
+    // Apply the overlay ONLY when it is a non-empty object. An absent/empty overlay is a no-op (leaving
+    // the config byte-identical to base+injection); a NON-object overlay (a misconfigured
+    // `review.opencode: "…"`/`[…]`) is ignored rather than allowed to clobber our whole config into a
+    // scalar — the deep merge's replace arm is for nested values, not the top-level config root.
+    if let Some(overlay) = overlay.filter(|v| v.as_object().is_some_and(|o| !o.is_empty())) {
+        deep_merge(&mut config, overlay);
     }
 
-    let disabled_tools: serde_json::Map<String, Value> = DISABLED_BUILTINS
-        .iter()
-        .map(|name| ((*name).to_string(), json!(false)))
-        .collect();
+    let floor_breaches = floor.diff(&config);
+    RenderedReviewConfig {
+        config,
+        floor_breaches,
+    }
+}
 
-    let headers: serde_json::Map<String, Value> = attribution
-        .iter()
-        .map(|(key, value)| (key.clone(), json!(value)))
-        .collect();
+/// Parse the checked-in base jsonc into a JSON value. The base is a compile-time constant we author, so
+/// a parse failure is a build-broke-the-asset bug, not a runtime condition — hence the expect (a
+/// dedicated test parses it so the failure surfaces at `cargo test`, not in prod).
+fn parse_base() -> Value {
+    let stripped = strip_jsonc_comments(BASE_REVIEW_JSONC);
+    serde_json::from_str(&stripped)
+        .expect("the checked-in review.jsonc base is valid JSON once comments are stripped")
+}
 
-    json!({
-        "$schema": "https://opencode.ai/config.json",
-        "provider": {
-            "eaig": {
-                "npm": "@ai-sdk/openai-compatible",
-                "name": "eaig",
-                "options": {
-                    "baseURL": "{env:LCI_EAIG_BASE_URL}",
-                    "apiKey": "{env:LCI_EAIG_API_KEY}",
-                    // Per-project billing attribution (epic #89) — forwarded on every provider request.
-                    "headers": headers
-                },
-                "models": {
-                    "reviewer": {
-                        "id": "{env:LCI_EAIG_MODEL}",
-                        "name": "eaig reviewer",
-                        // Deep tier runs a reasoning-capable model (ADR-0069 floor); fast does not.
-                        "reasoning": !fast,
-                        "options": model_options
+/// Patch the per-task runtime values onto the parsed base (ADR-0099 layer 2): the attribution headers
+/// (dynamic keys), the tier `reasoning` flag, and `temperature` when set. Everything else the base
+/// already carries as `{env:*}`/`{file:*}` placeholders opencode resolves at load.
+fn inject_runtime(
+    config: &mut Value,
+    fast: bool,
+    temperature: Option<f64>,
+    attribution: &[(String, String)],
+) {
+    let reviewer = &mut config["provider"]["eaig"]["models"]["reviewer"];
+    // Deep tier runs a reasoning-capable model (ADR-0069 floor); fast does not.
+    reviewer["reasoning"] = Value::Bool(!fast);
+    if let Some(temperature) = temperature {
+        reviewer["options"]["temperature"] = json_number(temperature);
+    }
+
+    // Per-project billing attribution (#89) — dynamic header keys, so patched in rather than `{env:*}`.
+    let headers: Map<String, Value> = attribution
+        .iter()
+        .map(|(key, value)| (key.clone(), Value::String(value.clone())))
+        .collect();
+    config["provider"]["eaig"]["options"]["headers"] = Value::Object(headers);
+}
+
+/// A finite `f64` as a JSON number, falling back to null on the (unreachable for a real temperature)
+/// non-finite case — `serde_json::Number::from_f64` returns `None` for NaN/inf.
+fn json_number(value: f64) -> Value {
+    serde_json::Number::from_f64(value).map_or(Value::Null, Value::Number)
+}
+
+/// Deep-merge `overlay` INTO `base` with the ADR-0099 policy: two objects merge recursively; for any
+/// other pair (scalar-vs-anything, array-vs-anything, type mismatch) the overlay value REPLACES the
+/// base value. This is the operator's full-override semantics.
+fn deep_merge(base: &mut Value, overlay: &Value) {
+    match (base, overlay) {
+        (Value::Object(base_map), Value::Object(overlay_map)) => {
+            for (key, overlay_value) in overlay_map {
+                match base_map.get_mut(key) {
+                    Some(base_value) => deep_merge(base_value, overlay_value),
+                    None => {
+                        base_map.insert(key.clone(), overlay_value.clone());
                     }
                 }
             }
-        },
-        "model": "eaig/reviewer",
-        "plugin": PLUGIN_PATHS,
-        // Global read-only posture.
-        "permission": {
-            "edit": "deny",
-            "bash": "deny",
-            "webfetch": "deny"
-        },
-        // TOP-LEVEL tool disables (see DISABLED_BUILTINS) — agent-independent, so they hold even though
-        // opencode-over-ACP runs its default `build` agent rather than the `review` agent below.
-        "tools": disabled_tools,
-        // The review write/terminal tools over stdio MCP (ADR-0095 / #440). opencode-over-ACP honors
-        // stdio MCP only via the config `mcp` block (NOT `session/new.mcpServers`), so it is wired here;
-        // the host sets LCI_MCP_* in the process env the spawned server inherits.
-        "mcp": {
-            "lightbridge": {
-                "type": "local",
-                "command": ["lci-review-mcp"],
-                "enabled": true
-            }
-        },
-        "agent": {
-            "review": {
-                "mode": "primary",
-                "description": "Lightbridge review: investigates a PR via the mediated retrieval tools \
-    and records findings with lightbridge_add_review_comment, then calls lightbridge_finish with a \
-    verdict (or lightbridge_abort). Read-only; never edits or runs commands.",
-                "prompt": system_prompt,
-                "permission": {
-                    "edit": "deny",
-                    "bash": "deny",
-                    "webfetch": "deny"
-                }
+        }
+        (base, overlay) => *base = overlay.clone(),
+    }
+}
+
+/// The base floor captured before the overlay merge: exactly the invariants the ADR-0099 diff warns
+/// about when relaxed. Derived from the (injected) base so it can't drift from what the base declares.
+struct Floor {
+    /// Built-in tool names the base disables (`tools.<name> == false`).
+    disabled_builtins: Vec<String>,
+    /// Permission keys the base denies (`permission.<key> == "deny"`).
+    denied_permissions: Vec<String>,
+    /// The base's `mcp.lightbridge` object, if present (dropped/replaced ⇒ breach).
+    lightbridge_mcp: Option<Value>,
+    /// The base's `plugin` entries (any missing from the final ⇒ breach).
+    plugins: Vec<Value>,
+}
+
+impl Floor {
+    /// Extract the floor from a config value (the injected base).
+    fn capture(config: &Value) -> Self {
+        let disabled_builtins = config
+            .get("tools")
+            .and_then(Value::as_object)
+            .map(|tools| {
+                tools
+                    .iter()
+                    .filter(|(_, v)| *v == &Value::Bool(false))
+                    .map(|(k, _)| k.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let denied_permissions = config
+            .get("permission")
+            .and_then(Value::as_object)
+            .map(|perm| {
+                perm.iter()
+                    .filter(|(_, v)| v.as_str() == Some("deny"))
+                    .map(|(k, _)| k.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let lightbridge_mcp = config
+            .get("mcp")
+            .and_then(|mcp| mcp.get("lightbridge"))
+            .cloned();
+        let plugins = config
+            .get("plugin")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        Self {
+            disabled_builtins,
+            denied_permissions,
+            lightbridge_mcp,
+            plugins,
+        }
+    }
+
+    /// Diff the final (post-overlay) config against this floor, returning a breach per relaxation.
+    fn diff(&self, final_config: &Value) -> Vec<FloorBreach> {
+        let mut breaches = Vec::new();
+
+        // A disabled built-in that is no longer `false` (re-enabled, or the whole `tools` object was
+        // replaced by a non-object / dropped) escapes the mediated path and blinds coverage.
+        let final_tools = final_config.get("tools");
+        for name in &self.disabled_builtins {
+            let still_disabled = final_tools
+                .and_then(|t| t.get(name))
+                .is_some_and(|v| v == &Value::Bool(false));
+            if !still_disabled {
+                breaches.push(FloorBreach {
+                    message: format!("built-in tool `{name}` re-enabled (coverage may go blind)"),
+                });
             }
         }
-    })
+
+        // A permission no longer `"deny"` lets the review mutate the tree or egress.
+        let final_perm = final_config.get("permission");
+        for key in &self.denied_permissions {
+            let still_denied =
+                final_perm.and_then(|p| p.get(key)).and_then(Value::as_str) == Some("deny");
+            if !still_denied {
+                breaches.push(FloorBreach {
+                    message: format!("permission `{key}` opened (no longer \"deny\")"),
+                });
+            }
+        }
+
+        // The mediated `lightbridge` MCP dropped or replaced breaks the finalize/coverage path.
+        if let Some(base_mcp) = &self.lightbridge_mcp {
+            let final_mcp = final_config
+                .get("mcp")
+                .and_then(|mcp| mcp.get("lightbridge"));
+            match final_mcp {
+                None => breaches.push(FloorBreach {
+                    message: "the `lightbridge` MCP was dropped (finish/coverage path broken)"
+                        .to_string(),
+                }),
+                Some(mcp) if mcp != base_mcp => breaches.push(FloorBreach {
+                    message: "the `lightbridge` MCP was replaced (finish/coverage path may break)"
+                        .to_string(),
+                }),
+                Some(_) => {}
+            }
+        }
+
+        // A required plugin missing from the final `plugin` list (arrays are replaced wholesale under
+        // full override, so an overlay that sets `plugin` can drop the recorder/gate/logger).
+        let final_plugins = final_config
+            .get("plugin")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        for plugin in &self.plugins {
+            if !final_plugins.contains(plugin) {
+                let name = plugin.as_str().unwrap_or("<plugin>");
+                breaches.push(FloorBreach {
+                    message: format!(
+                        "required plugin `{name}` dropped or replaced (recorder/gate/logger)"
+                    ),
+                });
+            }
+        }
+
+        breaches
+    }
+}
+
+/// Strip `//` line comments and `/* … */` block comments from a jsonc string, leaving valid JSON. The
+/// input is our own checked-in base (not arbitrary input), but this is string-literal-aware so a `//`
+/// INSIDE a string (e.g. the `$schema` URL `https://…`) is preserved. Escapes are respected so a `\"`
+/// inside a string doesn't end it. No trailing-comma handling: the base is authored comma-clean.
+fn strip_jsonc_comments(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    let mut in_string = false;
+    let mut escaped = false;
+    while let Some(c) = chars.next() {
+        if in_string {
+            out.push(c);
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match c {
+            '"' => {
+                in_string = true;
+                out.push(c);
+            }
+            '/' if chars.peek() == Some(&'/') => {
+                // Line comment: consume to (but keep) the newline so line numbers/layout survive.
+                for next in chars.by_ref() {
+                    if next == '\n' {
+                        out.push('\n');
+                        break;
+                    }
+                }
+            }
+            '/' if chars.peek() == Some(&'*') => {
+                // Block comment: consume through the closing `*/`.
+                chars.next(); // the '*'
+                let mut prev = '\0';
+                for next in chars.by_ref() {
+                    if prev == '*' && next == '/' {
+                        break;
+                    }
+                    prev = next;
+                }
+            }
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    fn render(fast: bool, temperature: Option<f64>, attribution: &[(String, String)]) -> Value {
+        render_review_config(fast, temperature, attribution, None).config
+    }
 
     #[test]
-    fn wires_stdio_review_mcp_and_embeds_the_prompt() {
-        let config = render_review_config("be a careful reviewer", false, None, &[]);
-        assert_eq!(config["mcp"]["lightbridge"]["type"], "local");
-        assert_eq!(config["mcp"]["lightbridge"]["command"][0], "lci-review-mcp");
-        assert_eq!(config["agent"]["review"]["prompt"], "be a careful reviewer");
+    fn base_jsonc_parses_and_carries_the_invariants() {
+        let config = render(false, None, &[]);
+        // Model wiring + secret placeholders (never inlined).
         assert_eq!(config["model"], "eaig/reviewer");
-        // Secrets are placeholders, never inlined.
+        assert_eq!(
+            config["provider"]["eaig"]["options"]["baseURL"],
+            "{env:LCI_EAIG_BASE_URL}"
+        );
         assert_eq!(
             config["provider"]["eaig"]["options"]["apiKey"],
             "{env:LCI_EAIG_API_KEY}"
         );
+        // The reviewer prompt is a {file:*} reference the host fills per task (ADR-0099).
+        assert_eq!(
+            config["agent"]["review"]["prompt"],
+            format!("{{file:./{REVIEW_PROMPT_FILE}}}")
+        );
+        // The mediated stdio review MCP.
+        assert_eq!(config["mcp"]["lightbridge"]["type"], "local");
+        assert_eq!(config["mcp"]["lightbridge"]["command"][0], "lci-review-mcp");
+        // The three first-party plugins by absolute path.
+        assert_eq!(config["plugin"].as_array().map(Vec::len), Some(3));
     }
 
     #[test]
     fn disables_builtin_file_and_exec_tools_at_top_level_for_mediated_coverage() {
-        let config = render_review_config("p", false, None, &[]);
+        let config = render(false, None, &[]);
         // TOP-LEVEL, not per-agent (opencode-over-ACP runs its default `build` agent, so a per-agent
-        // block is ignored — proven by the agent-runner e2e's advertised-tools assertion). Every
-        // built-in that could read the tree off the mediated path is off, so all reads flow through
-        // lightbridge_read_file (exact coverage accounting).
+        // block is ignored). Every built-in that could read the tree off the mediated path is off, so
+        // all reads flow through lightbridge_read_file (exact coverage accounting).
         let tools = &config["tools"];
         for builtin in [
             "read",
@@ -175,7 +410,10 @@ mod tests {
             "list",
             "edit",
             "write",
+            "patch",
             "bash",
+            "webfetch",
+            "websearch",
             "task",
             "skill",
             "todowrite",
@@ -188,12 +426,13 @@ mod tests {
         // Read-only posture.
         assert_eq!(config["permission"]["edit"], "deny");
         assert_eq!(config["permission"]["bash"], "deny");
+        assert_eq!(config["permission"]["webfetch"], "deny");
     }
 
     #[test]
     fn deep_tier_enables_reasoning_fast_does_not() {
-        let deep = render_review_config("p", false, None, &[]);
-        let fast = render_review_config("p", true, None, &[]);
+        let deep = render(false, None, &[]);
+        let fast = render(true, None, &[]);
         assert_eq!(
             deep["provider"]["eaig"]["models"]["reviewer"]["reasoning"],
             true
@@ -206,8 +445,7 @@ mod tests {
 
     #[test]
     fn forwards_attribution_as_provider_headers() {
-        let config = render_review_config(
-            "p",
+        let config = render(
             false,
             None,
             &[("x-project".to_string(), "acme".to_string())],
@@ -217,14 +455,20 @@ mod tests {
             "acme"
         );
         // Empty attribution → empty headers object, never missing.
-        let none = render_review_config("p", false, None, &[]);
+        let none = render(false, None, &[]);
         assert!(none["provider"]["eaig"]["options"]["headers"].is_object());
+        assert_eq!(
+            none["provider"]["eaig"]["options"]["headers"]
+                .as_object()
+                .map(Map::len),
+            Some(0)
+        );
     }
 
     #[test]
     fn threads_temperature_only_when_set() {
-        let with = render_review_config("p", false, Some(0.2), &[]);
-        let without = render_review_config("p", false, None, &[]);
+        let with = render(false, Some(0.2), &[]);
+        let without = render(false, None, &[]);
         assert_eq!(
             with["provider"]["eaig"]["models"]["reviewer"]["options"]["temperature"],
             0.2
@@ -234,5 +478,143 @@ mod tests {
                 .get("temperature")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn absent_and_empty_overlay_are_no_ops_and_leave_no_breaches() {
+        let base_plus_injection = render_review_config(false, None, &[], None);
+        let empty_overlay = render_review_config(false, None, &[], Some(&json!({})));
+        // Byte-identical (no behaviour change) and no floor breach for absent/empty overlay.
+        assert_eq!(base_plus_injection.config, empty_overlay.config);
+        assert!(base_plus_injection.floor_breaches.is_empty());
+        assert!(empty_overlay.floor_breaches.is_empty());
+    }
+
+    #[test]
+    fn overlay_adds_a_subagent_without_breaching_the_floor() {
+        let overlay = json!({
+            "agent": {
+                "explore": {
+                    "mode": "subagent",
+                    "description": "read-only investigation helper",
+                    "prompt": "explore the code"
+                }
+            }
+        });
+        let rendered = render_review_config(false, None, &[], Some(&overlay));
+        // The custom sub-agent is present…
+        assert_eq!(rendered.config["agent"]["explore"]["mode"], "subagent");
+        // …and the base `review` agent is untouched (recursive object merge).
+        assert_eq!(rendered.config["agent"]["review"]["mode"], "primary");
+        // Adding an agent relaxes nothing.
+        assert!(rendered.floor_breaches.is_empty());
+        assert!(rendered.disclosure_note().is_none());
+    }
+
+    #[test]
+    fn overlay_can_point_a_tier_at_a_different_model_without_a_breach() {
+        // A model/provider swap is a legitimate operator override (ADR-0099 §3) and is NOT a floor
+        // relaxation — no warning.
+        let overlay = json!({
+            "provider": { "openrouter": { "npm": "@openrouter/ai-sdk-provider", "name": "OpenRouter" } },
+            "model": "openrouter/some-model"
+        });
+        let rendered = render_review_config(false, None, &[], Some(&overlay));
+        assert_eq!(rendered.config["model"], "openrouter/some-model");
+        assert_eq!(
+            rendered.config["provider"]["openrouter"]["name"],
+            "OpenRouter"
+        );
+        // The base eaig provider still present (recursive merge, not replaced).
+        assert_eq!(rendered.config["provider"]["eaig"]["name"], "eaig");
+        assert!(rendered.floor_breaches.is_empty());
+    }
+
+    #[test]
+    fn overlay_opening_permission_bash_fires_the_floor_warning() {
+        let overlay = json!({ "permission": { "bash": "allow" } });
+        let rendered = render_review_config(false, None, &[], Some(&overlay));
+        // Full override took effect…
+        assert_eq!(rendered.config["permission"]["bash"], "allow");
+        // …AND the floor warning fired for it (only it — edit/webfetch still deny).
+        assert!(
+            rendered
+                .floor_breaches
+                .iter()
+                .any(|b| b.message.contains("permission `bash` opened")),
+            "expected a bash-permission breach, got {:?}",
+            rendered.floor_breaches
+        );
+        assert!(rendered.disclosure_note().is_some());
+    }
+
+    #[test]
+    fn overlay_re_enabling_a_builtin_fires_the_floor_warning() {
+        let overlay = json!({ "tools": { "read": true } });
+        let rendered = render_review_config(false, None, &[], Some(&overlay));
+        assert_eq!(rendered.config["tools"]["read"], true);
+        assert!(
+            rendered
+                .floor_breaches
+                .iter()
+                .any(|b| b.message.contains("built-in tool `read` re-enabled")),
+            "expected a read re-enable breach, got {:?}",
+            rendered.floor_breaches
+        );
+    }
+
+    #[test]
+    fn overlay_replacing_plugins_or_dropping_the_mcp_fires_the_floor_warning() {
+        // Replacing the `plugin` ARRAY drops all three first-party plugins (full override on arrays).
+        let overlay = json!({ "plugin": ["/some/custom/plugin.ts"] });
+        let rendered = render_review_config(false, None, &[], Some(&overlay));
+        assert_eq!(
+            rendered
+                .floor_breaches
+                .iter()
+                .filter(|b| b.message.contains("required plugin"))
+                .count(),
+            3,
+            "all three base plugins should be reported dropped: {:?}",
+            rendered.floor_breaches
+        );
+
+        // Replacing the lightbridge MCP command is a breach.
+        let overlay = json!({ "mcp": { "lightbridge": { "type": "local", "command": ["evil"], "enabled": true } } });
+        let rendered = render_review_config(false, None, &[], Some(&overlay));
+        assert!(
+            rendered
+                .floor_breaches
+                .iter()
+                .any(|b| b.message.contains("`lightbridge` MCP was replaced")),
+            "expected a lightbridge-replaced breach, got {:?}",
+            rendered.floor_breaches
+        );
+    }
+
+    #[test]
+    fn strip_jsonc_comments_preserves_slashes_inside_strings() {
+        let input = r#"{
+            // a line comment
+            "url": "https://opencode.ai/config.json", /* block */
+            "path": "/opt/x", "q": "a \"//b\" c"
+        }"#;
+        let stripped = strip_jsonc_comments(input);
+        let value: Value = serde_json::from_str(&stripped).expect("valid JSON after strip");
+        assert_eq!(value["url"], "https://opencode.ai/config.json");
+        assert_eq!(value["path"], "/opt/x");
+        assert_eq!(value["q"], r#"a "//b" c"#);
+    }
+
+    #[test]
+    fn deep_merge_recurses_objects_and_replaces_arrays_and_scalars() {
+        let mut base = json!({ "a": { "b": 1, "c": [1, 2] }, "d": "x" });
+        deep_merge(&mut base, &json!({ "a": { "c": [9], "e": 2 }, "d": "y" }));
+        // Objects merge recursively; the untouched key survives.
+        assert_eq!(base["a"]["b"], 1);
+        assert_eq!(base["a"]["e"], 2);
+        // Arrays and scalars are replaced wholesale.
+        assert_eq!(base["a"]["c"], json!([9]));
+        assert_eq!(base["d"], "y");
     }
 }
