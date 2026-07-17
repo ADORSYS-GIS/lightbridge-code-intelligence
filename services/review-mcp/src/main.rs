@@ -19,6 +19,7 @@
 //!   LCI_MCP_CP_URL, LCI_MCP_RUNNER_TOKEN, LCI_MCP_TASK_ID, LCI_MCP_CHECKOUT,
 //!   LCI_MCP_EMBED_URL, LCI_MCP_EMBED_KEY, LCI_MCP_EMBED_MODEL
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -29,6 +30,37 @@ use lci_review_agent::tools::Tools;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use uuid::Uuid;
+
+/// OpenCode prefixes every MCP tool with this server's config key (`lightbridge`), so an advertised
+/// `read_file` reaches the model as `lightbridge_read_file`. A few review tools are ALSO natively
+/// `lightbridge_`-prefixed (`lightbridge_vector_semantic_search`, `lightbridge_graph_find_symbol`,
+/// `lightbridge_graph_get_callers`) — advertising those verbatim makes OpenCode render
+/// `lightbridge_lightbridge_…` (a doubled prefix), inconsistent with the bare-named peers.
+const SERVER_PREFIX: &str = "lightbridge_";
+
+/// The name to advertise for a canonical tool over MCP: strip a leading `lightbridge_` so OpenCode
+/// adds exactly one server prefix and every tool reads `lightbridge_<tool>`. Bare names pass through
+/// unchanged (`read_file` → `read_file` → OpenCode → `lightbridge_read_file`). This is the inverse of
+/// the recorder's `normalize_tool_name`, which maps the OpenCode-observed id back to the canonical
+/// name for the reused coverage gates — so the const names, the native path, and the goldens are all
+/// untouched; only the MCP-advertised surface changes.
+fn advertised_name(canonical: &str) -> &str {
+    canonical.strip_prefix(SERVER_PREFIX).unwrap_or(canonical)
+}
+
+/// Build the advertised→canonical map from the registered specs, so a `tools/call` arriving under the
+/// advertised (bare) name dispatches to the canonical registry entry. Stripping is only lossy if two
+/// canonical names collide on the same advertised name (e.g. both `read_file` and
+/// `lightbridge_read_file`); the review surface has no such pair, so the map is a clean bijection.
+fn advertised_to_canonical<I>(canonical_names: I) -> HashMap<String, String>
+where
+    I: IntoIterator<Item = String>,
+{
+    canonical_names
+        .into_iter()
+        .map(|canonical| (advertised_name(&canonical).to_string(), canonical))
+        .collect()
+}
 
 /// Read a required env var, trimmed — a stray newline/space (e.g. from a here-doc or a k8s
 /// `stringData` value) must not break a UUID/URL parse downstream.
@@ -55,10 +87,12 @@ fn build_tools() -> Result<Tools> {
         .map_err(|error| anyhow::anyhow!("building the review tool registry: {error}"))
 }
 
-/// Map a review `ToolSpec` to an MCP tool definition.
+/// Map a review `ToolSpec` to an MCP tool definition. The advertised name drops a leading
+/// `lightbridge_` (see [`advertised_name`]) so OpenCode's server-prefixing yields a single
+/// `lightbridge_<tool>` for every tool.
 fn mcp_tool(spec: &ToolSpec) -> Value {
     json!({
-        "name": spec.function.name,
+        "name": advertised_name(&spec.function.name),
         "description": spec.function.description,
         "inputSchema": spec.function.parameters,
     })
@@ -77,7 +111,7 @@ fn mcp_result(outcome: ToolOutcome) -> Value {
     json!({ "content": [{ "type": "text", "text": text }], "isError": false })
 }
 
-async fn handle(tools: &Tools, req: &Value) -> Option<Value> {
+async fn handle(tools: &Tools, name_map: &HashMap<String, String>, req: &Value) -> Option<Value> {
     let id = req.get("id").cloned();
     let method = req.get("method").and_then(Value::as_str).unwrap_or("");
     // Notifications (no id) get no response.
@@ -93,11 +127,17 @@ async fn handle(tools: &Tools, req: &Value) -> Option<Value> {
         "tools/list" => json!({ "tools": tools.specs().iter().map(mcp_tool).collect::<Vec<_>>() }),
         "tools/call" => {
             let params = req.get("params");
-            let name = params
+            let advertised = params
                 .and_then(|p| p.get("name"))
                 .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string();
+                .unwrap_or_default();
+            // OpenCode calls back with the name we advertised (bare); map it to the canonical registry
+            // name so dispatch matches. Unknown names pass through so `dispatch` renders its own
+            // "unknown tool" error rather than us swallowing it.
+            let name = name_map
+                .get(advertised)
+                .cloned()
+                .unwrap_or_else(|| advertised.to_string());
             // MCP passes arguments as an object; the review tools deserialize from a JSON string.
             let arguments = params
                 .and_then(|p| p.get("arguments"))
@@ -125,6 +165,11 @@ async fn handle(tools: &Tools, req: &Value) -> Option<Value> {
 #[tokio::main]
 async fn main() -> Result<()> {
     let tools = Arc::new(build_tools().context("initializing lci-review-mcp")?);
+    // Advertised (bare) → canonical name map, built once from the registered specs so `tools/call`
+    // arriving under the advertised name dispatches to the right registry entry.
+    let name_map = Arc::new(advertised_to_canonical(
+        tools.specs().into_iter().map(|spec| spec.function.name),
+    ));
 
     // Each request runs in its own task so batched tool calls (the review does parallel read-only
     // tool batching, ADR-0042) don't serialize behind each other; a single writer task owns stdout
@@ -152,9 +197,10 @@ async fn main() -> Result<()> {
             continue;
         };
         let tools = Arc::clone(&tools);
+        let name_map = Arc::clone(&name_map);
         let tx = tx.clone();
         tokio::spawn(async move {
-            if let Some(resp) = handle(&tools, &req).await
+            if let Some(resp) = handle(&tools, &name_map, &req).await
                 && let Ok(line) = serde_json::to_string(&resp)
             {
                 let _ = tx.send(line);
@@ -177,6 +223,56 @@ mod tests {
         assert_eq!(m["name"], "t");
         assert_eq!(m["description"], "desc");
         assert_eq!(m["inputSchema"]["type"], "object");
+    }
+
+    #[test]
+    fn advertises_bare_names_so_opencode_single_prefixes() {
+        // A natively `lightbridge_`-prefixed tool is advertised WITHOUT the prefix, so OpenCode's own
+        // server-prefix yields exactly `lightbridge_vector_semantic_search` (not a doubled prefix).
+        assert_eq!(
+            advertised_name("lightbridge_vector_semantic_search"),
+            "vector_semantic_search"
+        );
+        assert_eq!(
+            advertised_name("lightbridge_graph_find_symbol"),
+            "graph_find_symbol"
+        );
+        // A bare tool passes through untouched.
+        assert_eq!(advertised_name("read_file"), "read_file");
+        // The MCP shape reflects the stripped name.
+        let spec = ToolSpec::function(
+            "lightbridge_vector_semantic_search",
+            "search",
+            json!({"type": "object"}),
+        );
+        assert_eq!(mcp_tool(&spec)["name"], "vector_semantic_search");
+    }
+
+    #[test]
+    fn name_map_round_trips_advertised_back_to_canonical() {
+        let canonical = [
+            "lightbridge_vector_semantic_search",
+            "lightbridge_graph_find_symbol",
+            "lightbridge_graph_get_callers",
+            "read_file",
+            "add_review_comment",
+            "finish",
+        ];
+        let map = advertised_to_canonical(canonical.iter().map(|s| s.to_string()));
+        // A call under the advertised (bare) name resolves to the canonical registry name.
+        assert_eq!(
+            map.get("vector_semantic_search").map(String::as_str),
+            Some("lightbridge_vector_semantic_search")
+        );
+        assert_eq!(
+            map.get("graph_get_callers").map(String::as_str),
+            Some("lightbridge_graph_get_callers")
+        );
+        // Bare tools map to themselves.
+        assert_eq!(map.get("read_file").map(String::as_str), Some("read_file"));
+        assert_eq!(map.get("finish").map(String::as_str), Some("finish"));
+        // Every advertised key is distinct (clean bijection — no lossy collision).
+        assert_eq!(map.len(), canonical.len());
     }
 
     #[test]

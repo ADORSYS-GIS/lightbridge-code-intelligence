@@ -244,7 +244,15 @@ mod tests {
             Some(READ_FILE)
         );
         assert_eq!(normalize_tool_name("lightbridge_finish"), Some(FINISH));
-        // A name already `lightbridge_`-prefixed natively → server double-prefix; strip one, match.
+        // The MCP surface now advertises the bare name (`lci-review-mcp` strips a leading
+        // `lightbridge_`), so OpenCode emits a SINGLE server prefix — the canonical const's own value.
+        // Whole-string suffix match returns it unchanged.
+        assert_eq!(
+            normalize_tool_name("lightbridge_vector_semantic_search"),
+            Some(VECTOR_SEMANTIC_SEARCH)
+        );
+        // The pre-fix doubled form (`lightbridge_lightbridge_…`) still normalizes too — the recorder
+        // stays robust to either prefix depth.
         assert_eq!(
             normalize_tool_name("lightbridge_lightbridge_vector_semantic_search"),
             Some(VECTOR_SEMANTIC_SEARCH)
