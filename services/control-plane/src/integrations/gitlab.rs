@@ -384,12 +384,17 @@ impl CodePlatform for GitlabClient {
             tracing::warn!("GitLab verify_webhook failed: configured webhook_secret is empty");
             return false; // fail-closed
         }
-        let token = match headers.get("x-gitlab-token").and_then(|v| v.to_str().ok()) {
-            Some(s) => s,
+        let header_value = match headers.get("x-gitlab-token") {
+            Some(v) => v,
             None => {
-                tracing::warn!(
-                    "GitLab verify_webhook failed: X-Gitlab-Token header is missing or invalid"
-                );
+                tracing::warn!("GitLab verify_webhook failed: X-Gitlab-Token header is missing");
+                return false;
+            }
+        };
+        let token = match header_value.to_str() {
+            Ok(s) => s,
+            Err(_) => {
+                tracing::warn!("GitLab verify_webhook failed: X-Gitlab-Token header contains invalid UTF-8");
                 return false;
             }
         };
