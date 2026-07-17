@@ -1,3 +1,7 @@
+// Unix-only: stubs `opengrep` via a `#!/bin/sh` script + `PermissionsExt` (the review runner images are
+// all Linux/musl anyway). Gate the whole file so a non-Unix `cargo test` still compiles.
+#![cfg(unix)]
+
 //! Wire-boundary proof for the SAST parity port (ADR-0073 / ADR-0097): spawn the REAL `lci-review-mcp`
 //! binary, speak JSON-RPC over its stdio, and prove `run_sast`
 //!   1. is advertised in `tools/list` ONLY when the supervisor set the SAST env group (opt-in surface),
@@ -52,7 +56,12 @@ fn write_stub_opengrep(dir: &Path, sarif_body: &str) -> PathBuf {
 }
 
 /// Spawn the real MCP binary with the given extra env; base env (`LCI_MCP_*`) is always set.
-fn spawn_mcp(cp_uri: &str, task_id: Uuid, checkout: &Path, extra_env: &[(String, String)]) -> Child {
+fn spawn_mcp(
+    cp_uri: &str,
+    task_id: Uuid,
+    checkout: &Path,
+    extra_env: &[(String, String)],
+) -> Child {
     let bin = env!("CARGO_BIN_EXE_lci-review-mcp");
     let mut cmd = Command::new(bin);
     cmd.env("LCI_MCP_CP_URL", cp_uri)
@@ -157,7 +166,10 @@ async fn run_sast_absent_from_tools_list_without_sast_env() {
         "run_sast must NOT be offered without the SAST env: {names:?}"
     );
     // Sanity: the core review tools ARE there (so the assertion above isn't a "no tools at all" bug).
-    assert!(names.contains(&"add_review_comment".to_string()), "{names:?}");
+    assert!(
+        names.contains(&"add_review_comment".to_string()),
+        "{names:?}"
+    );
 
     let _ = child.kill().await;
 }

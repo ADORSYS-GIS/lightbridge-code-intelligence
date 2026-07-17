@@ -57,11 +57,14 @@ fn resolve_sast_tool_config() -> Result<Option<SastToolConfig>> {
     let Some(config) = SastConfig::from_env() else {
         return Ok(None);
     };
-    let Some(list_path) = std::env::var(ENV_CHANGED_FILES).ok().filter(|p| !p.trim().is_empty())
+    let Some(list_path) = std::env::var(ENV_CHANGED_FILES)
+        .ok()
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty())
     else {
         return Ok(None);
     };
-    let raw = std::fs::read_to_string(list_path.trim())
+    let raw = std::fs::read_to_string(&list_path)
         .with_context(|| format!("reading the SAST changed-file list at {list_path}"))?;
     let changed_files: Vec<String> = raw
         .lines()

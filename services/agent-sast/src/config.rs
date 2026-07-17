@@ -45,9 +45,18 @@ impl SastConfig {
         vec![
             (format!("{ENV_PREFIX}BIN"), self.bin.clone()),
             (format!("{ENV_PREFIX}RULES"), self.rules.clone()),
-            (format!("{ENV_PREFIX}MIN_SEVERITY"), self.min_severity.clone()),
-            (format!("{ENV_PREFIX}MAX_FINDINGS"), self.max_findings.to_string()),
-            (format!("{ENV_PREFIX}TIMEOUT_SECS"), self.timeout_secs.to_string()),
+            (
+                format!("{ENV_PREFIX}MIN_SEVERITY"),
+                self.min_severity.clone(),
+            ),
+            (
+                format!("{ENV_PREFIX}MAX_FINDINGS"),
+                self.max_findings.to_string(),
+            ),
+            (
+                format!("{ENV_PREFIX}TIMEOUT_SECS"),
+                self.timeout_secs.to_string(),
+            ),
         ]
     }
 

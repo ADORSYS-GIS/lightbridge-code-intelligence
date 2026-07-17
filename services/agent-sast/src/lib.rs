@@ -334,7 +334,10 @@ mod tests {
     // a fabricated coordinate.
     #[test]
     fn parse_digest_leads_ignores_non_finding_lines() {
-        assert!(parse_digest_leads("## Deterministic SAST findings (opengrep)\n\nsome prose").is_empty());
+        assert!(
+            parse_digest_leads("## Deterministic SAST findings (opengrep)\n\nsome prose")
+                .is_empty()
+        );
         assert!(parse_digest_leads("- [P1] not-a-coordinate — no colon here (`r.id`)").is_empty());
     }
 }

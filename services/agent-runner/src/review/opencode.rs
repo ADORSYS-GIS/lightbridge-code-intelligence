@@ -255,8 +255,9 @@ pub async fn run_opencode_agent(
     // their absence leaves the tool unregistered. The supervisor-side `SastAnchorGate` is already
     // composed in `ReviewGates` and recovers its leads from the tool's result digest.
     let diff_present = diff.is_some();
-    let sast_offered =
-        sast_config.is_some() && diff_present && super::tool_surface::sast_explicitly_listed(review);
+    let sast_offered = sast_config.is_some()
+        && diff_present
+        && super::tool_surface::sast_explicitly_listed(review);
     if let (true, Some(sast_config)) = (sast_offered, sast_config) {
         let changed_files = diff.map(|pr| pr.files.clone()).unwrap_or_default();
         let list_path = workdir.join("sast-changed-files.txt");
@@ -264,7 +265,10 @@ pub async fn run_opencode_agent(
             .await
             .context("writing the SAST changed-file list for lci-review-mcp")?;
         env.extend(sast_config.to_env_pairs());
-        env.push((ENV_CHANGED_FILES.to_string(), list_path.display().to_string()));
+        env.push((
+            ENV_CHANGED_FILES.to_string(),
+            list_path.display().to_string(),
+        ));
     }
 
     // ── Spawn + handshake ───────────────────────────────────────────────────────────────────────

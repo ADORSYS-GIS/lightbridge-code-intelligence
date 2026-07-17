@@ -13,7 +13,9 @@ use lci_agent_loop::{
 };
 use lci_agent_types::{ToolOutcome, ToolSpec};
 
-use crate::policies::{CoverageGate, CoverageState, RefuteGate, SastAnchorGate, SastLead, SastLeadSink};
+use crate::policies::{
+    CoverageGate, CoverageState, RefuteGate, SastAnchorGate, SastLead, SastLeadSink,
+};
 use crate::tools::RUN_SAST;
 
 /// A minimal `TurnState` for driving the finish-time gates. The reused gates read only `turn`
@@ -115,13 +117,15 @@ impl ReviewGates {
             let ToolOutcome::Continue(text) = &result.outcome else {
                 continue;
             };
-            recovered.extend(lci_agent_sast::parse_digest_leads(text).into_iter().map(|lead| {
-                SastLead {
-                    file: lead.file,
-                    line: lead.line,
-                    rule_id: lead.rule_id,
-                }
-            }));
+            recovered.extend(
+                lci_agent_sast::parse_digest_leads(text)
+                    .into_iter()
+                    .map(|lead| SastLead {
+                        file: lead.file,
+                        line: lead.line,
+                        rule_id: lead.rule_id,
+                    }),
+            );
         }
         if !recovered.is_empty() {
             sink.lock()
@@ -387,7 +391,10 @@ mod tests {
                 "recorded finding at .env:60",
             ),
         ]);
-        assert_eq!(gates.observe_cycle(&scan_and_misanchor), GateDecision::Proceed);
+        assert_eq!(
+            gates.observe_cycle(&scan_and_misanchor),
+            GateDecision::Proceed
+        );
 
         // Cycle 2: the model tries to finish — the anchor gate bounces it and names the real line :216.
         let finish = cycle_turn_outcome(&[
@@ -400,8 +407,14 @@ mod tests {
         ]);
         match gates.observe_cycle(&finish) {
             GateDecision::RejectFinish(nudge) => {
-                assert!(nudge.contains(".env:216"), "names the real flagged line: {nudge}");
-                assert!(nudge.contains(".env:60"), "names the wrong line used: {nudge}");
+                assert!(
+                    nudge.contains(".env:216"),
+                    "names the real flagged line: {nudge}"
+                );
+                assert!(
+                    nudge.contains(".env:60"),
+                    "names the wrong line used: {nudge}"
+                );
             }
             other => panic!("expected a SAST-anchor RejectFinish, got {other:?}"),
         }
