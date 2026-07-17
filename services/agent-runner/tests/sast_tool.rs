@@ -91,6 +91,7 @@ fn review_config(base_url: String) -> ReviewConfig {
             ReviewToolSelector::Builtin(ReviewTool::Finish),
             ReviewToolSelector::Builtin(ReviewTool::Abort),
         ]),
+        opencode_overlay: None,
     }
 }
 

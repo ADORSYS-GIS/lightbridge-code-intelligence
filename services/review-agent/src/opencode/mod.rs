@@ -39,7 +39,7 @@ mod transcript;
 #[cfg(test)]
 mod test_support;
 
-pub use config::render_review_config;
+pub use config::{FloorBreach, REVIEW_PROMPT_FILE, RenderedReviewConfig, render_review_config};
 pub use drive::{ReviewSession, run_review_loop};
 pub use driver::{DriveAction, ReviewDriver, ReviewResolution};
 pub use gates::{GateDecision, ReviewGates};

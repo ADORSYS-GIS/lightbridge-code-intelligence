@@ -182,6 +182,7 @@ mod tests {
             resilience: ResilienceConfig::default(),
             fast: false,
             tools,
+            opencode_overlay: None,
         }
     }
 

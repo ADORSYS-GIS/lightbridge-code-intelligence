@@ -1,0 +1,131 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  // ─────────────────────────────────────────────────────────────────────────────────────────────
+  // Lightbridge REVIEW-mode OpenCode config — the checked-in, human-readable BASE (ADR-0099).
+  //
+  // This file is the source of truth for "what the reviewer runs by default": the model wiring, the
+  // read-only posture, the disabled built-ins (coverage invariant), the mediated `lightbridge` MCP,
+  // and the recorder/gate/logger plugins. It mirrors the `open`-mode precedent (`opencode.jsonc`) so
+  // review is a readable artifact rather than a Rust `json!` blob.
+  //
+  // It is NOT written verbatim to disk at runtime. The supervisor (`render_review_config`) parses
+  // this file (baked in via include_str!), applies the RUNTIME INJECTION layer, then deep-merges the
+  // trusted OPERATOR OVERLAY (`review.opencode` from ai-helm-values) on top with FULL OVERRIDE, and
+  // writes the result as `OPENCODE_CONFIG`. So this file shows layer 1 of 3; the table below documents
+  // what layers 2–3 set ON TOP — i.e. what a SysAdmin's overlay is overriding.
+  //
+  //   layer 1 (this file) → layer 2 (runtime injection) → layer 3 (operator overlay) = OPENCODE_CONFIG
+  //
+  // RUNTIME INJECTION (layer 2 — patched onto this file's parsed JSON, per task, by the supervisor):
+  //   key                                        who / why
+  //   provider.eaig.options.headers              attribution/billing headers (#89) — DYNAMIC keys, so
+  //                                              they can't be a static {env:*}; patched in.
+  //   provider.eaig.models.reviewer.reasoning    the tier flag (deep = true / fast = false, ADR-0069) —
+  //                                              a bool, so it can't be a string {env:*}; patched in.
+  //   provider.eaig.models.reviewer.options.temperature  set only when the tier configures one.
+  //   agent.review.prompt (the {file:*} target)  the per-task system prompt is WRITTEN to
+  //                                              `review-prompt.md` next to this config each task; the
+  //                                              {file:*} reference below stays static, its CONTENT is
+  //                                              per-task. opencode resolves {file:*}/{env:*} at load.
+  //
+  // OPERATOR OVERLAY (layer 3 — `review.opencode` in ai-helm-values, TRUSTED, FULL OVERRIDE):
+  //   Deep-merged LAST: objects merge recursively; arrays and scalars from the overlay REPLACE ours.
+  //   An operator may add `agent.*` sub-agents, extra `provider.*`/models, extra `mcp.*`, or change
+  //   `permission`/`tools`. There is NO lock: the overlay wins on every key. When it RELAXES a review
+  //   invariant below — re-enables a disabled built-in, opens a `permission`, or drops/replaces the
+  //   `lightbridge` MCP or a plugin — the supervisor logs a WARNING and the review's coverage
+  //   disclosure notes that a custom config was active. Constraints: opencode's schema REJECTS unknown
+  //   keys (verified 1.18.2 — even a `"//"` string-key fails), so a typo in the overlay fails the WHOLE
+  //   review; secrets ride {env:*}, never inlined; the untrusted checkout is still never a config
+  //   source (HOME/XDG empty, neutral cwd — ADR-0097 #6).
+  //
+  // NOTE: this file is `.jsonc` on purpose — opencode's config schema REJECTS unrecognized keys
+  // (verified against 1.18.2: a `"//"` comment KEY fails with "Unrecognized key: //"). Use real `//`
+  // line comments here, never `"//": "..."` string-keys. The Rust loader strips these comments before
+  // parsing; opencode reads jsonc natively.
+  // ─────────────────────────────────────────────────────────────────────────────────────────────
+  "provider": {
+    "eaig": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "eaig",
+      "options": {
+        // Secrets ride {env:*} placeholders — the supervisor sets LCI_EAIG_* in opencode's env.
+        "baseURL": "{env:LCI_EAIG_BASE_URL}",
+        "apiKey": "{env:LCI_EAIG_API_KEY}",
+        // Per-project billing attribution (#89) is PATCHED IN at runtime (dynamic keys) — empty here.
+        "headers": {}
+      },
+      "models": {
+        "reviewer": {
+          "id": "{env:LCI_EAIG_MODEL}",
+          "name": "eaig reviewer",
+          // PATCHED IN at runtime: deep tier runs a reasoning-capable model (ADR-0069 floor), fast
+          // does not. Static `false` here; the supervisor sets the real value per tier.
+          "reasoning": false,
+          // `temperature` is PATCHED IN here when the tier configures one; otherwise left to the model.
+          "options": {}
+        }
+      }
+    }
+  },
+  "model": "eaig/reviewer",
+  // First-party plugins (ADR-0095) by ABSOLUTE in-image path (they live under /opt, staged by the
+  // review image build — NOT in the checkout). recorder = the coverage/transcript authority; the gate
+  // + logger back it up. Dropping/replacing any of these can break `finish`/coverage accounting.
+  "plugin": [
+    "/opt/lightbridge/opencode/plugins/recorder/src/index.ts",
+    "/opt/lightbridge/opencode/plugins/gate-interlock/src/index.ts",
+    "/opt/lightbridge/opencode/plugins/logger/src/index.ts"
+  ],
+  // Read-only posture: a review never mutates the tree or egresses.
+  "permission": {
+    "edit": "deny",
+    "bash": "deny",
+    "webfetch": "deny"
+  },
+  // TOP-LEVEL built-in disables (coverage invariant, ADR-0097 #3) — agent-independent, so they hold
+  // even though opencode-over-ACP runs its default `build` agent rather than the `review` agent below.
+  // Every built-in that could read the tree OFF the mediated path is off, so all reads flow through
+  // `lightbridge_read_file` (exact recorder-driven coverage). `task` is disabled too: a subagent's
+  // built-in reads would escape coverage accounting. The full set is listed so a future opencode
+  // addition doesn't silently re-open the hole — keep it in sync with what the model is offered.
+  "tools": {
+    "read": false,
+    "grep": false,
+    "glob": false,
+    "list": false,
+    "edit": false,
+    "write": false,
+    "patch": false,
+    "bash": false,
+    "webfetch": false,
+    "websearch": false,
+    "task": false,
+    "skill": false,
+    "todowrite": false
+  },
+  // The mediated review write/terminal tools over stdio MCP (ADR-0095 / #440). opencode-over-ACP honors
+  // stdio MCP only via the config `mcp` block (NOT `session/new.mcpServers`), so it is wired here; the
+  // supervisor sets LCI_MCP_* in the process env the spawned server inherits.
+  "mcp": {
+    "lightbridge": {
+      "type": "local",
+      "command": ["lci-review-mcp"],
+      "enabled": true
+    }
+  },
+  "agent": {
+    "review": {
+      "mode": "primary",
+      "description": "Lightbridge review: investigates a PR via the mediated retrieval tools and records findings with lightbridge_add_review_comment, then calls lightbridge_finish with a verdict (or lightbridge_abort). Read-only; never edits or runs commands.",
+      // The per-task system prompt is written to `review-prompt.md` beside this config each task and
+      // referenced here; opencode resolves {file:*} relative to the config file's directory at load.
+      "prompt": "{file:./review-prompt.md}",
+      "permission": {
+        "edit": "deny",
+        "bash": "deny",
+        "webfetch": "deny"
+      }
+    }
+  }
+}

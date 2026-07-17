@@ -70,6 +70,11 @@ impl ReviewConfig {
             "fast": self.fast,
             "tier": if self.fast { "fast" } else { "deep" },
             "tools": tools,
+            // The operator OpenCode overlay (ADR-0099) is auditable config — WHICH custom agents/models
+            // were active is exactly the churn the owner wants recorded — but it's raw operator JSON that
+            // could carry an inlined credential (e.g. a `headers.authorization`), so it rides the SAME
+            // recursive key-based scrub as `extra` (secrets should be `{env:}`, but defend in depth).
+            "opencode_overlay": self.opencode_overlay.as_ref().map(redact_value),
         })
     }
 
@@ -248,6 +253,15 @@ mod tests {
             resilience: ResilienceConfig::default(),
             fast: false,
             tools: Some(tools),
+            // An operator overlay (ADR-0099) carrying a misconfigured INLINE credential (secrets are
+            // meant to ride `{env:}`, but defend in depth) plus a non-secret custom sub-agent — the
+            // former must be redacted, the latter must survive as audit data.
+            opencode_overlay: Some(serde_json::json!({
+                "provider": { "eaig": { "options": { "headers": {
+                    "authorization": "Bearer overlay-inlined-secret-token"
+                }}}},
+                "agent": { "explore": { "mode": "subagent", "description": "read-only helper" } }
+            })),
         }
     }
 
@@ -291,6 +305,10 @@ mod tests {
         assert!(
             !decoded_str.contains("url-pass-secret") && !decoded_str.contains("query-secret"),
             "base_url userinfo and query credentials must not be persisted"
+        );
+        assert!(
+            !decoded_str.contains("overlay-inlined-secret-token"),
+            "an inlined credential in the operator OpenCode overlay (ADR-0099) must be redacted"
         );
 
         // Round-trip decode: the audit payload is the resolved config with secrets redacted.
@@ -336,6 +354,16 @@ mod tests {
         let tools = value["tools"].as_array().expect("tools array");
         assert_eq!(tools[0], serde_json::json!("add_review_comment"));
         assert_eq!(tools[1], serde_json::json!("mcp__context7__.*"));
+        // The operator overlay (ADR-0099): its inlined credential is redacted, its non-secret custom
+        // sub-agent survives as audit data.
+        assert_eq!(
+            value["opencode_overlay"]["provider"]["eaig"]["options"]["headers"]["authorization"],
+            serde_json::json!(REDACTED)
+        );
+        assert_eq!(
+            value["opencode_overlay"]["agent"]["explore"]["mode"],
+            serde_json::json!("subagent")
+        );
     }
 
     /// The value-based scrub also catches the runner's own credential env vars when a template inlines

@@ -153,6 +153,16 @@ pub struct ReviewFile {
     /// plus all discovered MCP tools — for DEEP; the wind-down write/finish/abort set for FAST).
     #[serde(default)]
     pub tools: Option<Vec<ReviewToolSelector>>,
+    /// Operator-supplied OpenCode config overlay for the review run (ADR-0099). A raw OpenCode config
+    /// object, deep-merged LAST over our base+injection with **full override** (objects merge
+    /// recursively; arrays/scalars from the overlay replace ours), so a SysAdmin can add custom
+    /// sub-agents, extra models/providers, extra MCP servers, or change `permission`/`tools` with no
+    /// code change. TRUSTED (owner-managed via ai-helm-values), unlike the untrusted checkout which is
+    /// still never a config source (ADR-0097 #6). Relaxing a review invariant is permitted but WARNED
+    /// (and noted on the coverage disclosure), never blocked. When a per-tier block sets its own
+    /// `opencode`, that wins for the tier; else the flat `review.opencode` applies to both tiers.
+    #[serde(default)]
+    pub opencode: Option<serde_json::Value>,
 }
 
 /// A tool the review agent can be configured to offer (ADR-0062). A **closed enum** so a per-tier

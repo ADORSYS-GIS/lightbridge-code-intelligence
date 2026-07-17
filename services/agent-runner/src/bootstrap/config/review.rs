@@ -79,6 +79,11 @@ pub struct ReviewConfig {
     /// tier offers the model (a non-empty list of [`ReviewToolSelector`] — built-in names + `mcp__`
     /// regex selectors). `None` = the built-in default for the tier. From `review.<tier>.tools`.
     pub tools: Option<Vec<ReviewToolSelector>>,
+    /// Operator OpenCode config overlay for the review run (ADR-0099), from `review.opencode` (or a
+    /// per-tier `review.<tier>.opencode`, which wins for that tier). A raw OpenCode config object
+    /// deep-merged LAST over the base+injection with full override; `None` = no overlay. Trusted
+    /// (owner-managed); relaxing a review invariant is warned + disclosed, never blocked.
+    pub opencode_overlay: Option<serde_json::Value>,
 }
 
 /// Resilience policy for the review LLM transport (ADR-0039). eaig can legitimately take ~2 minutes
@@ -184,6 +189,9 @@ impl ReviewConfig {
             // No env knob for a per-tier tool allowlist — the file path (`review.<tier>.tools`) is where
             // an operator declares it; env config uses the built-in per-tier defaults.
             tools: None,
+            // The OpenCode overlay (ADR-0099) is file-config only (`review.opencode`); the env path has
+            // none, so review runs on the base+injection alone.
+            opencode_overlay: None,
         }))
     }
 
@@ -324,6 +332,9 @@ impl ReviewConfig {
             },
             fast: false, // set by resolve_tiers / main per the task tier (ADR-0062)
             tools,
+            // The overlay from THIS block (ADR-0099); `resolve_tiers` fills the flat `review.opencode`
+            // fallback when a per-tier block leaves it unset.
+            opencode_overlay: r.opencode.clone(),
         }))
     }
 
@@ -343,7 +354,7 @@ impl ReviewConfig {
             }
             return Ok(ReviewConfigs { fast, deep });
         };
-        let deep = match r.deep.as_deref() {
+        let mut deep = match r.deep.as_deref() {
             Some(d) => Self::from_review_file(d)?,
             None => Self::from_review_file(r)?,
         };
@@ -353,6 +364,14 @@ impl ReviewConfig {
         };
         if let Some(c) = fast.as_mut() {
             c.fast = true;
+        }
+        // OpenCode overlay fallback (ADR-0099): a per-tier block's own `opencode` wins (already set by
+        // `from_review_file`); otherwise the flat `review.opencode` applies to that tier. So an operator
+        // can set ONE overlay at `review.opencode` and have it reach both tiers, or override per tier.
+        for tier in [deep.as_mut(), fast.as_mut()].into_iter().flatten() {
+            if tier.opencode_overlay.is_none() {
+                tier.opencode_overlay = r.opencode.clone();
+            }
         }
         Ok(ReviewConfigs { fast, deep })
     }
@@ -476,6 +495,7 @@ mod tests {
                 fast: None,
                 deep: None,
                 tools: None,
+                opencode: None,
             }),
         };
         let cfg = ReviewConfig::resolve(Some(&file))
@@ -524,6 +544,7 @@ mod tests {
             fast: None,
             deep: None,
             tools: None,
+            opencode: None,
         }
     }
 
@@ -623,6 +644,77 @@ mod tests {
         ReviewConfig::from_review_file(&empty).expect_err("empty allowlist must fail");
 
         std::fs::remove_file(&prompt).ok();
+    }
+
+    // Operator OpenCode overlay (ADR-0099): a flat `review.opencode` reaches BOTH tiers; a per-tier
+    // `review.<tier>.opencode` wins for that tier. So one overlay at the flat level covers fast+deep,
+    // and an operator can still special-case a tier.
+    #[test]
+    fn resolve_tiers_overlay_flat_reaches_both_tiers_and_per_tier_overrides() {
+        let prompt = std::env::temp_dir().join(format!("lci-ovl-{}.md", std::process::id()));
+        std::fs::write(&prompt, "You are a reviewer.").unwrap();
+        let p = prompt.to_string_lossy().into_owned();
+
+        // Flat overlay only, with tier blocks that DON'T set their own opencode → both tiers inherit it.
+        let mut flat = review_block("flat-model", &p);
+        flat.opencode = Some(serde_json::json!({ "model": "flat-override" }));
+        flat.fast = Some(Box::new(review_block("fast-model", &p)));
+        flat.deep = Some(Box::new(review_block("deep-model", &p)));
+        let file = FileConfig {
+            embeddings: None,
+            sast: None,
+            review: Some(flat),
+        };
+        let tiers = ReviewConfig::resolve_tiers(Some(&file)).expect("resolves");
+        assert_eq!(
+            tiers.for_tier("fast").unwrap().opencode_overlay,
+            Some(serde_json::json!({ "model": "flat-override" })),
+            "flat review.opencode reaches the fast tier"
+        );
+        assert_eq!(
+            tiers.for_tier("deep").unwrap().opencode_overlay,
+            Some(serde_json::json!({ "model": "flat-override" })),
+            "flat review.opencode reaches the deep tier"
+        );
+
+        // A per-tier overlay on DEEP wins for deep; fast still inherits the flat one.
+        let mut flat = review_block("flat-model", &p);
+        flat.opencode = Some(serde_json::json!({ "model": "flat-override" }));
+        let mut deep = review_block("deep-model", &p);
+        deep.opencode = Some(serde_json::json!({ "model": "deep-override" }));
+        flat.deep = Some(Box::new(deep));
+        flat.fast = Some(Box::new(review_block("fast-model", &p)));
+        let file = FileConfig {
+            embeddings: None,
+            sast: None,
+            review: Some(flat),
+        };
+        let tiers = ReviewConfig::resolve_tiers(Some(&file)).expect("resolves");
+        assert_eq!(
+            tiers.for_tier("deep").unwrap().opencode_overlay,
+            Some(serde_json::json!({ "model": "deep-override" })),
+            "a per-tier review.deep.opencode wins for deep"
+        );
+        assert_eq!(
+            tiers.for_tier("fast").unwrap().opencode_overlay,
+            Some(serde_json::json!({ "model": "flat-override" })),
+            "fast still inherits the flat overlay"
+        );
+        std::fs::remove_file(&prompt).ok();
+    }
+
+    // The overlay deserializes as a raw JSON object from the file config (a full OpenCode config the
+    // runner passes through verbatim), alongside the typed review knobs.
+    #[test]
+    fn review_opencode_overlay_deserializes_as_raw_json() {
+        let file: FileConfig = serde_json::from_str(
+            r#"{"review":{"base_url":"u","api_key":"k","model":"m",
+                "opencode":{"agent":{"explore":{"mode":"subagent"}},"permission":{"bash":"allow"}}}}"#,
+        )
+        .expect("valid config with an opencode overlay");
+        let overlay = file.review.unwrap().opencode.expect("overlay present");
+        assert_eq!(overlay["agent"]["explore"]["mode"], "subagent");
+        assert_eq!(overlay["permission"]["bash"], "allow");
     }
 
     // `review.stream` (file config) takes precedence; when unset it falls back to the `LLM_STREAM`

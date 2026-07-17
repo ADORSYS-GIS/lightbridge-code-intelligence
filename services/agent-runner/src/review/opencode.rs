@@ -17,8 +17,8 @@ use lci_acp_host::{AcpClient, PermissionPolicy};
 use lci_agent_clients::{ControlPlaneClient, TranscriptEntry};
 use lci_agent_sast::{ENV_CHANGED_FILES, SastConfig};
 use lci_review_agent::opencode::{
-    RecorderEvent, ReviewDriver, ReviewGates, ReviewResolution, ReviewSession, parse_recorder,
-    render_review_config, run_review_loop, transcript_from_recorder,
+    REVIEW_PROMPT_FILE, RecorderEvent, ReviewDriver, ReviewGates, ReviewResolution, ReviewSession,
+    parse_recorder, render_review_config, run_review_loop, transcript_from_recorder,
 };
 use lci_review_agent::prompt::{self, PrDiffRef, PromptConfig};
 
@@ -161,12 +161,34 @@ pub async fn run_opencode_agent(
         .collect::<Vec<_>>()
         .join("\n\n");
 
-    // ── Render + write the config, and pick the recorder path ───────────────────────────────────
-    let config = render_review_config(&system_prompt, review.fast, review.temperature, attribution);
+    // ── Render the config (base + injection + operator overlay), and pick the workdir ────────────
+    // ADR-0099: the base is the checked-in `review.jsonc`; the supervisor injects the tier/headers and
+    // deep-merges the trusted operator overlay (`review.opencode`) with full override. A relaxation of
+    // the coverage/read-only floor is WARNED (and disclosed below), never blocked.
+    let rendered = render_review_config(
+        review.fast,
+        review.temperature,
+        attribution,
+        review.opencode_overlay.as_ref(),
+    );
+    for breach in &rendered.floor_breaches {
+        tracing::warn!(
+            task_id = %task_id,
+            relaxation = %breach.message,
+            "operator OpenCode overlay (review.opencode) relaxed a review floor invariant (ADR-0099)"
+        );
+    }
+    let floor_disclosure = rendered.disclosure_note();
+    let config = rendered.config;
     let workdir = std::env::temp_dir().join(format!("lci-opencode-review-{task_id}"));
     tokio::fs::create_dir_all(&workdir)
         .await
         .context("creating the opencode review workdir")?;
+    // The reviewer prompt rides a `{file:REVIEW_PROMPT_FILE}` reference in the config (ADR-0099); write
+    // its per-task content BESIDE the config so opencode resolves the reference (config-dir-relative).
+    tokio::fs::write(workdir.join(REVIEW_PROMPT_FILE), &system_prompt)
+        .await
+        .context("writing the opencode review prompt file")?;
     // ⚠️ CONFIG ISOLATION (security): opencode MERGES config from its cwd's `opencode.json` and from
     // the global HOME/XDG config over our `OPENCODE_CONFIG`. The checkout is UNTRUSTED (a PR from a
     // fork could ship an `opencode.json` that re-enables built-in tools / bash, injects an MCP server
@@ -319,19 +341,33 @@ pub async fn run_opencode_agent(
     }
 
     // ── Map the resolution onto a ReviewOutcome (+ post any coverage disclosure) ─────────────────
+    // The coverage disclosure (ADR-0069) is augmented with the ADR-0099 floor note when the operator
+    // overlay relaxed an invariant, so findings produced under a custom config aren't read as default.
     Ok(
         match resolution.context("driving the opencode review loop")? {
             ReviewResolution::Finished { disclosure } => {
+                let disclosure = merge_disclosure(disclosure, floor_disclosure);
                 post_disclosure(client, task_id, disclosure).await;
                 ReviewOutcome::Finished
             }
             ReviewResolution::Exhausted { disclosure } => {
+                let disclosure = merge_disclosure(disclosure, floor_disclosure);
                 post_disclosure(client, task_id, disclosure).await;
                 ReviewOutcome::Exhausted
             }
             ReviewResolution::Aborted(reason) => ReviewOutcome::Aborted(reason),
         },
     )
+}
+
+/// Combine the coverage disclosure (ADR-0069) with the ADR-0099 operator-overlay floor note. Either may
+/// be absent; when both are present the floor note follows the coverage note as its own paragraph.
+fn merge_disclosure(coverage: Option<String>, floor: Option<String>) -> Option<String> {
+    match (coverage, floor) {
+        (Some(coverage), Some(floor)) => Some(format!("{coverage}\n\n{floor}")),
+        (Some(coverage), None) => Some(coverage),
+        (None, floor) => floor,
+    }
 }
 
 /// Best-effort post of the coverage disclosure note (ADR-0069 / #306) as the review summary — a failed
@@ -360,7 +396,8 @@ mod e2e {
 
     use lci_acp_host::{AcpClient, PermissionPolicy};
     use lci_review_agent::opencode::{
-        ReviewDriver, ReviewGates, ReviewResolution, run_review_loop,
+        REVIEW_PROMPT_FILE, ReviewDriver, ReviewGates, ReviewResolution, render_review_config,
+        run_review_loop,
     };
 
     use super::OpencodeReviewSession;
@@ -550,6 +587,101 @@ mod e2e {
         assert!(
             recorder.contains("finish"),
             "recorder missing finish:\n{recorder}"
+        );
+    }
+
+    /// ADR-0099 proof against REAL opencode: the rendered config (base + injection + operator overlay)
+    /// is a config opencode's strict schema ACCEPTS, and the overlay actually takes effect — a custom
+    /// sub-agent appears and a permission the overlay opened is honoured — while a floor invariant the
+    /// overlay did NOT touch (built-in `read` disabled) stays intact. Uses `opencode debug config`
+    /// (opencode's own resolver, incl. `{env:*}`/`{file:*}` substitution) so this is opencode's verdict,
+    /// not ours. Skipped when `opencode` isn't on PATH so CI stays green.
+    #[test]
+    fn rendered_config_with_overlay_is_accepted_by_real_opencode() {
+        if !on_path("opencode") {
+            eprintln!("SKIP: opencode not on PATH — this ADR-0099 proof needs it");
+            return;
+        }
+        // The overlay a SysAdmin might ship: add a read-only `explore` sub-agent and open `bash`.
+        let overlay = serde_json::json!({
+            "agent": { "explore": { "mode": "subagent", "description": "read-only helper" } },
+            "permission": { "bash": "allow" }
+        });
+        let rendered = render_review_config(false, None, &[], Some(&overlay));
+        // Our floor diff must have flagged the bash relaxation (surfaced, not blocked).
+        assert!(
+            rendered
+                .floor_breaches
+                .iter()
+                .any(|b| b.message.contains("permission `bash` opened")),
+            "expected the render to flag the bash relaxation: {:?}",
+            rendered.floor_breaches
+        );
+
+        let workdir = std::env::temp_dir().join("lci-adr0099-overlay-proof");
+        let _ = std::fs::remove_dir_all(&workdir);
+        let home = workdir.join("home");
+        let xdg = workdir.join("xdg");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&xdg).unwrap();
+        let config_path = workdir.join("opencode.review.json");
+        std::fs::write(
+            &config_path,
+            serde_json::to_vec_pretty(&rendered.config).unwrap(),
+        )
+        .unwrap();
+        // The `{file:REVIEW_PROMPT_FILE}` reference resolves relative to the config dir — write it there.
+        std::fs::write(workdir.join(REVIEW_PROMPT_FILE), "REVIEWER PROMPT BODY").unwrap();
+
+        // opencode's OWN resolver: it parses the config (strict schema — an unknown key would fail the
+        // whole thing) and applies substitution. Isolated HOME/XDG so only OUR config is a source.
+        let out = std::process::Command::new("opencode")
+            .args(["debug", "config"])
+            .env("OPENCODE_CONFIG", &config_path)
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", &xdg)
+            .env("XDG_DATA_HOME", &xdg)
+            .env("XDG_CACHE_HOME", &xdg)
+            .env("OPENCODE_DISABLE_AUTOUPDATE", "1")
+            .env("OPENCODE_DISABLE_MODELS_FETCH", "1")
+            .env("LCI_EAIG_BASE_URL", "https://gw.internal/v1")
+            .env("LCI_EAIG_API_KEY", "test-key")
+            .env("LCI_EAIG_MODEL", "test-model")
+            .output()
+            .expect("run opencode debug config");
+        assert!(
+            out.status.success(),
+            "opencode REJECTED the rendered config (strict schema):\nstdout={}\nstderr={}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let resolved: serde_json::Value =
+            serde_json::from_slice(&out.stdout).expect("opencode debug config emits JSON");
+
+        // The overlay took effect: the custom sub-agent is present…
+        assert_eq!(
+            resolved["agent"]["explore"]["mode"], "subagent",
+            "overlay sub-agent missing from opencode's resolved config: {resolved}"
+        );
+        // …and the permission the overlay opened is honoured.
+        assert_eq!(
+            resolved["permission"]["bash"], "allow",
+            "overlay permission not honoured: {resolved}"
+        );
+        // A floor invariant the overlay did NOT touch stays intact (mediated coverage preserved).
+        assert_eq!(
+            resolved["tools"]["read"], false,
+            "untouched floor invariant (read disabled) was lost: {resolved}"
+        );
+        // The reviewer prompt resolved from the {file:*} reference to the per-task file content.
+        assert_eq!(
+            resolved["agent"]["review"]["prompt"], "REVIEWER PROMPT BODY",
+            "the {{file:*}} reviewer prompt did not resolve: {resolved}"
+        );
+        // Secrets stayed as resolved-from-env (never inlined into the checked-in base).
+        assert_eq!(
+            resolved["provider"]["eaig"]["options"]["baseURL"],
+            "https://gw.internal/v1"
         );
     }
 }
