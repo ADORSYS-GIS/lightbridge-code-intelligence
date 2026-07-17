@@ -387,24 +387,29 @@ impl CodePlatform for GitlabClient {
         let token = match headers.get("x-gitlab-token").and_then(|v| v.to_str().ok()) {
             Some(s) => s,
             None => {
-                tracing::warn!("GitLab verify_webhook failed: X-Gitlab-Token header is missing or invalid");
+                tracing::warn!(
+                    "GitLab verify_webhook failed: X-Gitlab-Token header is missing or invalid"
+                );
                 return false;
             }
         };
         // Constant-time comparison.
         use subtle::ConstantTimeEq;
-        let is_valid: bool = self.webhook_secret
+        let is_valid: bool = self
+            .webhook_secret
             .as_bytes()
             .ct_eq(token.as_bytes())
             .into();
 
         if !is_valid {
+            let expected_trimmed_len = self.webhook_secret.trim().len();
+            let token_trimmed_len = token.trim().len();
             tracing::warn!(
-                "GitLab verify_webhook failed: token mismatch. Expected len {}, got len {}. (Expected: {:?}, Got: {:?})",
+                "GitLab verify_webhook failed: token mismatch. Expected len {} (trimmed {}), got len {} (trimmed {})",
                 self.webhook_secret.len(),
+                expected_trimmed_len,
                 token.len(),
-                self.webhook_secret,
-                token
+                token_trimmed_len
             );
         }
 
