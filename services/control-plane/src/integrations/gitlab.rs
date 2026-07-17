@@ -394,7 +394,9 @@ impl CodePlatform for GitlabClient {
         let token = match header_value.to_str() {
             Ok(s) => s,
             Err(_) => {
-                tracing::warn!("GitLab verify_webhook failed: X-Gitlab-Token header contains invalid UTF-8");
+                tracing::warn!(
+                    "GitLab verify_webhook failed: X-Gitlab-Token header contains invalid UTF-8"
+                );
                 return false;
             }
         };
