@@ -1,5 +1,47 @@
 # Changelog
 
+## [0.6.0](https://github.com/vymalo/lightbridge-code-intelligence/compare/v0.5.1...v0.6.0) (2026-07-17)
+
+
+### ⚠ BREAKING CHANGES
+
+* **control-plane:** rip out the Restate egress path — reconciler drain is the sole egress (ADR-0093, #433) ([#436](https://github.com/vymalo/lightbridge-code-intelligence/issues/436))
+
+### Features
+
+* **acp-host:** pass env + OPENCODE_CONFIG to the spawned opencode acp child (RFC-0009 slice 3) ([#445](https://github.com/vymalo/lightbridge-code-intelligence/issues/445)) ([6750122](https://github.com/vymalo/lightbridge-code-intelligence/commit/6750122713fbad0bb05ecd67031e8b53dc65d6c2))
+* **acp-host:** Rust ACP client — agent-plane supervisor foundation (ADR-0094) ([#439](https://github.com/vymalo/lightbridge-code-intelligence/issues/439)) ([fdba309](https://github.com/vymalo/lightbridge-code-intelligence/commit/fdba309f99696477af2699f32a00d9b5f7ba2cb6))
+* **agent-runner:** OpenCode review transport host + real-opencode e2e proof (RFC-0009 slice 3) ([#447](https://github.com/vymalo/lightbridge-code-intelligence/issues/447)) ([dbfc21d](https://github.com/vymalo/lightbridge-code-intelligence/commit/dbfc21d4b66854185dfa45b00eb32b4a555bda29))
+* **opencode:** OpenCode-over-ACP agent host — RFC-0009, ADR-0094/0095/0096, offline sim ([#435](https://github.com/vymalo/lightbridge-code-intelligence/issues/435)) ([fd64e19](https://github.com/vymalo/lightbridge-code-intelligence/commit/fd64e19a4e62cb0fd7a4b93c09cd7a26bb322621))
+* **opencode:** wire the probe to eaig for reasoning fidelity — RFC-0009 item c ([#438](https://github.com/vymalo/lightbridge-code-intelligence/issues/438)) ([1aa640c](https://github.com/vymalo/lightbridge-code-intelligence/commit/1aa640ce3663647526c6efd2af1ac621eedffa3e))
+* **review-agent:** OpenCode review gate adapter — reuse coverage/refute over opencode cycles (RFC-0009 slice 3) ([#442](https://github.com/vymalo/lightbridge-code-intelligence/issues/442)) ([f8dcf2e](https://github.com/vymalo/lightbridge-code-intelligence/commit/f8dcf2ec6c5fab515e3dccffc82b819989fa5b99))
+* **review-agent:** reconstruct the ADR-0034 transcript from the OpenCode recorder (RFC-0009 slice 3) ([#444](https://github.com/vymalo/lightbridge-code-intelligence/issues/444)) ([30062f8](https://github.com/vymalo/lightbridge-code-intelligence/commit/30062f855e4c35ccae363a8218416930199bfbfb))
+* **review-agent:** render the per-task OpenCode review config (RFC-0009 slice 3) ([#443](https://github.com/vymalo/lightbridge-code-intelligence/issues/443)) ([27e5ed1](https://github.com/vymalo/lightbridge-code-intelligence/commit/27e5ed1e665d18bfa9df006facc3b5814fbe4d88))
+* **review-agent:** review drive loop over a ReviewSession trait (RFC-0009 slice 3) ([#446](https://github.com/vymalo/lightbridge-code-intelligence/issues/446)) ([14b2f80](https://github.com/vymalo/lightbridge-code-intelligence/commit/14b2f80f60c8645bf6ed1bfd3b1647b60a2697e4))
+* **review-mcp:** expose review tools over MCP for an OpenCode host — review cutover slice 1 ([#440](https://github.com/vymalo/lightbridge-code-intelligence/issues/440)) ([3a82546](https://github.com/vymalo/lightbridge-code-intelligence/commit/3a825464769b1efad0e535635799723eb46b1652))
+* **review-mcp:** restore ADR-0066 customer/external MCP discovery on the OpenCode review path ([#455](https://github.com/vymalo/lightbridge-code-intelligence/issues/455)) ([b79b7ea](https://github.com/vymalo/lightbridge-code-intelligence/commit/b79b7ead00f498e4a04f0cea21fc1245a67a2710))
+* **review:** cut the live review path to OpenCode (ADR-0097 slice 5) — DO NOT auto-merge ([#452](https://github.com/vymalo/lightbridge-code-intelligence/issues/452)) ([ebf00e7](https://github.com/vymalo/lightbridge-code-intelligence/commit/ebf00e7899f01be8ff0d403d51e34e5c68a5c89c))
+* **review:** operator OpenCode config overlay + file-based base (ADR-0099) ([#464](https://github.com/vymalo/lightbridge-code-intelligence/issues/464)) ([ba2e05a](https://github.com/vymalo/lightbridge-code-intelligence/commit/ba2e05a1f737d0b809eccf74c27fe9922befe6cc))
+* **review:** wire run_sast into the OpenCode review path (ADR-0073 parity, closes ADR-0097 slice-5 gap) ([#456](https://github.com/vymalo/lightbridge-code-intelligence/issues/456)) ([5f692d6](https://github.com/vymalo/lightbridge-code-intelligence/commit/5f692d6f0426d22c2e63e56abad4b693c201777d))
+* **xtask:** OpenCode↔native review shadow parity gate (RFC-0009 slice 4) ([#450](https://github.com/vymalo/lightbridge-code-intelligence/issues/450)) ([2666c3c](https://github.com/vymalo/lightbridge-code-intelligence/commit/2666c3c0a2800f5382c94cdaa228357d4a3e178e))
+
+
+### Bug Fixes
+
+* **control-plane:** rip out the Restate egress path — reconciler drain is the sole egress (ADR-0093, [#433](https://github.com/vymalo/lightbridge-code-intelligence/issues/433)) ([#436](https://github.com/vymalo/lightbridge-code-intelligence/issues/436)) ([5b2ed49](https://github.com/vymalo/lightbridge-code-intelligence/commit/5b2ed4902c88b8ee130bea606bf7e7cc5affb3a7))
+* **review-agent:** address gemini review findings on the OpenCode review core ([#448](https://github.com/vymalo/lightbridge-code-intelligence/issues/448)) ([d9fc7ba](https://github.com/vymalo/lightbridge-code-intelligence/commit/d9fc7ba0f9415c32f3be0fb8b177a2297aed3c9c))
+* **review-agent:** classify .sqlx/*.json as generated (coverage gate loop → shallow reviews) ([#441](https://github.com/vymalo/lightbridge-code-intelligence/issues/441)) ([a9a0e13](https://github.com/vymalo/lightbridge-code-intelligence/commit/a9a0e1393fcd37b461c8823abdfdf09f68b5d2fe))
+* **review-agent:** disable OpenCode built-in tools at the config TOP LEVEL (coverage-parity) ([#449](https://github.com/vymalo/lightbridge-code-intelligence/issues/449)) ([6e972c3](https://github.com/vymalo/lightbridge-code-intelligence/commit/6e972c345d3c82086041fa69d7c4113b6fd30345))
+* **review-mcp:** single-prefix OpenCode tool names (ADR-0097 cleanup, part 1 of 2) ([#454](https://github.com/vymalo/lightbridge-code-intelligence/issues/454)) ([7d7f879](https://github.com/vymalo/lightbridge-code-intelligence/commit/7d7f879c1e9887bfdfde37896b4b66c7ce6d54d1))
+* **review:** give opencode the internal CA (NODE_EXTRA_CA_CERTS) — eaig TLS (prod hotfix) ([#453](https://github.com/vymalo/lightbridge-code-intelligence/issues/453)) ([b8d3223](https://github.com/vymalo/lightbridge-code-intelligence/commit/b8d322349565ce3bc2acb36d41ef1e1fd6fadab4))
+
+
+### Documentation
+
+* add ROADMAP.md + AGENTS.md rule to keep it current ([#465](https://github.com/vymalo/lightbridge-code-intelligence/issues/465)) ([e5dfda5](https://github.com/vymalo/lightbridge-code-intelligence/commit/e5dfda53e3d8ed307b618d7221e29261a08dd501))
+* **adr:** ADR-0097 review runs on OpenCode + amend RFC-0009 phasing (as-built) ([#451](https://github.com/vymalo/lightbridge-code-intelligence/issues/451)) ([4a41ce4](https://github.com/vymalo/lightbridge-code-intelligence/commit/4a41ce4f96eb7726f55358935f604837f131f20f))
+* **adr:** ADR-0099 operator OpenCode config overlay for review (file-based base + full override) ([#460](https://github.com/vymalo/lightbridge-code-intelligence/issues/460)) ([b497abb](https://github.com/vymalo/lightbridge-code-intelligence/commit/b497abbdcad14d2ec9692c1131acc2fb9fdc2126))
+
 ## [0.5.1](https://github.com/vymalo/lightbridge-code-intelligence/compare/v0.5.0...v0.5.1) (2026-07-16)
 
 
