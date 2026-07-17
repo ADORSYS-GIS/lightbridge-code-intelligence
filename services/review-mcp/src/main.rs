@@ -271,7 +271,7 @@ mod tests {
         };
         let out = filter_discovered(vec![
             tool("mcp__acme__a"),
-            tool("read_file"),    // non-mcp__: would collide with the built-in read_file → dropped
+            tool("read_file"), // non-mcp__: would collide with the built-in read_file → dropped
             tool("mcp__acme__a"), // duplicate → dropped
             tool("mcp__acme__b"),
         ]);
