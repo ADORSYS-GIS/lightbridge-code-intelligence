@@ -11,6 +11,5 @@ pub use checkpoint::{
 pub use control_plane::{
     ChunkBatch, ChunkHit, ChunkPayload, ControlPlaneClient, DiscoveredTool, GraphBatch,
     GraphEdgePayload, GraphNodePayload, KnowledgeToolResult, StoredStep, SymbolHit, TaskContext,
-    TranscriptEntry,
 };
 pub use embeddings::EmbeddingsClient;

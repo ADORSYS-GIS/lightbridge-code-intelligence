@@ -154,8 +154,8 @@ THEME:
 DEV / REVIEW:
     --render [screen]     draw a screen to text via a headless backend and print it
                           (no auth, no network — seeded fake data). Screens:
-                          repos | runs | detail | transcript | confirm | help |
-                          empty | small. `--render` with no name (or `--render list`)
+                          repos | runs | detail | confirm | help | empty | small.
+                          `--render` with no name (or `--render list`)
                           prints the valid names and exits. Tune with --width,
                           --height, --theme (e.g. lci --render detail --width 120).
 
@@ -259,8 +259,8 @@ mod tests {
     }
 
     #[test]
-    fn render_accepts_detail_and_transcript_screens() {
-        for name in ["detail", "transcript", "list"] {
+    fn render_accepts_detail_screen() {
+        for name in ["detail", "runs", "list"] {
             match parse_str(&["--render", name]).command {
                 Command::Render(spec) => assert_eq!(spec.screen, name),
                 other => panic!("expected Render({name}), got {other:?}"),

@@ -7,7 +7,7 @@
 //! same pure [`crate::tui::ui::draw`] against a test backend.
 
 use crate::api::RepositoryRow;
-use crate::api::{Claims, Me, ReviewRow, TaskRow, TranscriptRow};
+use crate::api::{Claims, Me, ReviewRow, TaskRow};
 use crate::theme::{ButtonKind, ThemeKind};
 use crate::tui::app::{App, DetailState, PendingAction, View};
 use ratatui::Terminal;
@@ -21,10 +21,8 @@ pub enum Screen {
     Repos,
     /// Runs list with a running + failed row.
     Runs,
-    /// The Run Detail page: meta + review + transcript, on a *terminal* (done) run with a review.
+    /// The Run Detail page: meta + review, on a *terminal* (done) run with a review.
     Detail,
-    /// The Run Detail page in its live-tailing state (active run, no review yet).
-    Transcript,
     /// The approve confirm dialog (over the repos list).
     Confirm,
     /// The help overlay.
@@ -42,7 +40,6 @@ impl Screen {
             "repos" | "repositories" => Screen::Repos,
             "runs" => Screen::Runs,
             "detail" => Screen::Detail,
-            "transcript" => Screen::Transcript,
             "confirm" => Screen::Confirm,
             "help" => Screen::Help,
             "empty" => Screen::Empty,
@@ -52,7 +49,7 @@ impl Screen {
     }
 
     /// The accepted names, comma-separated, for the list output + error message.
-    pub const NAMES: &'static str = "repos, runs, detail, transcript, confirm, help, empty, small";
+    pub const NAMES: &'static str = "repos, runs, detail, confirm, help, empty, small";
 }
 
 /// Build a seeded [`App`] for a screen, with the given theme.
@@ -90,7 +87,7 @@ fn seeded_app(screen: Screen, theme: ThemeKind) -> App {
             app.runs_active_only = false; // show the failed row too
             app.set_tasks(sample_tasks());
         }
-        // A completed run WITH a review + a rich transcript (the reviewable "static" detail state).
+        // A completed run WITH a review (the reviewable "static" detail state).
         Screen::Detail => {
             app.set_view(View::Runs);
             app.runs_active_only = false;
@@ -98,22 +95,6 @@ fn seeded_app(screen: Screen, theme: ThemeKind) -> App {
             let mut d = DetailState::new(sample_detail_task("succeeded", 3600), true);
             d.review = Some(sample_review());
             d.review_loaded = true;
-            d.merge_transcript(sample_transcript());
-            d.transcript_loaded = true;
-            // Seed the geometry so the scrollbar renders a sensible thumb in the snapshot.
-            d.record_geometry(sample_transcript().len() as u16 * 3, 12);
-            d.sync_after_render();
-            app.detail = Some(d);
-            app.view = View::Detail;
-        }
-        // An ACTIVE run, no review yet, mid-tail (the "live log tail" state).
-        Screen::Transcript => {
-            app.set_view(View::Runs);
-            app.set_tasks(sample_tasks());
-            let mut d = DetailState::new(sample_detail_task("running", 95), true);
-            d.review_loaded = true; // fetched → none recorded (yet)
-            d.merge_transcript(sample_transcript());
-            d.transcript_loaded = true;
             app.detail = Some(d);
             app.view = View::Detail;
         }
@@ -314,69 +295,6 @@ fn sample_review() -> ReviewRow {
     }
 }
 
-fn sample_transcript() -> Vec<TranscriptRow> {
-    let ts = fixed_ts();
-    let mk = |seq: i32,
-              role: &str,
-              content: Option<&str>,
-              tool_name: Option<&str>,
-              tool_calls: Option<serde_json::Value>,
-              pt: Option<i64>,
-              ct: Option<i64>| TranscriptRow {
-        seq,
-        role: role.into(),
-        content: content.map(String::from),
-        tool_calls,
-        tool_name: tool_name.map(String::from),
-        prompt_tokens: pt,
-        completion_tokens: ct,
-        model: None,
-        created_at: ts,
-    };
-    vec![
-        mk(
-            0,
-            "assistant",
-            Some(
-                "Starting the review. Let me read the diff and the surrounding files to ground the findings.",
-            ),
-            None,
-            None,
-            Some(1240),
-            Some(58),
-        ),
-        mk(
-            1,
-            "tool",
-            None,
-            Some("read_file"),
-            Some(serde_json::json!({"args": {"path": "src/main.rs", "start": 1, "end": 120}})),
-            None,
-            None,
-        ),
-        mk(
-            2,
-            "tool",
-            None,
-            Some("search_code"),
-            Some(serde_json::json!({"args": {"query": "retry backoff", "k": 8}})),
-            None,
-            None,
-        ),
-        mk(
-            3,
-            "assistant",
-            Some(
-                "Two small nits (naming + an unused import) and one deferred concern: the retry loop has no jittered backoff, which can thundering-herd the IdP. Posting the review.",
-            ),
-            None,
-            None,
-            Some(2980),
-            Some(211),
-        ),
-    ]
-}
-
 /// Render a screen to a plain-text string (one line per buffer row, trailing blanks trimmed). Each
 /// cell contributes its symbol; styling is dropped (this is a layout snapshot, not a color one).
 pub fn render_to_string(screen: Screen, width: u16, height: u16, theme: ThemeKind) -> String {
@@ -437,7 +355,6 @@ mod tests {
     fn screen_names_round_trip() {
         assert_eq!(Screen::from_name("repos"), Some(Screen::Repos));
         assert_eq!(Screen::from_name("detail"), Some(Screen::Detail));
-        assert_eq!(Screen::from_name("transcript"), Some(Screen::Transcript));
         assert_eq!(Screen::from_name("TOO-SMALL"), Some(Screen::TooSmall));
         assert_eq!(Screen::from_name("nope"), None);
         // `list` is handled by `run`, not a drawable screen.
@@ -445,7 +362,7 @@ mod tests {
     }
 
     #[test]
-    fn detail_snapshot_has_meta_review_and_transcript() {
+    fn detail_snapshot_has_meta_and_review() {
         let s = render_to_string(Screen::Detail, 80, 24, ThemeKind::Midnight);
         // Meta panel.
         assert!(s.contains("Run "), "meta panel title");
@@ -458,31 +375,17 @@ mod tests {
             !s.contains("—→—"),
             "no SHA placeholder now the fields exist"
         );
-        // Review panel.
+        // Review panel — now the bottom panel filling the page (no transcript panel post-#459).
         assert!(s.contains("Review"), "review panel");
         assert!(s.contains("inline"), "finding tally");
-        // Transcript panel.
-        assert!(s.contains("Transcript"), "transcript panel");
-        assert!(s.contains("assistant"), "a turn header role");
+        assert!(!s.contains("Transcript"), "transcript panel is gone (#459)");
 
-        // The 120x40 size must also render (used in the PR body).
+        // The 120x40 size must also render (used in the PR body); the wrapped summary shows.
         let wide = render_to_string(Screen::Detail, 120, 40, ThemeKind::Midnight);
-        assert!(wide.contains("Transcript"));
         assert!(
             wide.contains("retry backoff") || wide.contains("backoff"),
-            "content wrapped in"
+            "review summary wrapped in"
         );
-    }
-
-    #[test]
-    fn transcript_snapshot_shows_live_tail_and_no_review() {
-        let s = render_to_string(Screen::Transcript, 120, 40, ThemeKind::Midnight);
-        assert!(s.contains("● live"), "active run shows the live badge");
-        assert!(
-            s.contains("no review recorded"),
-            "no-review-yet inline notice"
-        );
-        assert!(s.contains("Transcript"));
     }
 
     #[test]
@@ -579,16 +482,15 @@ mod tests {
         let err = run(&bad).unwrap_err().to_string();
         assert!(err.contains("wat"), "echoes the bad name");
         assert!(
-            err.contains("detail") && err.contains("transcript"),
+            err.contains("detail") && err.contains("runs"),
             "lists valid names"
         );
         assert!(err.contains("valid:"), "uses the valid: phrasing");
     }
 
     #[test]
-    fn names_list_includes_the_new_screens() {
+    fn names_list_includes_the_detail_screen() {
         assert!(Screen::NAMES.contains("detail"));
-        assert!(Screen::NAMES.contains("transcript"));
     }
 
     #[test]

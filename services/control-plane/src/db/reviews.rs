@@ -2,7 +2,7 @@
 //! telemetry, and the review-comment refs the feedback poller reads (ADR-0035 wiring). Split out of
 //! the former monolithic `db.rs` (ADR-0086 follow-up) — pure move, no behavior change.
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::Value;
 use sqlx::PgPool;
 use time::OffsetDateTime;
@@ -244,95 +244,6 @@ pub async fn posted_findings_for_head(
     .bind(target_id)
     .bind(head_sha)
     .bind(current_task_id)
-    .fetch_all(pool)
-    .await
-}
-
-// ── ADR-0034 agent run transcript ──────────────────────────────────────────────────────────────
-
-/// One transcript entry submitted by the runner (the ingest shape; mirrors
-/// `lci-agent-clients::TranscriptEntry`).
-#[derive(Debug, Deserialize)]
-pub struct TranscriptInput {
-    pub role: String,
-    #[serde(default)]
-    pub content: Option<String>,
-    #[serde(default)]
-    pub tool_calls: Option<Value>,
-    #[serde(default)]
-    pub tool_name: Option<String>,
-    #[serde(default)]
-    pub prompt_tokens: Option<i64>,
-    #[serde(default)]
-    pub completion_tokens: Option<i64>,
-    #[serde(default)]
-    pub reasoning_tokens: Option<i64>,
-    #[serde(default)]
-    pub model: Option<String>,
-}
-
-/// One stored transcript entry, serialized to `GET /tasks/{id}/transcript` (ADR-0034) for the
-/// dashboard timeline.
-#[derive(Debug, Serialize, sqlx::FromRow)]
-pub struct TranscriptRow {
-    pub seq: i32,
-    pub role: String,
-    pub content: Option<String>,
-    pub tool_calls: Option<Value>,
-    pub tool_name: Option<String>,
-    pub prompt_tokens: Option<i64>,
-    pub completion_tokens: Option<i64>,
-    #[serde(with = "time::serde::rfc3339")]
-    pub created_at: OffsetDateTime,
-}
-
-/// Replace a task's transcript with `entries` (ordered). The runner submits the whole transcript once
-/// at run end; a re-submit (task retry) replaces the prior rows, so the row set always reflects the
-/// latest run. Done in one transaction so a reader never sees a half-written transcript.
-pub async fn replace_transcript(
-    pool: &PgPool,
-    task_id: Uuid,
-    entries: &[TranscriptInput],
-) -> Result<(), sqlx::Error> {
-    let mut tx = pool.begin().await?;
-    sqlx::query("DELETE FROM agent_transcript WHERE task_id = $1")
-        .bind(task_id)
-        .execute(&mut *tx)
-        .await?;
-    for (seq, e) in entries.iter().enumerate() {
-        sqlx::query(
-            "INSERT INTO agent_transcript \
-             (id, task_id, seq, role, content, tool_calls, tool_name, prompt_tokens, completion_tokens, \
-              reasoning_tokens, model) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
-        )
-        .bind(Uuid::new_v4())
-        .bind(task_id)
-        .bind(seq as i32)
-        .bind(&e.role)
-        .bind(&e.content)
-        .bind(&e.tool_calls)
-        .bind(&e.tool_name)
-        .bind(e.prompt_tokens)
-        .bind(e.completion_tokens)
-        .bind(e.reasoning_tokens)
-        .bind(&e.model)
-        .execute(&mut *tx)
-        .await?;
-    }
-    tx.commit().await
-}
-
-/// Load a task's transcript in order (ADR-0034), or an empty vec if none was recorded.
-pub async fn get_transcript(
-    pool: &PgPool,
-    task_id: Uuid,
-) -> Result<Vec<TranscriptRow>, sqlx::Error> {
-    sqlx::query_as::<_, TranscriptRow>(
-        "SELECT seq, role, content, tool_calls, tool_name, prompt_tokens, completion_tokens, created_at \
-         FROM agent_transcript WHERE task_id = $1 ORDER BY seq",
-    )
-    .bind(task_id)
     .fetch_all(pool)
     .await
 }

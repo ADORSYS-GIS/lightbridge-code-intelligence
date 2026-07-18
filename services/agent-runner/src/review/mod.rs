@@ -13,14 +13,13 @@
 //! Outcome model (#137): the run returns a [`ReviewOutcome`] — `Finished` (the model called `finish`),
 //! `Exhausted` (the turn budget ran out while findings may be buffered), or `Aborted(reason)` (the
 //! model called `abort`). **Only a true transport/loop failure returns `Err`.** The caller finalizes on
-//! all three so buffered findings are never discarded. The transcript is reconstructed from the loop's
-//! sink + the model client's telemetry side-channel and submitted by the caller regardless of outcome
-//! (a failed run's reasoning is the most useful to inspect).
+//! all three so buffered findings are never discarded. Run observability is logs-only (epic #459):
+//! per-turn proof-of-work lines go to Loki as the run happens; there is no DB transcript.
 //!
 //! [`run_native_agent`] is a thin **host** over four extracted concerns (quality pass, no behaviour
 //! change): [`model_client`] (building the LLM client + its starting log), [`tool_surface`] (resolving
 //! what's offered — diff gate, per-tier allowlist, MCP discovery), [`telemetry`] (the run-start
-//! snapshot + token-usage summation), and [`transcript`] (reconstructing the ADR-0034 transcript).
+//! snapshot + token-usage summation), and [`transcript`] (the per-turn proof-of-work log lines).
 
 pub mod instructions;
 pub mod opencode;
@@ -38,7 +37,7 @@ use anyhow::Context;
 use uuid::Uuid;
 
 use lci_agent_clients::{
-    CheckpointRuntime, ControlPlaneClient, ControlPlaneStepStore, EmbeddingsClient, TranscriptEntry,
+    CheckpointRuntime, ControlPlaneClient, ControlPlaneStepStore, EmbeddingsClient,
 };
 use lci_agent_loop::{Conversation, LoopOutcome, RequestOptions, TranscriptEvent, TranscriptSink};
 use lci_agent_sast::SastConfig;
@@ -81,11 +80,12 @@ fn durable_replay_enabled() -> bool {
         .unwrap_or(false)
 }
 
-/// A [`TranscriptSink`] that captures the loop's events so the host can reconstruct the ADR-0034
-/// transcript afterwards (even on error). Cloneable handle: grab a clone before boxing it into the
-/// loop, then lock `.0` directly to read the events once the run returns — cloning the whole
-/// (possibly still-growing) transcript via [`entries`](Self::entries) is test-only; production reads
-/// hold the lock in place instead (the live status poller ticks every second on it).
+/// A [`TranscriptSink`] that captures the loop's events so the host can emit the per-turn
+/// proof-of-work log lines afterwards (even on error) and sum token usage. Cloneable handle: grab a
+/// clone before boxing it into the loop, then lock `.0` directly to read the events once the run
+/// returns — cloning the whole (possibly still-growing) event log via [`entries`](Self::entries) is
+/// test-only; production reads hold the lock in place instead (the live status poller ticks every
+/// second on it).
 #[derive(Clone, Default)]
 struct JobSink(Arc<Mutex<Vec<TranscriptEvent>>>);
 
@@ -114,8 +114,8 @@ impl TranscriptSink for JobSink {
 /// Run the native agent loop. The agent acts via the mediated write tools during the run. Returns a
 /// [`ReviewOutcome`] describing how it ended (`Finished` / `Exhausted` / `Aborted`) — the caller turns
 /// each into a visible PR artifact and finalizes the buffer in all three cases (#137). Only a true
-/// transport/loop failure returns `Err`; in that case nothing is posted (but the partial transcript is
-/// still accumulated for submission).
+/// transport/loop failure returns `Err`; in that case nothing is posted (but the run's per-turn
+/// proof-of-work is still logged, even on error).
 #[allow(clippy::too_many_arguments)]
 pub async fn run_native_agent(
     review: &ReviewConfig,
@@ -136,9 +136,6 @@ pub async fn run_native_agent(
     // The checked-out repo root (the working tree under review). `read_file` reads from here,
     // path-sanitized to within it (epic #137).
     checkout_root: &Path,
-    // Accumulates the run transcript (ADR-0034). The caller owns it and submits it afterwards (even on
-    // error), so a failed run's reasoning is still captured.
-    transcript: &mut Vec<TranscriptEntry>,
     // Live status projection (RFC-0007 slice 5), `Some` only when the operator enabled the status API.
     // When set, the loop sink is teed through a `StatusSink` (behaviour-neutral) and token usage is fed
     // from the telemetry side-channel; `None` keeps today's path exactly (no wrapping, no feed).
@@ -337,10 +334,10 @@ pub async fn run_native_agent(
         handle.observe_usage(prompt, completion);
     }
 
-    // Reconstruct the ADR-0034 transcript from the sink events BEFORE propagating any loop error, so
-    // the caller still submits a failed run's reasoning. Each `Assistant` event carries its own
-    // telemetry (ADR-0087) — no separate side-channel to zip against.
-    transcript::append_transcript(transcript, &final_events, task_id);
+    // Emit the per-turn proof-of-work log lines BEFORE propagating any loop error, so a failed run's
+    // reasoning still reaches the logs (the observability surface — epic #459). Each `Assistant` event
+    // carries its own telemetry (ADR-0087) — no separate side-channel to zip against.
+    transcript::log_agent_turns(&final_events, task_id);
     drop(final_events);
 
     Ok(match outcome? {

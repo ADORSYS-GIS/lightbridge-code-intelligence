@@ -7,7 +7,8 @@ import type { Plugin } from "@opencode-ai/plugin";
  *
  * Appends one JSONL line per observed event to LCI_RECORDER_PATH. Runs in-process, so it sees
  * every tool call — including subagent-internal ones an ACP client may never be shown. The
- * agent-plane supervisor ships the file to the transcript store (ADR-0034) at task end.
+ * agent-plane supervisor reads the file per-cycle to drive the review quality gates (coverage
+ * accounting); it is not a transcript store (the DB transcript was retired — epic #459).
  *
  * This plugin must never fail the loop: recording errors are reported on stderr and swallowed.
  */
@@ -71,16 +72,10 @@ export const RecorderPlugin: Plugin = async () => {
       );
     },
     event: async ({ event }) => {
-      // Reasoning capture (the ADR-0060 requirement) plus session lifecycle markers. Everything
-      // else on the bus is intentionally not persisted — tool fidelity comes from the hooks above.
+      // Session lifecycle markers only. Model parts (reasoning/content) are the observability
+      // surface's job (Loki via the logger plugin, epic #459) — the recorder persists tool fidelity
+      // for the quality gates, not the model's prose. Everything else on the bus is not recorded.
       guard(() => {
-        if (event?.type === "message.part.updated") {
-          const part = (event.properties as { part?: { type?: string } } | undefined)?.part;
-          if (part?.type === "reasoning") {
-            record({ kind: "reasoning.part", part });
-          }
-          return;
-        }
         if (event?.type === "session.idle" || event?.type === "session.error") {
           record({ kind: event.type, properties: event.properties });
         }

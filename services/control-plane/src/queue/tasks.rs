@@ -106,29 +106,6 @@ pub async fn get_review(
     }
 }
 
-/// `GET /tasks/{id}/transcript` — the agent run transcript (ADR-0034): ordered tool calls, reasoning,
-/// and per-turn token usage. Empty array when none was recorded. Gated on `review:read` (it's run
-/// observability, same surface as the review).
-pub async fn get_transcript(
-    caller: Caller,
-    State(state): State<AppState>,
-    Path(id): Path<Uuid>,
-) -> Response {
-    if let Err(e) = caller.require("review:read") {
-        return e.into_response();
-    }
-    let Some(pool) = state.db.as_ref() else {
-        return (StatusCode::SERVICE_UNAVAILABLE, "no database").into_response();
-    };
-    match crate::db::get_transcript(pool, id).await {
-        Ok(entries) => Json(entries).into_response(),
-        Err(error) => {
-            tracing::error!(%error, "get transcript failed");
-            (StatusCode::INTERNAL_SERVER_ERROR, "query error").into_response()
-        }
-    }
-}
-
 /// `GET /tasks/{id}/feedback` — 👍/👎 reactions captured on the run's posted comments (ADR-0035),
 /// with the file/line of the finding each reacts to. Empty array when none. Gated `review:read`.
 pub async fn get_feedback(

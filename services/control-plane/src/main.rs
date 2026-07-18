@@ -300,7 +300,6 @@ fn app(state: AppState) -> Router {
         .route("/tasks", get(tasks::list))
         .route("/tasks/{id}", get(tasks::get))
         .route("/tasks/{id}/review", get(tasks::get_review))
-        .route("/tasks/{id}/transcript", get(tasks::get_transcript))
         .route("/tasks/{id}/feedback", get(tasks::get_feedback))
         .route("/tasks/{id}/cancel", post(tasks::cancel))
         .route("/repositories", get(tasks::list_repositories))
@@ -343,11 +342,6 @@ fn app(state: AppState) -> Router {
         .route(
             "/internal/tasks/{id}/knowledge/call",
             post(internal::call_knowledge_tool),
-        )
-        // The agent run transcript (ADR-0034): the runner submits it at run end.
-        .route(
-            "/internal/tasks/{id}/transcript",
-            post(internal::ingest_transcript),
         )
         // Run-level review telemetry (ADR-0034/0062/0066): the runner submits the offered tool set +
         // the redacted, base64-encoded resolved config at run START (a crashed run still records it).

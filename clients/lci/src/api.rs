@@ -152,28 +152,6 @@ pub struct ReviewRow {
     pub created_at: OffsetDateTime,
 }
 
-/// One agent turn from `GET /tasks/{id}/transcript` (ADR-0034). Mirrors `db::TranscriptRow`. Ordered
-/// by `seq`. `model` is accepted if the server sends it (forward-compatible; today's row omits it).
-#[derive(Debug, Clone, Deserialize)]
-pub struct TranscriptRow {
-    pub seq: i32,
-    pub role: String,
-    #[serde(default)]
-    pub content: Option<String>,
-    #[serde(default)]
-    pub tool_calls: Option<Value>,
-    #[serde(default)]
-    pub tool_name: Option<String>,
-    #[serde(default)]
-    pub prompt_tokens: Option<i64>,
-    #[serde(default)]
-    pub completion_tokens: Option<i64>,
-    #[serde(default)]
-    pub model: Option<String>,
-    #[serde(with = "time::serde::rfc3339")]
-    pub created_at: OffsetDateTime,
-}
-
 /// Thin authenticated client over the control-plane base URL.
 ///
 /// The bearer is a **shared, swappable** cell (`Arc<RwLock<String>>`) read fresh per request, so a
@@ -282,11 +260,6 @@ impl ApiClient {
             return Ok(None);
         }
         self.decode::<ReviewRow>(resp, &path).await.map(Some)
-    }
-
-    /// `GET /tasks/{id}/transcript` — the ordered agent turns (may be empty). Gated on `review:read`.
-    pub async fn get_transcript(&self, id: Uuid) -> Result<Vec<TranscriptRow>> {
-        self.get_json(&format!("/tasks/{id}/transcript")).await
     }
 
     /// Shared GET → JSON with status-mapped errors.
@@ -486,42 +459,6 @@ mod tests {
         assert!(r.review_url.is_some());
         assert_eq!(r.github_review_id, Some(987654));
         assert!(r.summary.contains("LGTM"));
-    }
-
-    #[test]
-    fn parses_transcript_rows_fixture_ordered_by_seq() {
-        // Note: the server's TranscriptRow omits `model` today; our struct tolerates it either way.
-        let json = r#"[
-            {
-                "seq": 0,
-                "role": "assistant",
-                "content": "Let me look at the diff.",
-                "tool_calls": null,
-                "tool_name": null,
-                "prompt_tokens": 1200,
-                "completion_tokens": 48,
-                "created_at": "2026-07-02T09:10:00Z"
-            },
-            {
-                "seq": 1,
-                "role": "tool",
-                "content": null,
-                "tool_calls": {"name": "read_file", "args": {"path": "src/main.rs"}},
-                "tool_name": "read_file",
-                "prompt_tokens": null,
-                "completion_tokens": null,
-                "model": "some-model",
-                "created_at": "2026-07-02T09:10:03Z"
-            }
-        ]"#;
-        let rows: Vec<TranscriptRow> = serde_json::from_str(json).unwrap();
-        assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].seq, 0);
-        assert_eq!(rows[0].role, "assistant");
-        assert_eq!(rows[0].prompt_tokens, Some(1200));
-        assert_eq!(rows[1].tool_name.as_deref(), Some("read_file"));
-        assert_eq!(rows[1].model.as_deref(), Some("some-model"));
-        assert!(rows[1].content.is_none());
     }
 
     #[test]

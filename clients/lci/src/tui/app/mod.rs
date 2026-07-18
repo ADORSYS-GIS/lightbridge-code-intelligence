@@ -5,8 +5,8 @@
 //! - [`update`] — a second `impl App` block holding the **transitions**: screen/filter switches,
 //!   selection navigation, the confirm-dialog flow, overlay toggles, and the run-detail page's
 //!   open/close. Turns an operator intent into a new `App` state.
-//! - [`detail`] — the Run Detail page's own sub-model (`DetailState`): task/review/transcript data
-//!   plus its scroll/merge transitions, self-contained because it's a page with its own life cycle.
+//! - [`detail`] — the Run Detail page's own sub-model (`DetailState`): task + review data, self-
+//!   contained because it's a page with its own life cycle (run observability is Loki-only — epic #459).
 //! - [`types`] — the small value types both layers share (`View`, `RepoFilter`, `Toast`, `Confirm`,
 //!   `PendingAction`).
 //!
@@ -225,8 +225,7 @@ mod tests {
         a.open_detail();
         assert_eq!(a.view, View::Detail);
         let d = a.detail.as_ref().expect("detail open");
-        assert!(d.live, "a running task tails live");
-        assert!(d.should_poll() || d.permission_denied);
+        assert!(d.live, "a running task reads as live");
         a.close_detail();
         assert_eq!(a.view, View::Runs);
         assert!(a.detail.is_none());
@@ -244,7 +243,6 @@ mod tests {
             d.permission_denied,
             "no review:read → inline notice, no fetch"
         );
-        assert!(!d.should_poll(), "denied read must not poll");
     }
 
     #[test]

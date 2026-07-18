@@ -123,62 +123,18 @@ pub(super) fn handle_key(
     }
 }
 
-/// The detail page's key map: scroll the transcript, jump top/bottom (re-engaging the live tail),
-/// refresh, and back out to the Runs list.
+/// The detail page's key map: refresh the task + review, and back out to the Runs list. Run
+/// observability moved to Loki (epic #459), so the page is a static status + review summary — there is
+/// no transcript to scroll.
 fn handle_detail_key(
     app: &mut App,
     key: KeyEvent,
     api: &ApiClient,
     tx: &mpsc::UnboundedSender<Msg>,
 ) {
-    // A page = the transcript viewport height; fall back to a sensible default if not yet measured.
-    let page = app
-        .detail
-        .as_ref()
-        .map(|d| d.viewport_lines.get().max(1))
-        .unwrap_or(10);
-
-    // Scroll actions mutate only `app.detail`; do them in a scoped borrow so the `app.*` calls
-    // (mark_dirty / close_detail / toasts) below don't collide with a held `&mut d`.
     match key.code {
         KeyCode::Esc | KeyCode::Char('h') | KeyCode::Left | KeyCode::Char('q') => {
             app.close_detail();
-        }
-        KeyCode::Down | KeyCode::Char('j') => {
-            if let Some(d) = app.detail.as_mut() {
-                d.scroll_down(1);
-            }
-            app.mark_dirty();
-        }
-        KeyCode::Up | KeyCode::Char('k') => {
-            if let Some(d) = app.detail.as_mut() {
-                d.scroll_up(1);
-            }
-            app.mark_dirty();
-        }
-        KeyCode::PageDown => {
-            if let Some(d) = app.detail.as_mut() {
-                d.scroll_down(page);
-            }
-            app.mark_dirty();
-        }
-        KeyCode::PageUp => {
-            if let Some(d) = app.detail.as_mut() {
-                d.scroll_up(page);
-            }
-            app.mark_dirty();
-        }
-        KeyCode::Char('g') | KeyCode::Home => {
-            if let Some(d) = app.detail.as_mut() {
-                d.scroll_top();
-            }
-            app.mark_dirty();
-        }
-        KeyCode::Char('G') | KeyCode::End => {
-            if let Some(d) = app.detail.as_mut() {
-                d.scroll_bottom();
-            }
-            app.mark_dirty();
         }
         KeyCode::Char('?') => app.toggle_help(),
         KeyCode::Char('t') => app.cycle_theme(),
@@ -197,28 +153,12 @@ fn handle_detail_key(
     }
 }
 
-/// Handle a mouse event: wheel scroll drives the focused scrollable pane (the transcript in detail
-/// view; otherwise the list selection). A left click on a Runs row selects it.
+/// Handle a mouse event: wheel scroll drives the list selection (the detail page has nothing to
+/// scroll). A left click on a Runs row selects it.
 pub(super) fn handle_mouse(app: &mut App, m: MouseEvent) {
     match m.kind {
-        MouseEventKind::ScrollDown => match app.view {
-            View::Detail => {
-                if let Some(d) = app.detail.as_mut() {
-                    d.scroll_down(3);
-                    app.mark_dirty();
-                }
-            }
-            _ => app.select_next(),
-        },
-        MouseEventKind::ScrollUp => match app.view {
-            View::Detail => {
-                if let Some(d) = app.detail.as_mut() {
-                    d.scroll_up(3);
-                    app.mark_dirty();
-                }
-            }
-            _ => app.select_prev(),
-        },
+        MouseEventKind::ScrollDown => app.select_next(),
+        MouseEventKind::ScrollUp => app.select_prev(),
         MouseEventKind::Down(MouseButton::Left) => {
             // Nice-to-have: a left click on the Runs list opens the row under the cursor's detail.
             // We keep it minimal — a click just selects the nearest row by not changing selection
