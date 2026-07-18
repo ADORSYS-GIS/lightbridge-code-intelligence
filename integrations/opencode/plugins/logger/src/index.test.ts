@@ -130,19 +130,18 @@ test("text part → an info agent.content line at info level", async () => {
   });
 });
 
-test("reasoning part → a debug agent.reasoning line, suppressed at info", async () => {
-  await withLogger({ LCI_LOG_LEVEL: "debug" }, async ({ hooks, lines }) => {
+test("reasoning part → an info agent.reasoning line at info level (one per completed part)", async () => {
+  // The agent is the star: its chain-of-thought must be legible in a default `info` tail, not only
+  // under debug. Streaming re-fires still collapse to exactly one line carrying the final text.
+  await withLogger({ LCI_LOG_LEVEL: "info" }, async ({ hooks, lines }) => {
+    await hooks.event?.(partEvent({ type: "reasoning", text: "Let me check" }));
     await hooks.event?.(
       partEvent({ type: "reasoning", text: "Let me check bounds first.", done: true }),
     );
     const reasoning = find(lines(), "agent.reasoning");
     assert.equal(reasoning.length, 1);
-    assert.equal(reasoning[0]?.level, "debug");
+    assert.equal(reasoning[0]?.level, "info");
     assert.equal(reasoning[0]?.text, "Let me check bounds first.");
-  });
-  await withLogger({ LCI_LOG_LEVEL: "info" }, async ({ hooks, lines }) => {
-    await hooks.event?.(partEvent({ type: "reasoning", text: "Hidden at info." }));
-    assert.equal(find(lines(), "agent.reasoning").length, 0);
   });
 });
 
@@ -222,6 +221,36 @@ test("tool.done stays info; tool.output preview is debug-only and bounded", asyn
       { title: "a.rs", output: "fn main() {}", metadata: {} } as any,
     );
     assert.equal(find(lines(), "tool.done").length, 1);
+    assert.equal(find(lines(), "tool.output").length, 0);
+  });
+});
+
+test("info boundary: every agent.* signal + tool.done show at info; tool.start/tool.output stay debug-only", async () => {
+  // Locks the new level split: the AGENT is the star — reasoning, content, and the unknown-part
+  // shape-drift signal are all legible in a default `info` tail (no flip to debug), together with
+  // tool.done. The deep tool I/O (input args, result preview) stays debug-only and is suppressed here.
+  await withLogger({ LCI_LOG_LEVEL: "info" }, async ({ hooks, lines }) => {
+    await hooks.event?.(
+      partEvent({ type: "reasoning", id: "r", text: "weighing options", done: true }),
+    );
+    await hooks.event?.(partEvent({ type: "text", id: "t", text: "looks correct", done: true }));
+    await hooks.event?.(partEvent({ type: "reasoning-delta", id: "u", text: "renamed shape" }));
+    await hooks["tool.execute.before"]?.(
+      { tool: "read_file", sessionID: "s1", callID: "c1" },
+      { args: { path: "a.rs" } },
+    );
+    await hooks["tool.execute.after"]?.(
+      { tool: "read_file", sessionID: "s1", callID: "c1", args: {} },
+      // biome-ignore lint/suspicious/noExplicitAny: built-in result shape ({title,output,metadata}).
+      { title: "a.rs", output: "fn main() {}", metadata: {} } as any,
+    );
+    // Present at info — the agent's full narrative plus the tool outcome.
+    assert.equal(find(lines(), "agent.reasoning").length, 1);
+    assert.equal(find(lines(), "agent.content").length, 1);
+    assert.equal(find(lines(), "agent.part.unknown").length, 1);
+    assert.equal(find(lines(), "tool.done").length, 1);
+    // Suppressed at info — the deep forensic tool I/O only surfaces at debug.
+    assert.equal(find(lines(), "tool.start").length, 0);
     assert.equal(find(lines(), "tool.output").length, 0);
   });
 });
@@ -341,12 +370,15 @@ test("streaming: no double-emit across completion re-fire, idle flush, and dispo
 
 test("LCI_LOG_LEVEL set to a prototype key (toString) falls back to the info threshold", async () => {
   await withLogger({ LCI_LOG_LEVEL: "toString" }, async ({ hooks, lines }) => {
-    // At the info threshold: content (info) is emitted, reasoning (debug) is suppressed. Under the
+    // At the info threshold: content (info) is emitted, tool.start (debug) is suppressed. Under the
     // old `in` check `threshold` would be a function and every level comparison would misbehave.
     await hooks.event?.(partEvent({ type: "text", id: "t", text: "visible", done: true }));
-    await hooks.event?.(partEvent({ type: "reasoning", id: "r", text: "hidden", done: true }));
+    await hooks["tool.execute.before"]?.(
+      { tool: "read_file", sessionID: "s1", callID: "c1" },
+      { args: { path: "a.rs" } },
+    );
     assert.equal(find(lines(), "agent.content").length, 1);
-    assert.equal(find(lines(), "agent.reasoning").length, 0);
+    assert.equal(find(lines(), "tool.start").length, 0);
   });
 });
 
@@ -379,11 +411,12 @@ test("synthetic / ignored text parts are never logged as agent.content", async (
 
 // --- unknown part.type visibility (#463 F4, #411 silent-drop shape) ------------------------------
 
-test("unknown part.type → exactly one debug agent.part.unknown line; known types emit none", async () => {
-  await withLogger({ LCI_LOG_LEVEL: "debug" }, async ({ hooks, lines }) => {
+test("unknown part.type → exactly one info agent.part.unknown line; known types emit none", async () => {
+  await withLogger({ LCI_LOG_LEVEL: "info" }, async ({ hooks, lines }) => {
     // A future/renamed shape (e.g. `reasoning-delta`) re-fires per streaming delta with the SAME id;
     // it must surface EXACTLY ONCE (on first sighting — an unknown shape has no known completion
     // marker, so we can't wait), carrying the unrecognized type + a bounded length — not the text.
+    // It rides the agent's narrative, so it shows at info alongside content/reasoning.
     await hooks.event?.(partEvent({ type: "reasoning-delta", id: "u1", text: "chain of" }));
     await hooks.event?.(partEvent({ type: "reasoning-delta", id: "u1", text: "chain of thought" }));
     // Known types (text/reasoning) must NOT be reported as unknown.
@@ -392,7 +425,7 @@ test("unknown part.type → exactly one debug agent.part.unknown line; known typ
 
     const unknown = find(lines(), "agent.part.unknown");
     assert.equal(unknown.length, 1);
-    assert.equal(unknown[0]?.level, "debug");
+    assert.equal(unknown[0]?.level, "info");
     assert.equal(unknown[0]?.partType, "reasoning-delta");
     // Length is the first-sighting snapshot ("chain of"), a magnitude signal, not the final text.
     assert.equal(unknown[0]?.chars, "chain of".length);
@@ -404,22 +437,22 @@ test("unknown part.type → exactly one debug agent.part.unknown line; known typ
   });
 });
 
-test("unknown part.type is suppressed below debug (info level)", async () => {
-  await withLogger({ LCI_LOG_LEVEL: "info" }, async ({ hooks, lines }) => {
-    await hooks.event?.(partEvent({ type: "reasoning-delta", id: "u1", text: "hidden at info" }));
+test("unknown part.type is suppressed below info (warn level)", async () => {
+  await withLogger({ LCI_LOG_LEVEL: "warn" }, async ({ hooks, lines }) => {
+    await hooks.event?.(partEvent({ type: "reasoning-delta", id: "u1", text: "hidden at warn" }));
     assert.equal(find(lines(), "agent.part.unknown").length, 0);
   });
 });
 
 test("a MISSING / non-string part.type still emits one agent.part.unknown (type stringified)", async () => {
   // The most-unexpected shape — a part with a valid id but `type` undefined/null/numeric — is the one
-  // most likely to be silently dropped (#411/#463). It must surface, with the type stringified.
+  // most likely to be silently dropped (#411/#463). It must surface at info, with the type stringified.
   const rawPartEvent = (part: Record<string, unknown>) =>
     ({
       event: { type: "message.part.updated", properties: { part } },
       // biome-ignore lint/suspicious/noExplicitAny: driving the branch with a hand-built wire shape.
     }) as any;
-  await withLogger({ LCI_LOG_LEVEL: "debug" }, async ({ hooks, lines }) => {
+  await withLogger({ LCI_LOG_LEVEL: "info" }, async ({ hooks, lines }) => {
     // `type` absent entirely (valid string id keeps the per-part de-dupe safe).
     await hooks.event?.(rawPartEvent({ id: "u-undef", text: "x" }));
     await hooks.event?.(rawPartEvent({ id: "u-undef", text: "xx" })); // re-fire → still exactly one
@@ -433,7 +466,7 @@ test("a MISSING / non-string part.type still emits one agent.part.unknown (type 
     assert.equal(unknown.length, 2);
     assert.deepEqual(unknown.map((l) => l.partType).sort(), ["42", "undefined"]);
     for (const line of unknown) {
-      assert.equal(line.level, "debug");
+      assert.equal(line.level, "info");
       assert.ok(!("text" in line)); // never the text, only the type + a length
     }
     // The known parts still logged on their own channels.

@@ -27,11 +27,12 @@ import { bounded, countCodePoints, resultText } from "./text.ts";
  * `cycle_turn_outcome` for coverage accounting; it is NOT an observability dependency here.)
  *
  * Level dial — pick how much of the loop you want in the tail:
- *   info  = the readable narrative: `agent.content` (the model's visible message), `tool.done`
+ *   info  = the agent's full narrative — the star of the show is legible without flipping to debug:
+ *           `agent.reasoning` (chain-of-thought), `agent.content` (the model's visible message), and
+ *           `agent.part.unknown` (a once-per-part shape-drift signal, type only) — PLUS `tool.done`
  *           (per-call name/ok/duration), `session.*` lifecycle, and `permission.ask` decisions.
- *   debug = the full forensic overview: everything at info PLUS `agent.reasoning` (chain-of-thought),
- *           `tool.start` carrying the tool INPUT args, and `tool.output` carrying a bounded preview
- *           of each tool's RESULT.
+ *   debug = the deep forensic detail on top of info: `tool.start` carrying the tool INPUT args, and
+ *           `tool.output` carrying a bounded preview of each tool's RESULT.
  *
  * Config (rendered per task by the supervisor):
  *   LCI_LOG_LEVEL              error | warn | info | debug   (default: info)
@@ -230,8 +231,9 @@ export const LoggerPlugin: Plugin = async ({ project, directory, worktree }) => 
       guard(() => {
         const type = event.type;
         if (type === "message.part.updated") {
-          // The model's own output, streamed as parts. `text` is its visible answer (info — the
-          // review narrative); `reasoning` is its chain-of-thought (debug — the forensic overview).
+          // The model's own output, streamed as parts. Both channels are the agent's narrative and
+          // emit at info: `text` is its visible answer, `reasoning` is its chain-of-thought — the
+          // agent is the star, so its reasoning shows in a default tail without flipping to debug.
           // OpenCode 1.18.2 surfaces the visible answer as `part.type === "text"`. This event is
           // STREAMING: track the latest snapshot per part id and emit once (see the maps above).
           const part = (
@@ -250,10 +252,10 @@ export const LoggerPlugin: Plugin = async ({ project, directory, worktree }) => 
           )?.part;
           if (part === undefined || typeof part.id !== "string") return;
           if (part.type === "reasoning") {
-            if (!enabled("debug")) return; // reasoning is debug-only — don't even track at info
+            if (!enabled("info")) return; // reasoning now emits at info — don't track below it
             if (!emittedParts.has(part.id)) {
               pendingParts.set(part.id, {
-                level: "debug",
+                level: "info",
                 message: "agent.reasoning",
                 text: part.text,
                 cap: reasoningCap,
@@ -274,17 +276,18 @@ export const LoggerPlugin: Plugin = async ({ project, directory, worktree }) => 
             // Unknown part.type — neither `reasoning` nor `text`. Rather than silently dropping it (the
             // #411 "silent-drop" failure shape: a future provider/opencode version tagging reasoning or
             // content differently — `reasoning-delta`, a nested or renamed shape — would vanish with
-            // ZERO signal), surface the UNRECOGNIZED type once per part id at debug so a shape drift
-            // shows up in a debug tail. Emit only the type + a bounded length, NEVER the text itself
-            // (cheap, and it can't leak content). De-duped via `unknownParts` (cleared per cycle) so a
-            // streaming unknown part doesn't spam one line per delta.
-            if (enabled("debug") && !unknownParts.has(part.id)) {
+            // ZERO signal), surface the UNRECOGNIZED type once per part id at info — it belongs to the
+            // agent's narrative, so a shape drift shows up in a default tail, not only under debug.
+            // Emit only the type + a bounded length, NEVER the text itself (cheap, and it can't leak
+            // content). De-duped via `unknownParts` (cleared per cycle) so a streaming unknown part
+            // doesn't spam one line per delta.
+            if (enabled("info") && !unknownParts.has(part.id)) {
               unknownParts.add(part.id);
               // Stringify the type so a MISSING/undefined/null/non-string type — the most-unexpected
               // shape, and the one most likely to be silently dropped (#411/#463) — still surfaces as
               // "undefined"/"null"/"42" rather than vanishing. (`part.id` is already a string here —
               // the outer guard returned otherwise — so `unknownParts` is safe.)
-              log("debug", "agent.part.unknown", {
+              log("info", "agent.part.unknown", {
                 partType: typeof part.type === "string" ? part.type : String(part.type),
                 chars: typeof part.text === "string" ? countCodePoints(part.text) : undefined,
               });
