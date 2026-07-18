@@ -222,6 +222,10 @@ change.
 
 ### 3.3 Per-turn logs and reasoning capture
 
+> These lines describe the **native fallback loop**. On the live OpenCode-over-ACP path
+> ([ADR-0097](adr/0097-review-runs-on-opencode.md)) the equivalent emitter is the OpenCode logger plugin
+> — see [§3.4](#34-run-observability-logs-are-the-surface).
+
 The loop logs proof-of-work without opening the DB:
 
 - **At start:** model id, base-URL **host only** (path/key kept out of logs), the resilience policy,
@@ -263,10 +267,15 @@ the reconstruction was a lossy *post-hoc* record, not execution state, and dupli
 OpenCode logger plugin already covers. Migration `0032_drop_agent_transcript.sql` `DROP`s the table
 (forward-only; irreversible in prod).
 
-Run observability is therefore **Loki-only**: the per-turn proof-of-work lines of [§3.3](#33-per-turn-logs-and-reasoning-capture)
-(model id, tool names, tokens, `reasoning_chars`, `latency_ms`, and the bounded `agent reasoning` /
-`agent content` chain-of-thought) are shipped to Loki and are the single source of run legibility.
-Leveled per-turn reasoning/content/tool lines on the OpenCode path land under #462 (hardened by #463).
+Run observability is therefore **Loki-only**, and on the live OpenCode-over-ACP path the emitter is the
+**OpenCode logger plugin** (`integrations/opencode/plugins/logger`): per turn it ships `agent.reasoning`,
+`agent.content`, `agent.part.unknown` and `tool.done` at **info**, plus `tool.start` (the tool input
+args) and `tool.output` (a bounded result preview) at **debug** — bounded + de-duped per completed part,
+dialed by `LCI_LOG_LEVEL`. #462 landed those leveled lines, #463 hardened the capture, and #474 raised
+the `agent.*` narrative signals to info, so a whole review is legible from a default tail. The per-turn
+proof-of-work lines of [§3.3](#33-per-turn-logs-and-reasoning-capture) (model id, tool names, tokens,
+`reasoning_chars`, `latency_ms`, and the bounded `agent reasoning` / `agent content` chain-of-thought)
+are the **native fallback loop's** equivalent surface, shipped to Loki the same way.
 
 Observability data the dashboards still read: `error_detail` on `tasks`
 (`migrations/0016_task_error_detail.sql`) records *why* a review posted nothing — added after a live

@@ -6,11 +6,12 @@ the posted output, and finally egress to GitHub. It is the companion to
 [github-app-and-control-plane.md](github-app-and-control-plane.md) (the App + trust boundary) and
 [indexing-and-storage.md](indexing-and-storage.md) (the retrieval substrate the deep tier reads from).
 
-> **Note (2026-07-16):** this describes the **current live** review path (the native in-process loop).
-> A cutover to hosting the review loop on **OpenCode** — reusing these same coverage/refute gates and
-> mediated tools supervisor-side — is built and proven against real OpenCode, with the live dispatch
-> swap the one pending step (shadow-gated). See [ADR-0097](adr/0097-review-runs-on-opencode.md). Until
-> that cut lands, everything below is the running system.
+> **Note (updated 2026-07-18):** the **live** review path is **OpenCode-over-ACP**
+> ([ADR-0097](adr/0097-review-runs-on-opencode.md), live in prod since 2026-07-17): the review loop is
+> hosted on OpenCode, reusing the same coverage/refute gates and mediated tools supervisor-side. The
+> **native in-process loop described below is now the fallback/legacy path** — its coverage/refute gate
+> mechanics still run supervisor-side on the OpenCode path, so the sections below remain the reference
+> for those gates and the mediated-tool contract, but the in-process loop is no longer the live host.
 
 The review agent is a **native, in-process Rust loop** ([ADR-0026](adr/0026-native-review-agent.md))
 acting via **mediated write tools** through the control plane
@@ -319,7 +320,8 @@ one whole-request timeout (useful for a heavy reasoner). The run races against a
 cancelled task drops the in-flight future. Per-turn telemetry (model, tools, tokens, rate-limit budget,
 latency) and the model's **reasoning_content** are logged
 ([ADR-0060](adr/0060-capture-model-reasoning-and-glm-5-2-latency-finding.md), bounded by
-`REASONING_LOG_CHARS`) and recorded in the transcript ([ADR-0034](adr/0034-agent-run-transcript-and-observability.md)).
+`REASONING_LOG_CHARS`) to **Loki only** — there is no DB run transcript
+([ADR-0100](adr/0100-retire-db-transcript-logs-as-observability.md)).
 
 ### Context injected into the prompt (`build_messages`)
 
@@ -364,8 +366,8 @@ The net invariant ([ADR-0056](adr/0056-control-plane-owns-the-posted-output.md))
 leaves a **visible artifact** unless the gateway was unreachable. `main.rs` finalizes on Finished **and**
 Exhausted **and** Aborted (an earlier version bailed on exhaustion and lost 5 real findings at turn 16).
 **Finalize failure is fatal** (unlike the rest of review, which is best-effort) so the task retries
-rather than being marked succeeded with nothing posted. The transcript is submitted regardless of
-outcome.
+rather than being marked succeeded with nothing posted. Run observability is emitted to Loki regardless
+of outcome ([ADR-0100](adr/0100-retire-db-transcript-logs-as-observability.md)).
 
 ## 6. Control-plane finalize and shaping
 

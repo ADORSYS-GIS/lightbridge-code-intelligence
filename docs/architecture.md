@@ -1,12 +1,15 @@
 # Architecture overview
 
-> **Current state (2026-06).** This document reflects the system as it runs today. The review agent is
-> a **native, in-process Rust loop** ([ADR-0026](adr/0026-native-review-agent.md)) that acts through
-> **mediated write tools** ([ADR-0037](adr/0037-agent-acts-via-mediated-tools.md)); the earlier
-> OpenCode/ACP/MCP-subprocess shape and the review fallback model are **gone**
-> ([ADR-0053](adr/0053-remove-review-fallback-model.md)). Review now runs in **two tiers**
+> **Current state (updated 2026-07-18).** This document reflects the system as it runs today. The
+> **live review path is OpenCode-over-ACP** ([ADR-0097](adr/0097-review-runs-on-opencode.md), live in
+> prod since 2026-07-17): OpenCode hosts the agent loop, and the tuned coverage/refute gates + the
+> **mediated write tools** ([ADR-0037](adr/0037-agent-acts-via-mediated-tools.md)) are reused
+> supervisor-side. The **native, in-process Rust loop** ([ADR-0026](adr/0026-native-review-agent.md))
+> is now the fallback/legacy path; the review fallback *model* was removed earlier
+> ([ADR-0053](adr/0053-remove-review-fallback-model.md)). Review runs in **two tiers**
 > ([ADR-0062](adr/0062-two-tier-review-fast-auto-deep-on-demand.md)). For the per-subsystem detail see
-> the cross-links throughout and [INDEX.md](INDEX.md).
+> the cross-links throughout and [INDEX.md](INDEX.md). Several diagrams/labels below still read "native
+> review agent loop" — read those as the reused loop mechanics now driven supervisor-side over OpenCode.
 
 > **Where this is heading — control-plane v2 (in design, [RFC-0007](rfc/0007-control-plane-v2-planes.md)).**
 > The as-built system below is a single `control-plane` binary selecting among **six** roles plus two
