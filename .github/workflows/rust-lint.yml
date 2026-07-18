@@ -42,13 +42,10 @@ concurrency:
 jobs:
   lint:
     runs-on: [self-hosted, vymalo-vps]
-    # The vymalo-vps hosts have no C toolchain, so native `cc`-linked builds (proc-macro2, serde_json,
-    # ring, …) fail with `linker 'cc' not found`. Run inside the org's batteries-included ARC image,
-    # which bakes build-essential + rustup stable (clippy/rustfmt/rust-src) + sccache. `--user root`
-    # so apt/cargo/git operate without a password-gated sudo (the host user cannot sudo).
-    container:
-      image: ghcr.io/vymalo/arc-runners:latest
-      options: --user root
+    # The `vymalo-vps` label now resolves to ARC pod runners whose image
+    # (ghcr.io/vymalo/arc-runners:jdk21-node22) already bakes build-essential + rustup stable
+    # (clippy/rustfmt/rust-src) + cargo-llvm-cov + sccache. There is no Docker daemon on these pods,
+    # so steps run directly on the runner — no `container:` wrapper.
     steps:
       - uses: actions/checkout@v4
       # v2.83.1, pinned to immutable reviewed code; checksums stay enabled explicitly.

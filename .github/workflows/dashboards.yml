@@ -22,18 +22,21 @@ permissions:
 jobs:
   generate-and-verify:
     runs-on: [self-hosted, vymalo-vps]
-    # `actions/setup-python` has no prebuilt interpreter for the runner host's Debian 13 (trixie), so
-    # it errors "version '3.12' … was not found for Debian 13". Run inside the official Python 3.12
-    # image instead — it ships `python`, `pip` (no PEP-668 marker) and `git` (buildpack-deps), which
-    # the stale-check `git diff` needs.
-    container: python:3.12-bookworm
+    # The `vymalo-vps` label now resolves to ARC pod runners (Ubuntu 24.04 noble base) whose image
+    # already ships system `python3` (3.12) + `python3-venv` + git. No Docker daemon on these pods, so
+    # steps run directly on the runner — no `container:` wrapper. The dependencies are installed into a
+    # throwaway venv (noble's system Python is PEP-668 externally-managed, so a bare `pip install`
+    # would be rejected), and the generator is invoked via that venv's interpreter.
     steps:
       - uses: actions/checkout@v4
       - name: Install generator
-        run: pip install -r tools/dashboard-gen/requirements.txt
+        run: |
+          python3 -m venv .dashboard-venv
+          ./.dashboard-venv/bin/pip install --upgrade pip
+          ./.dashboard-venv/bin/pip install -r tools/dashboard-gen/requirements.txt
       - name: Regenerate dashboards
         working-directory: tools/dashboard-gen
-        run: python generate.py
+        run: ../../.dashboard-venv/bin/python generate.py
       - name: Fail if dashboards are out of date
         run: |
           if ! git diff --exit-code -- deploy/observability/dashboards; then

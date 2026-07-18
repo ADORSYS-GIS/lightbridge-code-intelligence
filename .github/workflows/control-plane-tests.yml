@@ -33,36 +33,42 @@ concurrency:
 jobs:
   test:
     runs-on: [self-hosted, vymalo-vps]
-    # The vymalo-vps hosts lack a C toolchain (native builds fail `linker 'cc' not found`). Run inside
-    # the org's ARC image (build-essential + rustup stable + sccache baked); `--user root` because the
-    # host user cannot sudo. The pgvector service below shares the job's container network and is
-    # reachable by its service name (`postgres`), not `localhost` — see DATABASE_URL.
-    container:
-      image: ghcr.io/vymalo/arc-runners:latest
-      options: --user root
-    services:
-      # pgvector/pgvector:pg17 mirrors compose.yaml: the migrations do `CREATE EXTENSION vector`
-      # and create `vector(4096)` columns, so a stock postgres image would fail. `#[sqlx::test]`
-      # provisions a throwaway database per test (the `lightbridge` superuser can CREATE DATABASE)
-      # and runs the migrations itself. Neo4j is not needed — the one graph test is `#[ignore]`d.
-      postgres:
-        image: pgvector/pgvector:pg17
-        env:
-          POSTGRES_USER: lightbridge
-          POSTGRES_PASSWORD: lightbridge
-          POSTGRES_DB: lightbridge
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U lightbridge"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 10
+    # The `vymalo-vps` label now resolves to ARC pod runners whose image
+    # (ghcr.io/vymalo/arc-runners:jdk21-node22) bakes build-essential + rustup stable + sccache +
+    # rootless podman. There is no Docker daemon on these pods, so GitHub Actions `services:` (which
+    # launch via Docker) do not work — Postgres is started with rootless `podman run` below and reached
+    # over the published localhost port, not a service-network hostname.
     env:
-      # Inside a `container:` job the service is reached by service name, not localhost.
-      DATABASE_URL: postgres://lightbridge:lightbridge@postgres:5432/lightbridge
+      # The pgvector container publishes 5432 to localhost, so the tests connect to 127.0.0.1.
+      DATABASE_URL: postgres://lightbridge:lightbridge@127.0.0.1:5432/lightbridge
     steps:
       - uses: actions/checkout@v4
+      # pgvector/pgvector:pg17 mirrors compose.yaml: the migrations do `CREATE EXTENSION vector` and
+      # create `vector(4096)` columns, so a stock postgres image would fail. `#[sqlx::test]` provisions
+      # a throwaway database per test (the `lightbridge` superuser can CREATE DATABASE) and runs the
+      # migrations itself. Neo4j is not needed — the one graph test is `#[ignore]`d. Started with
+      # rootless podman (no Docker daemon on the ARC pods) and published to 127.0.0.1:5432.
+      - name: Start Postgres (pgvector, rootless podman)
+        run: |
+          podman run -d --name pg \
+            -p 5432:5432 \
+            -e POSTGRES_USER=lightbridge \
+            -e POSTGRES_PASSWORD=lightbridge \
+            -e POSTGRES_DB=lightbridge \
+            docker.io/pgvector/pgvector:pg17
+      - name: Wait for Postgres to be ready
+        run: |
+          for i in $(seq 1 30); do
+            if podman exec pg pg_isready -U lightbridge -d lightbridge >/dev/null 2>&1; then
+              echo "postgres is ready"
+              exit 0
+            fi
+            echo "waiting for postgres ($i/30)…"
+            sleep 2
+          done
+          echo "::error::postgres did not become ready in time"
+          podman logs pg || true
+          exit 1
       # Registry + git-dep download cache (the fetch side). sccache below caches compiler output.
       - uses: Swatinem/rust-cache@v2
         with:
@@ -79,3 +85,8 @@ jobs:
       - name: sccache stats
         if: always()
         run: sccache --show-stats || true
+      # The ARC pod is ephemeral (torn down after the job), but stop the DB explicitly so a reused
+      # runner never collides on the container name or the published port.
+      - name: Stop Postgres
+        if: always()
+        run: podman rm -f pg || true
