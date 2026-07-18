@@ -111,6 +111,39 @@
     },
     {
       "datasource": {
+        "type": "loki",
+        "uid": "${DS_LOKI}"
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 18,
+        "y": 0
+      },
+      "options": null,
+      "repeatDirection": "h",
+      "targets": [
+        {
+          "datasource": {
+            "type": "loki",
+            "uid": "${DS_LOKI}"
+          },
+          "expr": "sum(sum_over_time({service_name=\"envoy-ai-gateway\"} | json | oidc_jti=~\"runid:.+\" | account_id=~\"$repo\" | gen_ai_request_model=~\"$model\" | unwrap gen_ai_usage_total_tokens | __error__=\"\" [$__range]))",
+          "queryType": "range",
+          "refId": "A"
+        }
+      ],
+      "title": "Tokens (range)",
+      "transformations": [],
+      "transparent": false,
+      "type": "stat"
+    },
+    {
+      "datasource": {
         "type": "grafana-postgresql-datasource",
         "uid": "${DS_POSTGRES}"
       },
@@ -181,6 +214,72 @@
     },
     {
       "datasource": {
+        "type": "loki",
+        "uid": "${DS_LOKI}"
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 12
+      },
+      "options": null,
+      "repeatDirection": "h",
+      "targets": [
+        {
+          "datasource": {
+            "type": "loki",
+            "uid": "${DS_LOKI}"
+          },
+          "expr": "sum(sum_over_time({service_name=\"envoy-ai-gateway\"} | json | oidc_jti=~\"runid:.+\" | account_id=~\"$repo\" | gen_ai_request_model=~\"$model\" | unwrap gen_ai_usage_total_tokens | __error__=\"\" [$__interval]))",
+          "queryType": "range",
+          "refId": "A"
+        }
+      ],
+      "title": "Token usage (total)",
+      "transformations": [],
+      "transparent": false,
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "loki",
+        "uid": "${DS_LOKI}"
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 12
+      },
+      "options": null,
+      "repeatDirection": "h",
+      "targets": [
+        {
+          "datasource": {
+            "type": "loki",
+            "uid": "${DS_LOKI}"
+          },
+          "expr": "count by (gen_ai_request_model) (sum by (oidc_jti, gen_ai_request_model) (count_over_time({service_name=\"envoy-ai-gateway\"} | json | oidc_jti=~\"runid:.+\" | account_id=~\"$repo\" | gen_ai_request_model=~\"$model\" [$__range])))",
+          "queryType": "range",
+          "refId": "A"
+        }
+      ],
+      "title": "Runs by model",
+      "transformations": [],
+      "transparent": false,
+      "type": "bargauge"
+    },
+    {
+      "datasource": {
         "type": "grafana-postgresql-datasource",
         "uid": "${DS_POSTGRES}"
       },
@@ -192,7 +291,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 12
+        "y": 20
       },
       "options": null,
       "repeatDirection": "h",
@@ -227,7 +326,7 @@
         "h": 10,
         "w": 24,
         "x": 0,
-        "y": 20
+        "y": 28
       },
       "options": null,
       "repeatDirection": "h",
@@ -248,6 +347,39 @@
       "transformations": [],
       "transparent": false,
       "type": "table"
+    },
+    {
+      "datasource": {
+        "type": "loki",
+        "uid": "${DS_LOKI}"
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 12,
+        "w": 24,
+        "x": 0,
+        "y": 38
+      },
+      "options": null,
+      "repeatDirection": "h",
+      "targets": [
+        {
+          "datasource": {
+            "type": "loki",
+            "uid": "${DS_LOKI}"
+          },
+          "expr": "topk(500, sum by (oidc_jti, account_id, gen_ai_request_model) (sum_over_time({service_name=\"envoy-ai-gateway\"} | json | oidc_jti=~\"runid:.+\" | account_id=~\"$repo\" | gen_ai_request_model=~\"$model\" | unwrap gen_ai_usage_total_tokens | __error__=\"\" [$__range])))",
+          "queryType": "range",
+          "refId": "A"
+        }
+      ],
+      "title": "Review runs \u00d7 tokens \u00d7 model (range)",
+      "transformations": [],
+      "transparent": false,
+      "type": "table"
     }
   ],
   "refresh": "1m",
@@ -257,7 +389,48 @@
     "lightbridge",
     "generated"
   ],
-  "templating": {},
+  "templating": {
+    "list": [
+      {
+        "auto": false,
+        "auto_count": 30,
+        "auto_min": "10s",
+        "datasource": {
+          "type": "grafana-postgresql-datasource",
+          "uid": "${DS_POSTGRES}"
+        },
+        "hide": 0,
+        "id": "00000000-0000-0000-0000-000000000000",
+        "includeAll": false,
+        "label": "Repository",
+        "multi": false,
+        "name": "repo",
+        "query": "SELECT __text, __value FROM (  SELECT 'All' AS __text, '.+' AS __value, 0 AS ord   UNION ALL   SELECT owner || '/' || name AS __text, owner || '/' || name AS __value, 1 AS ord   FROM repositories) t ORDER BY ord, __text",
+        "skipUrlSync": false,
+        "type": "query"
+      },
+      {
+        "allValue": ".+",
+        "auto": false,
+        "auto_count": 30,
+        "auto_min": "10s",
+        "datasource": {
+          "type": "loki",
+          "uid": "${DS_LOKI}"
+        },
+        "hide": 0,
+        "id": "00000000-0000-0000-0000-000000000000",
+        "includeAll": true,
+        "label": "Model",
+        "multi": false,
+        "name": "model",
+        "query": "label_values(gen_ai_request_model)",
+        "refresh": 2,
+        "skipUrlSync": false,
+        "type": "query"
+      }
+    ]
+  },
   "time": {
     "from": "now-30d",
     "to": "now"

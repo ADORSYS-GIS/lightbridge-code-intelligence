@@ -146,6 +146,39 @@
     },
     {
       "datasource": {
+        "type": "loki",
+        "uid": "${DS_LOKI}"
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 0,
+        "y": 4
+      },
+      "options": null,
+      "repeatDirection": "h",
+      "targets": [
+        {
+          "datasource": {
+            "type": "loki",
+            "uid": "${DS_LOKI}"
+          },
+          "expr": "sum(sum_over_time({service_name=\"envoy-ai-gateway\"} | json | oidc_jti=~\"runid:.+\" | unwrap gen_ai_usage_total_tokens | __error__=\"\" [24h]))",
+          "queryType": "range",
+          "refId": "A"
+        }
+      ],
+      "title": "Tokens (24h)",
+      "transformations": [],
+      "transparent": false,
+      "type": "stat"
+    },
+    {
+      "datasource": {
         "type": "grafana-postgresql-datasource",
         "uid": "${DS_POSTGRES}"
       },
@@ -156,7 +189,7 @@
       "gridPos": {
         "h": 8,
         "w": 12,
-        "x": 0,
+        "x": 6,
         "y": 4
       },
       "options": null,
@@ -191,8 +224,8 @@
       "gridPos": {
         "h": 8,
         "w": 12,
-        "x": 12,
-        "y": 4
+        "x": 0,
+        "y": 12
       },
       "options": null,
       "repeatDirection": "h",
@@ -229,7 +262,7 @@
         "h": 8,
         "w": 24,
         "x": 0,
-        "y": 12
+        "y": 20
       },
       "options": null,
       "repeatDirection": "h",
@@ -264,7 +297,7 @@
         "h": 9,
         "w": 24,
         "x": 0,
-        "y": 20
+        "y": 28
       },
       "options": null,
       "repeatDirection": "h",

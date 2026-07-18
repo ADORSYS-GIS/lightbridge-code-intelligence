@@ -4,9 +4,20 @@ from __future__ import annotations
 
 from grafana_foundation_sdk.builders import bargauge, dashboard, stat, table, timeseries
 
-from .common import POSTGRES, Layout, sql
+from .common import LOKI, POSTGRES, Layout, logql, sql
 
 UID = "lci-overview"
+
+# 24h total tokens from the AI-Gateway (eaig) billing stream — the same envoy-ai-gateway Loki
+# stream review-cost / review-quality read (ADR-0100 moved per-run tokens off the dropped DB
+# run-transcript table onto these logs). `oidc_jti=~"runid:.+"` scopes to LCI review traffic;
+# the gateway logs a single total per call (no input/output/reasoning split). Fixed 24h window to
+# match the sibling "(24h)" KPIs, independent of the dashboard's selected range.
+_TOKENS_24H = (
+    "sum(sum_over_time("
+    '{service_name="envoy-ai-gateway"} | json | oidc_jti=~"runid:.+" '
+    '| unwrap gen_ai_usage_total_tokens | __error__="" [24h]))'
+)
 
 
 def dashboard_builder() -> dashboard.Dashboard:
@@ -48,6 +59,13 @@ def dashboard_builder() -> dashboard.Dashboard:
                 "WHERE received_at > now() - interval '24 hours'"
             )
         )
+        .grid_pos(layout.place(6, 4))
+    )
+    tokens_24h = (
+        stat.Panel()
+        .title("Tokens (24h)")
+        .datasource(LOKI)
+        .with_target(logql(_TOKENS_24H))
         .grid_pos(layout.place(6, 4))
     )
     created = (
@@ -118,6 +136,7 @@ def dashboard_builder() -> dashboard.Dashboard:
         .with_panel(running)
         .with_panel(failed)
         .with_panel(deliveries)
+        .with_panel(tokens_24h)
         .with_panel(created)
         .with_panel(by_status)
         .with_panel(duration_p95)
