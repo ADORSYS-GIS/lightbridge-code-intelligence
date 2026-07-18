@@ -9,8 +9,10 @@
 //!    (opencode resolves them at load); the reviewer prompt rides a `{file:*}` placeholder pointing at
 //!    a per-task file the host writes beside the config.
 //! 2. **runtime injection** — patched onto the parsed base per task: the attribution/billing headers
-//!    (#89, dynamic keys), the tier's `reasoning` flag (deep=true/fast=false, ADR-0069), and
-//!    `temperature` when set. These are the values that can't be a static `{env:*}`/`{file:*}`.
+//!    (#89, dynamic keys), the tier's `reasoning` flag (deep=true/fast=false, ADR-0069), the tier's
+//!    `review.extra` passthrough params (`reasoning_effort`, `top_p`, …) merged into the reviewer
+//!    model's `options`, and `temperature` when set. These are the values that can't be a static
+//!    `{env:*}`/`{file:*}`.
 //! 3. **operator overlay** — the trusted `review.opencode` object from ai-helm-values, deep-merged LAST
 //!    with **full override** (objects merge recursively; arrays and scalars from the overlay replace
 //!    ours). The merge is host-side so the untrusted checkout is never a config source (ADR-0097 #6).
@@ -91,6 +93,12 @@ impl RenderedReviewConfig {
 /// - `fast` selects the tier: deep enables the reasoning model (ADR-0069), fast does not.
 /// - `temperature` is patched into the provider model options when set (best-effort; fine sampling
 ///   params don't all map 1:1 once OpenCode owns the loop).
+/// - `extra` is the tier's provider-passthrough params (`review.extra` — `reasoning_effort`, `top_p`,
+///   `max_tokens`, …), merged into the reviewer model's `options` so the openai-compatible provider
+///   forwards them on the request body. This is the SAME map, keyed the same way, the native request
+///   body carries — native-path parity (ADR-0069 `reasoning_effort:"high"` reaches eaig on BOTH engines
+///   now; the OpenCode path previously dropped it, silently running deep reviews at the gateway's
+///   default low reasoning effort).
 /// - `attribution` is the per-project billing header set (#89), forwarded on every provider request
 ///   via the openai-compatible provider's `headers` option so OpenCode-hosted review bills as native.
 /// - `overlay` is the operator's `review.opencode` object (trusted); `None` (or an empty object) is a
@@ -103,11 +111,12 @@ impl RenderedReviewConfig {
 pub fn render_review_config(
     fast: bool,
     temperature: Option<f64>,
+    extra: &Map<String, Value>,
     attribution: &[(String, String)],
     overlay: Option<&Value>,
 ) -> RenderedReviewConfig {
     let mut config = parse_base();
-    inject_runtime(&mut config, fast, temperature, attribution);
+    inject_runtime(&mut config, fast, temperature, extra, attribution);
 
     // Snapshot the floor from the injected base BEFORE the overlay — the floor items (tools /
     // permission / mcp.lightbridge / plugin) are all base-owned, untouched by injection.
@@ -138,17 +147,37 @@ fn parse_base() -> Value {
 }
 
 /// Patch the per-task runtime values onto the parsed base (ADR-0099 layer 2): the attribution headers
-/// (dynamic keys), the tier `reasoning` flag, and `temperature` when set. Everything else the base
-/// already carries as `{env:*}`/`{file:*}` placeholders opencode resolves at load.
+/// (dynamic keys), the tier `reasoning` flag, the `review.extra` passthrough params, and `temperature`
+/// when set. Everything else the base already carries as `{env:*}`/`{file:*}` placeholders opencode
+/// resolves at load.
 fn inject_runtime(
     config: &mut Value,
     fast: bool,
     temperature: Option<f64>,
+    extra: &Map<String, Value>,
     attribution: &[(String, String)],
 ) {
     let reviewer = &mut config["provider"]["eaig"]["models"]["reviewer"];
-    // Deep tier runs a reasoning-capable model (ADR-0069 floor); fast does not.
+    // Deep tier runs a reasoning-capable model (ADR-0069 floor); fast does not. This is a capability
+    // BOOLEAN only — the reasoning EFFORT level rides `review.extra` (`reasoning_effort`) below.
     reviewer["reasoning"] = Value::Bool(!fast);
+
+    // Provider-passthrough generation params (`review.extra`) → the reviewer model's `options`, where
+    // the `@ai-sdk/openai-compatible` eaig provider forwards them on the request body. This is where the
+    // tier's configured `reasoning_effort` ("high" for deep, ADR-0069) actually reaches eaig; without
+    // it, qwen3p7-plus defaults to its lowest reasoning variant. The WHOLE map is threaded (parity with
+    // the native path, which merges the same `extra` into the chat body) so `top_p`/`max_tokens`/etc.
+    // an operator sets there flow too. Merged BEFORE `temperature` so an explicit tier `temperature`
+    // wins over any `temperature` an operator put in `extra`.
+    if !extra.is_empty() {
+        let options = reviewer["options"]
+            .as_object_mut()
+            .expect("the checked-in base ships reviewer.options as an object");
+        for (key, value) in extra {
+            options.insert(key.clone(), value.clone());
+        }
+    }
+
     if let Some(temperature) = temperature {
         reviewer["options"]["temperature"] = json_number(temperature);
     }
@@ -368,7 +397,12 @@ mod tests {
     use serde_json::json;
 
     fn render(fast: bool, temperature: Option<f64>, attribution: &[(String, String)]) -> Value {
-        render_review_config(fast, temperature, attribution, None).config
+        render_review_config(fast, temperature, &Map::new(), attribution, None).config
+    }
+
+    /// Render with an explicit `review.extra` passthrough map (the reasoning-effort fix path).
+    fn render_with_extra(fast: bool, extra: &Map<String, Value>) -> Value {
+        render_review_config(fast, None, extra, &[], None).config
     }
 
     #[test]
@@ -444,6 +478,80 @@ mod tests {
     }
 
     #[test]
+    fn extra_reasoning_effort_reaches_reviewer_options_on_both_tiers() {
+        // The bug this fixes: the OpenCode path dropped `review.extra`, so the deep tier's configured
+        // `reasoning_effort:"high"` (ADR-0069) never reached eaig — deep reviews silently ran at the
+        // gateway's default low reasoning variant. It must now land in the reviewer model's `options`,
+        // where the `@ai-sdk/openai-compatible` provider forwards it on the request body — the SAME key
+        // the native request body carries.
+        let deep_extra = Map::from_iter([("reasoning_effort".to_string(), json!("high"))]);
+        let deep = render_with_extra(false, &deep_extra);
+        assert_eq!(
+            deep["provider"]["eaig"]["models"]["reviewer"]["options"]["reasoning_effort"],
+            "high"
+        );
+        // The capability boolean is UNCHANGED — the effort level is additive, not a replacement.
+        assert_eq!(
+            deep["provider"]["eaig"]["models"]["reviewer"]["reasoning"],
+            true
+        );
+
+        // Fast tier carries its own configured effort ("low") the same way; reasoning bool stays false.
+        let fast_extra = Map::from_iter([("reasoning_effort".to_string(), json!("low"))]);
+        let fast = render_with_extra(true, &fast_extra);
+        assert_eq!(
+            fast["provider"]["eaig"]["models"]["reviewer"]["options"]["reasoning_effort"],
+            "low"
+        );
+        assert_eq!(
+            fast["provider"]["eaig"]["models"]["reviewer"]["reasoning"],
+            false
+        );
+
+        // Empty `extra` adds nothing to options, and the reasoning bool behaves exactly as before.
+        let empty = render_with_extra(false, &Map::new());
+        assert!(
+            empty["provider"]["eaig"]["models"]["reviewer"]["options"]
+                .get("reasoning_effort")
+                .is_none(),
+            "empty extra must not inject any option: {}",
+            empty["provider"]["eaig"]["models"]["reviewer"]["options"]
+        );
+        assert_eq!(
+            empty["provider"]["eaig"]["models"]["reviewer"]["reasoning"],
+            true
+        );
+    }
+
+    #[test]
+    fn extra_threads_the_whole_map_not_just_reasoning_effort() {
+        // The whole `extra` map flows (parity with the native chat-body merge), so an operator's
+        // `top_p`/`max_tokens` reach eaig too — the fix is not special-cased to `reasoning_effort`.
+        let extra = Map::from_iter([
+            ("reasoning_effort".to_string(), json!("high")),
+            ("top_p".to_string(), json!(0.9)),
+            ("max_tokens".to_string(), json!(4096)),
+        ]);
+        let options =
+            &render_with_extra(false, &extra)["provider"]["eaig"]["models"]["reviewer"]["options"];
+        assert_eq!(options["reasoning_effort"], "high");
+        assert_eq!(options["top_p"], 0.9);
+        assert_eq!(options["max_tokens"], 4096);
+    }
+
+    #[test]
+    fn explicit_temperature_wins_over_a_temperature_in_extra() {
+        // `temperature` is a dedicated tier field; if an operator also puts one in `extra`, the explicit
+        // tier value takes precedence (extra is merged first, the tier temperature patched last).
+        let extra = Map::from_iter([("temperature".to_string(), json!(0.99))]);
+        let config = render_review_config(false, Some(0.1), &extra, &[], None).config;
+        assert_eq!(
+            config["provider"]["eaig"]["models"]["reviewer"]["options"]["temperature"],
+            0.1
+        );
+    }
+
+    #[test]
     fn forwards_attribution_as_provider_headers() {
         let config = render(
             false,
@@ -482,8 +590,8 @@ mod tests {
 
     #[test]
     fn absent_and_empty_overlay_are_no_ops_and_leave_no_breaches() {
-        let base_plus_injection = render_review_config(false, None, &[], None);
-        let empty_overlay = render_review_config(false, None, &[], Some(&json!({})));
+        let base_plus_injection = render_review_config(false, None, &Map::new(), &[], None);
+        let empty_overlay = render_review_config(false, None, &Map::new(), &[], Some(&json!({})));
         // Byte-identical (no behaviour change) and no floor breach for absent/empty overlay.
         assert_eq!(base_plus_injection.config, empty_overlay.config);
         assert!(base_plus_injection.floor_breaches.is_empty());
@@ -501,7 +609,7 @@ mod tests {
                 }
             }
         });
-        let rendered = render_review_config(false, None, &[], Some(&overlay));
+        let rendered = render_review_config(false, None, &Map::new(), &[], Some(&overlay));
         // The custom sub-agent is present…
         assert_eq!(rendered.config["agent"]["explore"]["mode"], "subagent");
         // …and the base `review` agent is untouched (recursive object merge).
@@ -519,7 +627,7 @@ mod tests {
             "provider": { "openrouter": { "npm": "@openrouter/ai-sdk-provider", "name": "OpenRouter" } },
             "model": "openrouter/some-model"
         });
-        let rendered = render_review_config(false, None, &[], Some(&overlay));
+        let rendered = render_review_config(false, None, &Map::new(), &[], Some(&overlay));
         assert_eq!(rendered.config["model"], "openrouter/some-model");
         assert_eq!(
             rendered.config["provider"]["openrouter"]["name"],
@@ -533,7 +641,7 @@ mod tests {
     #[test]
     fn overlay_opening_permission_bash_fires_the_floor_warning() {
         let overlay = json!({ "permission": { "bash": "allow" } });
-        let rendered = render_review_config(false, None, &[], Some(&overlay));
+        let rendered = render_review_config(false, None, &Map::new(), &[], Some(&overlay));
         // Full override took effect…
         assert_eq!(rendered.config["permission"]["bash"], "allow");
         // …AND the floor warning fired for it (only it — edit/webfetch still deny).
@@ -551,7 +659,7 @@ mod tests {
     #[test]
     fn overlay_re_enabling_a_builtin_fires_the_floor_warning() {
         let overlay = json!({ "tools": { "read": true } });
-        let rendered = render_review_config(false, None, &[], Some(&overlay));
+        let rendered = render_review_config(false, None, &Map::new(), &[], Some(&overlay));
         assert_eq!(rendered.config["tools"]["read"], true);
         assert!(
             rendered
@@ -567,7 +675,7 @@ mod tests {
     fn overlay_replacing_plugins_or_dropping_the_mcp_fires_the_floor_warning() {
         // Replacing the `plugin` ARRAY drops all three first-party plugins (full override on arrays).
         let overlay = json!({ "plugin": ["/some/custom/plugin.ts"] });
-        let rendered = render_review_config(false, None, &[], Some(&overlay));
+        let rendered = render_review_config(false, None, &Map::new(), &[], Some(&overlay));
         assert_eq!(
             rendered
                 .floor_breaches
@@ -581,7 +689,7 @@ mod tests {
 
         // Replacing the lightbridge MCP command is a breach.
         let overlay = json!({ "mcp": { "lightbridge": { "type": "local", "command": ["evil"], "enabled": true } } });
-        let rendered = render_review_config(false, None, &[], Some(&overlay));
+        let rendered = render_review_config(false, None, &Map::new(), &[], Some(&overlay));
         assert!(
             rendered
                 .floor_breaches

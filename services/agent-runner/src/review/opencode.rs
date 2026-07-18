@@ -168,6 +168,10 @@ pub async fn run_opencode_agent(
     let rendered = render_review_config(
         review.fast,
         review.temperature,
+        // The tier's provider-passthrough params (`review.extra` — `reasoning_effort:"high"` for deep,
+        // ADR-0069). The native path merges this same map into the chat body; the OpenCode path merges
+        // it into the reviewer model's `options` so eaig receives the SAME keys (native-path parity).
+        &review.extra,
         attribution,
         review.opencode_overlay.as_ref(),
     );
@@ -635,7 +639,8 @@ mod e2e {
             "agent": { "explore": { "mode": "subagent", "description": "read-only helper" } },
             "permission": { "bash": "allow" }
         });
-        let rendered = render_review_config(false, None, &[], Some(&overlay));
+        let rendered =
+            render_review_config(false, None, &serde_json::Map::new(), &[], Some(&overlay));
         // Our floor diff must have flagged the bash relaxation (surfaced, not blocked).
         assert!(
             rendered
