@@ -80,9 +80,25 @@ async function withLogger(
 
 // A `message.part.updated` bus event carrying a single part. Cast through unknown — the real Event is
 // a large discriminated union we don't need to reconstruct to drive the one branch under test.
-function partEvent(part: { type: string; text?: string }): {
+// `id` defaults to a stable value so a single-part test drives one tracked part; `end: true` on
+// `time` supplies the completion marker that flushes that part immediately (see the streaming model).
+type PartInput = {
+  type: string;
+  text?: unknown;
+  id?: string;
+  synthetic?: boolean;
+  ignored?: boolean;
+  done?: boolean;
+};
+function partEvent(input: PartInput): {
   event: Parameters<NonNullable<Hooks["event"]>>[0]["event"];
 } {
+  const { done, ...rest } = input;
+  const part: Record<string, unknown> = { id: "p1", ...rest };
+  // A reasoning part always carries a `time`; a text part only once it completes. `done` sets `end`.
+  if (done || input.type === "reasoning") {
+    part.time = { start: 1, ...(done ? { end: 2 } : {}) };
+  }
   return {
     event: { type: "message.part.updated", properties: { part } } as unknown as Parameters<
       NonNullable<Hooks["event"]>
@@ -90,11 +106,21 @@ function partEvent(part: { type: string; text?: string }): {
   };
 }
 
+// A bare bus event (session lifecycle, etc.) with arbitrary properties.
+function busEvent(
+  type: string,
+  properties: Record<string, unknown> = {},
+): { event: Parameters<NonNullable<Hooks["event"]>>[0]["event"] } {
+  return {
+    event: { type, properties } as unknown as Parameters<NonNullable<Hooks["event"]>>[0]["event"],
+  };
+}
+
 const find = (lines: LogLine[], message: string) => lines.filter((l) => l.message === message);
 
 test("text part → an info agent.content line at info level", async () => {
   await withLogger({ LCI_LOG_LEVEL: "info" }, async ({ hooks, lines }) => {
-    await hooks.event?.(partEvent({ type: "text", text: "The diff looks correct." }));
+    await hooks.event?.(partEvent({ type: "text", text: "The diff looks correct.", done: true }));
     const content = find(lines(), "agent.content");
     assert.equal(content.length, 1);
     assert.equal(content[0]?.level, "info");
@@ -105,7 +131,9 @@ test("text part → an info agent.content line at info level", async () => {
 
 test("reasoning part → a debug agent.reasoning line, suppressed at info", async () => {
   await withLogger({ LCI_LOG_LEVEL: "debug" }, async ({ hooks, lines }) => {
-    await hooks.event?.(partEvent({ type: "reasoning", text: "Let me check bounds first." }));
+    await hooks.event?.(
+      partEvent({ type: "reasoning", text: "Let me check bounds first.", done: true }),
+    );
     const reasoning = find(lines(), "agent.reasoning");
     assert.equal(reasoning.length, 1);
     assert.equal(reasoning[0]?.level, "debug");
@@ -119,9 +147,9 @@ test("reasoning part → a debug agent.reasoning line, suppressed at info", asyn
 
 test("empty / blank text part emits no line", async () => {
   await withLogger({ LCI_LOG_LEVEL: "debug" }, async ({ hooks, lines }) => {
-    await hooks.event?.(partEvent({ type: "text", text: "" }));
-    await hooks.event?.(partEvent({ type: "text", text: "   \n\t " }));
-    await hooks.event?.(partEvent({ type: "reasoning", text: "" }));
+    await hooks.event?.(partEvent({ type: "text", text: "", id: "a", done: true }));
+    await hooks.event?.(partEvent({ type: "text", text: "   \n\t ", id: "b", done: true }));
+    await hooks.event?.(partEvent({ type: "reasoning", text: "", id: "c", done: true }));
     assert.equal(find(lines(), "agent.content").length, 0);
     assert.equal(find(lines(), "agent.reasoning").length, 0);
   });
@@ -131,7 +159,7 @@ test("oversized content is truncated to the cap with a marker", async () => {
   await withLogger(
     { LCI_LOG_LEVEL: "info", LCI_LOG_CONTENT_CHARS: "10" },
     async ({ hooks, lines }) => {
-      await hooks.event?.(partEvent({ type: "text", text: "0123456789ABCDEFGHIJ" }));
+      await hooks.event?.(partEvent({ type: "text", text: "0123456789ABCDEFGHIJ", done: true }));
       const [line] = find(lines(), "agent.content");
       assert.equal(line?.text, "0123456789…[+10 chars]");
       assert.equal(line?.chars, 20);
@@ -229,6 +257,13 @@ test("bounded(): blank → undefined, cap 0 → unbounded, surrogate pairs never
   assert.equal(bounded("short", 10), "short");
   // "😀" is a surrogate pair (2 UTF-16 units, 1 code point). Cap 1 keeps the whole emoji intact.
   assert.equal(bounded("😀😀😀", 1), "😀…[+2 chars]");
+  // Exactly at the cap (code points, not UTF-16 units) returns whole — no marker.
+  assert.equal(bounded("😀😀😀", 3), "😀😀😀");
+  // Defensive: a non-string (number/object) returns undefined rather than throwing on .trim().
+  // biome-ignore lint/suspicious/noExplicitAny: exercising the defensive non-string branch.
+  assert.equal(bounded(123 as any, 10), undefined);
+  // biome-ignore lint/suspicious/noExplicitAny: exercising the defensive non-string branch.
+  assert.equal(bounded({ a: 1 } as any, 10), undefined);
 });
 
 test("resultText(): MCP content join, built-in output/title, string, JSON fallbacks", () => {
@@ -245,4 +280,107 @@ test("resultText(): MCP content join, built-in output/title, string, JSON fallba
   assert.equal(resultText({ title: "just a title" }), "just a title");
   assert.equal(resultText("bare string"), "bare string");
   assert.equal(resultText({ some: "obj" }), JSON.stringify({ some: "obj" }));
+});
+
+// --- streaming de-duplication (finding 1) ---------------------------------------------------------
+
+test("streaming: many updates for one part id → exactly ONE agent.content with the final text", async () => {
+  await withLogger({ LCI_LOG_LEVEL: "info" }, async ({ hooks, lines }) => {
+    // Three re-fires of the same part id with growing accumulated text; only the last completes.
+    await hooks.event?.(partEvent({ type: "text", id: "t1", text: "Hel" }));
+    await hooks.event?.(partEvent({ type: "text", id: "t1", text: "Hello wo" }));
+    await hooks.event?.(partEvent({ type: "text", id: "t1", text: "Hello world", done: true }));
+    const content = find(lines(), "agent.content");
+    assert.equal(content.length, 1);
+    assert.equal(content[0]?.text, "Hello world");
+    assert.equal(content[0]?.chars, "Hello world".length);
+  });
+});
+
+test("streaming: a part with no completion marker is flushed exactly once on session.idle", async () => {
+  await withLogger({ LCI_LOG_LEVEL: "info" }, async ({ hooks, lines }) => {
+    await hooks.event?.(partEvent({ type: "text", id: "t1", text: "part one" }));
+    await hooks.event?.(partEvent({ type: "text", id: "t1", text: "part one, final" }));
+    // No `done` marker — nothing emitted yet.
+    assert.equal(find(lines(), "agent.content").length, 0);
+    await hooks.event?.(busEvent("session.idle"));
+    const content = find(lines(), "agent.content");
+    assert.equal(content.length, 1);
+    assert.equal(content[0]?.text, "part one, final");
+  });
+});
+
+test("streaming: two distinct part ids in one cycle → two lines", async () => {
+  await withLogger({ LCI_LOG_LEVEL: "info" }, async ({ hooks, lines }) => {
+    await hooks.event?.(partEvent({ type: "text", id: "a", text: "first answer" }));
+    await hooks.event?.(partEvent({ type: "text", id: "b", text: "second answer" }));
+    await hooks.event?.(busEvent("session.idle"));
+    const content = find(lines(), "agent.content");
+    assert.equal(content.length, 2);
+    assert.deepEqual(content.map((l) => l.text).sort(), ["first answer", "second answer"]);
+  });
+});
+
+test("streaming: no double-emit across completion re-fire, idle flush, and dispose", async () => {
+  await withLogger({ LCI_LOG_LEVEL: "info" }, async ({ hooks, lines }) => {
+    // "done" completes via its marker, then re-fires again in the SAME cycle (emittedParts guards it
+    // from re-emitting). "open" never completes and rides the idle flush.
+    await hooks.event?.(partEvent({ type: "text", id: "done", text: "completed", done: true }));
+    await hooks.event?.(partEvent({ type: "text", id: "done", text: "completed", done: true }));
+    await hooks.event?.(partEvent({ type: "text", id: "open", text: "still open" }));
+    await hooks.event?.(busEvent("session.idle")); // flushes "open" once
+    await hooks.dispose?.(); // pending already drained — nothing to re-emit
+    const content = find(lines(), "agent.content");
+    assert.equal(content.length, 2);
+    assert.deepEqual(content.map((l) => l.text).sort(), ["completed", "still open"]);
+  });
+});
+
+// --- robustness & correctness fixes ---------------------------------------------------------------
+
+test("LCI_LOG_LEVEL set to a prototype key (toString) falls back to the info threshold", async () => {
+  await withLogger({ LCI_LOG_LEVEL: "toString" }, async ({ hooks, lines }) => {
+    // At the info threshold: content (info) is emitted, reasoning (debug) is suppressed. Under the
+    // old `in` check `threshold` would be a function and every level comparison would misbehave.
+    await hooks.event?.(partEvent({ type: "text", id: "t", text: "visible", done: true }));
+    await hooks.event?.(partEvent({ type: "reasoning", id: "r", text: "hidden", done: true }));
+    assert.equal(find(lines(), "agent.content").length, 1);
+    assert.equal(find(lines(), "agent.reasoning").length, 0);
+  });
+});
+
+test('boundedArgs: a no-arg tool logs no `args` field (never the string "undefined")', async () => {
+  await withLogger({ LCI_LOG_LEVEL: "debug" }, async ({ hooks, lines }) => {
+    await hooks["tool.execute.before"]?.(
+      { tool: "list_dir", sessionID: "s1", callID: "c1" },
+      // biome-ignore lint/suspicious/noExplicitAny: a tool invoked with no args.
+      { args: undefined } as any,
+    );
+    const [line] = find(lines(), "tool.start");
+    assert.ok(line);
+    assert.equal(line?.args, undefined);
+    assert.ok(!("args" in (line ?? {})));
+  });
+});
+
+test("synthetic / ignored text parts are never logged as agent.content", async () => {
+  await withLogger({ LCI_LOG_LEVEL: "info" }, async ({ hooks, lines }) => {
+    await hooks.event?.(
+      partEvent({ type: "text", id: "s", text: "injected", synthetic: true, done: true }),
+    );
+    await hooks.event?.(
+      partEvent({ type: "text", id: "i", text: "compacted", ignored: true, done: true }),
+    );
+    await hooks.event?.(busEvent("session.idle"));
+    assert.equal(find(lines(), "agent.content").length, 0);
+  });
+});
+
+test("a non-string part.text neither throws into the loop nor emits a line", async () => {
+  await withLogger({ LCI_LOG_LEVEL: "info" }, async ({ hooks, lines }) => {
+    // Malformed wire shape: `text` is a number. The guard + defensive bounded() must swallow it.
+    await hooks.event?.(partEvent({ type: "text", id: "bad", text: 42, done: true }));
+    await hooks.dispose?.();
+    assert.equal(find(lines(), "agent.content").length, 0);
+  });
 });

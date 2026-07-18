@@ -59,15 +59,34 @@ function readCap(name: string, fallback: number): number {
  * The slice of `text` to show on a log line, or `undefined` when it is blank (skip the line — a pure
  * tool-call turn has no prose). `cap === 0` returns the whole string; otherwise the text is bounded
  * to at most `cap` Unicode code points and a `…[+N chars]` marker records how many were dropped.
- * Iterating code points (via the string iterator / spread) never slices a surrogate pair.
+ * Iterating code points (via the string iterator) never slices a surrogate pair.
+ *
+ * Defensive by contract: a non-string `text` (any shape) returns `undefined` rather than throwing —
+ * this runs on the hot path off untrusted wire shapes and must never take the agent loop down.
+ * Allocation-free on the common path: the whole-string `Array.from` is gone. A string's UTF-16
+ * `length` is an upper bound on its code-point count, so when `length <= cap` the text provably fits
+ * and is returned as-is with zero allocation; only when we actually truncate do we materialize the
+ * kept prefix (never the whole string).
  */
 export function bounded(text: string | undefined | null, cap: number): string | undefined {
-  if (text === undefined || text === null || text.trim() === "") return undefined;
+  if (typeof text !== "string" || text.trim() === "") return undefined;
   if (cap === 0) return text;
-  const points = Array.from(text); // one entry per code point — never splits a surrogate pair
-  if (points.length <= cap) return text;
-  const dropped = points.length - cap;
-  return `${points.slice(0, cap).join("")}…[+${dropped} chars]`;
+  if (text.length <= cap) return text; // UTF-16 length ≥ code points ⇒ within cap, no allocation
+  const kept: string[] = [];
+  let count = 0;
+  for (const ch of text) {
+    if (count < cap) kept.push(ch); // one entry per code point — never splits a surrogate pair
+    count += 1;
+  }
+  if (count <= cap) return text; // surrogates collapsed the count back under the cap
+  return `${kept.join("")}…[+${count - cap} chars]`;
+}
+
+/** Count Unicode code points without allocating (the string iterator collapses surrogate pairs). */
+function countCodePoints(text: string): number {
+  let count = 0;
+  for (const _ of text) count += 1;
+  return count;
 }
 
 /**
@@ -108,7 +127,11 @@ export const LoggerPlugin: Plugin = async ({ project, directory, worktree }) => 
   // Config is read per factory invocation (once per task process). Keeping it here — rather than at
   // module top-level — means a test can exercise a fresh level/caps per call without re-importing.
   const envLevel = process.env.LCI_LOG_LEVEL as Level | undefined;
-  const threshold = envLevel !== undefined && envLevel in LEVELS ? LEVELS[envLevel] : LEVELS.info;
+  // `Object.hasOwn`, not `envLevel in LEVELS`: `in` walks the prototype chain, so `LCI_LOG_LEVEL`
+  // set to `toString`/`valueOf`/… would resolve to an inherited function and make `threshold` a
+  // function (never a number) — every level comparison would then misbehave. Own-key only.
+  const threshold =
+    envLevel !== undefined && Object.hasOwn(LEVELS, envLevel) ? LEVELS[envLevel] : LEVELS.info;
   const service = process.env.LCI_LOG_SERVICE ?? "lci-opencode";
   const reasoningCap = readCap("LCI_LOG_REASONING_CHARS", CAP_DEFAULT);
   const contentCap = readCap("LCI_LOG_CONTENT_CHARS", CAP_DEFAULT);
@@ -136,19 +159,66 @@ export const LoggerPlugin: Plugin = async ({ project, directory, worktree }) => 
     }
   };
 
-  // Serialize tool args to a bounded string for the `tool.start` line. Never throws.
-  const boundedArgs = (args: unknown): string | undefined => {
+  // A hook must NEVER throw into the agent loop (the recorder's contract). `log()` guards its own
+  // I/O, but the pre-log meta computation (bounding, code-point counts, wire-shape access) can throw
+  // on an unexpected event shape; `guard` contains that so a malformed event can't take the loop
+  // down. Mirrors the recorder's `guard` — swallow to stderr, never rethrow.
+  const guard = (fn: () => void): void => {
+    try {
+      fn();
+    } catch (error) {
+      console.error("[lci-logger] hook error (swallowed):", error);
+    }
+  };
+
+  // Serialize a value to a bounded JSON string for a log line. `undefined` in → `undefined` out (no
+  // `args`/`properties` field on the line), never the literal string "undefined". Never throws.
+  const boundedJson = (value: unknown, cap: number): string | undefined => {
+    if (value === undefined) return undefined;
     let serialized: string;
     try {
-      serialized = typeof args === "string" ? args : (JSON.stringify(args) ?? String(args));
+      serialized = typeof value === "string" ? value : (JSON.stringify(value) ?? String(value));
     } catch {
-      serialized = String(args);
+      serialized = String(value);
     }
-    return bounded(serialized, toolArgsCap);
+    return bounded(serialized, cap);
   };
+  const boundedArgs = (args: unknown): string | undefined => boundedJson(args, toolArgsCap);
 
   // callID → start time, for tool durations. tool.execute.after fires per call, so this stays small.
   const started = new Map<string, number>();
+
+  // Streaming de-duplication of `message.part.updated`.
+  //
+  // `message.part.updated` is a STREAMING event: on a token-streaming provider it re-fires on every
+  // chunk while a text/reasoning part grows, each fire carrying the accumulated `part.text` so far.
+  // Logging on every fire would emit hundreds of growing duplicate lines per message (at `info`, the
+  // default). Instead we upsert the latest snapshot per part id and emit each part EXACTLY ONCE with
+  // its final text — when the part signals completion (`part.time.end`), else on the per-cycle
+  // boundary (`session.idle`) or at `dispose`. `emittedParts` guards against a double-emit; both maps
+  // are cleared at each flush so the next cycle starts clean.
+  type PendingPart = { level: Level; message: string; text: unknown; cap: number };
+  const pendingParts = new Map<string, PendingPart>();
+  const emittedParts = new Set<string>();
+
+  const emitPart = (id: string, part: PendingPart): void => {
+    pendingParts.delete(id);
+    if (emittedParts.has(id)) return;
+    emittedParts.add(id);
+    const text = bounded(typeof part.text === "string" ? part.text : undefined, part.cap);
+    if (text !== undefined) {
+      log(part.level, part.message, {
+        chars: countCodePoints(typeof part.text === "string" ? part.text : ""),
+        text,
+      });
+    }
+  };
+
+  const flushParts = (): void => {
+    for (const [id, part] of pendingParts) emitPart(id, part);
+    pendingParts.clear();
+    emittedParts.clear();
+  };
 
   // Note: never put a `level`/`message`/`timestamp` key in meta — it would clobber the winston
   // top-level field of the same name (meta is spread last).
@@ -159,80 +229,132 @@ export const LoggerPlugin: Plugin = async ({ project, directory, worktree }) => 
 
   return {
     "tool.execute.before": async (input, output) => {
-      started.set(input.callID, Date.now());
-      // At debug, carry the tool INPUT args (bounded) so a forensic tail shows exactly what the
-      // model asked each tool to do — this is the observability surface, not just coarse timing.
-      log("debug", "tool.start", {
-        tool: input.tool,
-        callID: input.callID,
-        sessionID: input.sessionID,
-        args: enabled("debug") ? boundedArgs(output?.args) : undefined,
+      guard(() => {
+        started.set(input.callID, Date.now());
+        // At debug, carry the tool INPUT args (bounded) so a forensic tail shows exactly what the
+        // model asked each tool to do — this is the observability surface, not just coarse timing.
+        log("debug", "tool.start", {
+          tool: input.tool,
+          callID: input.callID,
+          sessionID: input.sessionID,
+          args: enabled("debug") ? boundedArgs(output?.args) : undefined,
+        });
       });
     },
     "tool.execute.after": async (input, output) => {
-      const startedAt = started.get(input.callID);
-      started.delete(input.callID);
-      log("info", "tool.done", {
-        tool: input.tool,
-        callID: input.callID,
-        sessionID: input.sessionID,
-        durationMs: startedAt === undefined ? undefined : Date.now() - startedAt,
-        // ok reflects the MCP result flag ({content,isError} at runtime for mediated tools); `title`
-        // is populated for built-in tools.
-        ok: (output as { isError?: boolean }).isError !== true,
-        title: (output as { title?: string }).title,
-      });
-      // At debug, a bounded preview of the tool's RESULT (either result shape — see resultText).
-      if (enabled("debug")) {
-        const preview = bounded(resultText(output), toolOutputCap);
-        if (preview !== undefined) {
-          log("debug", "tool.output", {
-            tool: input.tool,
-            callID: input.callID,
-            sessionID: input.sessionID,
-            preview,
-          });
+      guard(() => {
+        const startedAt = started.get(input.callID);
+        started.delete(input.callID);
+        log("info", "tool.done", {
+          tool: input.tool,
+          callID: input.callID,
+          sessionID: input.sessionID,
+          durationMs: startedAt === undefined ? undefined : Date.now() - startedAt,
+          // ok reflects the MCP result flag ({content,isError} at runtime for mediated tools);
+          // `title` is populated for built-in tools.
+          ok: (output as { isError?: boolean }).isError !== true,
+          title: (output as { title?: string }).title,
+        });
+        // At debug, a bounded preview of the tool's RESULT (either result shape — see resultText).
+        if (enabled("debug")) {
+          const preview = bounded(resultText(output), toolOutputCap);
+          if (preview !== undefined) {
+            log("debug", "tool.output", {
+              tool: input.tool,
+              callID: input.callID,
+              sessionID: input.sessionID,
+              preview,
+            });
+          }
         }
-      }
+      });
     },
     "permission.ask": async (input, output) => {
-      // Security-relevant: what the agent asked to do and how policy answered.
-      log("info", "permission.ask", {
-        type: (input as { type?: string }).type,
-        pattern: (input as { pattern?: string }).pattern,
-        status: output.status,
+      guard(() => {
+        // Security-relevant: what the agent asked to do and how policy answered.
+        log("info", "permission.ask", {
+          type: (input as { type?: string }).type,
+          pattern: (input as { pattern?: string }).pattern,
+          status: output.status,
+        });
       });
     },
     event: async ({ event }) => {
-      const type = event.type;
-      if (type === "message.part.updated") {
-        // The model's own output, streamed as parts. `text` is its visible answer (info — the
-        // review narrative); `reasoning` is its chain-of-thought (debug — the forensic overview).
-        // OpenCode 1.18.2 surfaces the visible answer as `part.type === "text"`.
-        const part = (event.properties as { part?: { type?: string; text?: string } } | undefined)
-          ?.part;
-        if (part?.type === "reasoning" && enabled("debug")) {
-          const text = bounded(part.text, reasoningCap);
-          if (text !== undefined) {
-            log("debug", "agent.reasoning", { chars: Array.from(part.text ?? "").length, text });
+      guard(() => {
+        const type = event.type;
+        if (type === "message.part.updated") {
+          // The model's own output, streamed as parts. `text` is its visible answer (info — the
+          // review narrative); `reasoning` is its chain-of-thought (debug — the forensic overview).
+          // OpenCode 1.18.2 surfaces the visible answer as `part.type === "text"`. This event is
+          // STREAMING: track the latest snapshot per part id and emit once (see the maps above).
+          const part = (
+            event.properties as
+              | {
+                  part?: {
+                    id?: string;
+                    type?: string;
+                    text?: unknown;
+                    synthetic?: boolean;
+                    ignored?: boolean;
+                    time?: { start?: number; end?: number };
+                  };
+                }
+              | undefined
+          )?.part;
+          if (part === undefined || typeof part.id !== "string") return;
+          if (part.type === "reasoning") {
+            if (!enabled("debug")) return; // reasoning is debug-only — don't even track at info
+            if (!emittedParts.has(part.id)) {
+              pendingParts.set(part.id, {
+                level: "debug",
+                message: "agent.reasoning",
+                text: part.text,
+                cap: reasoningCap,
+              });
+            }
+          } else if (part.type === "text") {
+            // Synthetic/injected parts aren't the model's genuine visible answer — never log them.
+            if (part.synthetic === true || part.ignored === true) return;
+            if (!emittedParts.has(part.id)) {
+              pendingParts.set(part.id, {
+                level: "info",
+                message: "agent.content",
+                text: part.text,
+                cap: contentCap,
+              });
+            }
+          } else {
+            return;
           }
-        } else if (part?.type === "text") {
-          const text = bounded(part.text, contentCap);
-          if (text !== undefined) {
-            log("info", "agent.content", { chars: Array.from(part.text ?? "").length, text });
+          // Emit as soon as the part signals completion; otherwise it flushes on session.idle.
+          if (part.time?.end) {
+            const pending = pendingParts.get(part.id);
+            if (pending !== undefined) emitPart(part.id, pending);
           }
+          return;
         }
-        return;
-      }
-      if (type === "session.error") {
-        log("error", "session.error", { properties: event.properties });
-      } else if (type.startsWith("session.")) {
-        log("info", type, { properties: event.properties });
-      }
-      // Other bus events (tool state) are covered by the hooks above.
+        if (type === "session.idle") {
+          // The per-cycle boundary: guarantee-flush any part that never got a completion marker.
+          flushParts();
+          log("info", type, { properties: event.properties });
+          return;
+        }
+        if (type === "session.error") {
+          // Bound the error payload (stack/properties can be unbounded) — reuse the tool-output cap.
+          log("error", "session.error", {
+            properties: boundedJson(event.properties, toolOutputCap),
+          });
+        } else if (type.startsWith("session.")) {
+          log("info", type, { properties: event.properties });
+        }
+        // Other bus events (tool state) are covered by the hooks above.
+      });
     },
     dispose: async () => {
-      log("info", "opencode plugin logger disposing");
+      guard(() => {
+        flushParts(); // last-chance flush for anything still pending at teardown
+        log("info", "opencode plugin logger disposing");
+      });
     },
   };
 };
