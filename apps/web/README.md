@@ -16,8 +16,9 @@ capabilities (`task:read/cancel`, `repo:read/approve/deny`, `review:read`, …).
 - **Overview** — insights (KPIs, runs-over-time, breakdowns; client-aggregated).
 - **Runs** — timeline + sortable/paginated table with filters and a ⌘K command palette; URL-synced state
   via `nuqs`.
-- **Run detail** — persisted review output, **live Job log stream** (read from Kubernetes via the web
-  pod's own ServiceAccount), and a Cancel action (gated on `task:cancel`).
+- **Run detail** — persisted review output, an **embedded Grafana/Loki log panel** for the run (the
+  generated `task-runs` dashboard's "Logs for $task_id" panel via a `d-solo` iframe; Epic #459), and a
+  Cancel action (gated on `task:cancel`).
 - **Repositories** — connected repos + approval/run activity.
 - **Approvals** (admin) — the repo approval gate (epic #75): a repo is indexed/reviewed only once
   approved; decisions are reversible.
@@ -59,5 +60,7 @@ pnpm --filter @lightbridge/web build
 pnpm exec biome check .                 # lint/format (run in apps/web)
 ```
 
-Env: `.env` for the OIDC issuer/client + the control-plane URL + `AGENT_NAMESPACE`/the kube access the
-log-stream route needs. See [docs/local-setup.md](../../docs/local-setup.md).
+Env: `.env` for the OIDC issuer/client + the control-plane URL + `AGENT_NAMESPACE` (used for the
+`kubectl logs` snippet on the run detail page) + `NEXT_PUBLIC_GRAFANA_URL` (client-visible base URL for
+the embedded run-logs panel; unset falls back to the `kubectl` snippet). See
+[docs/local-setup.md](../../docs/local-setup.md).
