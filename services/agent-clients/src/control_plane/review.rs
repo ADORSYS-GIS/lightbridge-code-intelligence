@@ -7,16 +7,27 @@ use uuid::Uuid;
 
 use super::ControlPlaneClient;
 
-/// One entry in the agent run transcript (ADR-0034): an assistant turn (its reasoning text +
-/// `tool_calls`, with the turn's token usage) or a tool result. Submitted in order; the control plane
-/// assigns the sequence. Tool-result content is truncated by the runner to keep the row bounded.
+/// One entry in the agent run transcript (ADR-0034): an assistant turn (its visible answer +
+/// chain-of-thought + `tool_calls`, with the turn's token usage) or a tool result. Submitted in
+/// order; the control plane assigns the sequence. Tool-result content is truncated by the runner to
+/// keep the row bounded.
+///
+/// `content` and `reasoning` are DISTINCT and mean the same thing across both hosts (native and
+/// OpenCode), per epic #459 / #461: `content` = the model's **visible message/answer**, `reasoning`
+/// = its **chain-of-thought**. Historically the OpenCode host wrote reasoning into `content`; that is
+/// fixed here — reasoning now has its own column.
 #[derive(Debug, Clone, Serialize)]
 pub struct TranscriptEntry {
     /// `assistant` or `tool`.
     pub role: String,
-    /// Assistant reasoning text or the tool result; `None` for an assistant turn that only called tools.
+    /// The model's VISIBLE answer text, or the tool result; `None` for an assistant turn that only
+    /// called tools (no prose).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
+    /// The assistant turn's chain-of-thought (`reasoning_content`); `None` on tool rows and on turns
+    /// with no reasoning. Distinct from `content` — never the visible answer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
     /// The assistant turn's `tool_calls` array (raw JSON), when it called tools.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<serde_json::Value>,

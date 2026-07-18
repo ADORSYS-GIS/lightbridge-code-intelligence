@@ -2,9 +2,14 @@
 //!
 //! The native host builds the transcript from the loop's `TranscriptSink` events; the OpenCode host
 //! has no such sink — the in-process recorder (ADR-0095) is its record of what happened. This maps the
-//! recorder's reasoning + tool events onto [`TranscriptEntry`]s so a review run on OpenCode is
-//! inspectable exactly like a native one: an assistant turn folds its buffered reasoning together with
-//! the tool call it then made; each tool result is its own `tool` entry.
+//! recorder's reasoning + visible-content + tool events onto [`TranscriptEntry`]s so a review run on
+//! OpenCode is inspectable exactly like a native one: an assistant turn folds its buffered
+//! chain-of-thought (`reasoning`) and its visible answer (`content`) together with the tool call it
+//! then made; each tool result is its own `tool` entry.
+//!
+//! The `content` vs `reasoning` split is identical to the native host (ADR-0034, epic #459 / #461):
+//! `content` = the model's **visible message/answer**, `reasoning` = its **chain-of-thought**. The
+//! recorder emits these as distinct `text.part` / `reasoning.part` events, so they never conflate.
 //!
 //! Token usage isn't carried per-event by the recorder, so the token fields stay `None` (a known gap
 //! vs the native `AssistantTurn` telemetry — the transcript is for inspection, not billing).
@@ -26,12 +31,14 @@ fn tool_display_name(event: &RecorderEvent) -> Option<String> {
 
 fn assistant_entry(
     content: Option<String>,
+    reasoning: Option<String>,
     tool_calls: Option<Value>,
     model: &str,
 ) -> TranscriptEntry {
     TranscriptEntry {
         role: "assistant".to_string(),
         content,
+        reasoning,
         tool_calls,
         tool_name: None,
         prompt_tokens: None,
@@ -45,6 +52,7 @@ fn tool_entry(tool_name: Option<String>, content: Option<String>) -> TranscriptE
     TranscriptEntry {
         role: "tool".to_string(),
         content,
+        reasoning: None,
         tool_calls: None,
         tool_name,
         prompt_tokens: None,
@@ -54,30 +62,45 @@ fn tool_entry(tool_name: Option<String>, content: Option<String>) -> TranscriptE
     }
 }
 
+/// Append `text` to `buf`, newline-joining consecutive slices (the recorder streams a part in slices).
+fn push_slice(buf: &mut String, text: &str) {
+    if !buf.is_empty() {
+        buf.push('\n');
+    }
+    buf.push_str(text);
+}
+
 /// Reconstruct transcript entries, in stream order, from the recorder events of a whole review run.
-/// `model` stamps each assistant turn (ADR-0034). Reasoning slices coalesce and attach to the tool
-/// call they precede; a trailing reasoning block with no following tool call becomes its own
-/// assistant entry.
+/// `model` stamps each assistant turn (ADR-0034). Reasoning (`reasoning.part`, chain-of-thought) and
+/// content (`text.part`, visible answer) slices each coalesce into their OWN buffer and attach to the
+/// tool call they precede — the assistant turn carries `content` = visible text, `reasoning` = CoT,
+/// never conflating them (epic #459 / #461). A trailing block with no following tool call becomes its
+/// own assistant entry.
 #[must_use]
 pub fn transcript_from_recorder(events: &[RecorderEvent], model: &str) -> Vec<TranscriptEntry> {
     let mut entries = Vec::new();
     let mut reasoning = String::new();
+    let mut content = String::new();
     // Buffer consecutive `tool.before`s so parallel calls (ADR-0042 batching) group into ONE assistant
     // turn's `tool_calls`, flushed on the first following `tool.after` (gemini #444) — not one assistant
     // entry per call.
     let mut pending: Vec<Value> = Vec::new();
-    let flush =
-        |entries: &mut Vec<TranscriptEntry>, reasoning: &mut String, pending: &mut Vec<Value>| {
-            if pending.is_empty() {
-                return;
-            }
-            let content = (!reasoning.is_empty()).then(|| std::mem::take(reasoning));
-            entries.push(assistant_entry(
-                content,
-                Some(Value::Array(std::mem::take(pending))),
-                model,
-            ));
-        };
+    let flush = |entries: &mut Vec<TranscriptEntry>,
+                 content: &mut String,
+                 reasoning: &mut String,
+                 pending: &mut Vec<Value>| {
+        if pending.is_empty() {
+            return;
+        }
+        let content = (!content.is_empty()).then(|| std::mem::take(content));
+        let reasoning = (!reasoning.is_empty()).then(|| std::mem::take(reasoning));
+        entries.push(assistant_entry(
+            content,
+            reasoning,
+            Some(Value::Array(std::mem::take(pending))),
+            model,
+        ));
+    };
     for event in events {
         match event.kind.as_str() {
             "reasoning.part" => {
@@ -87,10 +110,17 @@ pub fn transcript_from_recorder(events: &[RecorderEvent], model: &str) -> Vec<Tr
                     .and_then(|part| part.get("text"))
                     .and_then(Value::as_str)
                 {
-                    if !reasoning.is_empty() {
-                        reasoning.push('\n');
-                    }
-                    reasoning.push_str(text);
+                    push_slice(&mut reasoning, text);
+                }
+            }
+            "text.part" => {
+                if let Some(text) = event
+                    .part
+                    .as_ref()
+                    .and_then(|part| part.get("text"))
+                    .and_then(Value::as_str)
+                {
+                    push_slice(&mut content, text);
                 }
             }
             "tool.before" => {
@@ -110,27 +140,33 @@ pub fn transcript_from_recorder(events: &[RecorderEvent], model: &str) -> Vec<Tr
                 }));
             }
             "tool.after" => {
-                flush(&mut entries, &mut reasoning, &mut pending);
-                let content = event.result.as_ref().map(result_text);
-                entries.push(tool_entry(tool_display_name(event), content));
+                flush(&mut entries, &mut content, &mut reasoning, &mut pending);
+                let result = event.result.as_ref().map(result_text);
+                entries.push(tool_entry(tool_display_name(event), result));
             }
             _ => {}
         }
     }
-    // Trailing tool calls with no result (cycle cut), else a trailing reasoning block.
+    // Trailing tool calls with no result (cycle cut), else a trailing content/reasoning block that had
+    // no following tool call (e.g. the model's closing answer).
     if pending.is_empty() {
-        if !reasoning.is_empty() {
-            entries.push(assistant_entry(Some(reasoning), None, model));
+        if !content.is_empty() || !reasoning.is_empty() {
+            entries.push(assistant_entry(
+                (!content.is_empty()).then_some(content),
+                (!reasoning.is_empty()).then_some(reasoning),
+                None,
+                model,
+            ));
         }
     } else {
-        flush(&mut entries, &mut reasoning, &mut pending);
+        flush(&mut entries, &mut content, &mut reasoning, &mut pending);
     }
     entries
 }
 
 #[cfg(test)]
 mod tests {
-    use super::super::test_support::{after, before, reasoning};
+    use super::super::test_support::{after, before, reasoning, text};
     use super::*;
 
     #[test]
@@ -147,9 +183,11 @@ mod tests {
         let entries = transcript_from_recorder(&events, "eaig/reviewer");
 
         assert_eq!(entries.len(), 2);
-        // Assistant turn: reasoning + the tool call, stamped with the model.
+        // Assistant turn: chain-of-thought lands in `reasoning` (NOT `content`) + the tool call,
+        // stamped with the model. With no visible `text.part`, `content` stays None (epic #461).
         assert_eq!(entries[0].role, "assistant");
-        assert_eq!(entries[0].content.as_deref(), Some("I should read a.rs"));
+        assert_eq!(entries[0].reasoning.as_deref(), Some("I should read a.rs"));
+        assert_eq!(entries[0].content, None);
         assert_eq!(entries[0].model.as_deref(), Some("eaig/reviewer"));
         let call = &entries[0].tool_calls.as_ref().unwrap()[0];
         // Normalized to the native tool name.
@@ -182,11 +220,58 @@ mod tests {
         // finish's assistant turn + its tool entry + the trailing assistant reasoning.
         assert_eq!(entries.len(), 3);
         assert_eq!(entries[2].role, "assistant");
+        // The trailing chain-of-thought lands in `reasoning`, not `content` (epic #461).
         assert_eq!(
-            entries[2].content.as_deref(),
+            entries[2].reasoning.as_deref(),
             Some("a closing reflection with no tool")
         );
+        assert_eq!(entries[2].content, None);
         assert!(entries[2].tool_calls.is_none());
+    }
+
+    /// The F1+F3 fix (epic #459 / #461): a turn's VISIBLE answer (`text.part`) lands in `content`
+    /// and its chain-of-thought (`reasoning.part`) in `reasoning` — the two are captured and stored
+    /// distinctly, never conflated. Before the fix, content was dropped and reasoning was written to
+    /// `content`.
+    #[test]
+    fn separates_visible_content_from_reasoning_on_the_assistant_turn() {
+        let events = vec![
+            reasoning("Let me weigh the null path"),
+            text("This looks safe; the guard covers it."),
+            before(
+                "lightbridge_finish",
+                "c1",
+                serde_json::json!({"summary": "ok"}),
+            ),
+            after("lightbridge_finish", "c1", "will finalize"),
+        ];
+        let entries = transcript_from_recorder(&events, "m");
+        assert_eq!(entries[0].role, "assistant");
+        assert_eq!(
+            entries[0].content.as_deref(),
+            Some("This looks safe; the guard covers it."),
+            "visible text → content"
+        );
+        assert_eq!(
+            entries[0].reasoning.as_deref(),
+            Some("Let me weigh the null path"),
+            "chain-of-thought → reasoning"
+        );
+        // They are genuinely distinct strings, not the same value copied into both columns.
+        assert_ne!(entries[0].content, entries[0].reasoning);
+    }
+
+    /// A trailing visible answer (`text.part`) with no following tool call becomes its own assistant
+    /// entry carrying `content` (not `reasoning`).
+    #[test]
+    fn trailing_visible_content_without_a_tool_call_becomes_its_own_entry() {
+        let events = vec![text("Review complete. DONE.")];
+        let entries = transcript_from_recorder(&events, "m");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].role, "assistant");
+        assert_eq!(entries[0].content.as_deref(), Some("Review complete. DONE."));
+        assert_eq!(entries[0].reasoning, None);
+        assert!(entries[0].tool_calls.is_none());
     }
 
     /// Parallel tool calls (two `tool.before`s before any `tool.after`) group into ONE assistant turn
@@ -234,6 +319,20 @@ mod tests {
         let events = vec![
             reasoning("part one"),
             reasoning("part two"),
+            before("lightbridge_finish", "c1", serde_json::json!({})),
+            after("lightbridge_finish", "c1", "ok"),
+        ];
+        let entries = transcript_from_recorder(&events, "m");
+        // Consecutive chain-of-thought slices coalesce into the `reasoning` buffer (epic #461).
+        assert_eq!(entries[0].reasoning.as_deref(), Some("part one\npart two"));
+    }
+
+    /// Consecutive visible-answer slices coalesce into the `content` buffer, mirroring reasoning.
+    #[test]
+    fn coalesces_consecutive_content_slices() {
+        let events = vec![
+            text("part one"),
+            text("part two"),
             before("lightbridge_finish", "c1", serde_json::json!({})),
             after("lightbridge_finish", "c1", "ok"),
         ];

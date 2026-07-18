@@ -35,7 +35,7 @@ pub(super) fn after(tool: &str, call_id: &str, text: &str) -> RecorderEvent {
     }
 }
 
-/// A `reasoning.part` event (ADR-0060) carrying one reasoning slice.
+/// A `reasoning.part` event (ADR-0060) carrying one reasoning (chain-of-thought) slice.
 pub(super) fn reasoning(text: &str) -> RecorderEvent {
     RecorderEvent {
         kind: "reasoning.part".into(),
@@ -44,5 +44,18 @@ pub(super) fn reasoning(text: &str) -> RecorderEvent {
         args: None,
         result: None,
         part: Some(serde_json::json!({ "type": "reasoning", "text": text })),
+    }
+}
+
+/// A `text.part` event (ADR-0034, epic #459) carrying one visible-answer (content) slice — the
+/// model's user-facing prose, kept distinct from `reasoning`.
+pub(super) fn text(content: &str) -> RecorderEvent {
+    RecorderEvent {
+        kind: "text.part".into(),
+        tool: None,
+        call_id: None,
+        args: None,
+        result: None,
+        part: Some(serde_json::json!({ "type": "text", "text": content })),
     }
 }

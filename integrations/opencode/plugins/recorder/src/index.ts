@@ -71,13 +71,19 @@ export const RecorderPlugin: Plugin = async () => {
       );
     },
     event: async ({ event }) => {
-      // Reasoning capture (the ADR-0060 requirement) plus session lifecycle markers. Everything
-      // else on the bus is intentionally not persisted — tool fidelity comes from the hooks above.
+      // Reasoning + visible-answer capture (the ADR-0060/ADR-0034 requirement) plus session
+      // lifecycle markers. Everything else on the bus is intentionally not persisted — tool fidelity
+      // comes from the hooks above.
       guard(() => {
         if (event?.type === "message.part.updated") {
           const part = (event.properties as { part?: { type?: string } } | undefined)?.part;
           if (part?.type === "reasoning") {
             record({ kind: "reasoning.part", part });
+          } else if (part?.type === "text") {
+            // The model's VISIBLE answer text (OpenCode 1.18.2 emits assistant prose as `text`
+            // parts). Recorded distinctly from reasoning so the transcript builder (ADR-0034) can
+            // put content in `content` and chain-of-thought in `reasoning` — never conflating them.
+            record({ kind: "text.part", part });
           }
           return;
         }

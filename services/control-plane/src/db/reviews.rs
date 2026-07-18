@@ -257,6 +257,10 @@ pub struct TranscriptInput {
     pub role: String,
     #[serde(default)]
     pub content: Option<String>,
+    /// The model's chain-of-thought for an assistant turn (epic #459 / #461), distinct from the
+    /// visible answer in `content`. `None` on tool rows / turns with no reasoning.
+    #[serde(default)]
+    pub reasoning: Option<String>,
     #[serde(default)]
     pub tool_calls: Option<Value>,
     #[serde(default)]
@@ -278,6 +282,8 @@ pub struct TranscriptRow {
     pub seq: i32,
     pub role: String,
     pub content: Option<String>,
+    /// The assistant turn's chain-of-thought (epic #459 / #461), distinct from `content`.
+    pub reasoning: Option<String>,
     pub tool_calls: Option<Value>,
     pub tool_name: Option<String>,
     pub prompt_tokens: Option<i64>,
@@ -302,15 +308,16 @@ pub async fn replace_transcript(
     for (seq, e) in entries.iter().enumerate() {
         sqlx::query(
             "INSERT INTO agent_transcript \
-             (id, task_id, seq, role, content, tool_calls, tool_name, prompt_tokens, completion_tokens, \
-              reasoning_tokens, model) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+             (id, task_id, seq, role, content, reasoning, tool_calls, tool_name, prompt_tokens, \
+              completion_tokens, reasoning_tokens, model) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
         )
         .bind(Uuid::new_v4())
         .bind(task_id)
         .bind(seq as i32)
         .bind(&e.role)
         .bind(&e.content)
+        .bind(&e.reasoning)
         .bind(&e.tool_calls)
         .bind(&e.tool_name)
         .bind(e.prompt_tokens)
@@ -329,7 +336,8 @@ pub async fn get_transcript(
     task_id: Uuid,
 ) -> Result<Vec<TranscriptRow>, sqlx::Error> {
     sqlx::query_as::<_, TranscriptRow>(
-        "SELECT seq, role, content, tool_calls, tool_name, prompt_tokens, completion_tokens, created_at \
+        "SELECT seq, role, content, reasoning, tool_calls, tool_name, prompt_tokens, completion_tokens, \
+         created_at \
          FROM agent_transcript WHERE task_id = $1 ORDER BY seq",
     )
     .bind(task_id)

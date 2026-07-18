@@ -312,6 +312,7 @@ async fn review_and_knowledge_endpoints_preserve_their_wire_contracts() {
             "entries": [{
                 "role": "assistant",
                 "content": "checking",
+                "reasoning": "let me verify the null path",
                 "tool_calls": [{"id": "call-1"}],
                 "prompt_tokens": 10,
                 "completion_tokens": 4,
@@ -410,6 +411,7 @@ async fn review_and_knowledge_endpoints_preserve_their_wire_contracts() {
             &[TranscriptEntry {
                 role: "assistant".to_string(),
                 content: Some("checking".to_string()),
+                reasoning: Some("let me verify the null path".to_string()),
                 tool_calls: Some(serde_json::json!([{"id": "call-1"}])),
                 tool_name: None,
                 prompt_tokens: Some(10),

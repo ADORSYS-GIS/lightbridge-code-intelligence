@@ -115,6 +115,10 @@ pub(crate) fn append_transcript(
                 transcript.push(TranscriptEntry {
                     role: "assistant".to_string(),
                     content: message.content.clone(),
+                    // Chain-of-thought → `reasoning`, distinct from the visible answer in `content`
+                    // (epic #459 / #461, parity with the OpenCode host). Same source as the
+                    // `agent reasoning` log line above.
+                    reasoning: reasoning.map(str::to_string),
                     tool_calls: (!message.tool_calls.is_empty())
                         .then(|| serde_json::to_value(&message.tool_calls).unwrap_or_default()),
                     tool_name: None,
@@ -129,6 +133,7 @@ pub(crate) fn append_transcript(
                     transcript.push(TranscriptEntry {
                         role: "tool".to_string(),
                         content: Some(truncate_on_boundary(result, 2048).to_string()),
+                        reasoning: None,
                         tool_calls: None,
                         tool_name: Some(call.function.name.clone()),
                         prompt_tokens: None,

@@ -1670,6 +1670,7 @@ async fn transcript_replace_and_read(pool: PgPool) {
         TranscriptInput {
             role: "assistant".to_string(),
             content: Some("let me search".to_string()),
+            reasoning: Some("the diff touches a.rs; search it first".to_string()),
             tool_calls: Some(
                 serde_json::json!([{ "function": { "name": "lightbridge_vector_semantic_search" } }]),
             ),
@@ -1682,6 +1683,7 @@ async fn transcript_replace_and_read(pool: PgPool) {
         TranscriptInput {
             role: "tool".to_string(),
             content: Some("hit: a.rs".to_string()),
+            reasoning: None,
             tool_calls: None,
             tool_name: Some("lightbridge_vector_semantic_search".to_string()),
             prompt_tokens: None,
@@ -1696,7 +1698,17 @@ async fn transcript_replace_and_read(pool: PgPool) {
     assert_eq!(rows[0].seq, 0);
     assert_eq!(rows[0].role, "assistant");
     assert_eq!(rows[0].prompt_tokens, Some(1200));
+    // `content` (visible answer) and `reasoning` (chain-of-thought) round-trip as DISTINCT columns
+    // (epic #459 / #461) — reasoning is not conflated into content, and the tool row's reasoning is
+    // NULL.
+    assert_eq!(rows[0].content.as_deref(), Some("let me search"));
+    assert_eq!(
+        rows[0].reasoning.as_deref(),
+        Some("the diff touches a.rs; search it first")
+    );
+    assert_ne!(rows[0].content, rows[0].reasoning);
     assert_eq!(rows[1].role, "tool");
+    assert_eq!(rows[1].reasoning, None);
     assert_eq!(
         rows[1].tool_name.as_deref(),
         Some("lightbridge_vector_semantic_search")
@@ -1717,6 +1729,7 @@ async fn transcript_replace_and_read(pool: PgPool) {
     let second = vec![TranscriptInput {
         role: "assistant".to_string(),
         content: Some("done".to_string()),
+        reasoning: None,
         tool_calls: None,
         tool_name: None,
         prompt_tokens: Some(500),
