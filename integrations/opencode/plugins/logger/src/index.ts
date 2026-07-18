@@ -278,10 +278,14 @@ export const LoggerPlugin: Plugin = async ({ project, directory, worktree }) => 
             // shows up in a debug tail. Emit only the type + a bounded length, NEVER the text itself
             // (cheap, and it can't leak content). De-duped via `unknownParts` (cleared per cycle) so a
             // streaming unknown part doesn't spam one line per delta.
-            if (enabled("debug") && typeof part.type === "string" && !unknownParts.has(part.id)) {
+            if (enabled("debug") && !unknownParts.has(part.id)) {
               unknownParts.add(part.id);
+              // Stringify the type so a MISSING/undefined/null/non-string type — the most-unexpected
+              // shape, and the one most likely to be silently dropped (#411/#463) — still surfaces as
+              // "undefined"/"null"/"42" rather than vanishing. (`part.id` is already a string here —
+              // the outer guard returned otherwise — so `unknownParts` is safe.)
               log("debug", "agent.part.unknown", {
-                partType: part.type,
+                partType: typeof part.type === "string" ? part.type : String(part.type),
                 chars: typeof part.text === "string" ? countCodePoints(part.text) : undefined,
               });
             }

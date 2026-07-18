@@ -411,6 +411,37 @@ test("unknown part.type is suppressed below debug (info level)", async () => {
   });
 });
 
+test("a MISSING / non-string part.type still emits one agent.part.unknown (type stringified)", async () => {
+  // The most-unexpected shape — a part with a valid id but `type` undefined/null/numeric — is the one
+  // most likely to be silently dropped (#411/#463). It must surface, with the type stringified.
+  const rawPartEvent = (part: Record<string, unknown>) =>
+    ({
+      event: { type: "message.part.updated", properties: { part } },
+      // biome-ignore lint/suspicious/noExplicitAny: driving the branch with a hand-built wire shape.
+    }) as any;
+  await withLogger({ LCI_LOG_LEVEL: "debug" }, async ({ hooks, lines }) => {
+    // `type` absent entirely (valid string id keeps the per-part de-dupe safe).
+    await hooks.event?.(rawPartEvent({ id: "u-undef", text: "x" }));
+    await hooks.event?.(rawPartEvent({ id: "u-undef", text: "xx" })); // re-fire → still exactly one
+    // `type` a number.
+    await hooks.event?.(rawPartEvent({ id: "u-num", type: 42, text: "y" }));
+    // Known types are NOT reported as unknown.
+    await hooks.event?.(partEvent({ type: "reasoning", id: "r", text: "thinking", done: true }));
+    await hooks.event?.(partEvent({ type: "text", id: "t", text: "answer", done: true }));
+
+    const unknown = find(lines(), "agent.part.unknown");
+    assert.equal(unknown.length, 2);
+    assert.deepEqual(unknown.map((l) => l.partType).sort(), ["42", "undefined"]);
+    for (const line of unknown) {
+      assert.equal(line.level, "debug");
+      assert.ok(!("text" in line)); // never the text, only the type + a length
+    }
+    // The known parts still logged on their own channels.
+    assert.equal(find(lines(), "agent.reasoning").length, 1);
+    assert.equal(find(lines(), "agent.content").length, 1);
+  });
+});
+
 test("a non-string part.text neither throws into the loop nor emits a line", async () => {
   await withLogger({ LCI_LOG_LEVEL: "info" }, async ({ hooks, lines }) => {
     // Malformed wire shape: `text` is a number. The guard + defensive bounded() must swallow it.
