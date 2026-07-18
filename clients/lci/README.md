@@ -172,9 +172,8 @@ transcript carries a scrollbar and, while live, a `▼ N new` badge when you've 
 ```text
  ▍ LCI                    Host:  code-intelligence-api.a             <↵/l> open
  Lightbridge Code         User:  operator                            <Esc> back
- Intelligence             Perms: approve / deny / cancel               <G> tail
-                          Token: 5m00s   ● connected                  <m> mouse
-                                                                       <?> help
+ Intelligence             Perms: approve / deny / cancel              <m> mouse
+                          Token: 5m00s   ● connected                   <?> help
 
   Repositories (0)   Runs (5)  ▸  Run Detail
 ╭▐ Run 3f2504e0 ▌ ● done───────────────────────────────────────────────────────╮

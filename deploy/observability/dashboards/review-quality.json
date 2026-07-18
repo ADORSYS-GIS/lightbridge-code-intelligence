@@ -119,41 +119,6 @@
         "overrides": []
       },
       "gridPos": {
-        "h": 4,
-        "w": 6,
-        "x": 18,
-        "y": 0
-      },
-      "options": null,
-      "repeatDirection": "h",
-      "targets": [
-        {
-          "datasource": {
-            "type": "grafana-postgresql-datasource",
-            "uid": "${DS_POSTGRES}"
-          },
-          "editorMode": "code",
-          "format": "table",
-          "rawQuery": true,
-          "rawSql": "SELECT coalesce(sum(prompt_tokens + completion_tokens), 0) FROM agent_transcript tr JOIN tasks t ON t.id = tr.task_id WHERE $__timeFilter(t.created_at)",
-          "refId": "A"
-        }
-      ],
-      "title": "Tokens (range)",
-      "transformations": [],
-      "transparent": false,
-      "type": "stat"
-    },
-    {
-      "datasource": {
-        "type": "grafana-postgresql-datasource",
-        "uid": "${DS_POSTGRES}"
-      },
-      "fieldConfig": {
-        "defaults": {},
-        "overrides": []
-      },
-      "gridPos": {
         "h": 8,
         "w": 12,
         "x": 0,
@@ -238,76 +203,6 @@
             "uid": "${DS_POSTGRES}"
           },
           "editorMode": "code",
-          "format": "time_series",
-          "rawQuery": true,
-          "rawSql": "SELECT $__timeGroupAlias(t.created_at, $__interval), sum(tr.prompt_tokens) AS \"input\", sum(tr.completion_tokens) AS \"output\", sum(tr.reasoning_tokens) AS \"reasoning\" FROM agent_transcript tr JOIN tasks t ON t.id = tr.task_id WHERE $__timeFilter(t.created_at) GROUP BY 1 ORDER BY 1",
-          "refId": "A"
-        }
-      ],
-      "title": "Token usage (input / output / reasoning)",
-      "transformations": [],
-      "transparent": false,
-      "type": "timeseries"
-    },
-    {
-      "datasource": {
-        "type": "grafana-postgresql-datasource",
-        "uid": "${DS_POSTGRES}"
-      },
-      "fieldConfig": {
-        "defaults": {},
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 12
-      },
-      "options": null,
-      "repeatDirection": "h",
-      "targets": [
-        {
-          "datasource": {
-            "type": "grafana-postgresql-datasource",
-            "uid": "${DS_POSTGRES}"
-          },
-          "editorMode": "code",
-          "format": "table",
-          "rawQuery": true,
-          "rawSql": "SELECT tr.model AS metric, count(DISTINCT tr.task_id) AS value FROM agent_transcript tr JOIN tasks t ON t.id = tr.task_id WHERE tr.model IS NOT NULL AND $__timeFilter(t.created_at) GROUP BY tr.model ORDER BY value DESC",
-          "refId": "A"
-        }
-      ],
-      "title": "Runs by model",
-      "transformations": [],
-      "transparent": false,
-      "type": "bargauge"
-    },
-    {
-      "datasource": {
-        "type": "grafana-postgresql-datasource",
-        "uid": "${DS_POSTGRES}"
-      },
-      "fieldConfig": {
-        "defaults": {},
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 0,
-        "y": 20
-      },
-      "options": null,
-      "repeatDirection": "h",
-      "targets": [
-        {
-          "datasource": {
-            "type": "grafana-postgresql-datasource",
-            "uid": "${DS_POSTGRES}"
-          },
-          "editorMode": "code",
           "format": "table",
           "rawQuery": true,
           "rawSql": "SELECT reaction AS metric, count(*) AS value FROM review_feedback rf JOIN tasks t ON t.id = rf.task_id WHERE $__timeFilter(t.created_at) GROUP BY reaction ORDER BY value DESC",
@@ -332,7 +227,7 @@
         "h": 10,
         "w": 24,
         "x": 0,
-        "y": 28
+        "y": 20
       },
       "options": null,
       "repeatDirection": "h",
@@ -345,7 +240,7 @@
           "editorMode": "code",
           "format": "table",
           "rawQuery": true,
-          "rawSql": "SELECT rv.created_at AS \"reviewed\", coalesce(r.owner || '/' || r.name, t.repository_id::text) AS \"repository\", t.target_id AS \"pr\", (SELECT string_agg(DISTINCT tr.model, ', ') FROM agent_transcript tr WHERE tr.task_id = rv.task_id AND tr.model IS NOT NULL) AS \"model\", jsonb_array_length(rv.findings) AS \"findings\", rv.inline_count AS \"inline\", rv.deferred_count AS \"deferred\", rv.out_of_scope_count AS \"out_of_scope\", (SELECT coalesce(sum(prompt_tokens), 0) FROM agent_transcript tr WHERE tr.task_id = rv.task_id) AS \"in\", (SELECT coalesce(sum(completion_tokens), 0) FROM agent_transcript tr WHERE tr.task_id = rv.task_id) AS \"out\", (SELECT coalesce(sum(reasoning_tokens), 0) FROM agent_transcript tr WHERE tr.task_id = rv.task_id) AS \"reasoning\", (SELECT coalesce(max(seq) + 1, 0) FROM agent_transcript tr WHERE tr.task_id = rv.task_id) AS \"turns\" FROM reviews rv JOIN tasks t ON t.id = rv.task_id LEFT JOIN repositories r ON r.id = t.repository_id WHERE $__timeFilter(rv.created_at) ORDER BY rv.created_at DESC LIMIT 50",
+          "rawSql": "SELECT rv.created_at AS \"reviewed\", coalesce(r.owner || '/' || r.name, t.repository_id::text) AS \"repository\", t.target_id AS \"pr\", jsonb_array_length(rv.findings) AS \"findings\", rv.inline_count AS \"inline\", rv.deferred_count AS \"deferred\", rv.out_of_scope_count AS \"out_of_scope\" FROM reviews rv JOIN tasks t ON t.id = rv.task_id LEFT JOIN repositories r ON r.id = t.repository_id WHERE $__timeFilter(rv.created_at) ORDER BY rv.created_at DESC LIMIT 50",
           "refId": "A"
         }
       ],
