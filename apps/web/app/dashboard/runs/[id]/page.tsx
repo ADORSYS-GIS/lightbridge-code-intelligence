@@ -2,7 +2,7 @@ import { ArrowLeft, Ban, ExternalLink } from "lucide-react";
 import Link from "next/link";
 import { notFound } from "next/navigation";
 import { ReviewOutput } from "@/components/runs/review-output";
-import { RunLogs } from "@/components/runs/run-logs";
+import { RunLogsEmbed } from "@/components/runs/run-logs-embed";
 import { Button } from "@/components/ui/button";
 import { Card, CardBody, CardHeader, CardTitle } from "@/components/ui/card";
 import { CommandSnippet } from "@/components/ui/command-snippet";
@@ -157,7 +157,7 @@ export default async function RunDetail({ params }: { params: Promise<{ id: stri
         </CardHeader>
         {task.job_name ? (
           <CardBody className="flex flex-col gap-3">
-            <RunLogs taskId={task.id} />
+            <RunLogsEmbed taskId={task.id} />
             {K8S_NAME_RE.test(task.job_name) && (
               <CommandSnippet
                 label="Or stream from your terminal:"

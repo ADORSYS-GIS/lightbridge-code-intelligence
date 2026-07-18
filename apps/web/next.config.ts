@@ -9,9 +9,6 @@ const config: NextConfig = {
   outputFileTracingRoot: path.join(__dirname, "../../"),
   // @lightbridge/auth ships TypeScript source; let Next transpile it from the workspace.
   transpilePackages: ["@lightbridge/auth"],
-  // The Kubernetes client (used by the run-logs route) has dynamic requires that don't bundle; keep
-  // it external so Next loads it from node_modules at runtime in the Node server.
-  serverExternalPackages: ["@kubernetes/client-node"],
 };
 
 export default config;
