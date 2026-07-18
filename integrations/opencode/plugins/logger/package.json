@@ -9,7 +9,7 @@
   "scripts": {
     "build": "tsc --noEmit",
     "lint": "biome check .",
-    "test": "echo \"@lightbridge/opencode-plugin-logger: exercised by integrations/opencode/probe\""
+    "test": "node --experimental-strip-types --test 'src/**/*.test.ts'"
   },
   "devDependencies": {
     "@lightbridge/tsconfig": "workspace:*",

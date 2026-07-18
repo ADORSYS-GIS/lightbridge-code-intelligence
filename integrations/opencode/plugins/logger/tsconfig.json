@@ -1,4 +1,10 @@
 {
   "extends": "@lightbridge/tsconfig/base.json",
+  // The unit tests import `./index.ts` with an explicit extension — required by Node's
+  // `--experimental-strip-types` test runner (see package.json `test`). tsc allows the `.ts`
+  // extension under `noEmit` (the `build` script) only when this is enabled.
+  "compilerOptions": {
+    "allowImportingTsExtensions": true
+  },
   "include": ["src"]
 }
