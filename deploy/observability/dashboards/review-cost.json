@@ -1,0 +1,376 @@
+{
+  "annotations": {},
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "panels": [
+    {
+      "datasource": {
+        "type": "loki",
+        "uid": "${DS_LOKI}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 0,
+        "y": 0
+      },
+      "options": null,
+      "repeatDirection": "h",
+      "targets": [
+        {
+          "datasource": {
+            "type": "loki",
+            "uid": "${DS_LOKI}"
+          },
+          "expr": "sum(sum_over_time({service_name=\"envoy-ai-gateway\"} | json | oidc_jti=~\"runid:.+\" | account_id=~\"$repo\" | gen_ai_request_model=~\"$model\" | unwrap gen_ai_usage_custom_total_cost | __error__=\"\" [$__range])) / 1e6",
+          "queryType": "range",
+          "refId": "A"
+        }
+      ],
+      "title": "Billed cost (range)",
+      "transformations": [],
+      "transparent": false,
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "loki",
+        "uid": "${DS_LOKI}"
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 6,
+        "y": 0
+      },
+      "options": null,
+      "repeatDirection": "h",
+      "targets": [
+        {
+          "datasource": {
+            "type": "loki",
+            "uid": "${DS_LOKI}"
+          },
+          "expr": "count(sum by (oidc_jti) (count_over_time({service_name=\"envoy-ai-gateway\"} | json | oidc_jti=~\"runid:.+\" | account_id=~\"$repo\" | gen_ai_request_model=~\"$model\" [$__range])))",
+          "queryType": "range",
+          "refId": "A"
+        }
+      ],
+      "title": "Reviews (range)",
+      "transformations": [],
+      "transparent": false,
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "loki",
+        "uid": "${DS_LOKI}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 12,
+        "y": 0
+      },
+      "options": null,
+      "repeatDirection": "h",
+      "targets": [
+        {
+          "datasource": {
+            "type": "loki",
+            "uid": "${DS_LOKI}"
+          },
+          "expr": "avg(sum by (oidc_jti) (sum_over_time({service_name=\"envoy-ai-gateway\"} | json | oidc_jti=~\"runid:.+\" | account_id=~\"$repo\" | gen_ai_request_model=~\"$model\" | unwrap gen_ai_usage_custom_total_cost | __error__=\"\" [$__range]))) / 1e6",
+          "queryType": "range",
+          "refId": "A"
+        }
+      ],
+      "title": "Avg cost / review (range)",
+      "transformations": [],
+      "transparent": false,
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "loki",
+        "uid": "${DS_LOKI}"
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 18,
+        "y": 0
+      },
+      "options": null,
+      "repeatDirection": "h",
+      "targets": [
+        {
+          "datasource": {
+            "type": "loki",
+            "uid": "${DS_LOKI}"
+          },
+          "expr": "sum(sum_over_time({service_name=\"envoy-ai-gateway\"} | json | oidc_jti=~\"runid:.+\" | account_id=~\"$repo\" | gen_ai_request_model=~\"$model\" | unwrap gen_ai_usage_total_tokens | __error__=\"\" [$__range]))",
+          "queryType": "range",
+          "refId": "A"
+        }
+      ],
+      "title": "Total tokens (range)",
+      "transformations": [],
+      "transparent": false,
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "loki",
+        "uid": "${DS_LOKI}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 4
+      },
+      "options": null,
+      "repeatDirection": "h",
+      "targets": [
+        {
+          "datasource": {
+            "type": "loki",
+            "uid": "${DS_LOKI}"
+          },
+          "expr": "sum by (gen_ai_request_model) (sum_over_time({service_name=\"envoy-ai-gateway\"} | json | oidc_jti=~\"runid:.+\" | account_id=~\"$repo\" | gen_ai_request_model=~\"$model\" | unwrap gen_ai_usage_custom_total_cost | __error__=\"\" [$__range])) / 1e6",
+          "queryType": "range",
+          "refId": "A"
+        }
+      ],
+      "title": "Billed cost by model (range)",
+      "transformations": [],
+      "transparent": false,
+      "type": "table"
+    },
+    {
+      "datasource": {
+        "type": "loki",
+        "uid": "${DS_LOKI}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 4
+      },
+      "options": null,
+      "repeatDirection": "h",
+      "targets": [
+        {
+          "datasource": {
+            "type": "loki",
+            "uid": "${DS_LOKI}"
+          },
+          "expr": "sum by (account_id) (sum_over_time({service_name=\"envoy-ai-gateway\"} | json | oidc_jti=~\"runid:.+\" | account_id=~\"$repo\" | gen_ai_request_model=~\"$model\" | unwrap gen_ai_usage_custom_total_cost | __error__=\"\" [$__range])) / 1e6",
+          "queryType": "range",
+          "refId": "A"
+        }
+      ],
+      "title": "Billed cost by repository (range)",
+      "transformations": [],
+      "transparent": false,
+      "type": "bargauge"
+    },
+    {
+      "datasource": {
+        "type": "loki",
+        "uid": "${DS_LOKI}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 12
+      },
+      "options": null,
+      "repeatDirection": "h",
+      "targets": [
+        {
+          "datasource": {
+            "type": "loki",
+            "uid": "${DS_LOKI}"
+          },
+          "expr": "sum(sum_over_time({service_name=\"envoy-ai-gateway\"} | json | oidc_jti=~\"runid:.+\" | account_id=~\"$repo\" | gen_ai_request_model=~\"$model\" | unwrap gen_ai_usage_custom_total_cost | __error__=\"\" [$__interval])) / 1e6",
+          "queryType": "range",
+          "refId": "A"
+        }
+      ],
+      "title": "Billed cost per interval",
+      "transformations": [],
+      "transparent": false,
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "loki",
+        "uid": "${DS_LOKI}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 12
+      },
+      "options": null,
+      "repeatDirection": "h",
+      "targets": [
+        {
+          "datasource": {
+            "type": "loki",
+            "uid": "${DS_LOKI}"
+          },
+          "expr": "sum by (gen_ai_request_model) (sum_over_time({service_name=\"envoy-ai-gateway\"} | json | oidc_jti=~\"runid:.+\" | account_id=~\"$repo\" | gen_ai_request_model=~\"$model\" | unwrap gen_ai_usage_custom_total_cost | __error__=\"\" [$__interval])) / 1e6",
+          "queryType": "range",
+          "refId": "A"
+        }
+      ],
+      "title": "Billed cost per interval, by model",
+      "transformations": [],
+      "transparent": false,
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "loki",
+        "uid": "${DS_LOKI}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 12,
+        "w": 24,
+        "x": 0,
+        "y": 20
+      },
+      "options": null,
+      "repeatDirection": "h",
+      "targets": [
+        {
+          "datasource": {
+            "type": "loki",
+            "uid": "${DS_LOKI}"
+          },
+          "expr": "topk(500, sum by (oidc_jti, account_id, gen_ai_request_model) (sum_over_time({service_name=\"envoy-ai-gateway\"} | json | oidc_jti=~\"runid:.+\" | account_id=~\"$repo\" | gen_ai_request_model=~\"$model\" | unwrap gen_ai_usage_custom_total_cost | __error__=\"\" [$__range])) / 1e6)",
+          "queryType": "range",
+          "refId": "A"
+        }
+      ],
+      "title": "Review runs \u00d7 billed cost (range)",
+      "transformations": [],
+      "transparent": false,
+      "type": "table"
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 36,
+  "style": "dark",
+  "tags": [
+    "lightbridge",
+    "generated",
+    "cost"
+  ],
+  "templating": {
+    "list": [
+      {
+        "auto": false,
+        "auto_count": 30,
+        "auto_min": "10s",
+        "datasource": {
+          "type": "grafana-postgresql-datasource",
+          "uid": "${DS_POSTGRES}"
+        },
+        "hide": 0,
+        "id": "00000000-0000-0000-0000-000000000000",
+        "includeAll": false,
+        "label": "Repository",
+        "multi": false,
+        "name": "repo",
+        "query": "SELECT __text, __value FROM (  SELECT 'All' AS __text, '.+' AS __value, 0 AS ord   UNION ALL   SELECT owner || '/' || name AS __text, owner || '/' || name AS __value, 1 AS ord   FROM repositories) t ORDER BY ord, __text",
+        "skipUrlSync": false,
+        "type": "query"
+      },
+      {
+        "allValue": ".+",
+        "auto": false,
+        "auto_count": 30,
+        "auto_min": "10s",
+        "datasource": {
+          "type": "loki",
+          "uid": "${DS_LOKI}"
+        },
+        "hide": 0,
+        "id": "00000000-0000-0000-0000-000000000000",
+        "includeAll": true,
+        "label": "Model",
+        "multi": false,
+        "name": "model",
+        "query": "label_values(gen_ai_request_model)",
+        "refresh": 2,
+        "skipUrlSync": false,
+        "type": "query"
+      }
+    ]
+  },
+  "time": {
+    "from": "now-30d",
+    "to": "now"
+  },
+  "timezone": "browser",
+  "title": "Lightbridge \u2014 Review Cost",
+  "uid": "lci-review-cost"
+}

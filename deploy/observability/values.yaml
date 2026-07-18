@@ -60,6 +60,7 @@ dashboards:
   repositories: true
   review-quality: true
   review-runs: true
+  review-cost: true
   feedback: true
   ingress-dispatcher: true
   operations: true
