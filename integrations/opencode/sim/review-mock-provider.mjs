@@ -12,6 +12,11 @@ import { createServer } from "node:http";
 const port = Number(process.env.LCI_SIM_PROVIDER_PORT ?? "8899");
 const toolsLog = process.env.LCI_SIM_TOOLS_LOG;
 
+// The chain-of-thought the mock streams on every turn as `reasoning_content` (see streamResponse /
+// jsonResponse). Kept deterministic + greppable so the real-wire e2e can assert the `agent.reasoning`
+// line the logger emits carries it.
+const REASONING_TEXT = "Inspecting the change before I act.";
+
 function decide(messages, tools) {
   const toolNames = (tools ?? [])
     .map((t) => t?.function?.name ?? t?.name)
@@ -61,6 +66,12 @@ function streamResponse(res, decision) {
   });
   const base = { id: "chatcmpl-sim", object: "chat.completion.chunk", created: 0, model: "sim-model" };
   res.write(chunk({ ...base, choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }] }));
+  // Emit a reasoning delta (OpenAI/DeepSeek/GLM-lineage `reasoning_content`, per ADR-0060's captured
+  // real-provider shape) BEFORE the content/tool_calls delta. On the REAL wire, opencode's
+  // `@ai-sdk/openai-compatible` provider maps this to a `message.part.updated` with `part.type` of
+  // "reasoning", which the logger plugin surfaces as an `agent.reasoning` line — the F4 (#463) round-
+  // trip the real-wire e2e asserts on. Additive: the content/tool_calls delta still follows unchanged.
+  res.write(chunk({ ...base, choices: [{ index: 0, delta: { reasoning_content: REASONING_TEXT }, finish_reason: null }] }));
   if (decision.kind === "text") {
     res.write(chunk({ ...base, choices: [{ index: 0, delta: { content: decision.text }, finish_reason: null }] }));
     res.write(chunk({ ...base, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] }));
@@ -95,10 +106,11 @@ function streamResponse(res, decision) {
 function jsonResponse(res, decision) {
   const message =
     decision.kind === "text"
-      ? { role: "assistant", content: decision.text }
+      ? { role: "assistant", content: decision.text, reasoning_content: REASONING_TEXT }
       : {
           role: "assistant",
           content: null,
+          reasoning_content: REASONING_TEXT,
           tool_calls: [
             {
               id: `call_${Date.now()}`,

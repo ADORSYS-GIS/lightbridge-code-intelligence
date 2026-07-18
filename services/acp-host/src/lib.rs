@@ -57,13 +57,48 @@ impl AcpClient {
         policy: PermissionPolicy,
         env: &[(String, String)],
     ) -> Result<Self> {
+        let (client, _) = Self::spawn_impl(bin, cwd, policy, env, false).await?;
+        Ok(client)
+    }
+
+    /// Like [`spawn`](Self::spawn), but PIPES the child's stderr into a shared line buffer (one
+    /// `String` per line) instead of inheriting it, and returns that buffer alongside the client.
+    ///
+    /// TEST-ONLY seam: production uses [`spawn`](Self::spawn), which inherits stderr so the OpenCode
+    /// logger plugin's JSON lines flow straight to the pod → Loki pipeline. This variant lets an e2e
+    /// ASSERT on those lines (e.g. that a real review emits an `agent.reasoning` line) without a Loki
+    /// round-trip. It changes nothing about the production path.
+    pub async fn spawn_with_captured_stderr(
+        bin: &str,
+        cwd: &Path,
+        policy: PermissionPolicy,
+        env: &[(String, String)],
+    ) -> Result<(Self, Arc<Mutex<Vec<String>>>)> {
+        let (client, capture) = Self::spawn_impl(bin, cwd, policy, env, true).await?;
+        let capture = capture.expect("capture_stderr=true yields a buffer");
+        Ok((client, capture))
+    }
+
+    async fn spawn_impl(
+        bin: &str,
+        cwd: &Path,
+        policy: PermissionPolicy,
+        env: &[(String, String)],
+        capture_stderr: bool,
+    ) -> Result<(Self, Option<Arc<Mutex<Vec<String>>>>)> {
+        // Production inherits stderr (→ pod → Loki); the capture variant pipes it so a test can read it.
+        let stderr = if capture_stderr {
+            Stdio::piped()
+        } else {
+            Stdio::inherit()
+        };
         let mut child = Command::new(bin)
             .arg("acp")
             .current_dir(cwd)
             .envs(env.iter().map(|(key, value)| (key.as_str(), value.as_str())))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
+            .stderr(stderr)
             // Kill the opencode child if this AcpClient is dropped without an explicit shutdown() —
             // tokio does not reap the OS process on drop otherwise, which would orphan opencode.
             .kill_on_drop(true)
@@ -77,6 +112,17 @@ impl AcpClient {
         let pending: Pending = Arc::default();
         let updates: Arc<Mutex<Vec<Value>>> = Arc::default();
 
+        // Drain piped stderr into the shared buffer. Draining also matters mechanically: an unread pipe
+        // fills and would eventually block the child, so we only pipe when a caller wants the capture.
+        let capture = if capture_stderr {
+            let buffer: Arc<Mutex<Vec<String>>> = Arc::default();
+            let stderr = child.stderr.take().context("child stderr was not piped")?;
+            tokio::spawn(stderr_capture_loop(stderr, buffer.clone()));
+            Some(buffer)
+        } else {
+            None
+        };
+
         tokio::spawn(reader_loop(
             stdout,
             pending.clone(),
@@ -85,13 +131,16 @@ impl AcpClient {
             policy,
         ));
 
-        Ok(Self {
-            child,
-            stdin,
-            pending,
-            updates,
-            next_id: AtomicI64::new(1),
-        })
+        Ok((
+            Self {
+                child,
+                stdin,
+                pending,
+                updates,
+                next_id: AtomicI64::new(1),
+            },
+            capture,
+        ))
     }
 
     /// Issue a JSON-RPC request and await its correlated response.
@@ -180,6 +229,15 @@ impl AcpClient {
             .await
             .context("waiting for opencode acp child to exit")?;
         Ok(())
+    }
+}
+
+/// Drains the child's piped stderr into `buffer`, one line per entry. Only spawned by the
+/// `spawn_with_captured_stderr` (test) path; the production path inherits stderr and never pipes it.
+async fn stderr_capture_loop(stderr: tokio::process::ChildStderr, buffer: Arc<Mutex<Vec<String>>>) {
+    let mut lines = BufReader::new(stderr).lines();
+    while let Ok(Some(line)) = lines.next_line().await {
+        buffer.lock().await.push(line);
     }
 }
 

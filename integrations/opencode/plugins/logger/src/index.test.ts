@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { Plugin } from "@opencode-ai/plugin";
-import { bounded, LoggerPlugin, resultText } from "./index.ts";
+import { LoggerPlugin } from "./index.ts";
+import { bounded, resultText } from "./text.ts";
 
 // Node's built-in test runner (`node --experimental-strip-types --test`) — no vitest/jest, matching
 // the repo's zero-runtime-dep, `import type`-only plugin convention (the probe runs the same way).
@@ -373,6 +374,71 @@ test("synthetic / ignored text parts are never logged as agent.content", async (
     );
     await hooks.event?.(busEvent("session.idle"));
     assert.equal(find(lines(), "agent.content").length, 0);
+  });
+});
+
+// --- unknown part.type visibility (#463 F4, #411 silent-drop shape) ------------------------------
+
+test("unknown part.type → exactly one debug agent.part.unknown line; known types emit none", async () => {
+  await withLogger({ LCI_LOG_LEVEL: "debug" }, async ({ hooks, lines }) => {
+    // A future/renamed shape (e.g. `reasoning-delta`) re-fires per streaming delta with the SAME id;
+    // it must surface EXACTLY ONCE (on first sighting — an unknown shape has no known completion
+    // marker, so we can't wait), carrying the unrecognized type + a bounded length — not the text.
+    await hooks.event?.(partEvent({ type: "reasoning-delta", id: "u1", text: "chain of" }));
+    await hooks.event?.(partEvent({ type: "reasoning-delta", id: "u1", text: "chain of thought" }));
+    // Known types (text/reasoning) must NOT be reported as unknown.
+    await hooks.event?.(partEvent({ type: "text", id: "t", text: "answer", done: true }));
+    await hooks.event?.(partEvent({ type: "reasoning", id: "r", text: "thinking", done: true }));
+
+    const unknown = find(lines(), "agent.part.unknown");
+    assert.equal(unknown.length, 1);
+    assert.equal(unknown[0]?.level, "debug");
+    assert.equal(unknown[0]?.partType, "reasoning-delta");
+    // Length is the first-sighting snapshot ("chain of"), a magnitude signal, not the final text.
+    assert.equal(unknown[0]?.chars, "chain of".length);
+    // The raw text is never placed on the line — only the type + a length.
+    assert.ok(!("text" in (unknown[0] ?? {})));
+    // The known parts still logged on their own channels, not as unknown.
+    assert.equal(find(lines(), "agent.content").length, 1);
+    assert.equal(find(lines(), "agent.reasoning").length, 1);
+  });
+});
+
+test("unknown part.type is suppressed below debug (info level)", async () => {
+  await withLogger({ LCI_LOG_LEVEL: "info" }, async ({ hooks, lines }) => {
+    await hooks.event?.(partEvent({ type: "reasoning-delta", id: "u1", text: "hidden at info" }));
+    assert.equal(find(lines(), "agent.part.unknown").length, 0);
+  });
+});
+
+test("a MISSING / non-string part.type still emits one agent.part.unknown (type stringified)", async () => {
+  // The most-unexpected shape — a part with a valid id but `type` undefined/null/numeric — is the one
+  // most likely to be silently dropped (#411/#463). It must surface, with the type stringified.
+  const rawPartEvent = (part: Record<string, unknown>) =>
+    ({
+      event: { type: "message.part.updated", properties: { part } },
+      // biome-ignore lint/suspicious/noExplicitAny: driving the branch with a hand-built wire shape.
+    }) as any;
+  await withLogger({ LCI_LOG_LEVEL: "debug" }, async ({ hooks, lines }) => {
+    // `type` absent entirely (valid string id keeps the per-part de-dupe safe).
+    await hooks.event?.(rawPartEvent({ id: "u-undef", text: "x" }));
+    await hooks.event?.(rawPartEvent({ id: "u-undef", text: "xx" })); // re-fire → still exactly one
+    // `type` a number.
+    await hooks.event?.(rawPartEvent({ id: "u-num", type: 42, text: "y" }));
+    // Known types are NOT reported as unknown.
+    await hooks.event?.(partEvent({ type: "reasoning", id: "r", text: "thinking", done: true }));
+    await hooks.event?.(partEvent({ type: "text", id: "t", text: "answer", done: true }));
+
+    const unknown = find(lines(), "agent.part.unknown");
+    assert.equal(unknown.length, 2);
+    assert.deepEqual(unknown.map((l) => l.partType).sort(), ["42", "undefined"]);
+    for (const line of unknown) {
+      assert.equal(line.level, "debug");
+      assert.ok(!("text" in line)); // never the text, only the type + a length
+    }
+    // The known parts still logged on their own channels.
+    assert.equal(find(lines(), "agent.reasoning").length, 1);
+    assert.equal(find(lines(), "agent.content").length, 1);
   });
 });
 
