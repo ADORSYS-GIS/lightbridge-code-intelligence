@@ -40,22 +40,19 @@ jobs:
   # ── Compile the Rust workspace natively → one static-musl binary per service ──────────────────────
   rust-build:
     runs-on: [self-hosted, vymalo-vps]
-    # The vymalo-vps hosts have no C toolchain (`linker 'cc' not found`). Run inside the org's ARC
-    # image (build-essential + rustup stable + sccache baked); `--user root` because the host user
-    # cannot sudo and the musl toolchain still needs an apt install.
-    container:
-      image: ghcr.io/vymalo/arc-runners:latest
-      options: --user root
+    # The `vymalo-vps` label now resolves to ARC pod runners whose image
+    # (ghcr.io/vymalo/arc-runners:jdk21-node22) bakes build-essential + rustup stable + sccache. No
+    # Docker daemon on these pods, so steps run directly on the runner — no `container:` wrapper.
     env:
       TARGET: x86_64-unknown-linux-musl
     steps:
       - uses: actions/checkout@v4
-      # musl-gcc (musl-tools) links the static target; cmake+clang (baked, reinstalled cheaply) build
-      # aws-lc-sys' C/asm for musl. Add the musl target to the image's baked stable toolchain. Running
-      # as root in-container, so plain apt-get (no sudo, which is password-gated on the host).
+      # musl-gcc (musl-tools) links the static target; cmake+clang build aws-lc-sys' C/asm for musl.
+      # Add the musl target to the runner's baked stable toolchain. The ARC runner user has
+      # password-less sudo for apt, so install the musl bits with sudo.
       - name: Install musl + C toolchain
         run: |
-          apt-get update && apt-get install -y --no-install-recommends musl-tools cmake clang file
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools cmake clang file
           rustup target add x86_64-unknown-linux-musl
       - uses: Swatinem/rust-cache@v2
         with:
