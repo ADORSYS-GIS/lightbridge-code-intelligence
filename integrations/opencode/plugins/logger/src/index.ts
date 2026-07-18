@@ -1,4 +1,5 @@
 import type { Plugin } from "@opencode-ai/plugin";
+import { bounded, countCodePoints, resultText } from "./text.ts";
 
 /**
  * Structured JSON operational logger (RFC-0009 / ADR-0095 sibling of the recorder).
@@ -40,6 +41,11 @@ import type { Plugin } from "@opencode-ai/plugin";
  *   LCI_LOG_TOOL_ARGS_CHARS    cap for `tool.start` args        (default: 4000, `0` = unbounded)
  *   LCI_LOG_TOOL_OUTPUT_CHARS  cap for `tool.output` preview    (default: 4000, `0` = unbounded)
  * The char defaults mirror the native `REASONING_LOG_CHARS`/`CONTENT_LOG_CHARS` (4000).
+ *
+ * ⚠️ Single-export contract: this module exports ONLY `LoggerPlugin`. OpenCode's plugin loader
+ * instantiates EVERY export of a configured plugin module as a `Plugin`, so a stray helper export
+ * would be called as a plugin factory and crash the loader (see `./text.ts`). Pure helpers live in
+ * `./text.ts` and are imported, never re-exported from here.
  */
 
 type Level = "error" | "warn" | "info" | "debug";
@@ -55,74 +61,10 @@ function readCap(name: string, fallback: number): number {
   return Number.isNaN(parsed) || parsed < 0 ? fallback : parsed;
 }
 
-/**
- * The slice of `text` to show on a log line, or `undefined` when it is blank (skip the line — a pure
- * tool-call turn has no prose). `cap === 0` returns the whole string; otherwise the text is bounded
- * to at most `cap` Unicode code points and a `…[+N chars]` marker records how many were dropped.
- * Iterating code points (via the string iterator) never slices a surrogate pair.
- *
- * Defensive by contract: a non-string `text` (any shape) returns `undefined` rather than throwing —
- * this runs on the hot path off untrusted wire shapes and must never take the agent loop down.
- * Allocation-free on the common path: the whole-string `Array.from` is gone. A string's UTF-16
- * `length` is an upper bound on its code-point count, so when `length <= cap` the text provably fits
- * and is returned as-is with zero allocation; only when we actually truncate do we materialize the
- * kept prefix (never the whole string).
- */
-export function bounded(text: string | undefined | null, cap: number): string | undefined {
-  if (typeof text !== "string" || text.trim() === "") return undefined;
-  if (cap === 0) return text;
-  if (text.length <= cap) return text; // UTF-16 length ≥ code points ⇒ within cap, no allocation
-  const kept: string[] = [];
-  let count = 0;
-  for (const ch of text) {
-    if (count < cap) kept.push(ch); // one entry per code point — never splits a surrogate pair
-    count += 1;
-  }
-  if (count <= cap) return text; // surrogates collapsed the count back under the cap
-  return `${kept.join("")}…[+${count - cap} chars]`;
-}
-
-/** Count Unicode code points without allocating (the string iterator collapses surrogate pairs). */
-function countCodePoints(text: string): number {
-  let count = 0;
-  for (const _ of text) count += 1;
-  return count;
-}
-
-/**
- * Extract the human-visible preview text of a tool result, mirroring the native `result_text`
- * (services/review-agent/src/opencode/recorder.rs): join `content[].text` (the MCP shape the
- * mediated review tools return, `{content:[{type,text}],isError}`); else the built-in `output`/
- * `title` string; else a bare string; else JSON. Never throws.
- */
-export function resultText(result: unknown): string {
-  try {
-    if (result !== null && typeof result === "object") {
-      const obj = result as Record<string, unknown>;
-      const content = obj.content;
-      if (Array.isArray(content)) {
-        const joined = content
-          .map((item) =>
-            item !== null && typeof item === "object"
-              ? (item as { text?: unknown }).text
-              : undefined,
-          )
-          .filter((t): t is string => typeof t === "string")
-          .join("\n");
-        if (joined !== "") return joined;
-      }
-      for (const key of ["output", "title"] as const) {
-        const value = obj[key];
-        if (typeof value === "string") return value;
-      }
-    }
-    if (typeof result === "string") return result;
-    return JSON.stringify(result) ?? String(result);
-  } catch {
-    return String(result);
-  }
-}
-
+// The pure text helpers (`bounded`, `countCodePoints`, `resultText`) live in `./text.ts` and are
+// imported above — NOT defined or re-exported here. OpenCode's plugin loader treats every export of a
+// configured plugin module as a `Plugin` factory, so this entry module MUST export exactly one thing
+// (`LoggerPlugin`); see the header note in text.ts for the failure mode a stray export triggers.
 export const LoggerPlugin: Plugin = async ({ project, directory, worktree }) => {
   // Config is read per factory invocation (once per task process). Keeping it here — rather than at
   // module top-level — means a test can exercise a fresh level/caps per call without re-importing.
@@ -200,6 +142,10 @@ export const LoggerPlugin: Plugin = async ({ project, directory, worktree }) => 
   type PendingPart = { level: Level; message: string; text: unknown; cap: number };
   const pendingParts = new Map<string, PendingPart>();
   const emittedParts = new Set<string>();
+  // Per-part-id de-dupe for the `agent.part.unknown` visibility line (below) — mirrors the emit-once
+  // discipline of `emittedParts` so an unknown streaming part doesn't spam one line per delta. Cleared
+  // at each flush alongside the other maps so the next cycle starts clean.
+  const unknownParts = new Set<string>();
 
   const emitPart = (id: string, part: PendingPart): void => {
     pendingParts.delete(id);
@@ -218,6 +164,7 @@ export const LoggerPlugin: Plugin = async ({ project, directory, worktree }) => 
     for (const [id, part] of pendingParts) emitPart(id, part);
     pendingParts.clear();
     emittedParts.clear();
+    unknownParts.clear();
   };
 
   // Note: never put a `level`/`message`/`timestamp` key in meta — it would clobber the winston
@@ -324,6 +271,20 @@ export const LoggerPlugin: Plugin = async ({ project, directory, worktree }) => 
               });
             }
           } else {
+            // Unknown part.type — neither `reasoning` nor `text`. Rather than silently dropping it (the
+            // #411 "silent-drop" failure shape: a future provider/opencode version tagging reasoning or
+            // content differently — `reasoning-delta`, a nested or renamed shape — would vanish with
+            // ZERO signal), surface the UNRECOGNIZED type once per part id at debug so a shape drift
+            // shows up in a debug tail. Emit only the type + a bounded length, NEVER the text itself
+            // (cheap, and it can't leak content). De-duped via `unknownParts` (cleared per cycle) so a
+            // streaming unknown part doesn't spam one line per delta.
+            if (enabled("debug") && typeof part.type === "string" && !unknownParts.has(part.id)) {
+              unknownParts.add(part.id);
+              log("debug", "agent.part.unknown", {
+                partType: part.type,
+                chars: typeof part.text === "string" ? countCodePoints(part.text) : undefined,
+              });
+            }
             return;
           }
           // Emit as soon as the part signals completion; otherwise it flushes on session.idle.

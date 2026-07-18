@@ -381,6 +381,13 @@ async fn post_disclosure(client: &ControlPlaneClient, task_id: Uuid, disclosure:
 /// `Finished`. It uses the node mock provider + mock review MCP (no eaig, no control plane) under
 /// `integrations/opencode/sim`. Skipped (not failed) when `opencode`/`node` aren't on PATH, so CI —
 /// which has neither — stays green; run it locally to prove the host.
+///
+/// F4 (#463) also rides this same real run: at `LCI_LOG_LEVEL=debug` the mock provider emits an
+/// OpenAI-style `reasoning_content` delta (ADR-0060's captured real-provider shape), so real opencode
+/// surfaces a `message.part.updated` with `part.type:"reasoning"`, and the logger plugin — whose
+/// stderr we capture here — must turn that into an `agent.reasoning` line. This is the real-wire proof
+/// that reasoning reaches the logs, which no synthetic-event unit test can give (it can't catch a
+/// wire-shape drift — the #411 silent-drop failure shape).
 #[cfg(test)]
 mod e2e {
     use std::path::{Path, PathBuf};
@@ -509,11 +516,22 @@ mod e2e {
                 "lightbridge_finish".to_string(),
             ),
             ("LCI_GATE_REQUIRED_TOOLS".to_string(), String::new()),
+            // Debug level so the logger emits `agent.reasoning` (chain-of-thought is debug-only). The
+            // mock provider streams a `reasoning_content` delta, so a real reasoning part flows here.
+            ("LCI_LOG_LEVEL".to_string(), "debug".to_string()),
         ];
 
-        let acp = AcpClient::spawn("opencode", &workdir, PermissionPolicy::Cancel, &env)
-            .await
-            .expect("spawn opencode acp");
+        // Capture the opencode child's stderr (where the logger plugin writes) so the F4 assertion can
+        // prove `agent.reasoning` reaches the logs on the real wire. Production uses the plain `spawn`
+        // (stderr inherited → Loki); only this e2e pipes it.
+        let (acp, logger_stderr) = AcpClient::spawn_with_captured_stderr(
+            "opencode",
+            &workdir,
+            PermissionPolicy::Cancel,
+            &env,
+        )
+        .await
+        .expect("spawn opencode acp");
         acp.initialize().await.expect("initialize");
         let session_id = acp
             .new_session(&workdir.to_string_lossy(), serde_json::json!([]))
@@ -580,6 +598,23 @@ mod e2e {
         assert!(
             recorder.contains("finish"),
             "recorder missing finish:\n{recorder}"
+        );
+
+        // F4 (#463): the real run must have surfaced the model's reasoning to the LOGS. The mock
+        // streamed a `reasoning_content` delta, real opencode mapped it to a `part.type:"reasoning"`
+        // `message.part.updated`, and the logger plugin (stderr captured above) must have emitted an
+        // `agent.reasoning` line. Asserting on the real captured stderr — not a synthetic event — is
+        // what makes this a wire-shape-drift guard.
+        let logger_lines = logger_stderr.lock().await.clone();
+        let reasoning_lines: Vec<&String> = logger_lines
+            .iter()
+            .filter(|l| l.contains("\"message\":\"agent.reasoning\""))
+            .collect();
+        assert!(
+            !reasoning_lines.is_empty(),
+            "no `agent.reasoning` line reached the logger's stderr — reasoning did NOT round-trip \
+             from the real wire to the logs (F4). Captured logger stderr:\n{}",
+            logger_lines.join("\n")
         );
     }
 
