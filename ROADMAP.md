@@ -9,13 +9,24 @@ open a PR to fix this file.
 > **Keeping this current is part of "done."** When a PR meaningfully ships, unblocks, or retires an item
 > here, update its status in the **same PR** (see [AGENTS.md](AGENTS.md)).
 
-_Last updated: 2026-07-17._
+_Last updated: 2026-07-18._
 
 ## Recently shipped
 
 - **Review runs on OpenCode** — the live code-review path is hosted on OpenCode-over-ACP instead of the
   in-house agent loop; the tuned review gates and tools are reused, not reimplemented.
   ([ADR-0097](docs/adr/0097-review-runs-on-opencode.md), live in prod since 2026-07-17)
+- **OpenCode review observability — logs-only** — the DB run transcript is retired and Loki is the single
+  observability surface; the logger plugin emits leveled per-turn `agent.reasoning`/`agent.content`/
+  `agent.part.unknown`/`tool.done`/`tool.start`/`tool.output` lines, with the `agent.*` narrative signals
+  raised to info. ([ADR-0100](docs/adr/0100-retire-db-transcript-logs-as-observability.md), Epic #459 —
+  #461 tore out the transcript subsystem, #462 landed the leveled lines, #463 hardened the capture, #474
+  raised `agent.*` to info)
+- **Deep-tier reasoning-effort parity** — deep reviews send `reasoning_effort: "high"` again; the OpenCode
+  cutover had silently dropped it (rendering only a `reasoning` bool). Fixed by threading `review.extra`
+  into the OpenCode reviewer model options. ([ADR-0069](docs/adr/0069-review-tier-minimum-model-capability.md), #475)
+- **CI on ARC pod runners** — the `vymalo-vps` runner is now ARC pod runners (`ghcr.io/vymalo/arc-runners`,
+  rootless podman, **no dind**) instead of a Docker VM. (#476)
 - **Customer / external MCP tools in review** — a repo owner can attach their own MCP server (declared in
   the control-plane config); the control plane mediates it, so the runner never talks to it directly.
   ([ADR-0066](docs/adr/0066-deep-tier-external-knowledge-tools.md), #455)
@@ -37,12 +48,10 @@ _Last updated: 2026-07-17._
   its native-only modules.
 - **A2A per-finding review streaming** — stream findings as they are confirmed at finalize.
   ([ADR-0098](https://github.com/vymalo/lightbridge-code-intelligence/pull/458), #458 — open)
-- **OpenCode review observability — logs-only** (Epic #459) — the DB run transcript is **retired**
-  ([ADR-0100](docs/adr/0100-retire-db-transcript-logs-as-observability.md)); on the OpenCode path it was a
-  post-hoc record, not a replay seam. #461 tore out the transcript subsystem (both writers, the
-  `POST/GET /tasks/{id}/transcript` API, the `clients/lci` transcript view, `DROP TABLE agent_transcript`).
-  **Loki logs are the single observability surface;** #462 emits leveled per-turn reasoning/content/tool
-  lines from the logger plugin and #463 hardens that capture (both open).
+- **Rebuild the token/usage dashboard views on Loki** (Epic #459) — with `agent_transcript` dropped
+  ([ADR-0100](docs/adr/0100-retire-db-transcript-logs-as-observability.md)), the review-cost / token-usage
+  panels re-source model + usage from the Loki `gen_ai_request_model` label instead of the removed table;
+  the `review-quality`/`overview` transcript panels were removed. (#472)
 
 ## Planned — open epics
 

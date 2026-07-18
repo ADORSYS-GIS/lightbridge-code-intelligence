@@ -22,9 +22,12 @@ data purge work. Diagrams are Mermaid (rendered by GitHub).
 > elapsed time), served over a tiny bearer-authenticated axum endpoint (`GET /status`) the `run-once`
 > host runs **alongside** the loop (`services/agent-status`, wired in
 > `services/agent-runner/src/{run.rs,review/mod.rs}`). It exposes **only progress metadata** — never
-> the diff, file contents, finding bodies, secrets, or env — and is sourced by teeing the existing
-> loop transcript sink, so the loop's behaviour and the ADR-0034 transcript are **unchanged** (a
-> `StatusSink` that forwards every event verbatim). It is **flag-gated and OFF in prod**
+> the diff, file contents, finding bodies, secrets, or env — and is sourced by teeing the loop's
+> in-memory event sink via a behaviour-neutral `StatusSink` that forwards every event verbatim, so the
+> loop's behaviour is **unchanged**. (The status API's coupling to the ADR-0034 **DB** transcript was
+> removed with the transcript itself — #461 / [ADR-0100](adr/0100-retire-db-transcript-logs-as-observability.md);
+> run observability is now Loki-only, so the status API tees the same in-process event stream but no
+> longer feeds any persisted transcript.) It is **flag-gated and OFF in prod**
 > (`LCI_STATUS_API` unset ⇒ no handle, no sink wrapping, no server started — byte-identical to today);
 > a NetworkPolicy/Service to actually reach the port is deploy-side and out of scope. The **`serve`
 > host topology itself remains deferred** to its measurement gate — the post-Graphify review-footprint
@@ -186,7 +189,7 @@ flowchart TD
     end
 
     subgraph JOB["Agent runner Job (per task)"]
-        WORK["clone @ snapshot · (re)index if cold/index task ·<br/>review at the task's tier (native Rust loop)"]
+        WORK["clone @ snapshot · (re)index if cold/index task ·<br/>review at the task's tier (OpenCode-over-ACP host; native loop = fallback)"]
         POLL["self-cancel: poll own status every 10s"]
         REPORT["report_status → running / posting_result /<br/>succeeded / failed"]
     end

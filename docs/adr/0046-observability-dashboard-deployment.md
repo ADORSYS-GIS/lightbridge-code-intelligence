@@ -4,6 +4,13 @@
 - **Date:** 2026-06-24
 - **Deciders:** @stephane-segning
 
+> **Update (2026-07-18, [ADR-0100](0100-retire-db-transcript-logs-as-observability.md)):** the
+> `agent_transcript` table referenced below (decision 3 / References) was **dropped** with the DB run
+> transcript. Token-usage is therefore re-sourced off `agent_transcript` onto the **Loki**
+> `gen_ai_request_model` label; the `review-quality`/`overview` panels that read `agent_transcript` were
+> **removed**, and `review-cost` is kept on the Loki source. The Loki rebuild is tracked in **#472**. The
+> original decision below is unchanged as a point-in-time record.
+
 ## Context and Problem Statement
 
 The dashboards-as-code chart (`deploy/observability/`, [PR #30]) has existed since the observability

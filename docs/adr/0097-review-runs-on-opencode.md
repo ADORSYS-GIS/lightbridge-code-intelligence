@@ -1,9 +1,17 @@
 # ADR-0097: Review runs on OpenCode (RFC-0009 Phase 3 cutover)
 
-- **Status:** Accepted (owner-directed 2026-07-16) — host built + proven against real OpenCode; the
-  live dispatch cutover (slice 5) is gated on a shadow parity run
+- **Status:** Accepted (owner-directed 2026-07-16); **live in prod since 2026-07-17** — the dispatch
+  cutover (slice 5, #452) shipped and OpenCode-over-ACP is the live review host, so the native loop
+  ([ADR-0026](0026-native-review-agent.md)) is now the fallback/legacy path
 - **Date:** 2026-07-16
 - **Deciders:** @stephane-segning
+
+> **Update (2026-07-18):** live since 2026-07-17. The cutover initially **dropped the deep tier's
+> `reasoning_effort`** — the OpenCode reviewer model options rendered only a `reasoning` bool, so deep
+> reviews ran without the high effort the deep tier assumes. Fixed in **#475** by threading `review.extra`
+> into the reviewer model options, so deep sends `reasoning_effort: "high"` again (cross-ref
+> [ADR-0069](0069-review-tier-minimum-model-capability.md), the deep-tier capability floor). The original
+> decision text below is unchanged.
 
 ## Context and Problem Statement
 
