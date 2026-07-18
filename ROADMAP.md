@@ -48,10 +48,13 @@ _Last updated: 2026-07-18._
   its native-only modules.
 - **A2A per-finding review streaming** — stream findings as they are confirmed at finalize.
   ([ADR-0098](https://github.com/vymalo/lightbridge-code-intelligence/pull/458), #458 — open)
-- **Rebuild the token/usage dashboard views on Loki** (Epic #459) — with `agent_transcript` dropped
-  ([ADR-0100](docs/adr/0100-retire-db-transcript-logs-as-observability.md)), the review-cost / token-usage
-  panels re-source model + usage from the Loki `gen_ai_request_model` label instead of the removed table;
-  the `review-quality`/`overview` transcript panels were removed. (#472)
+- **Rebuild the token/usage dashboard views on Loki** (Epic #459) — with the DB run transcript dropped
+  ([ADR-0100](docs/adr/0100-retire-db-transcript-logs-as-observability.md)), the token/model panels are
+  rebuilt on the AI-Gateway (eaig) Loki billing stream instead of the removed table: `review-cost` was
+  re-sourced to the `gen_ai_request_model` label in #471, and the `review-quality` token/model panels
+  (tokens KPI, token time-series, runs-by-model, per-run token/model table) + the `overview` 24h token KPI
+  are rebuilt in #478. Reasoning-token split omitted — the gateway stream carries only a single total, no
+  input/output/reasoning breakdown. (#472, #478 — open)
 
 ## Planned — open epics
 
