@@ -245,8 +245,6 @@ async fn graph_get_callers_posts_op_and_parses_symbols() {
 
 #[tokio::test]
 async fn review_and_knowledge_endpoints_preserve_their_wire_contracts() {
-    use lci_agent_clients::TranscriptEntry;
-
     let server = MockServer::start().await;
     let task_id = Uuid::nil();
     let authenticated_post = |suffix: &str, body: serde_json::Value| {
@@ -303,22 +301,6 @@ async fn review_and_knowledge_endpoints_preserve_their_wire_contracts() {
     authenticated_post(
         "/review/finalize",
         serde_json::json!({ "outcome": "finished" }),
-    )
-    .mount(&server)
-    .await;
-    authenticated_post(
-        "/transcript",
-        serde_json::json!({
-            "entries": [{
-                "role": "assistant",
-                "content": "checking",
-                "tool_calls": [{"id": "call-1"}],
-                "prompt_tokens": 10,
-                "completion_tokens": 4,
-                "reasoning_tokens": 2,
-                "model": "review-model"
-            }]
-        }),
     )
     .mount(&server)
     .await;
@@ -404,22 +386,6 @@ async fn review_and_knowledge_endpoints_preserve_their_wire_contracts() {
         .finalize_review(task_id, "finished")
         .await
         .expect("finalize");
-    client
-        .submit_transcript(
-            task_id,
-            &[TranscriptEntry {
-                role: "assistant".to_string(),
-                content: Some("checking".to_string()),
-                tool_calls: Some(serde_json::json!([{"id": "call-1"}])),
-                tool_name: None,
-                prompt_tokens: Some(10),
-                completion_tokens: Some(4),
-                reasoning_tokens: Some(2),
-                model: Some("review-model".to_string()),
-            }],
-        )
-        .await
-        .expect("transcript");
 
     let symbols = client
         .graph_find_symbol(task_id, "parse", 3)

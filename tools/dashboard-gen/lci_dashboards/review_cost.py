@@ -35,6 +35,7 @@ regenerated `deploy/observability/dashboards/review-cost.json` (CI diffs it).
 from __future__ import annotations
 
 from grafana_foundation_sdk.builders import bargauge, dashboard, stat, table, timeseries
+from grafana_foundation_sdk.models.dashboard import VariableRefresh
 
 from .common import LOKI, POSTGRES, Layout, logql
 
@@ -85,11 +86,16 @@ def dashboard_builder() -> dashboard.Dashboard:
     layout = Layout()
 
     # --- Template variables ---
-    # repo/model still enumerate from Postgres (the app knows its repos + the models
-    # it ran); the VALUES are used as Loki label filters. "All" resolves to the regex
-    # `.+` so `account_id=~"$repo"` / `gen_ai_request_model=~"$model"` match every LCI
-    # run rather than an empty string. There is no "kind" (review/ask) filter here —
-    # the gateway log carries no task-kind; this board is review-traffic cost.
+    # The VALUES are used as Loki label filters; "All" resolves to the regex `.+` so
+    # `account_id=~"$repo"` / `gen_ai_request_model=~"$model"` match every LCI run rather
+    # than an empty string. There is no "kind" (review/ask) filter here — the gateway log
+    # carries no task-kind; this board is review-traffic cost.
+    #
+    # `repo` still enumerates from Postgres (the app knows its repos), baking the
+    # "All" → `.+` row into the SQL. `model`, by contrast, is sourced from the **Loki**
+    # gateway stream the panels already read (`gen_ai_request_model`), NOT from Postgres —
+    # the DB run transcript it used to read was torn out (ADR-0100). Its "All" → `.+`
+    # comes from Grafana-native include_all + all_value.
     repo_var = (
         dashboard.QueryVariable("repo")
         .label("Repository")
@@ -106,16 +112,11 @@ def dashboard_builder() -> dashboard.Dashboard:
     model_var = (
         dashboard.QueryVariable("model")
         .label("Model")
-        .datasource(POSTGRES)
-        .query(
-            "SELECT __text, __value FROM ("
-            "  SELECT 'All' AS __text, '.+' AS __value, 0 AS ord "
-            "  UNION ALL "
-            "  SELECT DISTINCT coalesce(model, 'unknown') AS __text, "
-            "         coalesce(model, 'unknown') AS __value, 1 AS ord "
-            "  FROM agent_transcript WHERE role = 'assistant' AND model IS NOT NULL"
-            ") t ORDER BY ord, __text"
-        )
+        .datasource(LOKI)
+        .query("label_values(gen_ai_request_model)")
+        .include_all(True)
+        .all_value(".+")
+        .refresh(VariableRefresh.ON_TIME_RANGE_CHANGED)
     )
 
     # --- Row 1: headline KPIs over the selected range (all from the gateway logs) ---

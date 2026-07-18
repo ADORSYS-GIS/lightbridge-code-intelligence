@@ -1,0 +1,13 @@
+-- Retire the agent run transcript table (epic #459 pivot, ADR-0100).
+--
+-- The DB transcript (ADR-0034, created in 0014, extended in 0017) is no longer an observability
+-- surface. On the OpenCode-over-ACP review path we do NOT own the agent loop, so the recorder →
+-- `transcript_from_recorder` reconstruction was a post-hoc record, never a replay/resume seam; its
+-- only remaining reader was the `clients/lci` TUI Run Detail view, which is also removed. The single
+-- observability surface is now Loki logs (the OpenCode logger plugin + the native path's per-turn
+-- `agent reasoning` / `agent content` log lines).
+--
+-- This DROP reverts 0014_agent_transcript.sql and 0017_transcript_model_and_reasoning.sql and
+-- supersedes ADR-0034 on the OpenCode path. Migrations here are forward-only: this is a hard cutover,
+-- not reversible in prod — the historical transcript rows are discarded with the table.
+DROP TABLE IF EXISTS agent_transcript;

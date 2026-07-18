@@ -1,8 +1,11 @@
-//! Reconstructing the ADR-0034 transcript from the loop's sink events.
+//! Per-turn proof-of-work log lines (ADR-0060) from the loop's sink events.
+//!
+//! The DB run transcript was retired in favour of logs-only observability (epic #459): Loki is the
+//! single observability surface. What survives here is the *logging* — each assistant turn's
+//! chain-of-thought (`agent reasoning`) and visible answer (`agent content`), emitted so a native run
+//! is legible from a live log tail.
 
-use lci_agent_clients::TranscriptEntry;
 use lci_agent_loop::TranscriptEvent;
-use lci_agent_types::ToolOutcome;
 use uuid::Uuid;
 
 /// Default cap for the per-turn `agent reasoning` log line (ADR-0060). A heavy reasoner (GLM-5.2) emits
@@ -36,109 +39,77 @@ fn bounded_for_log(text: &str, cap: usize) -> Option<&str> {
     })
 }
 
-/// Reconstruct the ADR-0034 transcript rows from the loop's sink events. Each `Assistant` event
-/// carries its own `telemetry` (ADR-0087: it rides the journaled `AssistantTurn`, not a side-channel
-/// keyed by position — a resumed/replayed turn's telemetry is exactly what was journaled with it,
-/// never silently empty; see #411/#417). Tool results carry the (bounded) outcome text — the
-/// finish/abort terminal outcomes record no tool row, matching the legacy loop. Policy events are not
-/// transcript rows.
-///
-/// Alongside the persisted rows, this emits per-turn proof-of-work log lines (ADR-0060) so a run is
-/// legible from a live log tail, not just the DB transcript: `agent reasoning` (the model's
-/// chain-of-thought) and `agent content` (its visible answer), each as its own line, each bounded and
-/// skipped when empty. Both matter to an operator: the reasoning shows *how* it got there, the content
-/// shows *what* it concluded.
-pub(crate) fn append_transcript(
-    transcript: &mut Vec<TranscriptEntry>,
-    events: &[TranscriptEvent],
-    task_id: Uuid,
-) {
+/// Emit per-turn proof-of-work log lines (ADR-0060) from the loop's sink events so a native run is
+/// legible from a live log tail (Loki is the observability surface — epic #459). Each `Assistant`
+/// event carries its own `telemetry` (ADR-0087: it rides the journaled `AssistantTurn`, not a
+/// side-channel keyed by position — a resumed/replayed turn's telemetry is exactly what was journaled
+/// with it; see #411/#417). Three lines per assistant turn: `agent turn complete` (token counts +
+/// chain-of-thought length), `agent reasoning` (the model's chain-of-thought), and `agent content`
+/// (its visible answer) — each bounded and skipped when empty. Both prose lines matter to an operator:
+/// the reasoning shows *how* it got there, the content shows *what* it concluded. Tool and policy
+/// events carry no prose, so they emit nothing here.
+pub(crate) fn log_agent_turns(events: &[TranscriptEvent], task_id: Uuid) {
     // Resolved once (this fn runs a single time over all events), not per turn.
     let reasoning_cap = log_cap("REASONING_LOG_CHARS", REASONING_LOG_CHARS_DEFAULT);
     let content_cap = log_cap("CONTENT_LOG_CHARS", CONTENT_LOG_CHARS_DEFAULT);
 
     for event in events {
-        match event {
-            TranscriptEvent::Assistant {
+        let TranscriptEvent::Assistant {
+            turn,
+            message,
+            telemetry,
+        } = event
+        else {
+            // Tool results / policy events carry no model prose — nothing to log.
+            continue;
+        };
+        let telemetry = telemetry.as_ref();
+        let reasoning = telemetry.and_then(|entry| entry.reasoning.as_deref());
+        let reasoning_chars = reasoning.map(|r| r.chars().count()).unwrap_or(0);
+        // Proof-of-work (epic #137): one concise per-turn line, including the chain-of-thought
+        // length (the reliable "how far did it think" signal even when the gateway folds reasoning
+        // into `completion_tokens`).
+        tracing::info!(
+            task_id = %task_id,
+            turn,
+            model = telemetry.map(|entry| entry.model.as_str()).unwrap_or("?"),
+            prompt_tokens = telemetry.and_then(|entry| entry.prompt_tokens).unwrap_or(-1),
+            completion_tokens = telemetry
+                .and_then(|entry| entry.completion_tokens)
+                .unwrap_or(-1),
+            reasoning_tokens = telemetry
+                .and_then(|entry| entry.reasoning_tokens)
+                .unwrap_or(-1),
+            reasoning_chars,
+            "agent turn complete"
+        );
+        // Proof-of-work (ADR-0060): log the model's chain-of-thought so a run is legible from a live
+        // log tail. This is the *thinking* (`reasoning_content`), not the visible answer — present
+        // even on pure tool-call turns; kept off `ChatMessage`, so it is logged here, never echoed
+        // back to the model. Restores the `agent reasoning` line dropped in the god-file split
+        // (#395/#423), which had degraded this signal to a bare char count.
+        if let Some(shown) = reasoning.and_then(|r| bounded_for_log(r, reasoning_cap)) {
+            tracing::info!(
+                task_id = %task_id,
                 turn,
-                message,
-                telemetry,
-            } => {
-                let telemetry = telemetry.as_ref();
-                let reasoning = telemetry.and_then(|entry| entry.reasoning.as_deref());
-                let reasoning_chars = reasoning.map(|r| r.chars().count()).unwrap_or(0);
-                // Proof-of-work (epic #137): one concise per-turn line, including the chain-of-thought
-                // length (the reliable "how far did it think" signal even when the gateway folds
-                // reasoning into `completion_tokens`).
-                tracing::info!(
-                    task_id = %task_id,
-                    turn,
-                    model = telemetry.map(|entry| entry.model.as_str()).unwrap_or("?"),
-                    prompt_tokens = telemetry.and_then(|entry| entry.prompt_tokens).unwrap_or(-1),
-                    completion_tokens = telemetry
-                        .and_then(|entry| entry.completion_tokens)
-                        .unwrap_or(-1),
-                    reasoning_tokens = telemetry
-                        .and_then(|entry| entry.reasoning_tokens)
-                        .unwrap_or(-1),
-                    reasoning_chars,
-                    "agent turn complete"
-                );
-                // Proof-of-work (ADR-0060): log the model's chain-of-thought so a run is legible from a
-                // live log tail. This is the *thinking* (`reasoning_content`), not the visible answer —
-                // present even on pure tool-call turns; kept off `ChatMessage`, so it is logged here,
-                // never echoed back to the model. Restores the `agent reasoning` line dropped in the
-                // god-file split (#395/#423), which had degraded this signal to a bare char count.
-                if let Some(shown) = reasoning.and_then(|r| bounded_for_log(r, reasoning_cap)) {
-                    tracing::info!(
-                        task_id = %task_id,
-                        turn,
-                        reasoning_chars,
-                        reasoning = %shown,
-                        "agent reasoning"
-                    );
-                }
-                // The model's visible answer for this turn (the text it would post / reason from next).
-                // Distinct from reasoning and equally load-bearing for an operator — a maintainer needs
-                // to see *what* the model said, not only how long it thought.
-                let content = message.content.as_deref();
-                let content_chars = content.map(|c| c.chars().count()).unwrap_or(0);
-                if let Some(shown) = content.and_then(|c| bounded_for_log(c, content_cap)) {
-                    tracing::info!(
-                        task_id = %task_id,
-                        turn,
-                        content_chars,
-                        content = %shown,
-                        "agent content"
-                    );
-                }
-                transcript.push(TranscriptEntry {
-                    role: "assistant".to_string(),
-                    content: message.content.clone(),
-                    tool_calls: (!message.tool_calls.is_empty())
-                        .then(|| serde_json::to_value(&message.tool_calls).unwrap_or_default()),
-                    tool_name: None,
-                    prompt_tokens: telemetry.and_then(|entry| entry.prompt_tokens),
-                    completion_tokens: telemetry.and_then(|entry| entry.completion_tokens),
-                    reasoning_tokens: telemetry.and_then(|entry| entry.reasoning_tokens),
-                    model: telemetry.map(|entry| entry.model.clone()),
-                });
-            }
-            TranscriptEvent::Tool { call, outcome, .. } => {
-                if let ToolOutcome::Continue(result) = outcome {
-                    transcript.push(TranscriptEntry {
-                        role: "tool".to_string(),
-                        content: Some(truncate_on_boundary(result, 2048).to_string()),
-                        tool_calls: None,
-                        tool_name: Some(call.function.name.clone()),
-                        prompt_tokens: None,
-                        completion_tokens: None,
-                        reasoning_tokens: None,
-                        model: None,
-                    });
-                }
-            }
-            TranscriptEvent::Policy { .. } => {}
+                reasoning_chars,
+                reasoning = %shown,
+                "agent reasoning"
+            );
+        }
+        // The model's visible answer for this turn (the text it would post / reason from next).
+        // Distinct from reasoning and equally load-bearing for an operator — a maintainer needs to
+        // see *what* the model said, not only how long it thought.
+        let content = message.content.as_deref();
+        let content_chars = content.map(|c| c.chars().count()).unwrap_or(0);
+        if let Some(shown) = content.and_then(|c| bounded_for_log(c, content_cap)) {
+            tracing::info!(
+                task_id = %task_id,
+                turn,
+                content_chars,
+                content = %shown,
+                "agent content"
+            );
         }
     }
 }
@@ -164,7 +135,7 @@ mod tests {
     use lci_agent_types::{AssistantTurn, TurnTelemetry};
     use uuid::Uuid;
 
-    use super::{append_transcript, bounded_for_log};
+    use super::{bounded_for_log, log_agent_turns};
 
     /// A cloneable in-memory `MakeWriter` so a scoped subscriber can capture the actual log output.
     #[derive(Clone, Default)]
@@ -185,9 +156,9 @@ mod tests {
         }
     }
 
-    /// The whole point of this change: a maintainer must SEE the reasoning and the content, as two
+    /// The whole point of this logging: a maintainer must SEE the reasoning and the content, as two
     /// separate console lines, not a bare `reasoning_chars` count. This captures the real `tracing`
-    /// output of `append_transcript` and asserts both texts are emitted.
+    /// output of `log_agent_turns` and asserts both texts are emitted.
     #[test]
     fn emits_separate_reasoning_and_content_lines_a_maintainer_can_read() {
         let events = vec![TranscriptEvent::Assistant {
@@ -211,7 +182,7 @@ mod tests {
             .with_ansi(false)
             .finish();
         tracing::subscriber::with_default(subscriber, || {
-            append_transcript(&mut Vec::new(), &events, Uuid::nil());
+            log_agent_turns(&events, Uuid::nil());
         });
         let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
 

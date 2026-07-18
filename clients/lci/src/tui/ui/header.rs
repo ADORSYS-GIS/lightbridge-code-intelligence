@@ -119,7 +119,6 @@ fn draw_keymenu(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         View::Detail => vec![
             entry("↵/l", "open", true),
             entry("Esc", "back", true),
-            entry("G", "tail", true),
             entry("m", "mouse", true),
             entry("?", "help", true),
         ],

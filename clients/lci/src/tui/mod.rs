@@ -31,12 +31,9 @@ use std::time::{Duration, Instant};
 use terminal::TerminalGuard;
 use tokio::sync::mpsc;
 
-/// Auto-refresh cadence.
+/// Auto-refresh cadence. Also refreshes an open detail page's task status + review (epic #459 made
+/// logs the run-observability surface, so there is no faster live-tail poll on the detail page).
 const REFRESH_INTERVAL: Duration = Duration::from_secs(5);
-
-/// Live-tail poll cadence for the open detail page (2–3s per the ticket). Faster than the list
-/// refresh so a running agent's new turns show promptly.
-const DETAIL_POLL_INTERVAL: Duration = Duration::from_millis(2500);
 
 /// Run the TUI until the operator quits. `api` is already authenticated; `me` and `token_expires_at`
 /// seed the status bar. `cfg` + `http` power background refresh.
@@ -57,8 +54,6 @@ pub async fn run(
     let mut refresh_timer = tokio::time::interval(REFRESH_INTERVAL);
     // The first tick fires immediately; we also kick an initial load below.
     let mut ui_tick = tokio::time::interval(Duration::from_millis(250));
-    // The live-tail poll for an open detail page (fires only while one is open + still live).
-    let mut detail_poll = tokio::time::interval(DETAIL_POLL_INTERVAL);
 
     // Kick the initial data + a token-refresh watchdog state.
     app.set_loading(true);
@@ -88,17 +83,6 @@ pub async fn run(
                 app.set_loading(true);
                 message::spawn_refresh_current_view(&app, &api, &tx);
                 message::maybe_spawn_token_refresh(&mut app, &cfg, &http, &tx, &mut last_refresh_attempt);
-            }
-
-            // --- live-tail poll for an open detail page (status + transcript) ---
-            _ = detail_poll.tick() => {
-                // `should_poll` includes the in-flight guard, so a slow backend can't stack polls.
-                if let Some(d) = app.detail.as_mut()
-                    && d.should_poll() {
-                        let id = d.task_id;
-                        d.tail_in_flight = true;
-                        message::spawn_detail_tail(id, &api, &tx);
-                    }
             }
 
             // --- lightweight UI tick (toast expiry + spinner + token countdown redraw) ---
@@ -131,14 +115,6 @@ pub async fn run(
         }
         if app.take_dirty() {
             guard.terminal.draw(|f| ui::draw(f, &app))?;
-            // The detail renderer measured the transcript geometry into `DetailState`'s cells during
-            // the draw; reconcile the scroll offset (autoscroll pin / clamp) now. If it moved, a
-            // follow-up redraw shows the corrected position without waiting for the next event.
-            if let Some(d) = app.detail.as_mut()
-                && d.sync_after_render()
-            {
-                guard.terminal.draw(|f| ui::draw(f, &app))?;
-            }
         }
     }
 

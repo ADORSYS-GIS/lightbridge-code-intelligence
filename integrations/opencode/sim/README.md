@@ -40,23 +40,14 @@ PASS  logger emitted tool.done with durationMs
 - The gate throws in `tool.execute.before`; opencode feeds the error back to the model, which then
   satisfies the precondition and retries — block-until enforcement (ADR-0095) end-to-end.
 
-## Probe item (c) — reasoning fidelity against real eaig
+## Probe item (c) — reasoning fidelity
 
-The one probe item the offline sim can't fake (it needs a real reasoning model). `opencode.eaig.jsonc`
-points the provider at the eaig OpenAI-compatible gateway; `run-eaig-reasoning.sh` runs the image,
-asks a reasoning-inducing prompt, and reports whether the recorder captured `reasoning.part` entries.
-
-**Run it in your environment** (eaig is internal — HTTPS + a mounted CA — so this was *not* verified
-from the build sandbox; the config shape *was* validated: opencode 1.18.2 accepts the provider/agent):
-
-```
-LCI_EAIG_BASE_URL=https://eaig.internal/.../v1 \
-LCI_EAIG_API_KEY=... LCI_EAIG_MODEL=<reasoning-capable-model> LCI_EAIG_CA=/path/to/internal-ca.pem \
-  integrations/opencode/sim/run-eaig-reasoning.sh
-```
-
-A PASS (≥1 `reasoning.part`) closes item (c) and, with the offline sim's b/d/e/f, completes the
-RFC-0009 Phase-0 gate.
+Historically this item verified that per-turn reasoning survived the eaig path and reached the
+**recorder** as `reasoning.part` entries (via `opencode.eaig.jsonc` + `run-eaig-reasoning.sh`). Epic
+#459 retired that mechanism: the recorder no longer records reasoning, and run observability moved to
+**Loki logs** (the logger plugin, `LCI_LOG_LEVEL`). The reasoning-reaches-the-logs probe is re-homed
+onto the logger plugin under #462/#463; the old recorder-reasoning probe (script + `opencode.eaig.jsonc`)
+was removed here with the transcript teardown (#461).
 
 ## Bug this harness caught
 

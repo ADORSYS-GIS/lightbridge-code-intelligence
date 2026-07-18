@@ -356,46 +356,6 @@ pub struct ChunkBatch {
     pub chunks: Vec<ChunkInput>,
 }
 
-/// Body for `POST /internal/tasks/{id}/transcript` — the agent run transcript (ADR-0034).
-#[derive(Debug, Deserialize)]
-pub struct TranscriptSubmission {
-    pub entries: Vec<crate::db::TranscriptInput>,
-}
-
-/// `POST /internal/tasks/{id}/transcript` — store the agent run transcript (ADR-0034). Replaces any
-/// prior transcript for the task (a retry re-submits the whole thing).
-pub async fn ingest_transcript(
-    _auth: RunnerAuth,
-    State(state): State<AppState>,
-    Path(id): Path<Uuid>,
-    Json(submission): Json<TranscriptSubmission>,
-) -> Response {
-    let Some(pool) = state.db.as_ref() else {
-        return (StatusCode::SERVICE_UNAVAILABLE, "no database").into_response();
-    };
-    // Resolve the task first so an unknown id is a clean 404 rather than a foreign-key 500 on insert
-    // (mirrors `ingest_chunks`/`ingest_graph`).
-    match sqlx::query_scalar::<_, Uuid>("SELECT id FROM tasks WHERE id = $1")
-        .bind(id)
-        .fetch_optional(pool)
-        .await
-    {
-        Ok(Some(_)) => {}
-        Ok(None) => return (StatusCode::NOT_FOUND, "task not found").into_response(),
-        Err(error) => {
-            tracing::error!(%error, task_id = %id, "load task for transcript failed");
-            return (StatusCode::INTERNAL_SERVER_ERROR, "query error").into_response();
-        }
-    }
-    match crate::db::replace_transcript(pool, id, &submission.entries).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(error) => {
-            tracing::error!(%error, task_id = %id, "storing transcript failed");
-            (StatusCode::INTERNAL_SERVER_ERROR, "store error").into_response()
-        }
-    }
-}
-
 /// Body for `POST /internal/tasks/{id}/review/telemetry` — run-level review telemetry submitted at run
 /// START (extends ADR-0034/0017/0060). `tools` is the exact set OFFERED to the model this run (per-tier
 /// allowlist ADR-0062 + MCP-discovered tools ADR-0066), each `{name, source}`; `config_b64` is the

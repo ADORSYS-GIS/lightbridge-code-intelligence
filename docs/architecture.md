@@ -131,7 +131,7 @@ each role is its own Deployment so they scale independently ([RFC-0001](rfc/0001
   (below). The **internal runner API** (`/internal/tasks/{id}/*`) is authenticated by a per-task token
   (`AGENT_RUNNER_TOKEN`, HS256-signed from `RUNNER_TOKEN_SIGNING_KEY`, [ADR-0092](adr/0092-per-task-runner-tokens.md)),
   not OIDC — it serves the Job's context fetch, chunk/graph ingest, scoped
-  retrieval (`/search`, `/graph/query`), transcript submission, and the mediated review write actions
+  retrieval (`/search`, `/graph/query`), and the mediated review write actions
   (`/review/inline`, `/review/comment`, `/review/summary`, `/review/finalize`). `serve` holds the
   GitHub App key for **reads only**.
 - **`dispatcher`** — the queue consumer (`services/control-plane/src/queue/`). It claims a queued task
@@ -154,7 +154,7 @@ on a `dedup_key`; the reconciler just ships the bytes. This is the single PR out
 ### Data stores
 
 - **Postgres** — task queue and lifecycle, `github_deliveries`, the `github_outbox`, review findings
-  and feedback, agent transcripts, and the semantic chunk table. Migrations under
+  and feedback, and the semantic chunk table. Migrations under
   `services/control-plane/migrations/` (latest: `0021_task_tier.sql`). Dual retrieval
   ([ADR-0003](adr/0003-dual-retrieval-neo4j-pgvector.md)) uses pgvector for embeddings.
 - **pgvector** — semantic code chunks with their embeddings. Embeddings come from an OpenAI-compatible
@@ -180,7 +180,7 @@ self-cancels promptly on SIGTERM or when it observes its own task gone terminal 
 ### Web & auth tier
 
 `apps/web` is a Next.js (App Router) operator console (`app/dashboard`, `app/api`, `middleware.ts`)
-over the control plane: repository onboarding/approval, task history, index status, transcripts, audit.
+over the control plane: repository onboarding/approval, task history, index status, audit.
 Authentication is delegated to **Keycloak** OIDC ([ADR-0014](adr/0014-keycloak-oidc-resource-server.md)) —
 the web app is an OIDC client (Authorization-Code + PKCE) that stores the access token in an httpOnly
 cookie; the control plane is a pure OAuth2 **resource server** that validates the bearer JWT against
@@ -268,7 +268,6 @@ sequenceDiagram
     J->>S: search / graph query (deep, scoped to snapshot)
     J->>S: add_review_comment / add_comment / finish
   end
-  J->>S: POST /internal/tasks/{id}/transcript
   J->>S: POST /internal/tasks/{id}/review/finalize
   S->>S: verification/refute pass, coverage gate, dedup
   S->>S: enqueue review intent → github_outbox

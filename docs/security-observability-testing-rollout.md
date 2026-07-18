@@ -58,15 +58,16 @@ The `Caller` axum extractor carries the verified `Claims` plus the parsed permis
 |----------------|-----------------------------------------------------------------------------------|
 | `task:read`    | `GET /tasks`, `GET /tasks/{id}`                                                    |
 | `task:cancel`  | `POST /tasks/{id}/cancel`                                                          |
-| `review:read`  | `GET /tasks/{id}/review`, `GET /tasks/{id}/transcript`, `GET /tasks/{id}/feedback` |
+| `review:read`  | `GET /tasks/{id}/review`, `GET /tasks/{id}/feedback`                               |
 | `repo:read`    | `GET /repositories`, `GET /admin/repositories`                                     |
 | `repo:approve` | `POST /admin/repositories/{id}/approve`                                            |
 | `repo:deny`    | `POST /admin/repositories/{id}/deny`                                               |
 
 `GET /me` (`jwt::me`) returns the caller's verified claims plus the sorted effective permissions, so
 the web can render capability-aware affordances — but the control plane is the real enforcement
-point. The transcript route is gated on `review:read` because it contains repo code, file paths, and
-tool results (see [§3.4](#34-the-run-transcript)).
+point. (The `GET /tasks/{id}/transcript` route was **retired** with the DB run transcript in
+[ADR-0100](adr/0100-retire-db-transcript-logs-as-observability.md); run observability is now
+Loki-only — see [§3.4](#34-run-observability-logs-are-the-surface).)
 
 ### 1.3 The trust boundary: the control plane owns all writes
 
@@ -167,9 +168,11 @@ Implementation in `services/agent-runner/src/sast/mod.rs`:
 
 ## 3. Observability
 
-The design principle: **make a run legible from its own logs alone, and persist the proof-of-work we
-already have in hand.** Three layers — Prometheus metrics, structured per-turn logs, and a persisted
-DB transcript — plus the Grafana dashboards that mostly read Postgres.
+The design principle: **make a run legible from its own logs alone.** Two layers — Prometheus metrics
+and structured per-turn logs shipped to Loki — plus the Grafana dashboards that mostly read Postgres.
+(The persisted DB transcript that once formed a third layer was **retired** in
+[ADR-0100](adr/0100-retire-db-transcript-logs-as-observability.md): Loki logs are now the single
+run-observability surface — see [§3.4](#34-run-observability-logs-are-the-surface).)
 
 ### 3.1 Metrics
 
@@ -234,7 +237,7 @@ the model's chain-of-thought a first-class signal:
 
 - `reasoning_content` (DeepSeek/GLM lineage) is reassembled from SSE deltas (streaming) or read off
   the message (non-stream) into `Completion::reasoning`. It is kept **off** `ChatMessage` on purpose
-  — it is for logs/transcript only and is **not** echoed back to the model next turn. A `reasoning`
+  — it is for logs only and is **not** echoed back to the model next turn. A `reasoning`
   serde **alias** handles gateways that stream the field under that name.
 - `Usage::reasoning_tokens()` reads the OpenAI-style nested
   `completion_tokens_details.reasoning_tokens` **and** falls back to a top-level
@@ -250,27 +253,22 @@ the model's chain-of-thought a first-class signal:
 > the faster/cheaper MiniMax model — a one-line `review.model` change in ai-helm-values, no rebuild.
 > The model is operator-tuned and **churns**; never hardcode a model name as permanent.
 
-### 3.4 The run transcript
+### 3.4 Run observability: logs are the surface
 
-Per [ADR-0034](adr/0034-agent-run-transcript-and-observability.md), the runner submits the whole
-transcript once at run end (success or failure) to `POST /internal/tasks/{id}/transcript`; the
-control plane stores it in `agent_transcript` ordered by `seq`
-(`services/control-plane/migrations/0014_agent_transcript.sql`). A retry replaces the prior rows for
-the task. Columns:
+The per-run **DB transcript** ([ADR-0034](adr/0034-agent-run-transcript-and-observability.md)) —
+`POST /internal/tasks/{id}/transcript` → the `agent_transcript` table → `GET /tasks/{id}/transcript`
+— was **torn out** in [ADR-0100](adr/0100-retire-db-transcript-logs-as-observability.md) (epic #459,
+ticket #461). Once review moved onto OpenCode-over-ACP ([ADR-0097](adr/0097-review-runs-on-opencode.md))
+the reconstruction was a lossy *post-hoc* record, not execution state, and duplicated a surface the
+OpenCode logger plugin already covers. Migration `0032_drop_agent_transcript.sql` `DROP`s the table
+(forward-only; irreversible in prod).
 
-- `role` (`assistant` | `tool`), `content` (reasoning text / truncated tool result), `tool_calls`
-  (JSONB), `tool_name`, and per-assistant-turn `prompt_tokens` / `completion_tokens`.
-- `migrations/0017_transcript_model_and_reasoning.sql` adds `model` (the per-turn model id; the
-  column predates [ADR-0053](adr/0053-remove-review-fallback-model.md) removing the fallback model, so
-  today it records the single configured model per turn) and `reasoning_tokens` (nullable; a subset
-  of `completion_tokens`).
+Run observability is therefore **Loki-only**: the per-turn proof-of-work lines of [§3.3](#33-per-turn-logs-and-reasoning-capture)
+(model id, tool names, tokens, `reasoning_chars`, `latency_ms`, and the bounded `agent reasoning` /
+`agent content` chain-of-thought) are shipped to Loki and are the single source of run legibility.
+Leveled per-turn reasoning/content/tool lines on the OpenCode path land under #462 (hardened by #463).
 
-Capture is best-effort and non-blocking — failing to persist a step never fails the review.
-`GET /tasks/{id}/transcript` serves the turn-by-turn breakdown gated on `review:read`, since it
-contains repo code and tool results. (Reasoning *text* is currently logs-only and not yet persisted
-to the transcript — a noted follow-up in ADR-0060.)
-
-Related observability data the dashboards read: `error_detail` on `tasks`
+Observability data the dashboards still read: `error_detail` on `tasks`
 (`migrations/0016_task_error_detail.sql`) records *why* a review posted nothing — added after a live
 audit found ~68% of "succeeded" PR-review tasks had posted nothing, swallowing failures as green —
 and `review_feedback` (`migrations/0015_review_feedback.sql`) records reviewer reactions.
@@ -283,8 +281,8 @@ specifics in `ai-helm-values` ([ADR-0046](adr/0046-observability-dashboard-deplo
 
 The pinned design choice: **most dashboards read Postgres, not Prometheus.** The review agent is a
 one-shot Job — it is gone before any scrape could reach it — but its output is already persisted
-(findings with priority/category, token usage in `agent_transcript`, reactions in `review_feedback`).
-So the `review-quality` dashboard and the `overview`/`repositories` enrichments query those tables
+(findings with priority/category in `reviews`, reactions in `review_feedback`). So the
+`review-quality` dashboard and the `overview`/`repositories` enrichments query those tables
 directly via a least-privilege `grafana_ro` **CNPG managed role** (login + `SELECT` only), reached
 through the CNPG `*-rw` Service (no read replica exists yet; queries are read-only, infrequent, and
 `LIMIT`-bounded). Only `operations.json` (RED metrics) reads Prometheus and depends on the PodMonitor
@@ -293,11 +291,12 @@ scrape wiring; the Postgres dashboards light up as soon as the datasource resolv
 ```mermaid
 flowchart LR
   subgraph runner["agent runner (one-shot Job)"]
-    loop["native review loop"] -->|per-turn logs| stdout["pod stdout: model, tokens,\nreasoning_chars, latency_ms"]
-    loop -->|transcript at end| cpx["control plane internal API"]
+    loop["review loop"] -->|per-turn logs| stdout["pod stdout: model, tokens,\nreasoning_chars, latency_ms"]
+    loop -->|review result| cpx["control plane internal API"]
     sast["opengrep SAST"] -->|inline buffer| cpx
   end
-  cpx -->|writes| pg[("Postgres:\nagent_transcript, reviews,\nreview_feedback, tasks.error_detail")]
+  stdout -->|Alloy| loki[("Loki:\nrun logs (single\nobservability surface)")]
+  cpx -->|writes| pg[("Postgres:\nreviews,\nreview_feedback, tasks.error_detail")]
   serve["serve / dispatcher / reconciler"] -->|/metrics| prom[("Prometheus\nvia Alloy + PodMonitor")]
   pg -->|grafana_ro SELECT| graf["Grafana: review-quality,\noverview, repositories"]
   prom --> graf2["Grafana: operations.json (RED)"]
@@ -326,8 +325,8 @@ Concretely visible in this codebase:
   deterministic (seeded) backoff making schedules reproducible in tests.
 - **HMAC verification** is constant-time and unit-covered in `webhook.rs`.
 
-`wiremock` mocks outbound HTTP (e.g. the LLM gateway, GitHub) in Rust integration tests. SAST and
-transcript capture are best-effort by design, so their failure modes are exercised as non-fatal.
+`wiremock` mocks outbound HTTP (e.g. the LLM gateway, GitHub) in Rust integration tests. SAST is
+best-effort by design, so its failure modes are exercised as non-fatal.
 
 ---
 
@@ -380,7 +379,8 @@ non-review task (e.g. an `index` task, which ignores tier), gets the full/safe b
   [ADR-0014](adr/0014-keycloak-oidc-resource-server.md),
   [ADR-0023](adr/0023-db-backed-rbac.md)
 - Mediated tools: [ADR-0037](adr/0037-agent-acts-via-mediated-tools.md)
-- Resilience & observability: [ADR-0034](adr/0034-agent-run-transcript-and-observability.md),
+- Resilience & observability: [ADR-0034](adr/0034-agent-run-transcript-and-observability.md)
+  (superseded by [ADR-0100](adr/0100-retire-db-transcript-logs-as-observability.md)),
   [ADR-0039](adr/0039-agent-llm-resilience-and-observability.md),
   [ADR-0046](adr/0046-observability-dashboard-deployment.md),
   [ADR-0060](adr/0060-capture-model-reasoning-and-glm-5-2-latency-finding.md)

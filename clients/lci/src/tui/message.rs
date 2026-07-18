@@ -6,7 +6,7 @@
 
 use super::REFRESH_INTERVAL;
 use super::app::{App, PendingAction, View};
-use crate::api::{ApiClient, RepositoryRow, ReviewRow, TaskRow, TranscriptRow};
+use crate::api::{ApiClient, RepositoryRow, ReviewRow, TaskRow};
 use crate::auth::{self, EXPIRY_SKEW_SECS};
 use crate::config::Config;
 use anyhow::Result;
@@ -27,20 +27,18 @@ pub(super) enum Msg {
     Cancelled(Result<()>),
     /// Background refresh produced a new token (or failed → set the re-auth flag).
     TokenRefreshed(Result<auth::StoredToken>),
-    /// A detail-page fetch resolved (task metadata + review + transcript), carrying the task id it
-    /// was fetched for so a stale result for a closed/other page is ignored.
-    Detail {
-        task_id: Uuid,
-        task: Result<TaskRow>,
-        review: Result<Option<ReviewRow>>,
-        transcript: Result<Vec<TranscriptRow>>,
-    },
-    /// A lighter live-tail poll: just the task status + transcript (no review re-fetch).
-    DetailTail {
-        task_id: Uuid,
-        task: Result<TaskRow>,
-        transcript: Result<Vec<TranscriptRow>>,
-    },
+    /// A detail-page fetch resolved (task metadata + review). Boxed so this variant doesn't dominate
+    /// the enum's size (`clippy::large_enum_variant`): `TaskRow`/`ReviewRow` are large, and the other
+    /// variants are small.
+    Detail(Box<DetailFetch>),
+}
+
+/// The payload of [`Msg::Detail`]: the task metadata + review resolved for the detail page, carrying
+/// the task id it was fetched for so a stale result for a closed/other page is ignored.
+pub(super) struct DetailFetch {
+    pub task_id: Uuid,
+    pub task: Result<TaskRow>,
+    pub review: Result<Option<ReviewRow>>,
 }
 
 /// A follow-up the event loop performs after folding a message into state — things that need `&api`
@@ -95,19 +93,19 @@ pub(super) fn apply_msg(app: &mut App, msg: Msg) -> FollowUp {
             app.toast_error(format!("cancel failed: {e}"));
             FollowUp::None
         }
-        Msg::Detail {
-            task_id,
-            task,
-            review,
-            transcript,
-        } => {
+        Msg::Detail(fetch) => {
+            let DetailFetch {
+                task_id,
+                task,
+                review,
+            } = *fetch;
             app.set_loading(false);
             // Ignore a result for a page the operator has since closed or replaced.
             if app.detail.as_ref().map(|d| d.task_id) != Some(task_id) {
                 return FollowUp::None;
             }
             // Fold into the detail state in a scoped borrow, collecting any error text to toast after.
-            let mut errors: Vec<String> = Vec::new();
+            let mut review_error: Option<String> = None;
             if let Some(d) = app.detail.as_mut() {
                 if let Ok(t) = task {
                     d.set_task(t);
@@ -119,42 +117,12 @@ pub(super) fn apply_msg(app: &mut App, msg: Msg) -> FollowUp {
                     }
                     Err(e) => {
                         d.review_loaded = true;
-                        errors.push(format!("review: {e}"));
-                    }
-                }
-                match transcript {
-                    Ok(rows) => {
-                        d.merge_transcript(rows);
-                    }
-                    Err(e) => {
-                        d.transcript_loaded = true;
-                        errors.push(format!("transcript: {e}"));
+                        review_error = Some(format!("review: {e}"));
                     }
                 }
             }
-            if let Some(e) = errors.into_iter().next() {
+            if let Some(e) = review_error {
                 app.toast_error(e);
-            }
-            app.mark_dirty();
-            FollowUp::None
-        }
-        Msg::DetailTail {
-            task_id,
-            task,
-            transcript,
-        } => {
-            let Some(d) = app.detail.as_mut().filter(|d| d.task_id == task_id) else {
-                // Page closed/replaced while the tail was in flight — nothing to clear (a fresh page
-                // has its own `tail_in_flight = false`).
-                return FollowUp::None;
-            };
-            // Clear the in-flight guard so the next tick may poll again.
-            d.tail_in_flight = false;
-            if let Ok(t) = task {
-                d.set_task(t);
-            }
-            if let Ok(rows) = transcript {
-                d.merge_transcript(rows);
             }
             app.mark_dirty();
             FollowUp::None
@@ -242,10 +210,10 @@ pub(super) fn spawn_refresh_current_view(
                 let _ = tx.send(Msg::Tasks(result));
             });
         }
-        // The detail page refreshes primarily via its own tail poll; the periodic list refresh also
-        // re-fetches all three (task + review + transcript) so a freshly-posted review shows up. This
-        // path is `&App`, so it spawns the fetch directly (no loading-flag flip — the tail already
-        // keeps the page live); the interactive open/`r` paths go through `spawn_detail_fetch`.
+        // The detail page refreshes on the periodic view poll: re-fetch the task status + review so a
+        // freshly-posted review (and the run going terminal) shows up while the page is open. This
+        // path is `&App`, so it spawns the fetch directly (no loading-flag flip); the interactive
+        // open/`r` paths go through `spawn_detail_fetch`.
         View::Detail => {
             if let Some(id) = app
                 .detail
@@ -254,22 +222,20 @@ pub(super) fn spawn_refresh_current_view(
                 .map(|d| d.task_id)
             {
                 tokio::spawn(async move {
-                    let (task, review, transcript) =
-                        tokio::join!(api.get_task(id), api.get_review(id), api.get_transcript(id));
-                    let _ = tx.send(Msg::Detail {
+                    let (task, review) = tokio::join!(api.get_task(id), api.get_review(id));
+                    let _ = tx.send(Msg::Detail(Box::new(DetailFetch {
                         task_id: id,
                         task,
                         review,
-                        transcript,
-                    });
+                    })));
                 });
             }
         }
     }
 }
 
-/// Spawn the full detail fetch: task metadata + review (404→None) + transcript, all for `id`. Flips
-/// the loading flag on (the status-bar spinner) — cleared when the `Msg::Detail` result is folded in.
+/// Spawn the detail fetch: task metadata + review (404→None), both for `id`. Flips the loading flag
+/// on (the status-bar spinner) — cleared when the `Msg::Detail` result is folded in.
 pub(super) fn spawn_detail_fetch(
     id: Uuid,
     app: &mut App,
@@ -279,28 +245,13 @@ pub(super) fn spawn_detail_fetch(
     app.set_loading(true);
     let (api, tx) = (api.clone(), tx.clone());
     tokio::spawn(async move {
-        // Run the three fetches concurrently — they're independent GETs.
-        let (task, review, transcript) =
-            tokio::join!(api.get_task(id), api.get_review(id), api.get_transcript(id),);
-        let _ = tx.send(Msg::Detail {
+        // Run the two fetches concurrently — they're independent GETs.
+        let (task, review) = tokio::join!(api.get_task(id), api.get_review(id));
+        let _ = tx.send(Msg::Detail(Box::new(DetailFetch {
             task_id: id,
             task,
             review,
-            transcript,
-        });
-    });
-}
-
-/// Spawn the lighter live-tail poll: task status + transcript only (no review re-fetch).
-pub(super) fn spawn_detail_tail(id: Uuid, api: &ApiClient, tx: &mpsc::UnboundedSender<Msg>) {
-    let (api, tx) = (api.clone(), tx.clone());
-    tokio::spawn(async move {
-        let (task, transcript) = tokio::join!(api.get_task(id), api.get_transcript(id));
-        let _ = tx.send(Msg::DetailTail {
-            task_id: id,
-            task,
-            transcript,
-        });
+        })));
     });
 }
 

@@ -158,7 +158,6 @@ mod tests {
         assert_eq!(app.view, AppView::Detail, "detail opened via the real path");
         if let Some(d) = app.detail.as_mut() {
             d.review_loaded = true;
-            d.transcript_loaded = true;
         }
         let backend = TestBackend::new(w, h);
         let mut terminal = Terminal::new(backend).expect("test terminal");
@@ -197,7 +196,6 @@ mod tests {
             Screen::Repos,
             Screen::Runs,
             Screen::Detail,
-            Screen::Transcript,
             Screen::Confirm,
             Screen::Help,
             Screen::Empty,

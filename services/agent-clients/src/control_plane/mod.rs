@@ -24,7 +24,6 @@ mod tasks;
 pub use durable_step::StoredStep;
 pub use indexing::{ChunkBatch, ChunkPayload, GraphBatch, GraphEdgePayload, GraphNodePayload};
 pub use knowledge::{DiscoveredTool, KnowledgeToolResult};
-pub use review::TranscriptEntry;
 pub use search::{ChunkHit, SymbolHit};
 
 /// The context the control plane hands the runner: repo coordinates, an installation token, and the

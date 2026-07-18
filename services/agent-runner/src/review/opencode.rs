@@ -14,11 +14,11 @@ use anyhow::{Context, Result};
 use uuid::Uuid;
 
 use lci_acp_host::{AcpClient, PermissionPolicy};
-use lci_agent_clients::{ControlPlaneClient, TranscriptEntry};
+use lci_agent_clients::ControlPlaneClient;
 use lci_agent_sast::{ENV_CHANGED_FILES, SastConfig};
 use lci_review_agent::opencode::{
     REVIEW_PROMPT_FILE, RecorderEvent, ReviewDriver, ReviewGates, ReviewResolution, ReviewSession,
-    parse_recorder, render_review_config, run_review_loop, transcript_from_recorder,
+    parse_recorder, render_review_config, run_review_loop,
 };
 use lci_review_agent::prompt::{self, PrDiffRef, PromptConfig};
 
@@ -107,8 +107,9 @@ pub struct McpEnv<'a> {
 }
 
 /// Run one review on OpenCode. Renders the per-task config, spawns `opencode acp`, drives the review
-/// to resolution over the reused gates, reconstructs the ADR-0034 transcript from the recorder, and
-/// maps the result onto a [`ReviewOutcome`] (posting any coverage disclosure). Only a transport/loop
+/// to resolution over the reused gates, and maps the result onto a [`ReviewOutcome`] (posting any
+/// coverage disclosure). Run observability is Loki-only (epic #459) — the logger plugin emits the
+/// model's parts/tool calls to stderr → Loki; there is no DB transcript. Only a transport/loop
 /// failure returns `Err`; the caller finalizes on all three outcomes exactly as for the native host.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_opencode_agent(
@@ -128,7 +129,6 @@ pub async fn run_opencode_agent(
     mcp_env: &McpEnv<'_>,
     task_id: Uuid,
     client: &ControlPlaneClient,
-    transcript: &mut Vec<TranscriptEntry>,
 ) -> Result<ReviewOutcome> {
     // ── Prompt (reuse the native builder) ───────────────────────────────────────────────────────
     let prompt_config = PromptConfig {
@@ -327,13 +327,6 @@ pub async fn run_opencode_agent(
     let mut driver = ReviewDriver::new(gates, MAX_REVIEW_CYCLES);
     let mut session = OpencodeReviewSession::new(client_acp, session_id, recorder_path.clone());
     let resolution = run_review_loop(&mut session, &mut driver, &user_prompt).await;
-
-    // ── Transcript from the full recorder file (ADR-0034), regardless of how the loop ended ──────
-    let recorder_content = read_recorder_capped(&recorder_path).await;
-    transcript.extend(transcript_from_recorder(
-        &parse_recorder(&recorder_content),
-        &review.model,
-    ));
 
     // Reap opencode before returning either way.
     if let Err(error) = session.shutdown().await {

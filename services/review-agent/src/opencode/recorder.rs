@@ -77,10 +77,6 @@ pub struct RecorderEvent {
     /// built-ins). Recorded verbatim by the plugin.
     #[serde(default)]
     pub result: Option<Value>,
-    /// A reasoning slice (`kind:"reasoning.part"`, ADR-0060) — the recorder's `part` object, whose
-    /// `text` the transcript reconstruction folds into the assistant turn.
-    #[serde(default)]
-    pub part: Option<Value>,
 }
 
 /// Parse recorder JSONL, skipping blank or unparseable lines (the recorder must never take the loop

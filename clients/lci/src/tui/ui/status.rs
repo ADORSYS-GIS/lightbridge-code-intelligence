@@ -36,12 +36,11 @@ pub(super) fn draw_status(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
             } else {
                 "mouse:off"
             };
-            let tail = match app.detail.as_ref() {
-                Some(d) if d.live && d.autoscroll => "tail",
-                Some(d) if d.live => "held",
-                _ => "static",
+            let live = match app.detail.as_ref() {
+                Some(d) if d.live => "live",
+                _ => "done",
             };
-            format!("{mouse} · {tail}")
+            format!("{mouse} · {live}")
         }
     };
     let spinner = if app.loading {
@@ -55,7 +54,7 @@ pub(super) fn draw_status(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     let hint = match app.view {
         View::Repositories => "j/k move · f filter · r refresh · q quit ",
         View::Runs => "↵ open · j/k move · f active/all · r refresh · q quit ",
-        View::Detail => "j/k scroll · G bottom · m mouse · r refresh · Esc back ",
+        View::Detail => "m mouse · r refresh · Esc back ",
     };
 
     // Give the side segments what their content needs, but never more than ~45% each so a very long

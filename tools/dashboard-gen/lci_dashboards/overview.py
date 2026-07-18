@@ -50,20 +50,6 @@ def dashboard_builder() -> dashboard.Dashboard:
         )
         .grid_pos(layout.place(6, 4))
     )
-    tokens_24h = (
-        stat.Panel()
-        .title("Tokens (24h)")
-        .datasource(POSTGRES)
-        .with_target(
-            sql(
-                "SELECT coalesce(sum(tr.prompt_tokens + tr.completion_tokens), 0) "
-                "FROM agent_transcript tr JOIN tasks t ON t.id = tr.task_id "
-                "WHERE t.created_at > now() - interval '24 hours'"
-            )
-        )
-        .grid_pos(layout.place(6, 4))
-    )
-
     created = (
         timeseries.Panel()
         .title("Tasks created")
@@ -132,7 +118,6 @@ def dashboard_builder() -> dashboard.Dashboard:
         .with_panel(running)
         .with_panel(failed)
         .with_panel(deliveries)
-        .with_panel(tokens_24h)
         .with_panel(created)
         .with_panel(by_status)
         .with_panel(duration_p95)

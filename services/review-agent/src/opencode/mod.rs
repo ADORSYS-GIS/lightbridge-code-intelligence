@@ -23,7 +23,6 @@
 //! - [`driver`] — the pure re-prompt / finalize control loop over those gates.
 //! - [`drive`] — the review loop abstracted over a `ReviewSession` (prompt → recorder delta), so the
 //!   orchestration is unit-testable with a scripted fake and the host is a thin spawn/tail shell.
-//! - [`transcript`] — reconstruct the ADR-0034 run transcript from the same recorder JSONL.
 //!
 //! The async transport (spawning OpenCode, tailing the recorder, sending `session/prompt`) is the
 //! host's job and layers over this core. Public paths are re-exported so callers use
@@ -34,7 +33,6 @@ mod drive;
 mod driver;
 mod gates;
 mod recorder;
-mod transcript;
 
 #[cfg(test)]
 mod test_support;
@@ -46,4 +44,3 @@ pub use gates::{GateDecision, ReviewGates};
 pub use recorder::{
     KNOWN_REVIEW_TOOLS, RecorderEvent, cycle_turn_outcome, normalize_tool_name, parse_recorder,
 };
-pub use transcript::transcript_from_recorder;

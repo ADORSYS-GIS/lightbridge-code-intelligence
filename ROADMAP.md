@@ -37,8 +37,12 @@ _Last updated: 2026-07-17._
   its native-only modules.
 - **A2A per-finding review streaming** — stream findings as they are confirmed at finalize.
   ([ADR-0098](https://github.com/vymalo/lightbridge-code-intelligence/pull/458), #458 — open)
-- **OpenCode review observability** — capture the model's content and reasoning and tool I/O faithfully in
-  the persisted transcript (part of the review-quality epic below).
+- **OpenCode review observability — logs-only** (Epic #459) — the DB run transcript is **retired**
+  ([ADR-0100](docs/adr/0100-retire-db-transcript-logs-as-observability.md)); on the OpenCode path it was a
+  post-hoc record, not a replay seam. #461 tore out the transcript subsystem (both writers, the
+  `POST/GET /tasks/{id}/transcript` API, the `clients/lci` transcript view, `DROP TABLE agent_transcript`).
+  **Loki logs are the single observability surface;** #462 emits leveled per-turn reasoning/content/tool
+  lines from the logger plugin and #463 hardens that capture (both open).
 
 ## Planned — open epics
 

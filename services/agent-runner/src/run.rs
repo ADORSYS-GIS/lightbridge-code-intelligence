@@ -449,7 +449,6 @@ async fn perform_review(
     // Repo-native agent instructions (ADR-0036): read the repo's AGENTS.md/CLAUDE.md/… and fold them
     // into the prompt as untrusted context so the review respects house rules.
     let repo_instructions = review::instructions::read_agent_instructions(checkout).await;
-    let mut transcript = Vec::new();
     if let Some(status) = status {
         status.set_phase(Phase::Reviewing);
     }
@@ -477,18 +476,10 @@ async fn perform_review(
         &mcp_env,
         task_id,
         client,
-        &mut transcript,
     )
     .await;
     if let Some(status) = status {
         status.set_phase(Phase::Finalizing);
-    }
-    // Submit the transcript regardless of outcome (ADR-0034) — a failed run's reasoning is the most
-    // useful to inspect. Best-effort: never let it change the task result.
-    if !transcript.is_empty()
-        && let Err(error) = client.submit_transcript(task_id, &transcript).await
-    {
-        tracing::warn!(%error, "submitting transcript failed (non-fatal)");
     }
 
     finalize_review_outcome(outcome, review, client, task_id).await

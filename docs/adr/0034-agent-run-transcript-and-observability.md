@@ -1,7 +1,14 @@
 # ADR-0034: Persist the agent run transcript (tool calls, reasoning, tokens) and surface it
 
-- **Status:** Accepted
+- **Status:** Superseded by [ADR-0100](0100-retire-db-transcript-logs-as-observability.md) (2026-07-18, epic #459)
 - **Date:** 2026-06-22
+
+> **Superseded (2026-07-18, epic #459 pivot).** The `agent_transcript` DB table and its ingest/read
+> API were **removed** — see [ADR-0100](0100-retire-db-transcript-logs-as-observability.md). On the
+> OpenCode-over-ACP review path we do not own the agent loop, so the recorder→transcript
+> reconstruction was a post-hoc record, not a replay/resume seam; its only reader was the `clients/lci`
+> TUI Run Detail view, also removed. **Loki logs are now the single run-observability surface.** This
+> ADR is kept for historical context; the table (migrations `0014`/`0017`) is dropped by `0032`.
 
 ## Context and Problem Statement
 

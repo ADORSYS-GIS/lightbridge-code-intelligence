@@ -154,44 +154,9 @@
         "overrides": []
       },
       "gridPos": {
-        "h": 4,
-        "w": 6,
-        "x": 0,
-        "y": 4
-      },
-      "options": null,
-      "repeatDirection": "h",
-      "targets": [
-        {
-          "datasource": {
-            "type": "grafana-postgresql-datasource",
-            "uid": "${DS_POSTGRES}"
-          },
-          "editorMode": "code",
-          "format": "table",
-          "rawQuery": true,
-          "rawSql": "SELECT coalesce(sum(tr.prompt_tokens + tr.completion_tokens), 0) FROM agent_transcript tr JOIN tasks t ON t.id = tr.task_id WHERE t.created_at > now() - interval '24 hours'",
-          "refId": "A"
-        }
-      ],
-      "title": "Tokens (24h)",
-      "transformations": [],
-      "transparent": false,
-      "type": "stat"
-    },
-    {
-      "datasource": {
-        "type": "grafana-postgresql-datasource",
-        "uid": "${DS_POSTGRES}"
-      },
-      "fieldConfig": {
-        "defaults": {},
-        "overrides": []
-      },
-      "gridPos": {
         "h": 8,
         "w": 12,
-        "x": 6,
+        "x": 0,
         "y": 4
       },
       "options": null,
@@ -226,8 +191,8 @@
       "gridPos": {
         "h": 8,
         "w": 12,
-        "x": 0,
-        "y": 12
+        "x": 12,
+        "y": 4
       },
       "options": null,
       "repeatDirection": "h",
@@ -264,7 +229,7 @@
         "h": 8,
         "w": 24,
         "x": 0,
-        "y": 20
+        "y": 12
       },
       "options": null,
       "repeatDirection": "h",
@@ -299,7 +264,7 @@
         "h": 9,
         "w": 24,
         "x": 0,
-        "y": 28
+        "y": 20
       },
       "options": null,
       "repeatDirection": "h",

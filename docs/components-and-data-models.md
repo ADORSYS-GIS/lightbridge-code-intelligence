@@ -18,7 +18,7 @@ no durable write authority.
 | Rust control plane | Webhook verification, task creation, idempotency, policy/approval gate, mediated writes, GitHub egress | Deep repo reasoning |
 | Agent runner (indexer) | Clone repo, parse code, build Neo4j graph + pgvector chunks | GitHub write actions |
 | Agent runner (native review agent) | Investigation + review reasoning, SAST, finding emission via mediated tools | Trust decisions, durable writes |
-| Postgres | Source-of-truth metadata, task queue, persisted reviews/transcripts/feedback, GitHub outbox | Semantic retrieval |
+| Postgres | Source-of-truth metadata, task queue, persisted reviews/feedback, GitHub outbox | Semantic retrieval |
 | Neo4j | Structural code graph | System-of-record task state |
 | pgvector (`code_chunks`) | Chunk embeddings + exact cosine search | Code topology |
 
@@ -39,7 +39,7 @@ a legacy alias during the [ADR-0058](adr/0058-rename-poller-role-to-reconciler.m
 |---|---|---|
 | `src/main.rs` | all | Role selection, `AppState`, axum wiring, OIDC resource-server middleware |
 | `src/http/webhook.rs` | serve | GitHub webhook receiver: verify `X-Hub-Signature-256`, dedupe on delivery id, create tasks |
-| `src/http/internal.rs` | serve | Runner↔control-plane contract ([ADR-0017](adr/0017-agent-runner-control-plane-bootstrap.md)): status reports, mediated review tools, retrieval, transcript ingest |
+| `src/http/internal.rs` | serve | Runner↔control-plane contract ([ADR-0017](adr/0017-agent-runner-control-plane-bootstrap.md)): status reports, mediated review tools, retrieval |
 | `src/http/admin.rs` | serve | Approval gate + admin console API (Epic #75) |
 | `src/http/metrics.rs` | all | Prometheus `/metrics` renderer |
 | `src/queue/dispatcher.rs` | dispatcher | Claim queued tasks (`FOR UPDATE SKIP LOCKED`), launch one k8s Job per task ([ADR-0004](adr/0004-one-k8s-job-per-task.md)) |
@@ -53,7 +53,7 @@ a legacy alias during the [ADR-0058](adr/0058-rename-poller-role-to-reconciler.m
 | `src/integrations/github.rs` | serve / reconciler | GitHub App auth (App key for **reads** on serve; writes only via reconciler) |
 | `src/integrations/neo4j.rs` | — | Bolt persistence for the structural graph ([ADR-0019](adr/0019-graphify-cli-structural-graph.md)) |
 | `src/integrations/k8s.rs` | dispatcher | Job creation/deletion |
-| `src/db.rs` | all | All SQL: queue, tasks, repositories, reviews, transcripts, feedback, outbox, code chunks |
+| `src/db.rs` | all | All SQL: queue, tasks, repositories, reviews, feedback, outbox, code chunks |
 | `src/config.rs` | all | File config (`control-plane.json`), `deny_unknown_fields` |
 | `src/types.rs` | all | Core domain enums/structs mirroring the schema |
 
@@ -231,28 +231,15 @@ are append-only and consolidated into one reply at flush. The whole buffer is cl
 (re)starts, so a retry begins empty. On a PR posting a review, buffered `add_comment` replies are
 dropped — single PR output channel ([ADR-0056](adr/0056-control-plane-owns-the-posted-output.md)).
 
-### `agent_transcript` — run transcript / observability (ADR-0034)
+### `agent_transcript` — **retired** (ADR-0100)
 
-```sql
-CREATE TABLE agent_transcript (
-    id UUID PRIMARY KEY,
-    task_id UUID NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
-    seq INT NOT NULL,                 -- 0-based order within the run
-    role TEXT NOT NULL,               -- 'assistant' | 'tool'
-    content TEXT,                     -- reasoning text / tool result (truncated)
-    tool_calls JSONB,                 -- the assistant turn's tool_calls
-    tool_name TEXT,                   -- for a tool-result row
-    prompt_tokens BIGINT, completion_tokens BIGINT,
-    reasoning_tokens BIGINT,          -- 0017: SUBSET of completion_tokens, not additive
-    model TEXT,                       -- 0017: per-turn model (captures any failover)
-    created_at timestamptz NOT NULL DEFAULT now()
-);
-```
-
-Submitted once at end of run; re-submitting (a retry) replaces the prior rows. `model` +
-`reasoning_tokens` feed cost dashboards ([ADR-0046](adr/0046-observability-dashboard-deployment.md))
-and reasoning capture ([ADR-0060](adr/0060-capture-model-reasoning-and-glm-5-2-latency-finding.md)).
-Index: `agent_transcript_task_seq_idx (task_id, seq)`.
+The per-run `agent_transcript` table (ADR-0034: tool calls, reasoning, per-turn token usage, submitted
+once at end of run over `POST /internal/tasks/{id}/transcript` and served over
+`GET /tasks/{id}/transcript`) was **torn out** in
+[ADR-0100](adr/0100-retire-db-transcript-logs-as-observability.md) (epic #459, ticket #461). Migration
+`0032_drop_agent_transcript.sql` `DROP`s it (forward-only; irreversible in prod). Run observability is
+now **Loki-only** — the per-turn proof-of-work log lines are the single source of run legibility; there
+is no DB transcript and no `/transcript` endpoint.
 
 ### Feedback signal + memory: `review_comments` / `review_feedback` (ADR-0035, ADR-0044)
 
