@@ -4,12 +4,11 @@ import { StatusLine } from "@/components/ui/states";
 // replace the web pod's kube-client log stream with a Grafana/Loki embed).
 //   - UID: the `UID` constant in tools/dashboard-gen/lci_dashboards/task_runs.py.
 //   - LOGS_PANEL_ID: the panel titled "Logs for $task_id" in
-//     deploy/observability/dashboards/task-runs.json. The generated dashboards don't emit explicit
-//     panel ids; Grafana assigns them in panel-array order on load, and the logs panel is the 2nd
-//     (last) panel → id 2. If a panel is ever added/reordered ahead of it, re-check the id via the
-//     live panel's Share → Embed URL.
+//     deploy/observability/dashboards/task-runs.json. Its id is explicitly pinned to 100 in the
+//     generator (tools/dashboard-gen/lci_dashboards/task_runs.py), so this embed URL is
+//     deterministic regardless of panel order — keep the two values in sync.
 const GRAFANA_DASHBOARD_UID = "lci-task-runs";
-const GRAFANA_LOGS_PANEL_ID = 2;
+const GRAFANA_LOGS_PANEL_ID = 100;
 
 // The console is dark-only (daisyUI `dracula`, ADR-0027), so the embedded panel matches with the
 // Grafana `dark` theme. If the app ever gains a light/dark toggle, thread the active theme here.
