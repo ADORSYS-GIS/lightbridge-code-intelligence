@@ -100,6 +100,11 @@ jobs:
           TURBO_API: ${{ vars.TURBO_API }}
           TURBO_TEAM: ${{ vars.TURBO_TEAM }}
           TURBO_TOKEN: ${{ secrets.TURBO_TOKEN }}
+          # NEXT_PUBLIC_* vars are inlined into the client bundle at `next build` time (ADR-0102) —
+          # setting this at deploy/runtime instead would have no effect, the value is already baked
+          # into the compiled JS by then. Not a secret: it's a public URL and ends up in the bundle
+          # either way.
+          NEXT_PUBLIC_GRAFANA_URL: https://grafana.ai.camer.digital
         run: pnpm turbo run build --filter=@lightbridge/web
       - name: Stage bundle
         run: |
