@@ -196,6 +196,11 @@ Keycloak's JWKS (`services/control-plane/src/jwt.rs`) and reads identity from cl
 > API edge is a separate concern handled by Envoy + Authorino and the standalone `lightbridge-authz`
 > component — not this project's control plane. Both validate the same Keycloak-issued JWTs via JWKS.
 
+The run-detail page's live logs no longer come from a direct Kubernetes API call: `apps/web` embeds a
+Grafana/Loki panel instead of streaming pod logs via `@kubernetes/client-node`, so the web tier depends
+on a browser-reachable, embeddable Grafana instance rather than in-cluster `pods/log` RBAC
+([ADR-0102](adr/0102-grafana-loki-embedded-run-logs.md)).
+
 ## End-to-end: indexing flow
 
 ```mermaid
@@ -315,7 +320,10 @@ forces a strict three-repo deploy order (runner image → chart → values).
 
 There are **two physical clusters**: ArgoCD runs on a Talos cluster (kube context `admin@homeos`);
 the LCI workloads run on a Hetzner cluster (context `hetzner-prod`, namespace `converse`), with the
-per-task agent Jobs in namespace `lightbridge-agents`.
+per-task agent Jobs in namespace `lightbridge-agents`. CI (GitHub Actions) is a separate concern from
+workload deployment: the `vymalo-vps` self-hosted runner label resolves to ephemeral ARC pod runners
+on a third cluster — [ADR-0101](adr/0101-ci-arc-pod-runners-no-dind.md) is the canonical reference for
+that topology; this doc does not otherwise cover CI-runner infrastructure.
 
 > The review LLM model is operator-tuned in ai-helm-values and **churns** — never treat a specific model
 > name as permanent; read the live values.

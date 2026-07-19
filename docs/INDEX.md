@@ -62,6 +62,7 @@ This directory contains the complete documentation set for Lightbridge Code Inte
 1. [Architecture overview](architecture.md)
 2. [Kubernetes and deployment](kubernetes-deployment.md)
 3. [Security, observability, testing, rollout](security-observability-testing-rollout.md) + [ADR-0046](adr/0046-observability-dashboard-deployment.md) (how the Grafana dashboards deploy; most read Postgres, not Prometheus)
+4. [ADR-0101: CI moves to ARC pod runners; dind is rejected as a Docker-in-CI fix](adr/0101-ci-arc-pod-runners-no-dind.md) — the canonical reference for `vymalo-vps` self-hosted CI topology (no CI-runner section exists elsewhere in these docs)
 
 ### Web & auth path
 1. [Architecture overview — Web & auth tier](architecture.md#web--auth-tier)
@@ -69,7 +70,8 @@ This directory contains the complete documentation set for Lightbridge Code Inte
 3. [ADR-0014: Keycloak OIDC — web client + control-plane resource server](adr/0014-keycloak-oidc-resource-server.md) (supersedes the better-auth/rust-backend idea in [ADR-0007](adr/0007-better-auth-rust-backend-plugin.md))
 4. [ADR-0023: permission-based authz (permissions claim, per-capability)](adr/0023-db-backed-rbac.md)
 5. [ADR-0027: daisyUI (dracula) design system](adr/0027-daisyui-design-system.md)
-6. [FAQ — authN vs authZ](faq.md#how-does-authentication-authn-differ-from-authorization-authz)
+6. [ADR-0102: run logs move from a native k8s pod-log stream to an embedded Grafana/Loki panel](adr/0102-grafana-loki-embedded-run-logs.md)
+7. [FAQ — authN vs authZ](faq.md#how-does-authentication-authn-differ-from-authorization-authz)
 
 ## Design principles
 

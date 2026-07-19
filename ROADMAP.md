@@ -9,7 +9,7 @@ open a PR to fix this file.
 > **Keeping this current is part of "done."** When a PR meaningfully ships, unblocks, or retires an item
 > here, update its status in the **same PR** (see [AGENTS.md](AGENTS.md)).
 
-_Last updated: 2026-07-18._
+_Last updated: 2026-07-19._
 
 ## Recently shipped
 
@@ -26,7 +26,19 @@ _Last updated: 2026-07-18._
   cutover had silently dropped it (rendering only a `reasoning` bool). Fixed by threading `review.extra`
   into the OpenCode reviewer model options. ([ADR-0069](docs/adr/0069-review-tier-minimum-model-capability.md), #475)
 - **CI on ARC pod runners** — the `vymalo-vps` runner is now ARC pod runners (`ghcr.io/vymalo/arc-runners`,
-  rootless podman, **no dind**) instead of a Docker VM. (#476)
+  rootless podman, **no dind**) instead of a Docker VM; dind is now a rejected fix for any future
+  Docker-needing CI job on this fleet. ([ADR-0101](docs/adr/0101-ci-arc-pod-runners-no-dind.md), #476)
+- **Run logs: embedded Grafana/Loki panel replaces the native k8s log stream** — the run-detail page's
+  "Logs" card no longer calls the Kubernetes API directly (`@kubernetes/client-node` removed); it embeds
+  the generated `task-runs` dashboard's Loki panel via a `d-solo` iframe, gated on the new
+  `NEXT_PUBLIC_GRAFANA_URL` env var with a graceful `kubectl logs` fallback when unset.
+  ([ADR-0102](docs/adr/0102-grafana-loki-embedded-run-logs.md), #479, panel-id pinned for a
+  deterministic embed URL in #480 — Grafana-side embed prerequisites still open, see the ADR)
+- **Token/model dashboard panels rebuilt on Loki** — with the DB run transcript dropped
+  ([ADR-0100](docs/adr/0100-retire-db-transcript-logs-as-observability.md)), the `review-cost` panel
+  is re-sourced to the `gen_ai_request_model` Loki label and the `review-quality`/`overview` token/model
+  panels are rebuilt on the AI-Gateway (eaig) Loki billing stream instead of the removed table
+  (reasoning-token split omitted — the gateway stream carries only a single total). (#472, #478)
 - **Customer / external MCP tools in review** — a repo owner can attach their own MCP server (declared in
   the control-plane config); the control plane mediates it, so the runner never talks to it directly.
   ([ADR-0066](docs/adr/0066-deep-tier-external-knowledge-tools.md), #455)
@@ -48,13 +60,6 @@ _Last updated: 2026-07-18._
   its native-only modules.
 - **A2A per-finding review streaming** — stream findings as they are confirmed at finalize.
   ([ADR-0098](https://github.com/vymalo/lightbridge-code-intelligence/pull/458), #458 — open)
-- **Rebuild the token/usage dashboard views on Loki** (Epic #459) — with the DB run transcript dropped
-  ([ADR-0100](docs/adr/0100-retire-db-transcript-logs-as-observability.md)), the token/model panels are
-  rebuilt on the AI-Gateway (eaig) Loki billing stream instead of the removed table: `review-cost` was
-  re-sourced to the `gen_ai_request_model` label in #471, and the `review-quality` token/model panels
-  (tokens KPI, token time-series, runs-by-model, per-run token/model table) + the `overview` 24h token KPI
-  are rebuilt in #478. Reasoning-token split omitted — the gateway stream carries only a single total, no
-  input/output/reasoning breakdown. (#472, #478 — open)
 
 ## Planned — open epics
 
