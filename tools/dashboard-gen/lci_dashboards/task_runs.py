@@ -69,6 +69,10 @@ def dashboard_builder() -> dashboard.Dashboard:
 
     run_logs = (
         logs.Panel()
+        # explicit id pinned so the apps/web d-solo embed URL is deterministic (run-logs-embed.tsx).
+        # High constant (100) avoids collision with Grafana's auto-assigned ids for the other
+        # id-less panels, which start at 1.
+        .id(100)
         .title("Logs for $task_id")
         .datasource(LOKI)
         .show_time(True)

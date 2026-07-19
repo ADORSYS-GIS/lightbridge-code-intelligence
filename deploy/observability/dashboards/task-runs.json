@@ -54,6 +54,7 @@
         "x": 0,
         "y": 13
       },
+      "id": 100,
       "options": {
         "dedupStrategy": "none",
         "enableLogDetails": false,
