@@ -325,12 +325,15 @@ impl Floor {
         // exactly as real a floor relaxation as a global re-enable, just narrower in blast radius.
         if let Some(agents) = final_config.get("agent").and_then(Value::as_object) {
             for (agent_name, agent_config) in agents {
+                // Mirror the top-level checks' semantics exactly: a PRESENT key is a breach unless it
+                // is precisely the closed sentinel (`false` / `"deny"`) — not merely "unless it's
+                // exactly the open sentinel." A malformed or non-standard value (a string under
+                // `tools`, a bool under `permission`, a stray number) must still be treated as a
+                // relaxation rather than silently passing through `as_bool`/`as_str` as `None`.
                 let agent_tools = agent_config.get("tools").and_then(Value::as_object);
                 for name in &self.disabled_builtins {
-                    if agent_tools
-                        .and_then(|t| t.get(name))
-                        .and_then(Value::as_bool)
-                        == Some(true)
+                    if let Some(value) = agent_tools.and_then(|t| t.get(name))
+                        && value != &Value::Bool(false)
                     {
                         breaches.push(FloorBreach {
                             message: format!(
@@ -342,10 +345,8 @@ impl Floor {
                 }
                 let agent_perm = agent_config.get("permission").and_then(Value::as_object);
                 for key in &self.denied_permissions {
-                    if agent_perm
-                        .and_then(|p| p.get(key))
-                        .and_then(Value::as_str)
-                        .is_some_and(|v| v != "deny")
+                    if let Some(value) = agent_perm.and_then(|p| p.get(key))
+                        && value.as_str() != Some("deny")
                     {
                         breaches.push(FloorBreach {
                             message: format!(
@@ -767,6 +768,38 @@ mod tests {
             rendered.floor_breaches
         );
         assert!(rendered.disclosure_note().is_some());
+    }
+
+    #[test]
+    fn overlay_reopening_a_builtin_for_one_agent_with_a_malformed_value_still_fires() {
+        // gemini-code-assist catch on PR #485: checking for the exact OPEN sentinel (`Bool(true)` /
+        // a string `!= "deny"`) lets any non-standard type slip through `as_bool`/`as_str` as `None`
+        // and evade detection. Must instead check "present and NOT exactly the CLOSED sentinel" — the
+        // same rule the top-level checks already use. A string under `tools` or a bool under
+        // `permission` is exactly the kind of malformed-but-present value that must still count.
+        let overlay = json!({
+            "agent": {
+                "explore": {
+                    "tools": { "bash": "allow" },
+                    "permission": { "webfetch": true }
+                }
+            }
+        });
+        let rendered = render_review_config(false, None, &Map::new(), &[], Some(&overlay));
+        assert!(
+            rendered.floor_breaches.iter().any(|b| b
+                .message
+                .contains("agent `explore` re-enabled built-in tool `bash`")),
+            "a non-boolean tools value must still be treated as a breach: {:?}",
+            rendered.floor_breaches
+        );
+        assert!(
+            rendered.floor_breaches.iter().any(|b| b
+                .message
+                .contains("agent `explore` opened permission `webfetch`")),
+            "a non-string permission value must still be treated as a breach: {:?}",
+            rendered.floor_breaches
+        );
     }
 
     #[test]
