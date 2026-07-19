@@ -27,8 +27,9 @@
 //! Because the overlay wins on every key (full override, the owner's chosen policy), it can WEAKEN
 //! those invariants. That is permitted by design; the system makes it *visible*, not impossible:
 //! [`render_review_config`] diffs the merged config against the base floor and returns a
-//! [`FloorBreach`] for each relaxation (a built-in re-enabled, a permission opened, the `lightbridge`
-//! MCP or a plugin dropped/replaced) so the host can WARN and note it on the review's coverage
+//! [`FloorBreach`] for each relaxation (a built-in re-enabled — globally OR for one agent, a
+//! permission opened — globally OR for one agent, the `lightbridge` MCP or a plugin dropped/replaced)
+//! so the host can WARN and note it on the review's coverage
 //! disclosure.
 
 use serde_json::{Map, Value};
@@ -314,6 +315,46 @@ impl Floor {
                         .to_string(),
                 }),
                 Some(_) => {}
+            }
+        }
+
+        // A per-agent `tools`/`permission` override can ALSO re-enable a disabled built-in or open a
+        // denied permission, scoped to just that one agent — so it never shows up in the top-level
+        // checks above (the top-level `tools.bash`/`permission.bash` can stay closed while an operator
+        // opens them just for a sub-agent, e.g. ADR-0099's `explore`/`file-scout` delegation). That is
+        // exactly as real a floor relaxation as a global re-enable, just narrower in blast radius.
+        if let Some(agents) = final_config.get("agent").and_then(Value::as_object) {
+            for (agent_name, agent_config) in agents {
+                // Mirror the top-level checks' semantics exactly: a PRESENT key is a breach unless it
+                // is precisely the closed sentinel (`false` / `"deny"`) — not merely "unless it's
+                // exactly the open sentinel." A malformed or non-standard value (a string under
+                // `tools`, a bool under `permission`, a stray number) must still be treated as a
+                // relaxation rather than silently passing through `as_bool`/`as_str` as `None`.
+                let agent_tools = agent_config.get("tools").and_then(Value::as_object);
+                for name in &self.disabled_builtins {
+                    if let Some(value) = agent_tools.and_then(|t| t.get(name))
+                        && value != &Value::Bool(false)
+                    {
+                        breaches.push(FloorBreach {
+                            message: format!(
+                                "agent `{agent_name}` re-enabled built-in tool `{name}` (coverage \
+                                 may go blind for that agent)"
+                            ),
+                        });
+                    }
+                }
+                let agent_perm = agent_config.get("permission").and_then(Value::as_object);
+                for key in &self.denied_permissions {
+                    if let Some(value) = agent_perm.and_then(|p| p.get(key))
+                        && value.as_str() != Some("deny")
+                    {
+                        breaches.push(FloorBreach {
+                            message: format!(
+                                "agent `{agent_name}` opened permission `{key}` (no longer \"deny\")"
+                            ),
+                        });
+                    }
+                }
             }
         }
 
@@ -667,6 +708,96 @@ mod tests {
                 .iter()
                 .any(|b| b.message.contains("built-in tool `read` re-enabled")),
             "expected a read re-enable breach, got {:?}",
+            rendered.floor_breaches
+        );
+    }
+
+    #[test]
+    fn overlay_reopening_a_builtin_or_permission_for_one_agent_fires_the_floor_warning() {
+        // A per-agent grant (ADR-0099's explore/file-scout shape) closes NOTHING at the top level —
+        // `tools.bash`/`permission.bash` both stay at their floor default — so only the per-agent check
+        // can catch it. Regression guard: this used to slip past `Floor::diff` entirely.
+        let overlay = json!({
+            "agent": {
+                "explore": {
+                    "tools": { "bash": true, "webfetch": true, "lightbridge_read_file": true },
+                    "permission": { "bash": "allow", "webfetch": "allow" }
+                }
+            }
+        });
+        let rendered = render_review_config(false, None, &Map::new(), &[], Some(&overlay));
+        // The top-level floor is untouched (still closed for the primary).
+        assert_eq!(rendered.config["tools"]["bash"], false);
+        assert_eq!(rendered.config["permission"]["bash"], "deny");
+        // …but the per-agent relaxation is still caught.
+        assert!(
+            rendered.floor_breaches.iter().any(|b| b
+                .message
+                .contains("agent `explore` re-enabled built-in tool `bash`")),
+            "expected an agent-scoped bash re-enable breach, got {:?}",
+            rendered.floor_breaches
+        );
+        assert!(
+            rendered.floor_breaches.iter().any(|b| b
+                .message
+                .contains("agent `explore` re-enabled built-in tool `webfetch`")),
+            "expected an agent-scoped webfetch re-enable breach, got {:?}",
+            rendered.floor_breaches
+        );
+        assert!(
+            rendered.floor_breaches.iter().any(|b| b
+                .message
+                .contains("agent `explore` opened permission `bash`")),
+            "expected an agent-scoped bash-permission breach, got {:?}",
+            rendered.floor_breaches
+        );
+        assert!(
+            rendered.floor_breaches.iter().any(|b| b
+                .message
+                .contains("agent `explore` opened permission `webfetch`")),
+            "expected an agent-scoped webfetch-permission breach, got {:?}",
+            rendered.floor_breaches
+        );
+        // Granting a MEDIATED tool (not a disabled built-in name) is NOT itself a breach.
+        assert!(
+            !rendered
+                .floor_breaches
+                .iter()
+                .any(|b| b.message.contains("lightbridge_read_file")),
+            "granting a mediated tool must not be reported as a floor breach: {:?}",
+            rendered.floor_breaches
+        );
+        assert!(rendered.disclosure_note().is_some());
+    }
+
+    #[test]
+    fn overlay_reopening_a_builtin_for_one_agent_with_a_malformed_value_still_fires() {
+        // gemini-code-assist catch on PR #485: checking for the exact OPEN sentinel (`Bool(true)` /
+        // a string `!= "deny"`) lets any non-standard type slip through `as_bool`/`as_str` as `None`
+        // and evade detection. Must instead check "present and NOT exactly the CLOSED sentinel" — the
+        // same rule the top-level checks already use. A string under `tools` or a bool under
+        // `permission` is exactly the kind of malformed-but-present value that must still count.
+        let overlay = json!({
+            "agent": {
+                "explore": {
+                    "tools": { "bash": "allow" },
+                    "permission": { "webfetch": true }
+                }
+            }
+        });
+        let rendered = render_review_config(false, None, &Map::new(), &[], Some(&overlay));
+        assert!(
+            rendered.floor_breaches.iter().any(|b| b
+                .message
+                .contains("agent `explore` re-enabled built-in tool `bash`")),
+            "a non-boolean tools value must still be treated as a breach: {:?}",
+            rendered.floor_breaches
+        );
+        assert!(
+            rendered.floor_breaches.iter().any(|b| b
+                .message
+                .contains("agent `explore` opened permission `webfetch`")),
+            "a non-string permission value must still be treated as a breach: {:?}",
             rendered.floor_breaches
         );
     }
