@@ -12,9 +12,21 @@ from .common import LOKI, POSTGRES, Layout, logql, sql
 
 UID = "lci-task-runs"
 
-# Stream selector is environment-specific; exposed as a textbox so it can be tuned without
-# regenerating. `| json` parses the control plane's structured logs so we can filter by task_id.
-DEFAULT_STREAM = '{app=~"lightbridge.*"}'
+# The review/index Job runs in its OWN ephemeral pod per task, named `lightbridge-agent-<task.id>`
+# (services/control-plane/src/integrations/k8s.rs:344) plus Kubernetes' own Job-controller suffix —
+# so `pod=~"lightbridge-agent-$task_id-.*"` selects exactly that run's stdout+stderr with no JSON
+# parsing needed. This carries BOTH the native agent-runner tracing (stdout) and the OpenCode
+# logger plugin's per-turn reasoning/content/tool lines (stderr) — the whole point of the ADR-0102
+# embed. Verified live against Loki (`namespace`/`pod` are real labels here; a prior `{app=~"..."}`
+# stream selector referenced a label THIS LOKI DOES NOT HAVE and silently matched zero streams —
+# see the Loki `/loki/api/v1/labels` response for the actual label set before changing this again).
+#
+# NOT covered here: the control plane's own task_id-tagged admin lines (e.g. "review queued for
+# egress") in a SEPARATE long-lived pod, which the original `| json | task_id = ...` design targeted.
+# That approach is independently broken on THIS Loki: pod logs are stored CRI-wrapped
+# (`<ts> stdout F {...}`), and a bare `| json` can't parse past that prefix (`JSONParserErr`) —
+# `| cri` is not a valid stage on this Loki version. Needs a `| pattern`/`| regexp` unwrap stage,
+# proven working, before it can be added back. Tracked as a follow-up, not fixed here.
 
 
 def dashboard_builder() -> dashboard.Dashboard:
@@ -42,9 +54,6 @@ def dashboard_builder() -> dashboard.Dashboard:
     )
     task_id_var = (
         dashboard.TextBoxVariable("task_id").label("Task ID (for logs)").default_value("")
-    )
-    stream_var = (
-        dashboard.TextBoxVariable("stream").label("Loki stream").default_value(DEFAULT_STREAM)
     )
 
     runs = (
@@ -77,7 +86,7 @@ def dashboard_builder() -> dashboard.Dashboard:
         .datasource(LOKI)
         .show_time(True)
         .wrap_log_message(True)
-        .with_target(logql('${stream} | json | task_id = `${task_id}`'))
+        .with_target(logql('{namespace="lightbridge-agents", pod=~"lightbridge-agent-${task_id}-.*"}'))
         .grid_pos(layout.place(24, 11))
     )
 
@@ -90,7 +99,6 @@ def dashboard_builder() -> dashboard.Dashboard:
         .with_variable(status_var)
         .with_variable(repo_var)
         .with_variable(task_id_var)
-        .with_variable(stream_var)
         .with_panel(runs)
         .with_panel(run_logs)
     )
