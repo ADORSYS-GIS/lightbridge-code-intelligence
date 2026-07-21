@@ -16,6 +16,7 @@ This directory contains the complete documentation set for Lightbridge Code Inte
 ## Table of contents
 
 ### Core docs
+- [Lightbridge Code Intelligence Overview](lightbridge-code-intelligence-overview.md) — High-level overview of the system
 - [Executive summary](executive-summary.md)
 - [Architecture overview](architecture.md)
 - [Components and data models](components-and-data-models.md)
