@@ -475,7 +475,7 @@ async fn perform_review(
         attribution,
         &mcp_env,
         task_id,
-        client,
+        // client,  // ← Not used (coverage disclosure no longer posted)
     )
     .await;
     if let Some(status) = status {
