@@ -14,7 +14,7 @@ use anyhow::{Context, Result};
 use uuid::Uuid;
 
 use lci_acp_host::{AcpClient, PermissionPolicy};
-use lci_agent_clients::ControlPlaneClient;
+// use lci_agent_clients::ControlPlaneClient;  // ← Not used (coverage disclosure no longer posted)
 use lci_agent_sast::{ENV_CHANGED_FILES, SastConfig};
 use lci_review_agent::opencode::{
     REVIEW_PROMPT_FILE, RecorderEvent, ReviewDriver, ReviewGates, ReviewResolution, ReviewSession,
@@ -128,7 +128,7 @@ pub async fn run_opencode_agent(
     attribution: &[(String, String)],
     mcp_env: &McpEnv<'_>,
     task_id: Uuid,
-    client: &ControlPlaneClient,
+    // client: &ControlPlaneClient,  // ← Not used (coverage disclosure no longer posted)
 ) -> Result<ReviewOutcome> {
     // ── Prompt (reuse the native builder) ───────────────────────────────────────────────────────
     let prompt_config = PromptConfig {
@@ -378,13 +378,14 @@ fn merge_disclosure(coverage: Option<String>, floor: Option<String>) -> Option<S
 
 /// Best-effort post of the coverage disclosure note (ADR-0069 / #306) as the review summary — a failed
 /// re-post keeps the model's own summary rather than failing a finished run.
-async fn post_disclosure(client: &ControlPlaneClient, task_id: Uuid, disclosure: Option<String>) {
-    if let Some(note) = disclosure
-        && let Err(error) = client.set_review_summary(task_id, &note).await
-    {
-        tracing::warn!(%error, task_id = %task_id, "coverage disclosure re-post failed (non-fatal)");
-    }
-}
+/// NOTE: This function is no longer used (coverage disclosure no longer posted to control plane).
+// async fn post_disclosure(client: &ControlPlaneClient, task_id: Uuid, disclosure: Option<String>) {
+//     if let Some(note) = disclosure
+//         && let Err(error) = client.set_review_summary(task_id, &note).await
+//     {
+//         tracing::warn!(%error, task_id = %task_id, "coverage disclosure re-post failed (non-fatal)");
+//     }
+// }
 
 /// End-to-end proof that the host drives a REAL `opencode acp` (RFC-0009 slice 3 / slice 4).
 ///
