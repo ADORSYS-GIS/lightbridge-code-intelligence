@@ -340,16 +340,25 @@ pub async fn run_opencode_agent(
     // ── Map the resolution onto a ReviewOutcome (+ post any coverage disclosure) ─────────────────
     // The coverage disclosure (ADR-0069) is augmented with the ADR-0099 floor note when the operator
     // overlay relaxed an invariant, so findings produced under a custom config aren't read as default.
+    // NOTE: The disclosure is now logged to runner logs (via tracing::warn) but NOT posted to the
+    // control plane to avoid cluttering review comments. This maintains transparency for developers
+    // while keeping end-user-facing reviews clean.
     Ok(
         match resolution.context("driving the opencode review loop")? {
             ReviewResolution::Finished { disclosure } => {
                 let disclosure = merge_disclosure(disclosure, floor_disclosure);
-                post_disclosure(client, task_id, disclosure).await;
+                // Log the disclosure for transparency (not posted to control plane)
+                if let Some(note) = &disclosure {
+                    tracing::warn!(%task_id, "coverage disclosure (not posted): {}", note);
+                }
                 ReviewOutcome::Finished
             }
             ReviewResolution::Exhausted { disclosure } => {
                 let disclosure = merge_disclosure(disclosure, floor_disclosure);
-                post_disclosure(client, task_id, disclosure).await;
+                // Log the disclosure for transparency (not posted to control plane)
+                if let Some(note) = &disclosure {
+                    tracing::warn!(%task_id, "coverage disclosure (not posted): {}", note);
+                }
                 ReviewOutcome::Exhausted
             }
             ReviewResolution::Aborted(reason) => ReviewOutcome::Aborted(reason),
