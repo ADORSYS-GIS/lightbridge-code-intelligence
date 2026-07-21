@@ -75,7 +75,7 @@ _Last updated: 2026-07-19._
 - **Graph-embedding retrieval** — semantic + structural search over the code graph.
   ([ADR-0089](docs/adr/0089-embeddings-on-the-code-graph.md) / [ADR-0090](docs/adr/0090-hybrid-retrieval-tools.md), Proposed)
 - **Incremental indexing — overlay model** (#244) — index only what changed on a PR.
-- **End-to-end tracing (OpenTelemetry)** (#419 / #431) — deployed but currently inert (endpoint unset).
+- **End-to-end tracing (OpenTelemetry)** (#419 / #431) — deployed and active (endpoint set to `http://alloy.observability.svc.cluster.local:4318`).
 - **GitLab support** (#414) — config-only to activate.
 - **Step reproducibility** (#430).
 
