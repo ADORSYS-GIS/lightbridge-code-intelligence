@@ -213,3 +213,55 @@ is shared with the model's `finish` verdict, so setting one clobbers the other),
 change touching the ADR-0068 finalize path. The prompt-side disclosure above covers the observed failure;
 the deterministic line is a follow-up if the model-authored coverage statement proves unreliable in
 practice.
+
+## Amendment (2026-07-22) — fast-tier parity: tools and gates unified, budget stays the differentiator
+
+**Problem.** A live fast-tier review on
+[ai-helm-values#111](https://github.com/ADORSYS-GIS/ai-helm-values/pull/111) demonstrated exactly what
+this ADR designed: a diff-only pass that flagged a cross-file assumption (whether `charts/lakefs-secrets`
+generates `lakefs-app-secret`) as an unverifiable P2 hedge instead of confirming or refuting it — because
+it structurally could not look. Users flagged this as the fast tier being "stupid" by design, not a bug.
+Investigation confirmed the "no retrieval" framing above (Decision, Mechanism) was already **stale**
+before this amendment: on the live OpenCode path (ADR-0097), the mediated MCP surface
+(`services/review-mcp/src/main.rs`) registers the full retrieval tool set for **both** tiers regardless of
+`review.<tier>.tools` — the fast tier's "no repo access" behavior came entirely from (a) three `fast: bool`
+short-circuits in `CoverageGate`/`RefuteGate`/`SastAnchorGate` that skipped bounce/refute/disclosure
+discipline for fast, and (b) a system prompt telling the model not to bother. Neither is a hard tool wall.
+
+**Decision.** Fast tier stops being structurally dumber. It becomes a **plain mechanical copy of deep** —
+same tools, same `CoverageGate`/`RefuteGate`/`SastAnchorGate` mechanics (all three gates had their `fast`
+parameter removed entirely; `services/review-agent/src/policies/{coverage,refute,sast_anchor}.rs`) —
+differentiated from deep by exactly three things:
+
+1. **A weaker/cheaper model**, unchanged, still deliberately below [ADR-0069](0069-review-tier-minimum-model-capability.md)'s reasoning floor (that ADR's own concern is addressed head-on in its companion amendment, not silently contradicted).
+2. **A smaller re-prompt-cycle budget** (`review.<tier>.max_cycles`, ai-helm-values `config.model.<tier>.maxCycles`) — see the correction below for why this, not opencode's own step cap, is the mechanism.
+3. **A rewritten fast system prompt** (`reviewSystemPromptFast`) dropping the now-false "you have no repository access… those calls are refused" framing, reframed around efficient, budget-conscious investigation instead of an assumed tool wall.
+
+**Correction to "Mechanism" above:** "the fast tier runs SAST, registers no retrieval tools, executes a
+single capped LLM turn, and finalizes — it never enters the investigation/verification loop" is no longer
+the design. Tools are un-gated on the live path (only `run_sast` remains explicitly allowlisted per tier,
+ADR-0073); the investigation/verification loop now runs for fast too, bounded by budget, not by mechanism.
+
+**A real dead end, worth recording so it isn't re-attempted uninformed:** the original plan for item 2
+was to retire the Rust-side re-prompt ceiling entirely and adopt opencode's own native per-agent step cap
+(`maxSteps`) as the sole budget mechanism — "if we adopt opencode, adopt its params." A real driven e2e
+test against the pinned opencode binary disproved this: `agent.build.maxSteps` is schema-accepted
+(`opencode debug config` resolves it) but does **not** functionally cap anything over ACP — a session
+against a provider that never finishes made 600+ round-trips in under a minute with `maxSteps: 3` set
+(`services/agent-runner/src/review/opencode.rs`'s `agent_build_max_steps_does_not_cap_a_never_finishing_model`
+e2e, kept as a permanent regression canary — it should start FAILING if a future opencode version fixes
+this, which is the signal to revisit). So the Rust-side ceiling stays, renamed conceptually from a
+hardcoded `MAX_REVIEW_CYCLES` constant to a tier-configurable `review.<tier>.max_cycles` field — it is the
+real stuck-model backstop on the OpenCode path, same job as before, now tunable per tier instead of one
+shared number. `review.<tier>.max_turns` is unrelated and unchanged: it only ever fed `CoverageGate`'s
+wind-down nudge heuristic, never opencode's own execution.
+
+**Also fixed in the same change, discovered by the same e2e-proof methodology:** the checked-in
+`integrations/opencode/config/review.jsonc` set `prompt`/`description`/`mode` on an `agent.review` block
+that — like the `tools` finding already documented in [ADR-0097](0097-review-runs-on-opencode.md) — was
+silently ignored, because the live ACP session runs opencode's default `build` agent, not a same-named
+custom one. This meant the carefully tier-differentiated system prompt may never have reached the model
+in production since the OpenCode cutover. Fixed by moving `prompt`/`description` onto `agent.build`,
+proven against the real binary (`agent_build_prompt_reaches_the_real_wire` e2e). Fixing this in the same
+change (not a separate ticket) because this amendment's own deliverable — a rewritten fast prompt — would
+have been silently inert otherwise.

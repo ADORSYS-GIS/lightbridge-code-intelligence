@@ -75,11 +75,13 @@ pub struct ReviewGates {
 }
 
 impl ReviewGates {
-    /// Compose the gates for one review, mirroring [`crate::flows::run_review`]'s construction (same
-    /// coverage denominator, bounce cap, and fast-tier disabling). The [`SastAnchorGate`] is always
-    /// composed — it stays inert (no leads) unless the model actually calls `run_sast`, so no separate
-    /// "is SAST on" flag is needed here; whether the tool is even offered is decided upstream where the
-    /// MCP surface is built.
+    /// Compose the gates for one review — full parity between fast and deep (fast-tier-parity change):
+    /// the coverage/refute/SAST-anchor gates no longer take a `fast` flag at all, so both tiers bounce,
+    /// refute, and disclose identically; `fast` is kept here only as a pass-through label for logging/
+    /// disclosure banners (see [`Self::is_fast`]) — no gate behavior branches on it any more. The
+    /// [`SastAnchorGate`] is always composed — it stays inert (no leads) unless the model actually calls
+    /// `run_sast`, so no separate "is SAST on" flag is needed here; whether the tool is even offered is
+    /// decided upstream where the MCP surface is built.
     #[must_use]
     pub fn new(
         diff_files: Vec<String>,
@@ -88,13 +90,13 @@ impl ReviewGates {
         fast: bool,
     ) -> Self {
         let (coverage, coverage_state) =
-            CoverageGate::new(diff_files, max_coverage_bounces, max_turns, fast);
+            CoverageGate::new(diff_files, max_coverage_bounces, max_turns);
         let sast_leads: SastLeadSink = Arc::new(Mutex::new(Vec::new()));
-        let sast_anchor = SastAnchorGate::new(Arc::clone(&sast_leads), fast);
+        let sast_anchor = SastAnchorGate::new(Arc::clone(&sast_leads));
         Self {
             coverage,
             coverage_state,
-            refute: RefuteGate::new(fast),
+            refute: RefuteGate::new(),
             sast_anchor,
             sast_leads,
             max_turns,
@@ -463,19 +465,76 @@ mod tests {
         );
     }
 
-    /// Fast tier never bounces and never discloses (parity with `run_review`'s fast path).
+    /// Fast-tier-parity proof: `is_fast()` is a pure label now — fast bounces a premature finish and
+    /// discloses unexamined coverage exactly like deep does in
+    /// [`coverage_bounces_a_premature_finish_then_accepts`], the only difference being the tier flag
+    /// itself. Replaces the old `fast_tier_accepts_immediately` test, whose assertion (fast skips the
+    /// gates entirely) is now false by design.
     #[test]
-    fn fast_tier_accepts_immediately() {
+    fn fast_tier_bounces_and_discloses_identically_to_deep() {
         let mut gates = ReviewGates::new(vec!["a.rs".into()], 3, 40, true);
         assert!(gates.is_fast());
-        let finish = cycle_turn_outcome(&[before(
+
+        let premature = cycle_turn_outcome(&[before(
             "lightbridge_finish",
             "c1",
             serde_json::json!({"summary": "quick"}),
         )]);
+        match gates.observe_cycle(&premature) {
+            GateDecision::RejectFinish(nudge) => assert!(nudge.contains("a.rs")),
+            other => panic!("expected fast tier to bounce a premature finish too, got {other:?}"),
+        }
+
+        let covered = cycle_turn_outcome(&[
+            before(
+                "lightbridge_read_file",
+                "c2",
+                serde_json::json!({"path": "a.rs"}),
+            ),
+            after("lightbridge_read_file", "c2", "source"),
+            before(
+                "lightbridge_finish",
+                "c3",
+                serde_json::json!({"summary": "done"}),
+            ),
+            after("lightbridge_finish", "c3", "finalize"),
+        ]);
         assert_eq!(
-            gates.observe_cycle(&finish),
+            gates.observe_cycle(&covered),
             GateDecision::Accept { disclosure: None }
         );
+    }
+
+    /// Fast-tier-parity proof, refute half: a P1 finding bounces the finish on fast exactly as it does
+    /// on deep in [`refute_bounces_an_outstanding_p1_once`].
+    #[test]
+    fn fast_tier_refutes_identically_to_deep() {
+        let mut gates = ReviewGates::new(vec![], 3, 40, true);
+        assert!(gates.is_fast());
+
+        let record_and_finish = cycle_turn_outcome(&[
+            before(
+                "lightbridge_add_review_comment",
+                "c1",
+                serde_json::json!({"file": "a.rs", "line": 2, "priority": "P1", "title": "bug"}),
+            ),
+            after(
+                "lightbridge_add_review_comment",
+                "c1",
+                "recorded finding at a.rs:2",
+            ),
+            before(
+                "lightbridge_finish",
+                "c2",
+                serde_json::json!({"summary": "one bug"}),
+            ),
+            after("lightbridge_finish", "c2", "finalize"),
+        ]);
+        match gates.observe_cycle(&record_and_finish) {
+            GateDecision::RejectFinish(nudge) => {
+                assert!(nudge.contains("re-verify") || nudge.contains("DISPROVE"));
+            }
+            other => panic!("expected fast tier to refute-bounce too, got {other:?}"),
+        }
     }
 }

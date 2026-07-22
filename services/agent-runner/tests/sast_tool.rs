@@ -77,6 +77,7 @@ fn review_config(base_url: String) -> ReviewConfig {
         max_searches: 15,
         max_batches: 6,
         max_coverage_bounces: 0,
+        max_cycles: 8,
         context_window: None,
         temperature: None,
         top_p: None,

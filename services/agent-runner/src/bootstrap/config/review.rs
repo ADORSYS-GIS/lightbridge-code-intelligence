@@ -9,8 +9,9 @@ use anyhow::Context;
 
 use super::defaults::{
     DEFAULT_CIRCUIT_BREAKER_THRESHOLD, DEFAULT_MAX_BATCH_SIZE, DEFAULT_MAX_BATCHES,
-    DEFAULT_MAX_COVERAGE_BOUNCES, DEFAULT_MAX_DIFF_CHARS, DEFAULT_MAX_FILES_READ,
-    DEFAULT_MAX_RETRIES, DEFAULT_MAX_SEARCHES, DEFAULT_MAX_TURNS, DEFAULT_REQUEST_TIMEOUT_SECS,
+    DEFAULT_MAX_COVERAGE_BOUNCES, DEFAULT_MAX_CYCLES, DEFAULT_MAX_DIFF_CHARS,
+    DEFAULT_MAX_FILES_READ, DEFAULT_MAX_RETRIES, DEFAULT_MAX_SEARCHES, DEFAULT_MAX_TURNS,
+    DEFAULT_REQUEST_TIMEOUT_SECS,
 };
 use super::env::{parse_env_u64, require, require_field};
 use super::file::{FileConfig, ReviewFile, ReviewTool, ReviewToolSelector};
@@ -51,6 +52,11 @@ pub struct ReviewConfig {
     /// `review.max_coverage_bounces` (or `LLM_MAX_COVERAGE_BOUNCES`) or
     /// [`DEFAULT_MAX_COVERAGE_BOUNCES`]. `0` disables the bounce; NOT clamped — zero is meaningful.
     pub max_coverage_bounces: usize,
+    /// OpenCode-path re-prompt ceiling (fast-tier-parity plan): from `review.<tier>.max_cycles` (or
+    /// [`DEFAULT_MAX_CYCLES`]). The real stuck-model backstop on the OpenCode path — see
+    /// [`DEFAULT_MAX_CYCLES`]'s doc for why this stayed Rust-side rather than moving to opencode's own
+    /// `maxSteps`. Unused by the native/legacy loop (which has its own turn-based budgets).
+    pub max_cycles: usize,
     /// Model context window in tokens (ADR-0045). `Some(n)` enables conversation budgeting: the loop
     /// winds down + trims old tool output as the estimate nears `n`, and finalizes (never discards
     /// findings) on an overflow error. `None` = no budgeting. From `review.context_window` /
@@ -174,6 +180,10 @@ impl ReviewConfig {
             max_coverage_bounces: parse_env_u64("LLM_MAX_COVERAGE_BOUNCES")
                 .map(|n| n as usize)
                 .unwrap_or(DEFAULT_MAX_COVERAGE_BOUNCES),
+            max_cycles: parse_env_u64("LLM_MAX_CYCLES")
+                .map(|n| n as usize)
+                .unwrap_or(DEFAULT_MAX_CYCLES)
+                .max(1),
             context_window: parse_env_u64("LLM_CONTEXT_WINDOW")
                 .map(|n| n as usize)
                 .filter(|&n| n > 0),
@@ -314,6 +324,11 @@ impl ReviewConfig {
                 .max_coverage_bounces
                 .or_else(|| parse_env_u64("LLM_MAX_COVERAGE_BOUNCES").map(|n| n as usize))
                 .unwrap_or(DEFAULT_MAX_COVERAGE_BOUNCES),
+            max_cycles: r
+                .max_cycles
+                .or_else(|| parse_env_u64("LLM_MAX_CYCLES").map(|n| n as usize))
+                .unwrap_or(DEFAULT_MAX_CYCLES)
+                .max(1),
             context_window,
             temperature,
             top_p,
@@ -488,6 +503,8 @@ mod tests {
                 max_batches: Some(0),
                 // NOT clamped, unlike the budgets above: 0 = coverage bounce disabled (ADR-0069).
                 max_coverage_bounces: Some(0),
+                // Clamped like the budgets above: an unbounded re-prompt loop (0) is never meaningful.
+                max_cycles: Some(0),
                 // A 0 context window is meaningless — it must resolve to "disabled" (None), not a
                 // window of zero that would force wind-down on turn 0 (ADR-0045).
                 context_window: Some(0),
@@ -514,6 +531,7 @@ mod tests {
             cfg.max_coverage_bounces, 0,
             "max_coverage_bounces is NOT clamped — 0 disables the coverage bounce (ADR-0069)"
         );
+        assert_eq!(cfg.max_cycles, 1, "max_cycles clamped");
         std::fs::remove_file(&prompt).ok();
     }
 
@@ -539,6 +557,7 @@ mod tests {
             max_searches: None,
             max_batches: None,
             max_coverage_bounces: None,
+            max_cycles: None,
             context_window: None,
             stream: None,
             fast: None,

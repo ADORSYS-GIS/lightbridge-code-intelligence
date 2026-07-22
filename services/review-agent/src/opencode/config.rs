@@ -461,7 +461,7 @@ mod tests {
         );
         // The reviewer prompt is a {file:*} reference the host fills per task (ADR-0099).
         assert_eq!(
-            config["agent"]["review"]["prompt"],
+            config["agent"]["build"]["prompt"],
             format!("{{file:./{REVIEW_PROMPT_FILE}}}")
         );
         // The mediated stdio review MCP.
@@ -653,8 +653,12 @@ mod tests {
         let rendered = render_review_config(false, None, &Map::new(), &[], Some(&overlay));
         // The custom sub-agent is present…
         assert_eq!(rendered.config["agent"]["explore"]["mode"], "subagent");
-        // …and the base `review` agent is untouched (recursive object merge).
-        assert_eq!(rendered.config["agent"]["review"]["mode"], "primary");
+        // …and the base `build` agent (the one ACP actually runs) is untouched (recursive object merge).
+        assert!(
+            rendered.config["agent"]["build"]["description"]
+                .as_str()
+                .is_some()
+        );
         // Adding an agent relaxes nothing.
         assert!(rendered.floor_breaches.is_empty());
         assert!(rendered.disclosure_note().is_none());

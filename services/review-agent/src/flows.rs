@@ -124,13 +124,19 @@ where
         params.diff_files.clone(),
         params.max_coverage_bounces,
         max_turns,
-        params.fast,
     );
 
     // Policy order is a behavioural contract (registration order = evaluation order in the engine):
     // context trim → wind-down → read budgets → turn budget → fast guard → scratchpad guard → coverage
     // gate → refute gate → SAST anchor gate → finding-finish nudge.
-    let policies: Vec<Box<dyn TurnPolicy>> = vec![
+    //
+    // The coverage/refute/SAST-anchor gates themselves no longer know about `fast` (fast-tier parity
+    // with deep on the OpenCode path, see ADR-0062's amendment) — but on THIS native/legacy loop,
+    // `FastTierGuard` still strips retrieval (`read_file`/vector/graph) every turn for fast, so
+    // composing gates that DEMAND engagement the model has no way to satisfy would just bounce it
+    // uselessly forever. Keep native's fast tier skipping these three, exactly as before, by leaving
+    // them out of the policy vec rather than re-threading a `fast` flag through the shared gate types.
+    let mut policies: Vec<Box<dyn TurnPolicy>> = vec![
         Box::new(ContextWindowTrim::new(params.context_window)),
         Box::new(
             WindDown::new(max_turns, params.max_batches)
@@ -143,11 +149,13 @@ where
         Box::new(TurnBudget::new(max_turns).disabled(params.fast)),
         Box::new(FastTierGuard::new(params.fast)),
         Box::new(ScratchpadLoopGuard::new()),
-        Box::new(coverage),
-        Box::new(RefuteGate::new(params.fast)),
-        Box::new(SastAnchorGate::new(params.sast_leads, params.fast)),
-        Box::new(FindingFinishNudge::new(params.fast)),
     ];
+    if !params.fast {
+        policies.push(Box::new(coverage));
+        policies.push(Box::new(RefuteGate::new()));
+        policies.push(Box::new(SastAnchorGate::new(params.sast_leads)));
+    }
+    policies.push(Box::new(FindingFinishNudge::new(params.fast)));
 
     let mut agent = AgentLoop::new(
         runtime,

@@ -116,6 +116,14 @@ pub struct ReviewFile {
     /// bounce (the coverage disclosure still applies), `1` = legacy bounce-once.
     #[serde(default, deserialize_with = "lci_config::de::opt_usize")]
     pub max_coverage_bounces: Option<usize>,
+    /// OpenCode-path re-prompt ceiling (fast-tier-parity plan): how many whole `session/prompt` cycles
+    /// the supervisor will re-drive before finalizing as exhausted. Unset = [`super::DEFAULT_MAX_CYCLES`].
+    /// Kept as a real Rust-side enforcement mechanism because opencode's own `maxSteps` was found NOT to
+    /// cap anything over ACP (see `services/agent-runner/src/review/opencode.rs`'s `e2e` module) — this
+    /// is what actually stops a stuck/adversarial model, tier-configurable so fast can run a
+    /// genuinely smaller budget than deep.
+    #[serde(default, deserialize_with = "lci_config::de::opt_usize")]
+    pub max_cycles: Option<usize>,
     /// Model context window in tokens (ADR-0045). When set, the agent budgets its conversation against
     /// it — winding down before overflow and trimming old tool output — instead of failing a 400 when
     /// the history grows too large. Unset = no budgeting (unchanged behaviour).

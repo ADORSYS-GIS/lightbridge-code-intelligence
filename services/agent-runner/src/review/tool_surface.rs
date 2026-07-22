@@ -173,6 +173,7 @@ mod tests {
             max_searches: 15,
             max_batches: 6,
             max_coverage_bounces: 3,
+            max_cycles: 8,
             context_window: None,
             temperature: None,
             top_p: None,

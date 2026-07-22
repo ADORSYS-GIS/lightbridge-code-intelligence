@@ -143,7 +143,6 @@ pub struct RefuteGate {
     findings: BTreeMap<(String, i64), Finding>,
     engaged: BTreeSet<String>,
     bounced: bool,
-    fast: bool,
     /// Set for exactly the turn following a bounce (#407): consumed and cleared by the very next
     /// `before_turn` call, so the forced retrieval set applies to that one re-verification turn only.
     force_reverify_next_turn: bool,
@@ -151,14 +150,19 @@ pub struct RefuteGate {
 
 impl RefuteGate {
     #[must_use]
-    pub fn new(fast: bool) -> Self {
+    pub fn new() -> Self {
         Self {
             findings: BTreeMap::new(),
             engaged: BTreeSet::new(),
             bounced: false,
-            fast,
             force_reverify_next_turn: false,
         }
+    }
+}
+
+impl Default for RefuteGate {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -233,7 +237,7 @@ impl TurnPolicy for RefuteGate {
                 _ => {}
             }
         }
-        if self.fast || self.bounced || self.findings.is_empty() || !outcome.finish_requested {
+        if self.bounced || self.findings.is_empty() || !outcome.finish_requested {
             return Vec::new();
         }
         self.bounced = true;
@@ -293,7 +297,7 @@ mod tests {
 
     #[test]
     fn refute_gate_is_one_shot_and_retracts_monotonically() {
-        let mut gate = RefuteGate::new(false);
+        let mut gate = RefuteGate::new();
         gate.after_turn_actions(
             &state(0),
             &finding_turn(r#"{"priority":"P1","file":"a.rs","line":2}"#),
@@ -311,7 +315,7 @@ mod tests {
 
     #[test]
     fn retracting_a_finding_by_file_and_line_clears_the_gate() {
-        let mut gate = RefuteGate::new(false);
+        let mut gate = RefuteGate::new();
         gate.after_turn_actions(
             &state(0),
             &finding_turn(r#"{"priority":"P1","file":"a.rs","line":2}"#),
@@ -338,7 +342,7 @@ mod tests {
     /// engaged file so the model doesn't waste the bounce re-reading it.
     #[test]
     fn absence_claim_gets_the_outward_search_directive() {
-        let mut gate = RefuteGate::new(false);
+        let mut gate = RefuteGate::new();
         gate.after_turn_actions(
             &state(0),
             &finding_turn(
@@ -363,7 +367,7 @@ mod tests {
     /// Idempotency-Key" — with no other matching language anywhere else in the finding to lean on.
     #[test]
     fn bare_without_phrasing_alone_is_detected_as_absence_claim() {
-        let mut gate = RefuteGate::new(false);
+        let mut gate = RefuteGate::new();
         gate.after_turn_actions(
             &state(0),
             &finding_turn(
@@ -385,7 +389,7 @@ mod tests {
     /// `COVERAGE_MAX_LISTED`) so a long deep-tier run doesn't bloat the nudge with dozens of paths.
     #[test]
     fn absence_directive_caps_the_engaged_files_list() {
-        let mut gate = RefuteGate::new(false);
+        let mut gate = RefuteGate::new();
         for i in 0..20 {
             gate.after_turn_actions(
                 &state(0),
@@ -423,7 +427,7 @@ mod tests {
     /// search directive is scoped to absence claims (ticket's "Out of Scope").
     #[test]
     fn non_absence_claim_skips_the_outward_search_directive() {
-        let mut gate = RefuteGate::new(false);
+        let mut gate = RefuteGate::new();
         gate.after_turn_actions(
             &state(0),
             &finding_turn(
@@ -439,18 +443,5 @@ mod tests {
             })
             .expect("expected a RejectFinish nudge");
         assert!(!nudge.contains("transport interceptor"));
-    }
-
-    #[test]
-    fn fast_tier_never_bounces() {
-        let mut gate = RefuteGate::new(true);
-        gate.after_turn_actions(
-            &state(0),
-            &finding_turn(r#"{"priority":"P1","file":"a.rs","line":2}"#),
-        );
-        assert!(
-            gate.after_turn_actions(&state(1), &finish_turn())
-                .is_empty()
-        );
     }
 }

@@ -155,7 +155,6 @@ pub struct CoverageGate {
     bounces: usize,
     engaged_at_last_bounce: usize,
     winddown: usize,
-    fast: bool,
     summary: Option<String>,
     state: CoverageState,
 }
@@ -166,7 +165,6 @@ impl CoverageGate {
         changed_files: impl IntoIterator<Item = impl Into<String>>,
         max_bounces: usize,
         max_turns: usize,
-        fast: bool,
     ) -> (Self, CoverageState) {
         let state = CoverageState::default();
         let mut changed = BTreeSet::new();
@@ -189,7 +187,6 @@ impl CoverageGate {
                 bounces: 0,
                 engaged_at_last_bounce: 0,
                 winddown: winddown_turn(max_turns),
-                fast,
                 summary: None,
                 state: state.clone(),
             },
@@ -297,8 +294,7 @@ impl TurnPolicy for CoverageGate {
         outcome: &TurnOutcome,
     ) -> Vec<PolicyAction> {
         self.update(outcome);
-        if self.fast
-            || !outcome.finish_requested
+        if !outcome.finish_requested
             || state.turn >= self.winddown
             || self.bounces >= self.max_bounces
         {
@@ -330,7 +326,7 @@ impl TurnPolicy for CoverageGate {
         _state: &TurnState<'_>,
         _outcome: &TurnOutcome,
     ) -> Vec<PolicyAction> {
-        if !self.fast && self.disclose() {
+        if self.disclose() {
             vec![PolicyAction::Record {
                 name: Some("coverage_disclosure"),
                 detail: serde_json::json!({}),
@@ -341,7 +337,7 @@ impl TurnPolicy for CoverageGate {
     }
 
     fn exhausted_actions(&mut self, _state: &TurnState<'_>) -> Vec<PolicyAction> {
-        if !self.fast && self.disclose() {
+        if self.disclose() {
             vec![PolicyAction::Record {
                 name: Some("coverage_disclosure"),
                 detail: serde_json::json!({}),
@@ -360,7 +356,7 @@ mod tests {
 
     #[test]
     fn coverage_requires_real_engagement_before_accepting_finish() {
-        let (mut gate, coverage) = CoverageGate::new(["./a.rs"], 1, 5, false);
+        let (mut gate, coverage) = CoverageGate::new(["./a.rs"], 1, 5);
         let early = TurnOutcome {
             assistant: ChatMessage::user(""),
             results: vec![call(
@@ -421,7 +417,7 @@ mod tests {
             "docker/fineract-config/base-config.yml",
             "pendingp2p/README.md",
         ];
-        let (mut gate, coverage) = CoverageGate::new(changed, 1, 5, false);
+        let (mut gate, coverage) = CoverageGate::new(changed, 1, 5);
 
         // Denominator: only the 4 real source files, not all 15.
         assert_eq!(gate.changed.len(), 4);
@@ -529,7 +525,7 @@ mod tests {
     #[test]
     fn discloses_low_signal_exclusions_even_when_source_coverage_is_complete() {
         let changed = ["src/main.rs", "lib/l10n/app_localizations.dart"];
-        let (mut gate, coverage) = CoverageGate::new(changed, 1, 5, false);
+        let (mut gate, coverage) = CoverageGate::new(changed, 1, 5);
         gate.update(&TurnOutcome {
             assistant: ChatMessage::user(""),
             results: vec![call(
@@ -567,7 +563,7 @@ mod tests {
     /// — matches [`coverage_requires_real_engagement_before_accepting_finish`]'s existing expectation.
     #[test]
     fn discloses_nothing_when_fully_covered_with_no_low_signal_files() {
-        let (mut gate, coverage) = CoverageGate::new(["src/main.rs"], 1, 5, false);
+        let (mut gate, coverage) = CoverageGate::new(["src/main.rs"], 1, 5);
         gate.update(&TurnOutcome {
             assistant: ChatMessage::user(""),
             results: vec![call(
