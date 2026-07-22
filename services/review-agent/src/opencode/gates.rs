@@ -191,8 +191,9 @@ impl ReviewGates {
         self.coverage_state.amended_summary()
     }
 
-    /// Whether these gates are running in FAST-tier (no bouncing, no disclosure) — exposed so a host
-    /// can assert the tier it configured.
+    /// Whether these gates are running in FAST-tier. Fast-tier-parity: this is now a pure tier LABEL —
+    /// no gate behavior branches on it any more (fast bounces/refutes/discloses identically to deep) —
+    /// exposed so a host can assert the tier it configured, or for logging/disclosure framing.
     #[must_use]
     pub fn is_fast(&self) -> bool {
         self.fast
