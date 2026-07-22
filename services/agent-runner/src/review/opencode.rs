@@ -376,9 +376,9 @@ fn merge_disclosure(coverage: Option<String>, floor: Option<String>) -> Option<S
     }
 }
 
-/// Best-effort post of the coverage disclosure note (ADR-0069 / #306) as the review summary — a failed
-/// re-post keeps the model's own summary rather than failing a finished run.
-/// NOTE: This function is no longer used (coverage disclosure no longer posted to control plane).
+// Best-effort post of the coverage disclosure note (ADR-0069 / #306) as the review summary — a failed
+// re-post keeps the model's own summary rather than failing a finished run.
+// NOTE: This function is no longer used (coverage disclosure no longer posted to control plane).
 // async fn post_disclosure(client: &ControlPlaneClient, task_id: Uuid, disclosure: Option<String>) {
 //     if let Some(note) = disclosure
 //         && let Err(error) = client.set_review_summary(task_id, &note).await
