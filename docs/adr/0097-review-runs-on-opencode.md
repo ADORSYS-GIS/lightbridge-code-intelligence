@@ -73,6 +73,17 @@ calls) and returns once. So the native review policies split into two classes:
    mediated path, escaping coverage accounting. A top-level `tools` disable is agent-independent;
    verified via the e2e's advertised-tools assertion (per-agent left `read`/`grep`/`bash`/… advertised;
    top-level leaves only the four `lightbridge_*` tools).
+   - **Update (2026-07-22, fast-tier-parity plan):** the SAME `agent.review`-is-ignored mechanism was
+     found to ALSO apply to `prompt` — `integrations/opencode/config/review.jsonc` had set the per-task
+     system prompt on `agent.review.prompt`, silently inert since the OpenCode cutover. Fixed by moving
+     it to `agent.build.prompt` (the agent actually in use), proven against the real binary
+     (`agent_build_prompt_reaches_the_real_wire` e2e,
+     `services/agent-runner/src/review/opencode.rs`). While investigating whether this class of
+     per-agent-block config ALSO covers a step-limit, opencode's own `agent.build.maxSteps` was tested
+     and found schema-accepted but **non-functional over ACP** — see
+     [ADR-0062's amendment](0062-two-tier-review-fast-auto-deep-on-demand.md#amendment-2026-07-22---fast-tier-parity-tools-and-gates-unified-budget-stays-the-differentiator)
+     for the full finding; the Rust-side `review.<tier>.max_cycles` stays the real re-prompt ceiling as
+     a result, not opencode's own step cap.
 4. **`session/new.mcpServers` is a JSON array; stdio MCP is wired via the config `mcp` block.** The
    mediated review tools (`lci-review-mcp`, reusing the tuned `ToolSpec`s) are stdio MCP declared in
    the rendered config, not via `session/new` (which honours only http/sse there).

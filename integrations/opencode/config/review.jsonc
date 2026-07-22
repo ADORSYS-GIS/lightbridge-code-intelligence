@@ -23,10 +23,15 @@
   //   provider.eaig.models.reviewer.reasoning    the tier flag (deep = true / fast = false, ADR-0069) —
   //                                              a bool, so it can't be a string {env:*}; patched in.
   //   provider.eaig.models.reviewer.options.temperature  set only when the tier configures one.
-  //   agent.review.prompt (the {file:*} target)  the per-task system prompt is WRITTEN to
+  //   agent.build.prompt (the {file:*} target)   the per-task system prompt is WRITTEN to
   //                                              `review-prompt.md` next to this config each task; the
   //                                              {file:*} reference below stays static, its CONTENT is
   //                                              per-task. opencode resolves {file:*}/{env:*} at load.
+  //                                              Targets `agent.build` (the agent opencode-over-ACP
+  //                                              actually runs), NOT a same-named custom agent — a
+  //                                              custom `agent.review` block here would be silently
+  //                                              ignored, proven against the real binary (see
+  //                                              `agent_build_prompt_reaches_the_real_wire` e2e).
   //
   // OPERATOR OVERLAY (layer 3 — `review.opencode` in ai-helm-values, TRUSTED, FULL OVERRIDE):
   //   Deep-merged LAST: objects merge recursively; arrays and scalars from the overlay REPLACE ours.
@@ -114,9 +119,12 @@
       "enabled": true
     }
   },
+  // Targets `build` — opencode-over-ACP runs its own default agent for a new session, NOT a custom
+  // same-named agent block (proven against the real binary: a `agent.review` block here was silently
+  // ignored, both for `tools`/`permission` — ADR-0097 decision #3 — and, until this fix, for `prompt`
+  // too). `description`/`prompt` below are what actually reach the model on the real wire.
   "agent": {
-    "review": {
-      "mode": "primary",
+    "build": {
       "description": "Lightbridge review: investigates a PR via the mediated retrieval tools and records findings with lightbridge_add_review_comment, then calls lightbridge_finish with a verdict (or lightbridge_abort). Read-only; never edits or runs commands.",
       // The per-task system prompt is written to `review-prompt.md` beside this config each task and
       // referenced here; opencode resolves {file:*} relative to the config file's directory at load.

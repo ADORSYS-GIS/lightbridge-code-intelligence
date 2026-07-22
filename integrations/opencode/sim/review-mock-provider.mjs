@@ -11,6 +11,13 @@ import { createServer } from "node:http";
 
 const port = Number(process.env.LCI_SIM_PROVIDER_PORT ?? "8899");
 const toolsLog = process.env.LCI_SIM_TOOLS_LOG;
+// Full incoming `messages` array per request — lets a test prove whether config-level prompt text
+// (e.g. `agent.review.prompt`/`agent.build.prompt`) actually reaches the model, vs just the
+// session/prompt user turn. Off by default (small perf/disk cost, only needed by that one proof).
+const msgLog = process.env.LCI_SIM_MSG_LOG;
+// When set, never take the "finish" branch — always request another tool call. Used to prove
+// whether opencode's own `maxSteps`/`steps` agent config actually caps in-session turns.
+const neverFinish = process.env.LCI_SIM_NEVER_FINISH === "1";
 
 // The chain-of-thought the mock streams on every turn as `reasoning_content` (see streamResponse /
 // jsonResponse). Kept deterministic + greppable so the real-wire e2e can assert the `agent.reasoning`
@@ -27,10 +34,24 @@ function decide(messages, tools) {
       appendFileSync(toolsLog, `${JSON.stringify(toolNames)}\n`);
     } catch {}
   }
+  if (msgLog) {
+    try {
+      appendFileSync(msgLog, `${JSON.stringify(messages ?? [])}\n`);
+    } catch {}
+  }
+
   const find = (re) => toolNames.find((n) => re.test(n));
   const readFile = find(/read_file/i);
   const addComment = find(/add_review_comment/i);
   const finish = find(/finish/i);
+
+  if (neverFinish) {
+    // Adversarial: keep requesting reads forever so a real `maxSteps`/`steps` cap is the ONLY thing
+    // that can stop the session — proves whether the injected limit takes effect on the real wire.
+    return readFile
+      ? { kind: "tool", name: readFile, args: { path: `a.rs#${(messages ?? []).length}` } }
+      : { kind: "text", text: "No read_file tool advertised. DONE." };
+  }
 
   const transcript = JSON.stringify(messages ?? []);
   const didRead = /READ_OK/.test(transcript);

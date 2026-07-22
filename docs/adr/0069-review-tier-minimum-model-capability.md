@@ -107,6 +107,33 @@ it), and the disclosure converts the residual failure mode from *undetectable* t
 - **Verify coverage claims semantically** (parse the summary for file names and cross-check). Rejected
   — brittle prose-parsing; the engagement set already is the ground truth, so disclose from it.
 
+## Amendment (2026-07-22) — fast-tier parity removes the "why that works" premise for fast; the floor itself stays
+
+[ADR-0062's amendment of the same date](0062-two-tier-review-fast-auto-deep-on-demand.md#amendment-2026-07-22---fast-tier-parity-tools-and-gates-unified-budget-stays-the-differentiator)
+gives fast tier the same tools and the same `CoverageGate`/`RefuteGate`/`SastAnchorGate` mechanics as deep.
+Two things in this ADR are now stale as a result, and this amendment addresses the tension head-on rather
+than silently contradict it, per this ADR's own warning ("a prompt is not a substitute for capability"):
+
+- **The capability table's "Why that works" cell for fast** ("closed tool allowlist, no retrieval,
+  diff-only, few turns") no longer describes fast's actual mechanics — it now has the same tools and gate
+  discipline as deep, differing only by model class and a smaller `review.<tier>.max_cycles` budget.
+- **"Bounce with a cap... still pre-wind-down only, still skipped for fast"** (Decision §2) is no longer
+  true: `CoverageGate` no longer takes a `fast` parameter at all; fast bounces, discloses, and gets
+  refuted exactly like deep.
+
+**Does this move fast below its own floor?** No — the floor itself is unchanged and still holds: fast
+still runs a small/cheap model, still below the frontier-reasoning-class deep requires. What changes is
+*why that's safe*. Before this amendment, fast's safety came from having no investigation loop for a weak
+model to fail *within* — it couldn't fabricate coverage because it never had retrieval to fabricate having
+used. That premise is gone. The new compensating control is the same one this ADR built for deep: **the
+full `CoverageGate` bounce-with-cap-and-disclosure and the one-shot `RefuteGate` now apply to fast too** —
+if a small model games the coverage nudge or fabricates a verdict the way `bac4b5d8` did, the same
+disclosure ("examined N of M changed files") and the same evidence-bounce now catch it on fast, not just
+on deep. This is explicitly the bet this amendment makes: a small model given real tools and gate pressure
+does more real work than a small model given no tools at all — worth watching for a `bac4b5d8`-shaped
+failure recurring on fast now that it has something to fabricate about; if that happens, the fix per this
+ADR's own precedent is a documented floor + disclosure, not silently reverting to no-tools.
+
 ## References
 
 - Incident: run `bac4b5d8-786c-4587-a071-e3d7f3f3d877` on `vymalo/vymalo-shop#422`, 2026-07-05;

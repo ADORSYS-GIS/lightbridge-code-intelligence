@@ -53,6 +53,13 @@ pub const DEFAULT_MAX_BATCHES: usize = 6;
 /// Deliberately NOT clamped to ≥1 — unlike the read budgets, zero is a meaningful setting here.
 pub const DEFAULT_MAX_COVERAGE_BOUNCES: usize = 3;
 
+/// Default ceiling on OpenCode `session/prompt` re-prompt cycles (fast-tier-parity plan). The real
+/// stuck-model backstop on the OpenCode path — opencode's own `maxSteps` was proven NOT to cap
+/// anything over ACP, so this Rust-side counter is what actually stops a run, not a nudge heuristic.
+/// Matches the pre-existing hardcoded `MAX_REVIEW_CYCLES` this default replaces; operator-tunable via
+/// `review.<tier>.max_cycles` so fast can run a smaller budget than deep.
+pub const DEFAULT_MAX_CYCLES: usize = 8;
+
 /// SAST (opengrep) defaults (ADR-0061). The whole feature is **opt-in** (default disabled) so the
 /// rollout is image-then-config: an existing deploy without the opengrep-bearing image is unaffected.
 pub const DEFAULT_SAST_BIN: &str = "opengrep";

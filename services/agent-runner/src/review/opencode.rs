@@ -26,11 +26,6 @@ use super::ReviewOutcome;
 use crate::bootstrap::config::ReviewConfig;
 use crate::clone::PrDiff;
 
-/// The supervisor re-prompt budget: how many `session/prompt` cycles the host will drive before
-/// declaring exhaustion. A cycle is a whole OpenCode agent run (many model turns), so this is small —
-/// it bounds gate bounces + keep-going nudges, not model turns (those are OpenCode's own budget).
-const MAX_REVIEW_CYCLES: usize = 8;
-
 /// Ceiling on how much of the recorder file to read into memory (gemini #447). The recorder logs tool
 /// RESULTS — including `read_file` output of arbitrary repo files — so a pathological repo could bloat
 /// it; cap the read so it can't OOM the runner. 32 MiB is far above any real review's recorder.
@@ -328,7 +323,10 @@ pub async fn run_opencode_agent(
         review.max_turns,
         review.fast,
     );
-    let mut driver = ReviewDriver::new(gates, MAX_REVIEW_CYCLES);
+    // The Rust-side re-prompt ceiling (fast-tier-parity plan): opencode's own `maxSteps` doesn't cap
+    // anything over ACP (see the `e2e` module below), so `review.max_cycles` — tier-configurable, fast
+    // smaller than deep — is what actually stops a stuck/adversarial model.
+    let mut driver = ReviewDriver::new(gates, review.max_cycles);
     let mut session = OpencodeReviewSession::new(client_acp, session_id, recorder_path.clone());
     let resolution = run_review_loop(&mut session, &mut driver, &user_prompt).await;
 
@@ -410,8 +408,8 @@ mod e2e {
 
     use lci_acp_host::{AcpClient, PermissionPolicy};
     use lci_review_agent::opencode::{
-        REVIEW_PROMPT_FILE, ReviewDriver, ReviewGates, ReviewResolution, render_review_config,
-        run_review_loop,
+        REVIEW_PROMPT_FILE, ReviewDriver, ReviewGates, ReviewResolution, ReviewSession,
+        render_review_config, run_review_loop,
     };
 
     use super::OpencodeReviewSession;
@@ -483,14 +481,16 @@ mod e2e {
                 "command": ["node", sim.join("review-mock-mcp.mjs").display().to_string()],
                 "enabled": true
             }},
-            // TOP-LEVEL tool disables (agent-independent) — the per-agent block was ignored because
-            // opencode runs its default `build` agent, not a custom one.
+            // TOP-LEVEL tool disables (agent-independent) — a per-agent block is ignored because
+            // opencode runs its default `build` agent, not a custom one (proven below and by
+            // `agent_build_prompt_reaches_the_real_wire`). Targeting `agent.build` here for the same
+            // reason, though this test's own instruction reaches the model via `run_review_loop`'s
+            // prompt argument, not this config field.
             "tools": { "read": false, "grep": false, "glob": false, "list": false,
                        "edit": false, "write": false, "patch": false, "bash": false,
                        "webfetch": false, "websearch": false, "task": false, "todowrite": false,
                        "skill": false },
-            "agent": { "review": {
-                "mode": "primary",
+            "agent": { "build": {
                 "description": "Review the change via the mediated tools; read-only.",
                 "prompt": "Review the changed file a.rs. Read it, record findings with add_review_comment, then call finish."
             }}
@@ -716,15 +716,291 @@ mod e2e {
             resolved["tools"]["read"], false,
             "untouched floor invariant (read disabled) was lost: {resolved}"
         );
-        // The reviewer prompt resolved from the {file:*} reference to the per-task file content.
+        // The reviewer prompt resolved from the {file:*} reference to the per-task file content, on
+        // `agent.build` — the agent ACP actually runs (see `agent_build_prompt_reaches_the_real_wire`).
         assert_eq!(
-            resolved["agent"]["review"]["prompt"], "REVIEWER PROMPT BODY",
+            resolved["agent"]["build"]["prompt"], "REVIEWER PROMPT BODY",
             "the {{file:*}} reviewer prompt did not resolve: {resolved}"
         );
         // Secrets stayed as resolved-from-env (never inlined into the checked-in base).
         assert_eq!(
             resolved["provider"]["eaig"]["options"]["baseURL"],
             "https://gw.internal/v1"
+        );
+    }
+
+    /// Fast-tier-parity plan, Step 0 (spike): `integrations/opencode/config/review.jsonc`'s own comment
+    /// and ADR-0097 already proved, for the `tools` key, that the live ACP session runs opencode's
+    /// default `build` agent, not the checked-in `agent.review` block. This proves the SAME is true for
+    /// `prompt` by checking the real wire (not `opencode debug config`, which only proves schema
+    /// resolution, never functional effect) — and proves the fix: targeting `agent.build.prompt` instead
+    /// actually reaches the model. `agent.review.prompt` is presumed inert by the same mechanism already
+    /// proven for `tools`; re-deriving that negative here would need a slow/flaky non-arrival timeout for
+    /// no extra signal, so this test asserts the positive fix only.
+    #[tokio::test]
+    async fn agent_build_prompt_reaches_the_real_wire() {
+        if !on_path("opencode") || !on_path("node") {
+            eprintln!("SKIP: opencode/node not on PATH — this e2e proof needs both");
+            return;
+        }
+        let root = repo_root();
+        let sim = root.join("integrations/opencode/sim");
+        let plugins = root.join("integrations/opencode/plugins");
+        let port = 8918u16;
+
+        let workdir = std::env::temp_dir().join("lci-opencode-review-e2e-build-prompt");
+        let _ = std::fs::remove_dir_all(&workdir);
+        std::fs::create_dir_all(&workdir).unwrap();
+        let fake_home = workdir.join("home");
+        let xdg = workdir.join("xdg");
+        std::fs::create_dir_all(&fake_home).unwrap();
+        std::fs::create_dir_all(&xdg).unwrap();
+        let recorder_path = workdir.join("recording.jsonl");
+        let config_path = workdir.join("opencode.json");
+        let msg_log = workdir.join("messages.log");
+
+        const MARKER: &str = "MARKER_AGENT_BUILD_PROMPT_9f2c1a";
+
+        let plugin = |name: &str| {
+            plugins
+                .join(name)
+                .join("src/index.ts")
+                .display()
+                .to_string()
+        };
+        let config = serde_json::json!({
+            "$schema": "https://opencode.ai/config.json",
+            "model": "sim/sim-model",
+            "provider": { "sim": {
+                "npm": "@ai-sdk/openai-compatible",
+                "name": "Sim",
+                "options": { "baseURL": format!("http://127.0.0.1:{port}/v1"), "apiKey": "sim" },
+                "models": { "sim-model": { "name": "Sim" } }
+            }},
+            "plugin": [plugin("recorder"), plugin("gate-interlock"), plugin("logger")],
+            "mcp": { "lightbridge": {
+                "type": "local",
+                "command": ["node", sim.join("review-mock-mcp.mjs").display().to_string()],
+                "enabled": true
+            }},
+            "tools": { "read": false, "grep": false, "glob": false, "list": false,
+                       "edit": false, "write": false, "patch": false, "bash": false,
+                       "webfetch": false, "websearch": false, "task": false, "todowrite": false,
+                       "skill": false },
+            // Target `agent.build` (the agent ACP actually runs) instead of the checked-in
+            // `agent.review` block — this is the injection-point fix this spike verifies.
+            "agent": { "build": { "prompt": MARKER } }
+        });
+        std::fs::write(&config_path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
+
+        let mut provider = tokio::process::Command::new("node")
+            .arg(sim.join("review-mock-provider.mjs"))
+            .env("LCI_SIM_PROVIDER_PORT", port.to_string())
+            .env("LCI_SIM_MSG_LOG", msg_log.display().to_string())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn mock provider");
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+
+        let env = vec![
+            (
+                "OPENCODE_CONFIG".to_string(),
+                config_path.display().to_string(),
+            ),
+            ("OPENCODE_DISABLE_AUTOUPDATE".to_string(), "1".to_string()),
+            ("OPENCODE_DISABLE_MODELS_FETCH".to_string(), "1".to_string()),
+            ("HOME".to_string(), fake_home.display().to_string()),
+            ("XDG_CONFIG_HOME".to_string(), xdg.display().to_string()),
+            ("XDG_DATA_HOME".to_string(), xdg.display().to_string()),
+            ("XDG_CACHE_HOME".to_string(), xdg.display().to_string()),
+            (
+                "LCI_RECORDER_PATH".to_string(),
+                recorder_path.display().to_string(),
+            ),
+            (
+                "LCI_GATE_TERMINAL_TOOL".to_string(),
+                "lightbridge_finish".to_string(),
+            ),
+            ("LCI_GATE_REQUIRED_TOOLS".to_string(), String::new()),
+        ];
+
+        let (acp, _logger_stderr) = AcpClient::spawn_with_captured_stderr(
+            "opencode",
+            &workdir,
+            PermissionPolicy::Cancel,
+            &env,
+        )
+        .await
+        .expect("spawn opencode acp");
+        acp.initialize().await.expect("initialize");
+        let session_id = acp
+            .new_session(&workdir.to_string_lossy(), serde_json::json!([]))
+            .await
+            .expect("session/new");
+
+        let mut session = OpencodeReviewSession::new(acp, session_id, recorder_path.clone());
+        let result = session
+            .prompt("Distinct user turn: please review a.rs now.")
+            .await;
+        let _ = session.shutdown().await;
+        let _ = provider.kill().await;
+
+        let logged = std::fs::read_to_string(&msg_log).unwrap_or_default();
+        result.unwrap_or_else(|error| {
+            panic!("review loop errored: {error}\n--- logged requests ---\n{logged}")
+        });
+        assert!(
+            logged.contains(MARKER),
+            "agent.build.prompt content never reached the model on the real wire — the injection \
+             point is wrong.\n--- logged requests ---\n{logged}"
+        );
+    }
+
+    /// Fast-tier-parity plan, Step 0 (spike), second half — **documents a known opencode limitation,
+    /// does not prove a working feature**. `agent.build.maxSteps` is schema-accepted by the pinned
+    /// binary (`opencode debug config` resolves it fine) but was found, empirically, NOT to bound the
+    /// model's in-session turns over ACP: driven against a provider that never finishes
+    /// (`LCI_SIM_NEVER_FINISH=1`) with `maxSteps: 3`, the session made 600+ round-trips before a test
+    /// timeout had to cut it off. Because of that finding, `review.max_cycles` (the Rust-side re-prompt
+    /// ceiling) was kept and made tier-configurable rather than retired — see the fast-tier-parity
+    /// plan's Context section. This test asserts the CURRENT (broken) behavior with a short bounded
+    /// timeout so it stays a fast, green CI canary: if opencode ever ships a fix, this test starts
+    /// FAILING — that failure is a signal to revisit whether `maxSteps` can now replace/shrink
+    /// `review.max_cycles`, not a regression to silently paper over.
+    #[tokio::test]
+    async fn agent_build_max_steps_does_not_cap_a_never_finishing_model() {
+        if !on_path("opencode") || !on_path("node") {
+            eprintln!("SKIP: opencode/node not on PATH — this e2e proof needs both");
+            return;
+        }
+        let root = repo_root();
+        let sim = root.join("integrations/opencode/sim");
+        let plugins = root.join("integrations/opencode/plugins");
+        let port = 8919u16;
+
+        let workdir = std::env::temp_dir().join("lci-opencode-review-e2e-max-steps");
+        let _ = std::fs::remove_dir_all(&workdir);
+        std::fs::create_dir_all(&workdir).unwrap();
+        let fake_home = workdir.join("home");
+        let xdg = workdir.join("xdg");
+        std::fs::create_dir_all(&fake_home).unwrap();
+        std::fs::create_dir_all(&xdg).unwrap();
+        let recorder_path = workdir.join("recording.jsonl");
+        let config_path = workdir.join("opencode.json");
+        let tools_log = workdir.join("tools.log");
+
+        const MAX_STEPS: u64 = 3;
+
+        let plugin = |name: &str| {
+            plugins
+                .join(name)
+                .join("src/index.ts")
+                .display()
+                .to_string()
+        };
+        let config = serde_json::json!({
+            "$schema": "https://opencode.ai/config.json",
+            "model": "sim/sim-model",
+            "provider": { "sim": {
+                "npm": "@ai-sdk/openai-compatible",
+                "name": "Sim",
+                "options": { "baseURL": format!("http://127.0.0.1:{port}/v1"), "apiKey": "sim" },
+                "models": { "sim-model": { "name": "Sim" } }
+            }},
+            "plugin": [plugin("recorder"), plugin("gate-interlock"), plugin("logger")],
+            "mcp": { "lightbridge": {
+                "type": "local",
+                "command": ["node", sim.join("review-mock-mcp.mjs").display().to_string()],
+                "enabled": true
+            }},
+            "tools": { "read": false, "grep": false, "glob": false, "list": false,
+                       "edit": false, "write": false, "patch": false, "bash": false,
+                       "webfetch": false, "websearch": false, "task": false, "todowrite": false,
+                       "skill": false },
+            "agent": { "build": { "maxSteps": MAX_STEPS } }
+        });
+        std::fs::write(&config_path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
+
+        let mut provider = tokio::process::Command::new("node")
+            .arg(sim.join("review-mock-provider.mjs"))
+            .env("LCI_SIM_PROVIDER_PORT", port.to_string())
+            .env("LCI_SIM_TOOLS_LOG", tools_log.display().to_string())
+            .env("LCI_SIM_NEVER_FINISH", "1")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn mock provider");
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+
+        let env = vec![
+            (
+                "OPENCODE_CONFIG".to_string(),
+                config_path.display().to_string(),
+            ),
+            ("OPENCODE_DISABLE_AUTOUPDATE".to_string(), "1".to_string()),
+            ("OPENCODE_DISABLE_MODELS_FETCH".to_string(), "1".to_string()),
+            ("HOME".to_string(), fake_home.display().to_string()),
+            ("XDG_CONFIG_HOME".to_string(), xdg.display().to_string()),
+            ("XDG_DATA_HOME".to_string(), xdg.display().to_string()),
+            ("XDG_CACHE_HOME".to_string(), xdg.display().to_string()),
+            (
+                "LCI_RECORDER_PATH".to_string(),
+                recorder_path.display().to_string(),
+            ),
+            (
+                "LCI_GATE_TERMINAL_TOOL".to_string(),
+                "lightbridge_finish".to_string(),
+            ),
+            ("LCI_GATE_REQUIRED_TOOLS".to_string(), String::new()),
+        ];
+
+        let (acp, _logger_stderr) = AcpClient::spawn_with_captured_stderr(
+            "opencode",
+            &workdir,
+            PermissionPolicy::Cancel,
+            &env,
+        )
+        .await
+        .expect("spawn opencode acp");
+        acp.initialize().await.expect("initialize");
+        let session_id = acp
+            .new_session(&workdir.to_string_lossy(), serde_json::json!([]))
+            .await
+            .expect("session/new");
+
+        let mut session = OpencodeReviewSession::new(acp, session_id, recorder_path.clone());
+        // Short bound (not 30s): we EXPECT this to time out — see the doc comment. Long enough to be
+        // confident it's not just slow to start (the provider answers in milliseconds), short enough
+        // to keep this a fast CI canary rather than a slow one.
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(8),
+            session.prompt("Review the change; keep going until you're told to stop."),
+        )
+        .await;
+
+        let _ = session.shutdown().await;
+        let _ = provider.kill().await;
+
+        let advertised_requests = std::fs::read_to_string(&tools_log)
+            .unwrap_or_default()
+            .lines()
+            .count();
+
+        assert!(
+            outcome.is_err(),
+            "agent.build.maxSteps={MAX_STEPS} unexpectedly capped the session after only \
+             {advertised_requests} requests — opencode may have fixed step-limit enforcement over ACP \
+             upstream. If so, revisit the fast-tier-parity plan's decision to keep review.max_cycles \
+             as the real ceiling instead of retiring it in favor of maxSteps."
+        );
+        assert!(
+            advertised_requests > (MAX_STEPS as usize) + 2,
+            "expected far more than {MAX_STEPS} provider round-trips in 8s (maxSteps is known not to \
+             cap ACP sessions at the pinned opencode version), got only {advertised_requests} — \
+             investigate before assuming this is still the same known-broken behavior"
         );
     }
 }

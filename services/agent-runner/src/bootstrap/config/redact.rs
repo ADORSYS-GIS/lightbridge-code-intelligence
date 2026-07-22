@@ -56,6 +56,7 @@ impl ReviewConfig {
             "max_searches": self.max_searches,
             "max_batches": self.max_batches,
             "max_coverage_bounces": self.max_coverage_bounces,
+            "max_cycles": self.max_cycles,
             "context_window": self.context_window,
             "temperature": self.temperature,
             "top_p": self.top_p,
@@ -196,7 +197,7 @@ fn sanitized_base_url(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bootstrap::config::defaults::DEFAULT_MAX_COVERAGE_BOUNCES;
+    use crate::bootstrap::config::defaults::{DEFAULT_MAX_COVERAGE_BOUNCES, DEFAULT_MAX_CYCLES};
     use crate::bootstrap::config::file::{ReviewTool, ReviewToolSelector};
     use crate::bootstrap::config::review::ResilienceConfig;
 
@@ -244,6 +245,7 @@ mod tests {
             max_searches: 30,
             max_batches: 12,
             max_coverage_bounces: DEFAULT_MAX_COVERAGE_BOUNCES,
+            max_cycles: DEFAULT_MAX_CYCLES,
             context_window: Some(128_000),
             temperature: Some(0.2),
             top_p: None,
