@@ -138,8 +138,8 @@ fn build_tracer_provider(service_name: &str, endpoint: &str) -> anyhow::Result<S
         .unwrap_or(0.1);
 
     // Build our own reqwest client — after the caller has pinned the crypto provider — rather than
-    // letting opentelemetry-otlp construct its own internal client, so this exporter rides the same
-    // audited TLS stack as the rest of the binary instead of an independently-resolved one.
+    // letting opentelemetry-otlp construct its own internal client. This allows us to configure
+    // insecure TLS to match the Alloy collector's configuration.
     // Allow insecure TLS
     let http_client = reqwest::Client::builder()
         .tls_danger_accept_invalid_certs(true)
