@@ -142,7 +142,7 @@ fn build_tracer_provider(service_name: &str, endpoint: &str) -> anyhow::Result<S
     // audited TLS stack as the rest of the binary instead of an independently-resolved one.
     // Allow insecure TLS
     let http_client = reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
+        .tls_danger_accept_invalid_certs(true)
         .build()?;
 
     // `endpoint` is the configured BASE url; append the OTLP/HTTP traces path ourselves (see doc
