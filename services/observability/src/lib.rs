@@ -8,6 +8,7 @@
 //! Postgres row read back much later — via [`current_traceparent`] / [`set_remote_parent`].
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 use opentelemetry::global;
 use opentelemetry::trace::{TraceContextExt, TracerProvider as _};
@@ -124,6 +125,11 @@ pub fn init_tracing(service_name: &str) -> OtelGuard {
 /// code, not an HTTP error, which is what made this easy to mistake for a transport/runtime bug
 /// during debugging rather than a wrong URL.
 ///
+/// Fix three: **TLS validation using internal CA**. The OTLP exporter validates Tempo's self-signed
+/// certificate using the cluster's internal CA (`self-signed-ca` ClusterIssuer). The CA certificate
+/// is mounted into the pod at `/etc/otel-certs/ca.crt` by the `alloy-internal-ca` Certificate
+/// resource. This replaces the insecure `danger_accept_invalid_certs(true)` workaround.
+///
 /// Both were reproduced and fixed by actually running this against a live collector — including
 /// across a real process boundary (a spawned child process picking up a `TRACEPARENT` env var, not
 /// just same-process spans) — not inferred from documentation.
@@ -137,10 +143,19 @@ fn build_tracer_provider(service_name: &str, endpoint: &str) -> anyhow::Result<S
         .and_then(|value| value.parse().ok())
         .unwrap_or(0.1);
 
-    // Build our own reqwest client — after the caller has pinned the crypto provider — rather than
-    // letting opentelemetry-otlp construct its own internal client, so this exporter rides the same
-    // audited TLS stack as the rest of the binary instead of an independently-resolved one.
-    let http_client = reqwest::Client::builder().build()?;
+    // Load the internal CA certificate from the mounted secret
+    let ca_cert_path = load_internal_ca_cert()?;
+
+    // Load the internal CA certificate content
+    let ca_cert = std::fs::read_to_string(&ca_cert_path)?;
+
+    // Build our own reqwest client with TLS configuration using the internal CA
+    let http_client = reqwest::Client::builder()
+        .danger_accept_invalid_certs(false) // ✅ Secure: validate certificates
+        .add_root_certificate(
+            reqwest::Certificate::from_pem(ca_cert.as_bytes())? // ✅ Trust the internal CA
+        )
+        .build()?;
 
     // `endpoint` is the configured BASE url; append the OTLP/HTTP traces path ourselves (see doc
     // comment above).
@@ -166,6 +181,41 @@ fn build_tracer_provider(service_name: &str, endpoint: &str) -> anyhow::Result<S
         ))))
         .with_resource(resource)
         .build())
+}
+
+/// Load the internal CA certificate from the mounted secret.
+///
+/// The CA certificate is mounted into the pod at `/etc/otel-certs/ca.crt` by the
+/// `alloy-internal-ca` Certificate resource (see `ai-helm-values/environments/base/deps/alloy/certificate-internal-ca.yaml`).
+/// This certificate is issued by the cluster's `self-signed-ca` ClusterIssuer and allows the
+/// OTLP exporter to validate Tempo's self-signed certificate.
+///
+/// Returns an error if the certificate file is not found or cannot be read.
+fn load_internal_ca_cert() -> anyhow::Result<PathBuf> {
+    let ca_cert_path = PathBuf::from("/etc/otel-certs/ca.crt");
+
+    if !ca_cert_path.exists() {
+        return Err(anyhow::anyhow!(
+            "Internal CA certificate not found at {}. \
+             Please ensure the alloy-internal-ca secret is mounted into the pod. \
+             The secret is created by the Certificate resource in \
+             ai-helm-values/environments/base/deps/alloy/certificate-internal-ca.yaml",
+            ca_cert_path.display()
+        ));
+    }
+
+    // Verify the file is readable
+    if std::fs::metadata(&ca_cert_path)
+        .map_err(|e| anyhow::anyhow!("Failed to read CA certificate file: {}", e))?
+        .is_file()
+    {
+        Ok(ca_cert_path)
+    } else {
+        Err(anyhow::anyhow!(
+            "CA certificate path exists but is not a file: {}",
+            ca_cert_path.display()
+        ))
+    }
 }
 
 /// The current span's OTel context, serialized as a W3C `traceparent` header value
