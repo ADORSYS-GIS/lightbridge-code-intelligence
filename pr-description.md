@@ -24,7 +24,7 @@ The intent of this PR is:
 
 ### In Scope
 
-- Modified `services/observability/src/lib.rs` to add `danger_accept_invalid_certs(true)` to the reqwest client builder
+- Modified `services/observability/src/lib.rs` to add `tls_danger_accept_invalid_certs(true)` to the reqwest client builder
 - Updated code comment to document the insecure TLS requirement
 
 ### Out of Scope
