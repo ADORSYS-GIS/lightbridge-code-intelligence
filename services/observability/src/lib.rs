@@ -144,15 +144,42 @@ fn build_tracer_provider(service_name: &str, endpoint: &str) -> anyhow::Result<S
         .unwrap_or(0.1);
 
     // Load the internal CA certificate from the mounted secret
-    let ca_cert_path = load_internal_ca_cert()?;
+    let ca_cert_path = load_internal_ca_cert().ok();
 
-    // Load the internal CA certificate content
-    let ca_cert = std::fs::read_to_string(&ca_cert_path)?;
+    // Load the internal CA certificate content if available
+    let ca_cert = if let Some(path) = &ca_cert_path {
+        match std::fs::read_to_string(path) {
+            Ok(content) => Some(content),
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to read internal CA certificate from {}: {}. \
+                     OTLP traces will be sent without TLS validation.",
+                    path.display(),
+                    e
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     // Build our own reqwest client with TLS configuration using the internal CA
-    let http_client = reqwest::Client::builder()
-        .tls_certs_merge([reqwest::Certificate::from_pem(ca_cert.as_bytes())?])
-        .build()?;
+    let http_client = if let Some(ca_cert) = &ca_cert {
+        reqwest::Client::builder()
+            .tls_certs_merge([reqwest::Certificate::from_pem(ca_cert.as_bytes())?])
+            .build()
+            .unwrap_or_else(|e| {
+                tracing::warn!(
+                    "Failed to build reqwest client with internal CA certificate: {}. \
+                     OTLP traces will be sent without TLS validation.",
+                    e
+                );
+                reqwest::Client::new()
+            })
+    } else {
+        reqwest::Client::new()
+    };
 
     // `endpoint` is the configured BASE url; append the OTLP/HTTP traces path ourselves (see doc
     // comment above).
