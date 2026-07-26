@@ -1,6 +1,6 @@
 # ADR-0063: CLI-only repository approval (retire the web approval gate)
 
-- **Status:** Accepted
+- **Status:** Superseded by [ADR-0110](0110-apps-web-investment.md) (web approval returns as an additional surface alongside the CLI, not instead of it)
 - **Date:** 2026-06-28
 - **Amended:** 2026-07-03
 - **Deciders:** @stephane-segning
