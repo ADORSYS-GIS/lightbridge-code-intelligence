@@ -125,7 +125,7 @@ pub fn init_tracing(service_name: &str) -> OtelGuard {
 /// code, not an HTTP error, which is what made this easy to mistake for a transport/runtime bug
 /// during debugging rather than a wrong URL.
 ///
-/// Fix three: **TLS validation using internal CA**. The OTLP exporter validates Tempo's self-signed
+/// TLS validation using internal CA. The OTLP exporter validates Tempo's self-signed
 /// certificate using the cluster's internal CA (`self-signed-ca` ClusterIssuer). The CA certificate
 /// is mounted into the pod at `/etc/otel-certs/ca.crt` by the `alloy-internal-ca` Certificate
 /// resource.
