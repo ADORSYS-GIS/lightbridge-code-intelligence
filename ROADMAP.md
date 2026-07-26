@@ -58,8 +58,10 @@ _Last updated: 2026-07-26._
   runner accepts the field, but no operator can set it until the chart surfaces it.
 - **Remove the dead native review path** — now unblocked (SAST is ported); delete `run_native_agent` and
   its native-only modules.
-- **A2A per-finding review streaming** — stream findings as they are confirmed at finalize.
-  ([ADR-0098](https://github.com/vymalo/lightbridge-code-intelligence/pull/458), #458 — open)
+- **A2A per-finding review streaming** — stream findings as they are confirmed at finalize. Tracked in
+  [PR #458](https://github.com/vymalo/lightbridge-code-intelligence/pull/458) (open) — no ADR exists
+  for this yet; a prior "ADR-0098" reference here was a dangling link to this same PR, not a real ADR
+  file. `0098` stays a deliberately-skipped number until #458 lands and the decision is written up.
 
 ## Planned — open epics
 
@@ -75,12 +77,24 @@ _Last updated: 2026-07-26._
   every backend role and wires the dormant `CodePlatform` trait for GitHub/GitLab + Bitbucket.
   ([RFC-0007](docs/rfc/0007-control-plane-v2-planes.md), [ADR-0107](docs/adr/0107-state-machine-backbone-all-backend-roles.md)/
   [0108](docs/adr/0108-codeplatform-github-gitlab-bitbucket.md); `durable_step` still gated on #363)
+- **Unify service domain under `code-intelligence-api.ai.camer.digital`** (Epic #492) — path-routes
+  `/a2a`, `/mcp`, and a new versioned `/api/v2` (including multi-forge webhook paths) behind one
+  domain, fulfilling RFC-0007's ingress-plane direction. ([ADR-0109](docs/adr/0109-unify-domain-code-intelligence-api.md))
 - **Retire `apps/web`** (Epic #241) — the web console is down to its last function (the repo approval
   gate); the `lci` admin TUI ([ADR-0063](docs/adr/0063-cli-only-repository-approval.md)) and Grafana absorb the rest,
   then `apps/web` is deleted.
 - **Review quality & reliability** (Epic #252) — the durable quality track: a fast-tier eval harness to
   catch calibration regressions (not started, being reframed around presets — see #491), the #285
   severity-stability watch, and the observability work above.
+
+## Retired
+
+- **Restate task-lifecycle orchestration** (Epic #294, RFC-0005) — closed 2026-07-26. Dead since
+  [ADR-0093](docs/adr/0093-restate-egress-pilot-no-go.md) (2026-07-16); never formally closed after
+  the reversal.
+- **A2A-compliant agent surface's own Deployment/Ingress** (Epic #295, RFC-0006) — closed 2026-07-26,
+  superseded by [ADR-0109](docs/adr/0109-unify-domain-code-intelligence-api.md)'s unified-domain
+  topology (Epic #492). Its remaining Phase 4 and #457 carry forward under the new epic.
 
 ## Where the detail lives
 
