@@ -1,6 +1,6 @@
 # ADR-0062: Two-tier review — a fast auto pass on every PR, a deep review on demand
 
-- **Status:** Accepted
+- **Status:** Superseded by [ADR-0103](0103-repo-configurable-opencode-review-presets.md) (fixed fast/deep tiers replaced by repo-configurable OpenCode presets)
 - **Date:** 2026-06-27
 - **Deciders:** @stephane-segning
 

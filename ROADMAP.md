@@ -9,7 +9,7 @@ open a PR to fix this file.
 > **Keeping this current is part of "done."** When a PR meaningfully ships, unblocks, or retires an item
 > here, update its status in the **same PR** (see [AGENTS.md](AGENTS.md)).
 
-_Last updated: 2026-07-19._
+_Last updated: 2026-07-26._
 
 ## Recently shipped
 
@@ -63,21 +63,19 @@ _Last updated: 2026-07-19._
 
 ## Planned — open epics
 
+- **Repo-configurable OpenCode review presets** (Epic #491) — replaces the fixed fast/deep tier model
+  with per-repo preset selection (`fast`/`deep`/`ultra` defaults, uniform tools/prompt), a full
+  OpenCode fs-tool suite, GitHub MCP access via App-derived tokens, and an OpenCode fatal-session
+  sentinel plugin. Also carries per-identity model selection + ACL (ADR-0038 upgrade, moved here from
+  Epic #241). ([ADR-0103](docs/adr/0103-repo-configurable-opencode-review-presets.md)/
+  [0104](docs/adr/0104-full-opencode-fs-tool-suite.md)/[0105](docs/adr/0105-github-mcp-via-app-derived-token.md)/
+  [0106](docs/adr/0106-opencode-fatal-situation-sentinel-plugin.md))
 - **Retire `apps/web`** (Epic #241) — the web console is down to its last function (the repo approval
   gate); the `lci` admin TUI ([ADR-0063](docs/adr/0063-cli-only-repository-approval.md)) and Grafana absorb the rest,
-  then `apps/web` is deleted. Also carries per-identity model selection + ACL (ADR-0038 upgrade).
+  then `apps/web` is deleted.
 - **Review quality & reliability** (Epic #252) — the durable quality track: a fast-tier eval harness to
-  catch calibration regressions (not started), the #285 severity-stability watch, and the observability
-  work above.
-
-## Exploring / proposed
-
-- **Graph-embedding retrieval** — semantic + structural search over the code graph.
-  ([ADR-0089](docs/adr/0089-embeddings-on-the-code-graph.md) / [ADR-0090](docs/adr/0090-hybrid-retrieval-tools.md), Proposed)
-- **Incremental indexing — overlay model** (#244) — index only what changed on a PR.
-- **End-to-end tracing (OpenTelemetry)** (#419 / #431) — deployed but currently inert (endpoint unset).
-- **GitLab support** (#414) — config-only to activate.
-- **Step reproducibility** (#430).
+  catch calibration regressions (not started, being reframed around presets — see #491), the #285
+  severity-stability watch, and the observability work above.
 
 ## Where the detail lives
 
