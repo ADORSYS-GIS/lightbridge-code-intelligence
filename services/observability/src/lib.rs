@@ -151,7 +151,7 @@ fn build_tracer_provider(service_name: &str, endpoint: &str) -> anyhow::Result<S
 
     // Build our own reqwest client with TLS configuration using the internal CA
     let http_client = reqwest::Client::builder()
-        .add_root_certificate(reqwest::Certificate::from_pem(ca_cert.as_bytes())?)
+        .tls_certs_merge([reqwest::Certificate::from_pem(ca_cert.as_bytes())?])
         .build()?;
 
     // `endpoint` is the configured BASE url; append the OTLP/HTTP traces path ourselves (see doc
