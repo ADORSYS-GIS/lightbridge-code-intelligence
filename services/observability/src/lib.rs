@@ -144,7 +144,18 @@ fn build_tracer_provider(service_name: &str, endpoint: &str) -> anyhow::Result<S
         .unwrap_or(0.1);
 
     // Load the internal CA certificate from the mounted secret
-    let ca_cert_path = load_internal_ca_cert().ok();
+    let ca_cert_path = match load_internal_ca_cert() {
+        Ok(path) => Some(path),
+        Err(e) => {
+            tracing::warn!(
+                "Internal CA certificate not found: {}. \
+                 OTLP traces will use the system root store, which cannot validate Tempo's self-signed cert — \
+                 trace export will fail until the CA is mounted.",
+                e
+            );
+            None
+        }
+    };
 
     // Load the internal CA certificate content if available
     let ca_cert = if let Some(path) = &ca_cert_path {
@@ -153,7 +164,8 @@ fn build_tracer_provider(service_name: &str, endpoint: &str) -> anyhow::Result<S
             Err(e) => {
                 tracing::warn!(
                     "Failed to read internal CA certificate from {}: {}. \
-                     OTLP traces will be sent without TLS validation.",
+                     OTLP traces will use the system root store, which cannot validate Tempo's self-signed cert — \
+                     trace export will fail until the CA is mounted.",
                     path.display(),
                     e
                 );
@@ -172,7 +184,8 @@ fn build_tracer_provider(service_name: &str, endpoint: &str) -> anyhow::Result<S
             .unwrap_or_else(|e| {
                 tracing::warn!(
                     "Failed to build reqwest client with internal CA certificate: {}. \
-                     OTLP traces will be sent without TLS validation.",
+                     OTLP traces will use the system root store, which cannot validate Tempo's self-signed cert — \
+                     trace export will fail until the CA is mounted.",
                     e
                 );
                 reqwest::Client::new()
