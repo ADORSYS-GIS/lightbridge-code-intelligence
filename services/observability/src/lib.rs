@@ -128,7 +128,7 @@ pub fn init_tracing(service_name: &str) -> OtelGuard {
 /// Fix three: **TLS validation using internal CA**. The OTLP exporter validates Tempo's self-signed
 /// certificate using the cluster's internal CA (`self-signed-ca` ClusterIssuer). The CA certificate
 /// is mounted into the pod at `/etc/otel-certs/ca.crt` by the `alloy-internal-ca` Certificate
-/// resource. This replaces the insecure `danger_accept_invalid_certs(true)` workaround.
+/// resource.
 ///
 /// Both were reproduced and fixed by actually running this against a live collector — including
 /// across a real process boundary (a spawned child process picking up a `TRACEPARENT` env var, not
@@ -151,10 +151,7 @@ fn build_tracer_provider(service_name: &str, endpoint: &str) -> anyhow::Result<S
 
     // Build our own reqwest client with TLS configuration using the internal CA
     let http_client = reqwest::Client::builder()
-        .danger_accept_invalid_certs(false) // ✅ Secure: validate certificates
-        .add_root_certificate(
-            reqwest::Certificate::from_pem(ca_cert.as_bytes())? // ✅ Trust the internal CA
-        )
+        .add_root_certificate(reqwest::Certificate::from_pem(ca_cert.as_bytes())?)
         .build()?;
 
     // `endpoint` is the configured BASE url; append the OTLP/HTTP traces path ourselves (see doc
