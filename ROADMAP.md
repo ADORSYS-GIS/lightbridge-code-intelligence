@@ -80,9 +80,9 @@ _Last updated: 2026-07-26._
 - **Unify service domain under `code-intelligence-api.ai.camer.digital`** (Epic #492) — path-routes
   `/a2a`, `/mcp`, and a new versioned `/api/v2` (including multi-forge webhook paths) behind one
   domain, fulfilling RFC-0007's ingress-plane direction. ([ADR-0109](docs/adr/0109-unify-domain-code-intelligence-api.md))
-- **Retire `apps/web`** (Epic #241) — the web console is down to its last function (the repo approval
-  gate); the `lci` admin TUI ([ADR-0063](docs/adr/0063-cli-only-repository-approval.md)) and Grafana absorb the rest,
-  then `apps/web` is deleted.
+- **apps/web investment** (Epic #493) — session/token refresh, cursor pagination, per-repo detail
+  pages, and Grafana-embedded Neo4j-graph + analytics panels. Reverses the retired #241's
+  retirement direction. ([ADR-0110](docs/adr/0110-apps-web-investment.md))
 - **Review quality & reliability** (Epic #252) — the durable quality track: a fast-tier eval harness to
   catch calibration regressions (not started, being reframed around presets — see #491), the #285
   severity-stability watch, and the observability work above.
@@ -95,6 +95,9 @@ _Last updated: 2026-07-26._
 - **A2A-compliant agent surface's own Deployment/Ingress** (Epic #295, RFC-0006) — closed 2026-07-26,
   superseded by [ADR-0109](docs/adr/0109-unify-domain-code-intelligence-api.md)'s unified-domain
   topology (Epic #492). Its remaining Phase 4 and #457 carry forward under the new epic.
+- **Retire `apps/web`** (Epic #241) — closed 2026-07-26, reversed by
+  [ADR-0110](docs/adr/0110-apps-web-investment.md) (Epic #493); ADR-0063/ADR-0064 marked Superseded
+  accordingly. The per-identity model+ACL scope it carried moved to Epic #491, not dropped.
 
 ## Where the detail lives
 
