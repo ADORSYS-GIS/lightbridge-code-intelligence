@@ -1,6 +1,6 @@
 # ADR-0069: Review tiers carry a minimum model-capability floor; the coverage gate verifies instead of trusting
 
-- **Status:** Accepted
+- **Status:** Superseded by [ADR-0103](0103-repo-configurable-opencode-review-presets.md) (the fixed-tier capability floor is restated as per-preset guidance)
 - **Date:** 2026-07-05
 - **Deciders:** @stephane-segning
 
