@@ -178,18 +178,29 @@ fn build_tracer_provider(service_name: &str, endpoint: &str) -> anyhow::Result<S
 
     // Build our own reqwest client with TLS configuration using the internal CA
     let http_client = if let Some(ca_cert) = &ca_cert {
-        reqwest::Client::builder()
-            .tls_certs_merge([reqwest::Certificate::from_pem(ca_cert.as_bytes())?])
-            .build()
-            .unwrap_or_else(|e| {
+        match reqwest::Certificate::from_pem(ca_cert.as_bytes()) {
+            Ok(cert) => reqwest::Client::builder()
+                .tls_certs_merge([cert])
+                .build()
+                .unwrap_or_else(|e| {
+                    tracing::warn!(
+                        "Failed to build reqwest client with internal CA certificate: {}. \
+                         OTLP traces will use the system root store, which cannot validate Tempo's self-signed cert — \
+                         trace export will fail until the CA is mounted.",
+                        e
+                    );
+                    reqwest::Client::new()
+                }),
+            Err(e) => {
                 tracing::warn!(
-                    "Failed to build reqwest client with internal CA certificate: {}. \
+                    "Failed to parse internal CA certificate: {}. \
                      OTLP traces will use the system root store, which cannot validate Tempo's self-signed cert — \
                      trace export will fail until the CA is mounted.",
                     e
                 );
                 reqwest::Client::new()
-            })
+            }
+        }
     } else {
         reqwest::Client::new()
     };
