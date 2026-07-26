@@ -1,6 +1,6 @@
 # ADR-0064: Observability via Grafana behind a Caddy + oauth2 proxy (retire the web dashboards)
 
-- **Status:** Proposed
+- **Status:** Superseded by [ADR-0110](0110-apps-web-investment.md) (analytics move back into apps/web via embedded Grafana panels, not a standalone Grafana replacing the web dashboards)
 - **Date:** 2026-06-28
 - **Deciders:** @stephane-segning
 
