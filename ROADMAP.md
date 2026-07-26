@@ -70,6 +70,11 @@ _Last updated: 2026-07-26._
   Epic #241). ([ADR-0103](docs/adr/0103-repo-configurable-opencode-review-presets.md)/
   [0104](docs/adr/0104-full-opencode-fs-tool-suite.md)/[0105](docs/adr/0105-github-mcp-via-app-derived-token.md)/
   [0106](docs/adr/0106-opencode-fatal-situation-sentinel-plugin.md))
+- **Control-plane v2 — three planes + the agent execution plane** (Epic #353) — the in-flight
+  `StepRuntime`/`CheckpointRuntime` strangler rewrite now also generalizes the state-machine seam to
+  every backend role and wires the dormant `CodePlatform` trait for GitHub/GitLab + Bitbucket.
+  ([RFC-0007](docs/rfc/0007-control-plane-v2-planes.md), [ADR-0107](docs/adr/0107-state-machine-backbone-all-backend-roles.md)/
+  [0108](docs/adr/0108-codeplatform-github-gitlab-bitbucket.md); `durable_step` still gated on #363)
 - **Retire `apps/web`** (Epic #241) — the web console is down to its last function (the repo approval
   gate); the `lci` admin TUI ([ADR-0063](docs/adr/0063-cli-only-repository-approval.md)) and Grafana absorb the rest,
   then `apps/web` is deleted.
