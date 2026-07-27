@@ -76,7 +76,7 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
 # deliver spans end-to-end.
 opentelemetry = "0.32"
 opentelemetry_sdk = { version = "0.32", features = ["rt-tokio", "experimental_trace_batch_span_processor_with_async_runtime"] }
-opentelemetry-otlp = { version = "0.32", default-features = false, features = ["http-proto", "reqwest-client"] }
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["http-proto", "reqwest-client", "reqwest-rustls"] }
 opentelemetry-http = { version = "0.32", features = ["reqwest"] }
 tracing-opentelemetry = "0.33"
 # Ergonomic async generators — used by the a2a role's SSE replay-then-tail stream (ADR-0077).

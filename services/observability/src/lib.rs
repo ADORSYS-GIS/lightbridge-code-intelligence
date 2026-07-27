@@ -8,7 +8,6 @@
 //! Postgres row read back much later — via [`current_traceparent`] / [`set_remote_parent`].
 
 use std::collections::HashMap;
-use std::path::PathBuf;
 
 use opentelemetry::global;
 use opentelemetry::trace::{TraceContextExt, TracerProvider as _};
@@ -125,10 +124,10 @@ pub fn init_tracing(service_name: &str) -> OtelGuard {
 /// code, not an HTTP error, which is what made this easy to mistake for a transport/runtime bug
 /// during debugging rather than a wrong URL.
 ///
-/// TLS validation using internal CA. The OTLP exporter validates Tempo's self-signed
-/// certificate using the cluster's internal CA (`self-signed-ca` ClusterIssuer). The CA certificate
-/// is mounted into the pod at `/etc/otel-certs/ca.crt` by the `alloy-internal-ca` Certificate
-/// resource.
+/// TLS validation using system trust roots. The OTLP exporter validates Tempo's self-signed
+/// certificate using the cluster's internal CA (`self-signed-ca` ClusterIssuer) via the
+/// `reqwest-rustls` feature, which automatically loads system trust roots via `rustls-native-certs`.
+/// This replaces the insecure `danger_accept_invalid_certs(true)` workaround and manual CA loading.
 ///
 /// Both were reproduced and fixed by actually running this against a live collector — including
 /// across a real process boundary (a spawned child process picking up a `TRACEPARENT` env var, not
@@ -143,67 +142,11 @@ fn build_tracer_provider(service_name: &str, endpoint: &str) -> anyhow::Result<S
         .and_then(|value| value.parse().ok())
         .unwrap_or(0.1);
 
-    // Load the internal CA certificate from the mounted secret
-    let ca_cert_path = match load_internal_ca_cert() {
-        Ok(path) => Some(path),
-        Err(e) => {
-            tracing::warn!(
-                "Internal CA certificate not found: {}. \
-                 OTLP traces will use the system root store, which cannot validate Tempo's self-signed cert — \
-                 trace export will fail until the CA is mounted.",
-                e
-            );
-            None
-        }
-    };
-
-    // Load the internal CA certificate content if available
-    let ca_cert = if let Some(path) = &ca_cert_path {
-        match std::fs::read_to_string(path) {
-            Ok(content) => Some(content),
-            Err(e) => {
-                tracing::warn!(
-                    "Failed to read internal CA certificate from {}: {}. \
-                     OTLP traces will use the system root store, which cannot validate Tempo's self-signed cert — \
-                     trace export will fail until the CA is mounted.",
-                    path.display(),
-                    e
-                );
-                None
-            }
-        }
-    } else {
-        None
-    };
-
-    // Build our own reqwest client with TLS configuration using the internal CA
-    let http_client = if let Some(ca_cert) = &ca_cert {
-        match reqwest::Certificate::from_pem(ca_cert.as_bytes()) {
-            Ok(cert) => reqwest::Client::builder()
-                .tls_certs_merge([cert])
-                .build()
-                .unwrap_or_else(|e| {
-                    tracing::warn!(
-                        "Failed to build reqwest client with internal CA certificate: {}. \
-                         OTLP traces will use the system root store, which cannot validate Tempo's self-signed cert — \
-                         trace export will fail until the CA is mounted.",
-                        e
-                    );
-                    reqwest::Client::new()
-                }),
-            Err(e) => {
-                tracing::warn!(
-                    "Failed to parse internal CA certificate: {}. \
-                     OTLP traces will use the system root store, which cannot validate Tempo's self-signed cert — \
-                     trace export will fail until the CA is mounted.",
-                    e
-                );
-                reqwest::Client::new()
-            }
-        }
-    } else {
-        reqwest::Client::new()
-    };
+    // Build reqwest client with TLS configuration using automatic system trust roots
+    // The reqwest-rustls feature automatically loads system trust roots via rustls-native-certs,
+    // which includes the cluster's internal CA certificate from the mounted secret
+    let http_client = reqwest::Client::builder()
+        .build()?;
 
     // `endpoint` is the configured BASE url; append the OTLP/HTTP traces path ourselves (see doc
     // comment above).
@@ -229,41 +172,6 @@ fn build_tracer_provider(service_name: &str, endpoint: &str) -> anyhow::Result<S
         ))))
         .with_resource(resource)
         .build())
-}
-
-/// Load the internal CA certificate from the mounted secret.
-///
-/// The CA certificate is mounted into the pod at `/etc/otel-certs/ca.crt` by the
-/// `alloy-internal-ca` Certificate resource (see `ai-helm-values/environments/base/deps/alloy/certificate-internal-ca.yaml`).
-/// This certificate is issued by the cluster's `self-signed-ca` ClusterIssuer and allows the
-/// OTLP exporter to validate Tempo's self-signed certificate.
-///
-/// Returns an error if the certificate file is not found or cannot be read.
-fn load_internal_ca_cert() -> anyhow::Result<PathBuf> {
-    let ca_cert_path = PathBuf::from("/etc/otel-certs/ca.crt");
-
-    if !ca_cert_path.exists() {
-        return Err(anyhow::anyhow!(
-            "Internal CA certificate not found at {}. \
-             Please ensure the alloy-internal-ca secret is mounted into the pod. \
-             The secret is created by the Certificate resource in \
-             ai-helm-values/environments/base/deps/alloy/certificate-internal-ca.yaml",
-            ca_cert_path.display()
-        ));
-    }
-
-    // Verify the file is readable
-    if std::fs::metadata(&ca_cert_path)
-        .map_err(|e| anyhow::anyhow!("Failed to read CA certificate file: {}", e))?
-        .is_file()
-    {
-        Ok(ca_cert_path)
-    } else {
-        Err(anyhow::anyhow!(
-            "CA certificate path exists but is not a file: {}",
-            ca_cert_path.display()
-        ))
-    }
 }
 
 /// The current span's OTel context, serialized as a W3C `traceparent` header value
