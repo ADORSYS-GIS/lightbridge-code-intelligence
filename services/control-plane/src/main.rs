@@ -318,12 +318,9 @@ fn db_readiness(has_pool: bool, ping_ok: bool, allow_no_db: bool) -> DbReadiness
     }
 }
 
-fn app(state: AppState) -> Router {
+fn api_v2_router() -> Router<AppState> {
     Router::new()
-        .route("/healthz", get(liveness))
-        .route("/readyz", get(readiness))
-        .route("/metrics", get(metrics_endpoint))
-        // Path-scoped webhook ingress — one route per forge, no header-sniffing.
+        // Webhook ingress: path-scoped per forge, no header-sniffing.
         .route(
             "/webhook/github",
             post(webhook::github_webhook).layer(DefaultBodyLimit::max(webhook::MAX_BODY_BYTES)),
@@ -448,6 +445,14 @@ fn app(state: AppState) -> Router {
             "/internal/tasks/{id}/propose-pr",
             post(internal::propose_pr).layer(DefaultBodyLimit::max(32 * 1024 * 1024)),
         )
+}
+
+fn app(state: AppState) -> Router {
+    Router::new()
+        .route("/healthz", get(liveness))
+        .route("/readyz", get(readiness))
+        .route("/metrics", get(metrics_endpoint))
+        .nest("/api/v2", api_v2_router())
         .layer(axum::middleware::from_fn(track_http_metrics))
         .with_state(state)
 }

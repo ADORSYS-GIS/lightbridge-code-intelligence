@@ -13,7 +13,7 @@ async fn get_context_sends_bearer_and_parses_the_response() {
     let task_id = Uuid::nil();
 
     Mock::given(method("GET"))
-        .and(path(format!("/internal/tasks/{task_id}")))
+        .and(path(format!("/api/v2/internal/tasks/{task_id}")))
         .and(bearer_token("runner-secret"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "task_id": task_id,
@@ -53,7 +53,7 @@ async fn task_status_sends_bearer_and_parses_status() {
     let task_id = Uuid::nil();
 
     Mock::given(method("GET"))
-        .and(path(format!("/internal/tasks/{task_id}/status")))
+        .and(path(format!("/api/v2/internal/tasks/{task_id}/status")))
         .and(bearer_token("runner-secret"))
         .respond_with(
             ResponseTemplate::new(200).set_body_json(serde_json::json!({ "status": "cancelled" })),
@@ -72,7 +72,7 @@ async fn report_status_posts_the_status_with_bearer() {
     let task_id = Uuid::nil();
 
     Mock::given(method("POST"))
-        .and(path(format!("/internal/tasks/{task_id}/status")))
+        .and(path(format!("/api/v2/internal/tasks/{task_id}/status")))
         .and(bearer_token("runner-secret"))
         .respond_with(ResponseTemplate::new(204))
         .expect(1)
@@ -95,7 +95,7 @@ async fn submit_chunks_posts_batch_with_bearer() {
     let task_id = Uuid::nil();
 
     Mock::given(method("POST"))
-        .and(path(format!("/internal/tasks/{task_id}/chunks")))
+        .and(path(format!("/api/v2/internal/tasks/{task_id}/chunks")))
         .and(bearer_token("runner-secret"))
         .respond_with(ResponseTemplate::new(204))
         .expect(1)
@@ -135,7 +135,9 @@ async fn submit_review_telemetry_posts_tools_and_config_with_bearer() {
     ]);
     // Pin the wire shape the control plane's `record_review_telemetry` deserializes: `{ tools, config_b64 }`.
     Mock::given(method("POST"))
-        .and(path(format!("/internal/tasks/{task_id}/review/telemetry")))
+        .and(path(format!(
+            "/api/v2/internal/tasks/{task_id}/review/telemetry"
+        )))
         .and(bearer_token("runner-secret"))
         .and(body_json(serde_json::json!({
             "tools": tools,
@@ -162,7 +164,7 @@ async fn submit_graph_posts_nodes_and_edges_with_bearer() {
     let task_id = Uuid::nil();
 
     Mock::given(method("POST"))
-        .and(path(format!("/internal/tasks/{task_id}/graph")))
+        .and(path(format!("/api/v2/internal/tasks/{task_id}/graph")))
         .and(bearer_token("runner-secret"))
         .respond_with(ResponseTemplate::new(204))
         .expect(1)
@@ -198,7 +200,7 @@ async fn search_posts_embedding_and_parses_hits() {
     let task_id = Uuid::nil();
 
     Mock::given(method("POST"))
-        .and(path(format!("/internal/tasks/{task_id}/search")))
+        .and(path(format!("/api/v2/internal/tasks/{task_id}/search")))
         .and(bearer_token("runner-secret"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
             {
@@ -226,7 +228,7 @@ async fn graph_get_callers_posts_op_and_parses_symbols() {
     let task_id = Uuid::nil();
 
     Mock::given(method("POST"))
-        .and(path(format!("/internal/tasks/{task_id}/graph/query")))
+        .and(path(format!("/api/v2/internal/tasks/{task_id}/graph/query")))
         .and(bearer_token("runner-secret"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
             { "node_id": "src_math_calc_bump", "label": "bump()", "source_file": "src/math.rs", "start_line": 6 }
@@ -249,7 +251,7 @@ async fn review_and_knowledge_endpoints_preserve_their_wire_contracts() {
     let task_id = Uuid::nil();
     let authenticated_post = |suffix: &str, body: serde_json::Value| {
         Mock::given(method("POST"))
-            .and(path(format!("/internal/tasks/{task_id}{suffix}")))
+            .and(path(format!("/api/v2/internal/tasks/{task_id}{suffix}")))
             .and(bearer_token("runner-secret"))
             .and(body_json(body))
             .respond_with(ResponseTemplate::new(204))
@@ -279,7 +281,7 @@ async fn review_and_knowledge_endpoints_preserve_their_wire_contracts() {
     .await;
     Mock::given(method("POST"))
         .and(path(format!(
-            "/internal/tasks/{task_id}/review/inline/clear"
+            "/api/v2/internal/tasks/{task_id}/review/inline/clear"
         )))
         .and(bearer_token("runner-secret"))
         .respond_with(ResponseTemplate::new(204))
@@ -305,7 +307,9 @@ async fn review_and_knowledge_endpoints_preserve_their_wire_contracts() {
     .mount(&server)
     .await;
     Mock::given(method("POST"))
-        .and(path(format!("/internal/tasks/{task_id}/graph/query")))
+        .and(path(format!(
+            "/api/v2/internal/tasks/{task_id}/graph/query"
+        )))
         .and(bearer_token("runner-secret"))
         .and(body_json(serde_json::json!({
             "op": "find_symbol",
@@ -324,7 +328,9 @@ async fn review_and_knowledge_endpoints_preserve_their_wire_contracts() {
         .mount(&server)
         .await;
     Mock::given(method("GET"))
-        .and(path(format!("/internal/tasks/{task_id}/knowledge/tools")))
+        .and(path(format!(
+            "/api/v2/internal/tasks/{task_id}/knowledge/tools"
+        )))
         .and(bearer_token("runner-secret"))
         .respond_with(
             ResponseTemplate::new(200).set_body_json(serde_json::json!([{
@@ -337,7 +343,9 @@ async fn review_and_knowledge_endpoints_preserve_their_wire_contracts() {
         .mount(&server)
         .await;
     Mock::given(method("POST"))
-        .and(path(format!("/internal/tasks/{task_id}/knowledge/call")))
+        .and(path(format!(
+            "/api/v2/internal/tasks/{task_id}/knowledge/call"
+        )))
         .and(bearer_token("runner-secret"))
         .and(body_json(serde_json::json!({
             "tool": "mcp__docs__lookup",
@@ -414,7 +422,7 @@ async fn get_context_errors_on_non_2xx() {
     let task_id = Uuid::nil();
 
     Mock::given(method("GET"))
-        .and(path(format!("/internal/tasks/{task_id}")))
+        .and(path(format!("/api/v2/internal/tasks/{task_id}")))
         .respond_with(ResponseTemplate::new(401))
         .mount(&server)
         .await;
