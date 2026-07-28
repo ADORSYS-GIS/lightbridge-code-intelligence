@@ -70,11 +70,18 @@ _Last updated: 2026-07-26._
   Epic #241). ([ADR-0103](docs/adr/0103-repo-configurable-opencode-review-presets.md)/
   [0104](docs/adr/0104-full-opencode-fs-tool-suite.md)/[0105](docs/adr/0105-github-mcp-via-app-derived-token.md)/
   [0106](docs/adr/0106-opencode-fatal-situation-sentinel-plugin.md))
-- **Control-plane v2 — three planes + the agent execution plane** (Epic #353) — the in-flight
-  `StepRuntime`/`CheckpointRuntime` strangler rewrite now also generalizes the state-machine seam to
-  every backend role and wires the dormant `CodePlatform` trait for GitHub/GitLab + Bitbucket.
+- **Control-plane v2 — three planes + the agent execution plane** (Epic #353) — the `StepRuntime`
+  seam is now generalized (`Passthrough`-backed, zero behavior change) to webhook ingress, the
+  dispatcher, the reconciler, and A2A's task lifecycle (#502); `CodePlatform` is fully wired into
+  the webhook router (outbox/reconciler were already wired) and activated for GitHub/GitLab (#504),
+  plus Bitbucket lands as a third implementation on the existing `/webhook` route (#505); error
+  layering across control-plane/agent-* crates now uses typed `thiserror` enums at internal
+  boundaries (#503, scoped to every hand-rolled error type + stringly-typed `Result<T, String>` site,
+  not a full sweep of every `anyhow` call site — see the PR for the explicit scope note).
   ([RFC-0007](docs/rfc/0007-control-plane-v2-planes.md), [ADR-0107](docs/adr/0107-state-machine-backbone-all-backend-roles.md)/
-  [0108](docs/adr/0108-codeplatform-github-gitlab-bitbucket.md); `durable_step` still gated on #363)
+  [0108](docs/adr/0108-codeplatform-github-gitlab-bitbucket.md)). Remaining: promoting
+  `CheckpointRuntime` to the production default for any role stays gated on #363's open P1s; a
+  per-role durable store (beyond `Passthrough`) is follow-up work, not done here.
 - **Retire `apps/web`** (Epic #241) — the web console is down to its last function (the repo approval
   gate); the `lci` admin TUI ([ADR-0063](docs/adr/0063-cli-only-repository-approval.md)) and Grafana absorb the rest,
   then `apps/web` is deleted.
