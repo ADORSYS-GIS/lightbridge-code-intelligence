@@ -6,8 +6,10 @@
 > **mediated write tools** ([ADR-0037](adr/0037-agent-acts-via-mediated-tools.md)) are reused
 > supervisor-side. The **native, in-process Rust loop** ([ADR-0026](adr/0026-native-review-agent.md))
 > is now the fallback/legacy path; the review fallback *model* was removed earlier
-> ([ADR-0053](adr/0053-remove-review-fallback-model.md)). Review runs in **two tiers**
-> ([ADR-0062](adr/0062-two-tier-review-fast-auto-deep-on-demand.md)). For the per-subsystem detail see
+> ([ADR-0053](adr/0053-remove-review-fallback-model.md)). Review runs under **named, repo-configurable
+> presets** — `fast`/`deep` ship as the platform defaults, replacing the old fixed two-tier model
+> ([ADR-0103](adr/0103-repo-configurable-opencode-review-presets.md), superseding
+> [ADR-0062](adr/0062-two-tier-review-fast-auto-deep-on-demand.md)). For the per-subsystem detail see
 > the cross-links throughout and [INDEX.md](INDEX.md). Several diagrams/labels below still read "native
 > review agent loop" — read those as the reused loop mechanics now driven supervisor-side over OpenCode.
 
@@ -111,11 +113,11 @@ events (`services/control-plane/src/http/webhook.rs`):
 
 | Event | Action |
 |---|---|
-| `pull_request` `opened` | create a **fast**-tier review task (the automatic first review) |
+| `pull_request` `opened` | create the automatic first-review task, entry point `pr_open` (resolves to the repo's configured preset, `fast` by platform default — [ADR-0103](adr/0103-repo-configurable-opencode-review-presets.md)) |
 | `pull_request` `closed` | cancel the PR's active tasks (reaper stops their Jobs) |
 | `pull_request` `synchronize` / `reopened` | nothing — re-review is via `@mention` |
 | `push` to the **default branch** | create a re-index task (keep the base index fresh) |
-| `issue_comment` `created`, body leads with `@<handle>` | **deep**-tier re-review (on a PR) or an issue answer |
+| `issue_comment` `created`, body leads with `@<handle>` | re-review (on a PR) or an issue answer, entry point `mention` (resolves to `deep` by platform default) |
 | `installation` / `installation_repositories` | register repos as **pending** / disable them |
 
 Repos start **pending** and require admin approval before any review or index runs (Epic #75); the
@@ -158,7 +160,9 @@ on a `dedup_key`; the reconciler just ships the bytes. This is the single PR out
 
 - **Postgres** — task queue and lifecycle, `github_deliveries`, the `github_outbox`, review findings
   and feedback, and the semantic chunk table. Migrations under
-  `services/control-plane/migrations/` (latest: `0021_task_tier.sql`). Dual retrieval
+  `services/control-plane/migrations/` (latest: `0033_task_preset.sql`, which renames `tasks.tier` to
+  `tasks.preset` and adds `tasks.entry_point` — [ADR-0103](adr/0103-repo-configurable-opencode-review-presets.md)).
+  Dual retrieval
   ([ADR-0003](adr/0003-dual-retrieval-neo4j-pgvector.md)) uses pgvector for embeddings.
 - **pgvector** — semantic code chunks with their embeddings. Embeddings come from an OpenAI-compatible
   internal gateway (**eaig**), model `qwen3-embedding-8b` at **4096 dims** with **no ANN index**
@@ -236,25 +240,32 @@ A review on an **already-indexed** repo reuses the latest indexed snapshot rathe
 cold repo (`main.rs` `needs_index`). Incremental/layered indexing is future work
 ([RFC-0002](rfc/0002-incremental-layered-indexing.md)).
 
-## End-to-end: review flow (two tiers)
+## End-to-end: review flow (named presets)
 
-A review task carries a **`tier`** column ([ADR-0062](adr/0062-two-tier-review-fast-auto-deep-on-demand.md)),
-set by the webhook router and used by the runner to pick a per-tier config (`ReviewConfig::resolve_tiers`,
-`ReviewConfigs::for_tier`):
+A review task carries a **`preset`** column and an **`entry_point`** column
+([ADR-0103](adr/0103-repo-configurable-opencode-review-presets.md), superseding
+[ADR-0062](adr/0062-two-tier-review-fast-auto-deep-on-demand.md)) — `preset` is resolved per entry point
+from the repo's `.lightbridge-code-review.jsonc` ([ADR-0030](adr/0030-repo-review-config.md)), falling
+back to a platform-default mapping (`pr_open` → `fast`, `mention`/`a2a` → `deep`) when the repo declares
+nothing. The runner resolves every configured preset up front (`ReviewConfig::resolve_presets`) and
+picks one per task by `context.preset` via `ReviewConfigs::for_preset`. The two platform-default presets
+still differ exactly as before — the difference is now expressed entirely in config, not in a code-level
+tier flag:
 
-| | **Fast** (auto on `pull_request opened`) | **Deep** (on `@mention`) |
+| | **`fast`** (platform default for `pr_open`) | **`deep`** (platform default for `mention`/`a2a`) |
 |---|---|---|
 | Model | cheap, operator-tuned (**churns — read it live**) | strong, operator-tuned |
-| Retrieval | none (diff-only) | full dual retrieval |
-| Tools | small per-tier allowlist (`review.fast.tools`) | full tool surface |
-| Turns | small cap | large cap, long timeout |
-| SAST | yes | yes |
+| Retrieval | none (diff-only, via its own tool allowlist) | full dual retrieval |
+| Tools | small allowlist (`review.presets.fast.tools`) | full tool surface (no allowlist set) |
+| Turns | small `max_turns` | large `max_turns`, long timeout |
+| SAST | yes (if listed in its own `tools`) | yes (if listed in its own `tools`) |
 | Prompt | lean diff-only (`review-system-fast.md`) | full persona (`review-system.md`) |
 
-The per-tier tool allowlist is a **closed enum** `ReviewTool`
-(`services/agent-runner/src/bootstrap/config.rs`) — an unknown name in `review.<tier>.tools` fails at
-deserialize, and a sync test asserts it can't drift from the actual tool surface in
-`services/agent-runner/src/review/native/tools.rs`.
+Both presets run the **same** gates (coverage, refute, wind-down) and the **same** tool-dispatch code —
+an operator's own additional preset (e.g. a future `ultra`) gets the identical guarantee. The per-preset
+tool allowlist is a **closed enum** `ReviewTool` (`services/agent-runner/src/bootstrap/config/file.rs`)
+— an unknown name in `review.presets.<name>.tools` fails at deserialize, and a sync test asserts it
+can't drift from the actual tool surface in `services/review-agent/src/tools.rs`.
 
 ```mermaid
 sequenceDiagram
@@ -264,16 +275,16 @@ sequenceDiagram
   participant E as eaig (LLM gateway)
   participant R as reconciler
 
-  G->>S: PR opened (fast)  /  @mention (deep)
-  S->>S: route → task.tier = fast | deep
+  G->>S: PR opened (entry_point=pr_open)  /  @mention (entry_point=mention)
+  S->>S: resolve preset (repo config or platform default) → task.preset = fast | deep | ...
   Note over J: dispatcher launched Job (see indexing flow)
   J->>J: compute PR diff
   J->>J: SAST (opengrep) over changed files
   J->>S: buffer SAST findings (one review channel)
-  loop bounded turns (per tier)
-    J->>E: chat + tool defs (tier allowlist)
-    E-->>J: retrieval calls (deep) / write-tool calls
-    J->>S: search / graph query (deep, scoped to snapshot)
+  loop bounded turns (per the resolved preset's budgets)
+    J->>E: chat + tool defs (preset's tool allowlist)
+    E-->>J: retrieval calls (if offered) / write-tool calls
+    J->>S: search / graph query (if offered, scoped to snapshot)
     J->>S: add_review_comment / add_comment / finish
   end
   J->>S: POST /internal/tasks/{id}/review/finalize
@@ -283,11 +294,13 @@ sequenceDiagram
   G-->>R: 👍/👎 reactions → review_feedback
 ```
 
-The native loop (`services/agent-runner/src/review/native/agent.rs`) returns an outcome — `Finished`
-(model called `finish`), `Exhausted` (turn budget ran out with findings possibly buffered), or
-`Aborted(reason)` — and **only a true transport failure returns `Err`**. Finalize flushes the buffered
-findings as **one grouped review**; an empty fast run gets a control-plane-rendered "quick pass" banner
-(with the real GitHub App `@handle`) pointing at the deep `@mention` path.
+The native loop (`services/agent-runner/src/review/mod.rs`'s `run_native_agent`, hosting
+`lci_review_agent::flows::run_review`) returns an outcome — `Finished` (model called `finish`),
+`Exhausted` (turn budget ran out with findings possibly buffered), or `Aborted(reason)` — and **only a
+true transport failure returns `Err`**. Finalize flushes the buffered findings as **one grouped
+review**; an empty `pr_open` run gets a control-plane-rendered "quick pass" banner (with the real GitHub
+App `@handle`) pointing at the `@mention` path — keyed on `entry_point`, not the preset name, since a
+preset is now operator-defined.
 
 Reviews layer several quality controls, all in `services/control-plane/src/review.rs` and the runner's
 review module:
@@ -343,6 +356,6 @@ sole egress to GitHub ([ADR-0002](adr/0002-rust-control-plane-trust-boundary.md)
 - [control-plane-roles-and-github-egress.md](control-plane-roles-and-github-egress.md) — roles + outbox
 - [jobs-and-lifecycle.md](jobs-and-lifecycle.md) — the Job/task state machine
 - [indexing-and-storage.md](indexing-and-storage.md) — dual index + snapshots
-- [review-pipeline.md](review-pipeline.md) — the two-tier review pipeline in depth
+- [review-pipeline.md](review-pipeline.md) — the named-preset review pipeline in depth
 - [kubernetes-deployment.md](kubernetes-deployment.md) — cluster/GitOps topology
 - [security-observability-testing-rollout.md](security-observability-testing-rollout.md)

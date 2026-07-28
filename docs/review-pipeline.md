@@ -1,10 +1,11 @@
-# Review pipeline (native agent, two-tier, SAST, verification)
+# Review pipeline (native agent, presets, SAST, verification)
 
 This document describes the whole review subsystem end to end: from a GitHub event, through
-tier selection, the native agent loop (which may call the opengrep SAST tool), control-plane shaping of
+preset resolution, the native agent loop (which may call the opengrep SAST tool), control-plane shaping of
 the posted output, and finally egress to GitHub. It is the companion to
 [github-app-and-control-plane.md](github-app-and-control-plane.md) (the App + trust boundary) and
-[indexing-and-storage.md](indexing-and-storage.md) (the retrieval substrate the deep tier reads from).
+[indexing-and-storage.md](indexing-and-storage.md) (the retrieval substrate a retrieval-heavy preset,
+e.g. the default `deep`, reads from).
 
 > **Note (updated 2026-07-18):** the **live** review path is **OpenCode-over-ACP**
 > ([ADR-0097](adr/0097-review-runs-on-opencode.md), live in prod since 2026-07-17): the review loop is
@@ -29,8 +30,8 @@ flowchart TD
         E2[issue/PR comment @mention]
     end
     subgraph CP[control-plane: serve role]
-        W[webhook handler]
-        T[(tasks: tier column)]
+        W[webhook handler + preset resolution]
+        T[(tasks: preset + entry_point columns)]
     end
     subgraph DISP[control-plane: dispatcher role]
         J[k8s Job per task]
@@ -48,8 +49,8 @@ flowchart TD
     end
     REC[control-plane: reconciler] --> GH
 
-    E1 -->|tier = fast| W
-    E2 -->|tier = deep| W
+    E1 -->|entry_point = pr_open| W
+    E2 -->|entry_point = mention| W
     W --> T --> J --> CLONE --> IDX
     IDX -->|no / index task| FULLIDX[semantic + structural index]
     IDX -->|yes| REUSE[reuse base index]
@@ -61,63 +62,99 @@ flowchart TD
     VAL --> SHAPE --> OUT --> REC
 ```
 
-A task carries everything downstream needs in a single `tier` column (`fast` | `deep`); the runner
-shapes its loop on it and the control plane shapes the posted body on it.
+A task carries a resolved `preset` column (`fast` | `deep` | any operator-defined name) plus an
+`entry_point` column (`pr_open` | `mention` | `a2a`, migration `0033_task_preset`); the runner picks its
+`ReviewConfig` by `preset`, and the control plane shapes the posted body by `entry_point`
+([ADR-0103](adr/0103-repo-configurable-opencode-review-presets.md)) — see below for why the two are kept
+separate.
 
-## 1. Trigger and tier selection (ADR-0062)
+## 1. Trigger and preset resolution (ADR-0103 + ADR-0030)
 
-Tier is decided in the webhook handler, `services/control-plane/src/http/webhook.rs`:
+Which **entry point** created the task is still decided in the webhook handler,
+`services/control-plane/src/http/webhook.rs`:
 
-- **`pull_request` `opened`** → an automatic **fast** review task (`tier: "fast"`). This is the only
+- **`pull_request` `opened`** → the automatic on-open pass, entry point `pr_open`. This is the only
   automatic review trigger; `synchronize`/`reopened` do nothing, and `closed` cancels the PR's active
   tasks (the reaper then stops their Jobs).
-- **An `@mention`** of the App handle on a PR or issue comment → a **deep** task (`tier: "deep"`),
-  whether the target is a PR (deep review) or an issue (conversational answer). The mention is matched
-  against `state.app_handle` (`GITHUB_APP_HANDLE`).
+- **An `@mention`** of the App handle on a PR or issue comment → entry point `mention`, whether the
+  target is a PR (review) or an issue (conversational answer). The mention is matched against
+  `state.app_handle` (`GITHUB_APP_HANDLE`).
+- **A2A** task creation (`a2a/handler/lifecycle.rs`) → entry point `a2a`.
 
-The task `tier` defaults to `deep` (the full/safe behaviour) for any task that didn't set it
-(`services/control-plane/src/http/internal.rs`, `TaskContext::tier`).
+Each entry point then resolves a **named preset** — `services/control-plane/src/preset.rs`'s
+`EntryPoint::{PrOpen,Mention,A2a}` plus `resolve_preset`/`resolve_preset_or_default` (the latter
+tolerates an unconfigured platform client, used by every webhook call site). Resolution fetches the
+repo's `.lightbridge-code-review.jsonc` ([ADR-0030](adr/0030-repo-review-config.md)) at the PR's **base**
+ref via a single small `CodePlatform::get_repo_file` call — never a clone, so task creation stays cheap —
+and picks, in order: (1) a per-entry-point override in the file's `entry_points` map (e.g.
+`{"pr_open": "fast"}`), (2) else the file's flat `preset` field, (3) else the platform-default mapping
+(`EntryPoint::platform_default_preset`: `pr_open` → `fast`, `mention`/`a2a` → `deep`) — reproducing
+today's pre-ADR-0103 fast/deep split exactly for a repo that configures nothing. Any fetch failure,
+absent file, oversized file (>64 KiB), or malformed/schema-invalid JSONC degrades to step 3; preset
+resolution never fails task creation. The A2A entry point skips repo-config resolution entirely and
+uses the platform default directly — the A2A role holds no forge credentials to fetch the file with.
 
-Why two tiers ([ADR-0062](adr/0062-two-tier-review-fast-auto-deep-on-demand.md)): the deep loop is a
+The resolved name is persisted on `tasks.preset` (renamed from `tasks.tier` by migration
+`0033_task_preset`), alongside the new `tasks.entry_point` column (default `mention`, the old `tier`
+column's own safe default). The two are kept as separate columns deliberately: `preset` is now an
+arbitrary, operator-defined string, so a framing decision like "was this the automatic on-open pass"
+can no longer key off a preset name the way it once keyed off `tier == "fast"` — an operator's own
+preset need not be named `fast` at all.
+
+Why tune the loop shape per trigger at all ([ADR-0062](adr/0062-two-tier-review-fast-auto-deep-on-demand.md),
+superseded in structure but not in rationale by ADR-0103): a retrieval-heavy pass is a
 multi-minute-to-~25-minute job whose cost is dominated by `reasoning_effort` + turn count + retrieval
 depth (not the model id — [ADR-0060](adr/0060-capture-model-reasoning-and-glm-5-2-latency-finding.md)).
 Running it on every opened PR over-taxes trivial changes. The lever is the **loop shape** (tools /
-effort / turns / timeout), tuned per tier — plus the near-instant `run_sast` opengrep tool
+effort / turns / timeout), tuned per **named preset** — plus the near-instant `run_sast` opengrep tool
 ([ADR-0061](adr/0061-sast-deterministic-finding-source.md) +
-[ADR-0073](adr/0073-sast-as-agent-tool.md)), offered on both tiers when an operator lists it in
-`review.<tier>.tools`.
+[ADR-0073](adr/0073-sast-as-agent-tool.md)), offered on any preset when an operator lists it in
+`review.presets.<name>.tools` (or the flat `review.tools`).
 
-## 2. Per-tier configuration
+## 2. Per-preset configuration (ADR-0103)
 
-The runner resolves **both** tiers up front (`ReviewConfig::resolve_tiers` in
-`services/agent-runner/src/bootstrap/config.rs`) and `main.rs` picks one per task by
-`context.tier` via `ReviewConfigs::for_tier`. Each tier is a **complete, independent** config block
-(own model, gateway, prompt, reasoning budget, timeout, turn/read budgets) — `review.fast` and
-`review.deep` in the mounted `agent.json`, **not** an overlay on the flat fields:
+The runner resolves **every configured preset** up front (`ReviewConfig::resolve_presets` in
+`services/agent-runner/src/bootstrap/config/review.rs`) and `run.rs` picks one per task by
+`context.preset` via `ReviewConfigs::for_preset`. Each preset is a **complete, independent** config
+block (own model, gateway, prompt, reasoning budget, timeout, turn/read budgets) —
+`review.presets.<name>` in the mounted `agent.json`, **not** an overlay on the flat fields:
 
-- `review.fast` / `review.deep` present → each tier uses its own block.
-- Neither present (legacy shape) → both tiers fall back to the flat `review.*` block, transition-safe
-  so the runner can deploy before the values are restructured.
+- `review.presets.<name>` present for one of the two platform-default names (`fast`/`deep`) → that
+  preset uses its own block.
+- Absent for a platform-default name (legacy shape, or a values file that predates presets) → that
+  name falls back to the flat `review.*` block, so an older values file keeps working unchanged
+  (ADR-0103's behavior-neutral-migration guarantee).
+- Any other operator-declared name under `review.presets` (e.g. a future `ultra`) resolves standalone —
+  no flat-block fallback, since it was explicitly configured.
+- `ReviewConfigs::for_preset` returns `Err` on a name nobody configured at all, rather than silently
+  resolving to another preset — a typo'd preset name fails the task instead of quietly running under
+  `deep` (the old `for_tier` behavior this replaces).
 
-The selected fast config carries a structural `fast: bool` flag (set in `resolve_tiers`/`main.rs` from
-the task tier — a Job runs one task, so mutating it on the resolved config is sound). The model is
-**operator-tuned in ai-helm-values and churns — read it live, never assume a model name**.
+There is **no structural tier flag any more** — the OpenCode-hosted live path's own comment
+(`services/agent-runner/src/review/opencode.rs`) puts it plainly: what varies between presets is purely
+the resolved config values (model, `max_cycles`, tool allowlist, `extra`/reasoning budget, `opencode`
+overlay); every preset renders through the same code path (`ReviewConfig::from_review_file`). The model
+is **operator-tuned in ai-helm-values and churns — read it live, never assume a model name**.
 
 Model *names* churn; model **capability floors** do not
-([ADR-0069](adr/0069-review-tier-minimum-model-capability.md)): the **fast** tier is engineered for
-small/cheap models (closed allowlist, diff-only, anti-rubber-stamp prompt), but the **deep** tier's
-quality levers (coverage gate, refute pass, wind-down) are behavioral contracts that assume a
-**frontier-class reasoning model** — a flash/lite-class model on deep games the nudges and fabricates
-coverage (run `bac4b5d8`). Never point deep below the floor; cheapen its budgets instead.
+([ADR-0069](adr/0069-review-tier-minimum-model-capability.md), superseded by ADR-0103, which restates the
+floor as per-preset guidance rather than pinning it to a fixed tier name): the coverage gate, refute
+pass, and wind-down (§5) are behavioral contracts every preset's model must respond to honestly — a
+flash/lite-class model pointed at a retrieval-heavy, generous-budget preset like `deep` games the
+nudges and fabricates coverage instead (run `bac4b5d8`, the incident that produced ADR-0069). The
+**fast** default preset sidesteps most of this by being engineered for small/cheap models in the first
+place (closed allowlist, diff-only, anti-rubber-stamp prompt, tiny budgets that converge before there's
+much room to fabricate). Never point a preset that leans on deep investigation below the capability
+floor; cheapen its budgets instead of its model.
 
-### Per-tier tool allowlist (`review.<tier>.tools`)
+### Per-preset tool allowlist (`review.presets.<name>.tools`)
 
-`review.<tier>.tools` declares the exact tool surface a tier offers the model. It deserializes to a
-**closed `ReviewTool` enum**, so an unknown tool name **fails at config parse** (serde lists the valid
-variants) rather than silently offering fewer tools; an empty list is also rejected (a tier with no
-tools can't act). A drift guard test (`review_tool_enum_matches_the_dispatch_surface`) keeps the enum
-in lockstep with the dispatch surface (`tools::known_tool_names`). The enum variants (serde names are
-the exact dispatched tool names):
+`review.presets.<name>.tools` (or the flat `review.tools`) declares the exact tool surface a preset
+offers the model. It deserializes to a **closed `ReviewTool` enum**, so an unknown tool name **fails at
+config parse** (serde lists the valid variants) rather than silently offering fewer tools; an empty list
+is also rejected (a preset with no tools can't act). A drift guard test
+(`review_tool_enum_matches_the_dispatch_surface`) keeps the enum in lockstep with the dispatch surface
+(`tools::known_tool_names`). The enum variants (serde names are the exact dispatched tool names):
 
 | Variant | Tool name | Kind |
 |---|---|---|
@@ -133,25 +170,35 @@ the exact dispatched tool names):
 | `Abort` | `abort` | terminal |
 | `RunSast` | `run_sast` | write (deterministic opengrep scan, ADR-0073) |
 
-A typical fast allowlist is `["add_review_comment", "finish", "abort"]` — diff-only, no retrieval.
-When unset, the tier uses the built-in default (the full surface for deep; the wind-down
-write/finish/abort set for fast). `run_sast` is **never** in either built-in default — an operator must
-list it explicitly (and set `sast.enabled`) for a tier to offer it.
+A typical tight-budget allowlist (the `fast` default preset's ai-helm-values config) is
+`["add_review_comment", "finish", "abort"]` — diff-only, no retrieval. **The built-in default when
+`tools` is unset is the same for every preset — the full surface** (`resolve_offered_tools` in
+`services/agent-runner/src/review/tool_surface.rs` never branches on the preset name); `fast`'s
+diff-only shape is entirely an ai-helm-values config choice (its own explicit allowlist), not a
+code-level per-name default. `run_sast` is **never** in the built-in (unset) default — an operator must
+list it explicitly (and set `sast.enabled`) for a preset to offer it.
 
-### The two prompts
+### The system prompt, per preset
 
 The reviewer's persona + guidance is **operator-owned config** ([ADR-0037](adr/0037-agent-acts-via-mediated-tools.md));
-there is **no built-in default** — review fails closed without one. The system message is composed as
-the operator prompt followed by a small, code-owned **tool-protocol** stanza (`TOOL_PROTOCOL` in
-`services/agent-runner/src/review/native/agent.rs`, appended last so it is the final instruction).
+there is **no built-in default** — review fails closed without one. Each preset's `system_prompt_file`
+(`review.presets.<name>.system_prompt_file`, or the flat `review.system_prompt_file`) is its own,
+independent prompt — ADR-0103 requires only that every preset run the **same tool-protocol/gate
+contract**, not the same prose. The system message is composed as the operator prompt followed by a
+small, code-owned **tool-protocol** stanza (`TOOL_PROTOCOL` in `services/review-agent/src/prompt.rs`,
+appended last so it is the final instruction).
 
-- **Deep** uses the full `reviewSystemPrompt` (mounted from `review-system.md`): grounding +
+The two platform-default presets ship with deliberately different prompts, mounted from ai-helm:
+
+- **`deep`** uses the full `reviewSystemPrompt` (mounted from `review-system.md`): grounding +
   uncertainty discipline ([ADR-0047](adr/0047-review-prompt-grounding-and-uncertainty.md)), prompt
   structure/technique ([ADR-0048](adr/0048-review-prompt-structure-and-technique.md)), eval-driven
   iteration ([ADR-0049](adr/0049-eval-driven-reviewer-prompt-iteration.md)).
-- **Fast** uses a lean `reviewSystemPromptFast` (mounted from `review-system-fast.md`): a diff-only
+- **`fast`** uses a lean `reviewSystemPromptFast` (mounted from `review-system-fast.md`): a diff-only
   pass that claims only what the diff proves, with anything unverifiable downgraded to a P2 question
   (it has no retrieval to confirm a deeper claim).
+
+An operator adding a new preset (e.g. a future `ultra`) mounts its own prompt file the same way.
 
 The diff itself, prior reviews, repo memory, and repo instructions are all assembled into the **user**
 message by `build_messages` (see below); the tool-protocol/persona in the system message stays
@@ -175,8 +222,8 @@ image-then-config) and best-effort (a scan failure is logged, never fatal).
 
 **It is no longer an automatic pre-agent pass (superseded, ADR-0073).** opengrep now runs *only* when the
 review agent calls the `run_sast` tool (`services/review-agent/src/tools/sast.rs`) — a built-in tool like
-any other, offered per tier via `review.<tier>.tools` (§2/§5), and only when a diff is present (nothing to
-scope a scan to otherwise). This fixes the ADR-0061 pre-pass's original cost: it ran at the start of
+any other, offered per preset via `review.presets.<name>.tools` (§2/§5), and only when a diff is present
+(nothing to scope a scan to otherwise). This fixes the ADR-0061 pre-pass's original cost: it ran at the start of
 *every* review runner, including a purely conversational `@mention` that never touches the diff — the
 run kind is only decided *inside* the agent loop (ADR-0033/ADR-0037), so a pre-agent scan couldn't tell a
 review from a question. The trade-off is deliberate and accepted: SAST coverage is now LLM-gated (a model
@@ -223,17 +270,28 @@ win the upsert; the digest keeps such collisions rare.
 
 ## 5. The native agent loop
 
-`run_native_agent` in `services/agent-runner/src/review/native/agent.rs` drives the chat client over
-the eaig gateway. The loop: build messages → for each turn, offer a (per-turn) tool set → model replies
-with tool calls → dispatch them → feed results back → repeat until `finish`/`abort` or the budget runs
-out.
+`run_native_agent` (`services/agent-runner/src/review/mod.rs`) is a thin host over
+`lci_review_agent::flows::run_review` (`services/review-agent/src/flows.rs`), which drives the chat
+client over the eaig gateway. The loop: build messages → for each turn, offer a (per-turn) tool set →
+model replies with tool calls → dispatch them → feed results back → repeat until `finish`/`abort` or the
+budget runs out.
+
+**Every preset runs through this exact same policy composition (ADR-0103).** `flows.rs`'s own doc
+comment says it plainly: *"nothing here branches on which preset is running"* — the old FAST-tier
+structural narrowing (a `FastTierGuard`, a hardcoded 5-turn cap, and skipping the coverage/refute/
+SAST-anchor gates for fast) was retired, because PR #488 already proved gate parity works and this
+makes divergence structurally impossible instead of a matter of discipline. A preset varies the review
+**only** through the numeric budgets in `ReviewRunParams` (`max_turns`, `max_files_read`,
+`max_searches`, `max_batches`, `max_coverage_bounces`, …) that the host resolves from that preset's
+`ReviewConfig` — a tight-budget preset (what used to be the structurally-distinct `fast` tier) converges
+quickly because its *own* budgets are small, not because any gate is skipped for it.
 
 ### Tool surface and dispatch
 
-The full surface (`tool_defs` in `services/agent-runner/src/review/native/tools.rs`), in stable order:
-retrieval (`lightbridge_vector_semantic_search`, `lightbridge_graph_find_symbol`,
-`lightbridge_graph_get_callers`), `read_file`, write actions (`add_review_comment`, `retract_finding`,
-`add_comment`, `finish`), and control (`report_progress`, `abort`).
+The full surface (`tool_defs` in `services/review-agent/src/tools.rs`), in stable order: retrieval
+(`lightbridge_vector_semantic_search`, `lightbridge_graph_find_symbol`, `lightbridge_graph_get_callers`),
+`read_file`, write actions (`add_review_comment`, `retract_finding`, `add_comment`, `finish`), and
+control (`report_progress`, `abort`).
 
 - **Retrieval + `read_file`** are read-only and run **concurrently in batches** of up to
   `max_batch_size` ([ADR-0042](adr/0042-risk-first-review-and-parallel-batching.md)). `read_file` is
@@ -255,14 +313,17 @@ evidence is folded into the rendered body so the claim is verifiable
 
 ### Per-turn offered tool set
 
-The offered set is narrowed each turn from the base `defs`:
+The offered set is narrowed each turn from the base `defs`, the same rules applying uniformly to every
+preset (ADR-0103 — none of this branches on the preset name):
 
-1. **Per-tier allowlist** restricts `defs` to `review.tools` (still subject to the rules below).
-2. **Fast tier**: never offers retrieval/`read_file`. With an explicit allowlist, `defs` already *is*
-   the reduced set; without one it falls back to the built-in wind-down write/finish/abort set. The
-   fast tier additionally **enforces** the offered set — a call to a non-offered tool is **refused**
-   (a synthetic steer), never dispatched, so the pass stays truly diff-only even if the shared prompt
-   mentions retrieval.
+1. **Per-preset allowlist** restricts `defs` to `review.presets.<name>.tools` (or the flat
+   `review.tools`), still subject to the rules below. With no allowlist, `defs` is the full built-in
+   surface for any preset (§2).
+2. **Non-offered-tool refusal**: a call to a tool not in the offered set is **refused** (a synthetic
+   steer, `render_fast_refusal` in `services/review-agent/src/policies/mod.rs` — the name is a holdover
+   from when this only applied to the fast tier; it now applies to every preset's registry), never
+   dispatched, so a tight allowlist stays enforced even if the shared prompt mentions a tool it doesn't
+   offer.
 3. **Read budgets** ([ADR-0042](adr/0042-risk-first-review-and-parallel-batching.md)): once
    `max_files_read` or `max_searches` is spent, just that tool category is dropped (with a one-time
    nudge); spending `max_batches` (investigation rounds) forces the wind-down.
@@ -272,35 +333,43 @@ The offered set is narrowed each turn from the base `defs`:
 
 ### Turn budget and convergence
 
-`max_turns` defaults to 40 for deep; for **fast** it is clamped to at most `FAST_TIER_MAX_TURNS = 5`
-(the fast tier's cheapness is no-retrieval + a cheap model + short timeout, **not** a single turn — a
-1-turn pass posted an empty review on a PR with changes, because the model's first action was also its
-last and it couldn't both act and `finish`).
+`max_turns` is the preset's own configured value (default 40, `DEFAULT_MAX_TURNS`) — applied **as-is,
+with no structural per-preset cap** (ADR-0103; the old hardcoded `FAST_TIER_MAX_TURNS = 5` ceiling was
+retired along with the rest of the fast-tier structural narrowing). The `fast` default preset's
+ai-helm-values config sets its own small `max_turns` instead; a 1-turn budget is deliberately avoided
+regardless of preset — an early prod run posted an empty review on a PR with changes because the
+model's first action was also its last and it couldn't both act and `finish`.
 
-Convergence levers (deep tier; the fast tier skips the investigation-oriented nudges):
+Convergence levers — **every one of these runs for every preset** (`services/review-agent/src/flows.rs`'s
+policy vector is fixed; a tight-budget preset converges quickly because its own turn/read/batch budgets
+are small, not because a gate is skipped for it):
 
-- **Wind-down** (`winddown_turn`): in the budget's tail (~`max_turns/10` reserved, min 2) the loop
-  switches the model onto the reduced write/finish/abort set and announces it once — with no way to keep
-  digging, the model must record any last findings and `finish`. Triggered by the turn budget **or** by
-  spending the batch budget **or** by the context-window estimate nearing the window. The wind-down set
-  is derived from the (allowlist-restricted) `defs`, so a per-tier allowlist is honoured in the tail too.
-- **Halfway nudge** + a light **finish nudge** once ≥1 finding is recorded.
-- **Full-diff coverage gate** ([ADR-0041](adr/0041-full-diff-coverage-gate.md), hardened by
-  [ADR-0069](adr/0069-review-tier-minimum-model-capability.md)): an early `finish` (before wind-down)
+- **Wind-down** (`WindDown`, wrapping `winddown_turn`): in the budget's tail (~`max_turns/10` reserved,
+  min 2) the loop switches the model onto the reduced write/finish/abort set and announces it once —
+  with no way to keep digging, the model must record any last findings and `finish`. Triggered by the
+  turn budget **or** by spending the batch budget **or** by the context-window estimate nearing the
+  window. The wind-down set is derived from the (allowlist-restricted) `defs`, so a per-preset allowlist
+  is honoured in the tail too.
+- **Halfway nudge** (`TurnBudget`) + a light **finish nudge** (`FindingFinishNudge`) once ≥1 finding is
+  recorded — one nudge text for every preset; it's the preset's own (smaller) budgets that make a
+  tight-budget run converge sooner, not different prompt text.
+- **Full-diff coverage gate** (`CoverageGate`, [ADR-0041](adr/0041-full-diff-coverage-gate.md), hardened
+  by [ADR-0069](adr/0069-review-tier-minimum-model-capability.md)): an early `finish` (before wind-down)
   with changed files the agent never opened or commented on is **bounced with the explicit
-  uncovered-file list, up to `review.<tier>.max_coverage_bounces` times** (default 3; `0` disables
-  the bounce, `1` = the legacy bounce-once), so one run accounts for the whole
-  change instead of finding one issue and stopping (two runs on the same PR each found a different
-  real P1). A re-`finish` with zero new engagement since the last bounce gets a harsher nudge naming
-  the fabrication, and a finish that ultimately goes through incomplete (cap hit, or the wind-down
-  tail skipped the gate) gets a machine-authored **coverage disclosure** ("examined N of M changed
-  files…") appended to the posted summary — a weak model gamed the original one-shot bounce by
-  re-finishing with zero reads and parroting the bounce's own file list as "thoroughly reviewed"
-  (run `bac4b5d8`). Skipped for the fast tier (it would waste the single useful turn).
-- **Refute pass** ([ADR-0043](adr/0043-review-finding-verification.md)): the first `finish` with any
-  P0/P1 finding is **bounced once** to force the model to re-verify each against its cited evidence and
-  `retract_finding` the ones that don't hold. A confidently-wrong blocker costs more trust than a missed
-  nit. Skipped for the fast tier.
+  uncovered-file list, up to `review.presets.<name>.max_coverage_bounces` times** (default 3; `0`
+  disables the bounce, `1` = the legacy bounce-once), so one run accounts for the whole change instead
+  of finding one issue and stopping (two runs on the same PR each found a different real P1). A
+  re-`finish` with zero new engagement since the last bounce gets a harsher nudge naming the
+  fabrication, and a finish that ultimately goes through incomplete (cap hit, or the wind-down tail
+  skipped the gate) gets a machine-authored **coverage disclosure** ("examined N of M changed files…")
+  appended to the posted summary — a weak model gamed the original one-shot bounce by re-finishing with
+  zero reads and parroting the bounce's own file list as "thoroughly reviewed" (run `bac4b5d8`). This
+  gate now runs identically regardless of preset — a tight budget (`max_coverage_bounces` set low, or
+  `0`) is how an operator opts a preset out of repeated bouncing, not a code-level skip.
+- **Refute pass** (`RefuteGate`, [ADR-0043](adr/0043-review-finding-verification.md)): the first `finish`
+  with any P0/P1 finding is **bounced once** to force the model to re-verify each against its cited
+  evidence and `retract_finding` the ones that don't hold. A confidently-wrong blocker costs more trust
+  than a missed nit. This also now runs for every preset, not just `deep`.
 
 ### Context-window budget (ADR-0045)
 
@@ -402,16 +471,27 @@ the repo-root-relative forward-slash form GitHub uses, deduped by `(file, line, 
 
 ### Body rendering
 
-- **Deep** → `render_body`: the `## Lightbridge review` heading + the verdict + the finding sections +
-  the governance disclosure (AI output is untrusted; a human owns the decision).
-- **Fast** → `render_fast_body`: a `> 🅵 **Fast automated pass**` blockquote banner naming the pass
-  (SAST + a quick, diff-scoped look, no repo-wide retrieval) and pointing to the deep review by
+The choice between the two body shapes is keyed on `context.entry_point == "pr_open"`, **not** on the
+resolved `preset` name (ADR-0103: a preset is operator-defined, so it can't be relied on to signal "this
+was the automatic on-open pass") — a comment at the call site in `internal.rs` spells this out:
+
+- **Any entry point other than `pr_open`** → `render_body`: the `## Lightbridge review` heading + the
+  verdict + the finding sections + the governance disclosure (AI output is untrusted; a human owns the
+  decision).
+- **`pr_open`** → `render_fast_body`: a `> 🅵 **Fast automated pass**` blockquote banner naming the pass
+  (SAST + a quick, diff-scoped look, no repo-wide retrieval) and pointing to a full review by
   **mentioning the App's real handle** — `mention @<handle> on this PR`, from `state.app_handle`
-  (`GITHUB_APP_HANDLE`). The handle lives only control-plane-side, which is **why the fast body is
-  composed here, not in the runner** (the runner once hardcoded the wrong `@lightbridge`). The model's
-  `finish` verdict follows the banner when present; an exhausted/clean fast pass shows the banner alone
-  (no fabricated "no issues" verdict), and inline findings still post as review comments. No handle
-  configured → a graceful generic `mention me on this PR`, never a dangling `@`.
+  (`GITHUB_APP_HANDLE`; GitLab/Bitbucket use their own registered bot handle). The handle lives only
+  control-plane-side, which is **why this body is composed here, not in the runner** (the runner once
+  hardcoded the wrong `@lightbridge`). The model's `finish` verdict follows the banner when present; an
+  exhausted/clean `pr_open` pass shows the banner alone (no fabricated "no issues" verdict), and inline
+  findings still post as review comments. No handle configured → a graceful generic `mention me on this
+  PR`, never a dangling `@`.
+
+The agent-runner side of exhaustion framing — whether it posts "review posted" or "review posted (fast
+pass)" — is keyed the same way: `finalize_review_outcome` in `run.rs` checks `entry_point == "pr_open"`,
+not the preset name (this was migrated in a follow-up after the control-plane side above, closing the
+one call site the initial ADR-0103 migration missed).
 
 Both paths share `append_finding_sections` (so the finding rendering can't drift) and the
 `REVIEW_DISCLOSURE`. All posted text passes through `strip_model_artifacts`, which removes leaked
@@ -435,17 +515,22 @@ author isn't left in silence.
 
 | Knob | Where | Notes |
 |---|---|---|
-| `tier` | task column (set in webhook) | `fast` on PR-opened, `deep` on @mention |
-| `review.fast` / `review.deep` | `agent.json` | complete per-tier blocks; fall back to flat `review.*` |
-| `review.<tier>.tools` | `agent.json` | closed `ReviewTool` enum; unknown/empty fails config |
-| `reviewSystemPrompt` / `reviewSystemPromptFast` | ai-helm → `review-system.md` / `review-system-fast.md` | required (fail-closed), operator-owned |
-| `review.max_turns` | `agent.json` | default 40; fast clamped to ≤5 |
-| `review.max_batch_size` / `max_files_read` / `max_searches` / `max_batches` | `agent.json` | read budgets (ADR-0042) |
-| `review.context_window` | `agent.json` | enables conversation budgeting (ADR-0045) |
-| `review.extra` | `agent.json` | passthrough params, notably the reasoning budget |
-| `review.stream` | `agent.json` / `LLM_STREAM` | SSE streaming |
-| `sast.enabled` + `sast.*` | `agent.json` | opt-in opengrep config; also needs `run_sast` in `review.<tier>.tools` to actually be offered (ADR-0061 + ADR-0073) |
-| model + reasoning budget | ai-helm-values | **operator-tuned, churns — read live** |
+| `preset` | task column (`tasks.preset`, resolved via repo config or the platform default) | e.g. `fast`/`deep`, or any operator-defined name (ADR-0103) |
+| `entry_point` | task column (`tasks.entry_point`, set in webhook/lifecycle) | `pr_open` / `mention` / `a2a` — drives body framing, never the preset lookup |
+| `review.presets.<name>` | `agent.json` | complete per-preset blocks; a platform-default name (`fast`/`deep`) falls back to the flat `review.*` when absent |
+| `review.presets.<name>.tools` | `agent.json` | closed `ReviewTool` enum; unknown/empty fails config; unset = full built-in surface for any preset |
+| `review.presets.<name>.system_prompt_file` | ai-helm → e.g. `review-system.md` / `review-system-fast.md` for the default presets | required (fail-closed), operator-owned, one per preset |
+| `review.presets.<name>.max_turns` | `agent.json` | default 40; applied as-is, no structural per-preset cap |
+| `review.presets.<name>.max_batch_size` / `max_files_read` / `max_searches` / `max_batches` | `agent.json` | read budgets (ADR-0042) |
+| `review.presets.<name>.context_window` | `agent.json` | enables conversation budgeting (ADR-0045) |
+| `review.presets.<name>.extra` | `agent.json` | passthrough params, notably the reasoning budget |
+| `review.presets.<name>.stream` | `agent.json` / `LLM_STREAM` | SSE streaming |
+| `sast.enabled` + `sast.*` | `agent.json` | opt-in opengrep config; also needs `run_sast` in `review.presets.<name>.tools` to actually be offered (ADR-0061 + ADR-0073) |
+| model + reasoning budget | ai-helm-values | **operator-tuned, churns — read live**, independently per preset |
+
+> Every knob above may also be set at the flat `review.*` level, which any platform-default preset name
+> (`fast`/`deep`) with no dedicated `review.presets.<name>` block falls back to (ADR-0103's
+> behavior-neutral migration).
 
 > Per the strict `deny_unknown_fields` file config, a deploy that touches these fields must land in the
 > 3-repo order: runner image → ai-helm chart → ai-helm-values.

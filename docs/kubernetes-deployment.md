@@ -177,14 +177,15 @@ The dispatcher mounts, into every agent Job (`job_manifest`):
 - **`agent.json` + prompt templates** — from the ConfigMap named by `agent.config_configmap`
   (`AGENT_CONFIG_CONFIGMAP`), mounted **read-only at `/etc/lightbridge`**, with `AGENT_CONFIG` pointed
   at `/etc/lightbridge/agent.json`. This ConfigMap carries:
-  - **`review-system.md`** — the deep-tier reviewer system prompt.
-  - **`review-system-fast.md`** — the lean fast-tier prompt (diff-only; "review the diff directly,
+  - **`review-system.md`** — the `deep` preset's reviewer system prompt.
+  - **`review-system-fast.md`** — the lean `fast`-preset prompt (diff-only; "review the diff directly,
     record findings, always `finish` with a verdict; raise only what the diff proves, phrase the
-    unverifiable as a P2 question") — pointed at by `review.fast.system_prompt_file`
+    unverifiable as a P2 question") — pointed at by `review.presets.fast.system_prompt_file`
     ([ADR-0062](adr/0062-two-tier-review-fast-auto-deep-on-demand.md) amendment).
-  - The per-tier review blocks (`review.fast` / `review.deep`): own model/gateway/prompt/reasoning
-    budget/timeout, and the closed-enum tool allowlist `review.<tier>.tools` (fast =
-    `[add_review_comment, finish, abort]`). An unknown tool name fails at config parse.
+  - The named review preset blocks (`review.presets.fast` / `review.presets.deep`, ADR-0103 — see the
+    schema note below): own model/gateway/prompt/reasoning budget/timeout, and the closed-enum tool
+    allowlist `review.presets.<name>.tools` (fast = `[add_review_comment, finish, abort]`). An unknown
+    tool name fails at config parse.
 - **Internal CA** — when `agent.ca_secret` is set, the Secret's `ca.crt` mounts read-only at
   `/etc/internal-ca`, and `EMBEDDINGS_CA_CERT` points the runner's reqwest clients at it so they trust
   the eaig gateway's private-issuer HTTPS cert ([ADR-0018](adr/0018-openai-compatible-embeddings.md)).
@@ -307,22 +308,39 @@ prompt alone needed no new runner (it rides the existing `system_prompt_file`). 
 binary that accepts **both** `poller` and `reconciler`, flip the Deployment `args`, then drop the
 alias.
 
-## Two-tier review on the cluster (ADR-0062)
+**A field *reshuffling* is the same hazard as a new field, and easier to miss.** The dance above covers
+adding a field the chart doesn't render yet; it is just as strict when an *existing* field's JSON
+**shape** changes (not just its name) — e.g. ADR-0103 replaced the runner's flat `review.fast`/
+`review.deep` fields with a `review.presets.<name>` map. `ai-helm`'s `config.yaml` template renders
+`review.fast`/`review.deep` **directly**, not through the runner's Rust types, so nothing in this repo's
+own CI catches the chart falling out of sync — the runner image shipping the new shape (this repo, PR
+#527) and the chart being updated to render the new shape are **two separate repos with no shared type
+check between them**, and only the second half of that pair actually breaks production. This exact gap
+crash-looped every review Job in prod (`"invalid agent config file": "deserializing
+/etc/lightbridge/agent.json"`) until the chart caught up ([ai-helm#798](https://github.com/ADORSYS-GIS/ai-helm/pull/798)).
+**Whenever a config-shape PR lands here, check whether `ai-helm`'s config template renders that section
+by hand-copying the shape (`git grep` the field name in `ai-helm/charts/*/templates/config.yaml`) — if
+it does, that chart needs a matching PR before/alongside this one, not after a crash-loop reveals it.**
 
-The trigger picks the tier, carried as a `tier` column to the runner:
+## Review presets on the cluster (ADR-0103)
 
-- **`pull_request opened` → fast** — automatic. SAST (opengrep) as the backbone + a lean
-  diff-only LLM pass, **no retrieval tools registered**, short turn cap (`max_turns` clamped to ≤5,
-  not 1) + job timeout (≲ 2 min). The
-  fast-tier framing ("🅵 quick pass — mention @handle for a deeper review") is rendered control-plane-
-  side at `finalize_review` (`render_fast_body`), where the real `GITHUB_APP_HANDLE` (GitHub) or
-  per-project GitLab `bot_handle` from `control-plane.json` lives.
-- **`@mention` → deep** — manual. Full graph + vector retrieval, `read_file`, generous turns,
-  streaming on, long job deadline (2h acceptable, since it is user-requested and async). On GitHub
-  the `@<GITHUB_APP_HANDLE>` mention on a PR comment triggers it; on GitLab the configured
-  `@<bot_handle>` mention on an MR note triggers it.
+Each task carries a resolved **`preset`** column (`fast`/`deep` by platform default, or any
+operator-defined name — see [review-pipeline.md](review-pipeline.md) for full resolution details) plus
+a separate **`entry_point`** column (`pr_open`/`mention`/`a2a`) that records which trigger created it:
 
-Both tiers post through the **single** review channel
+- **`pull_request opened` → entry point `pr_open`, `fast` by default** — automatic. SAST (opengrep) as
+  the backbone + a lean diff-only LLM pass, **no retrieval tools registered** by that preset's own
+  allowlist, small `max_turns` + job timeout (≲ 2 min). The quick-pass framing ("🅵 quick pass — mention
+  @handle for a deeper review") is rendered control-plane-side at `finalize_review` (`render_fast_body`),
+  keyed on **`entry_point == "pr_open"`** (not the preset name, since ADR-0103 made preset names
+  operator-defined) — where the real `GITHUB_APP_HANDLE` (GitHub) or per-project GitLab `bot_handle`
+  from `control-plane.json` lives.
+- **`@mention` → entry point `mention`, `deep` by default** — manual. Full graph + vector retrieval,
+  `read_file`, generous turns, streaming on, long job deadline (2h acceptable, since it is
+  user-requested and async). On GitHub the `@<GITHUB_APP_HANDLE>` mention on a PR comment triggers it;
+  on GitLab the configured `@<bot_handle>` mention on an MR note triggers it.
+
+Every preset posts through the **single** review channel
 ([ADR-0056](adr/0056-control-plane-owns-the-posted-output.md)) via the egress outbox. SAST findings
 ride the *same* buffer ([ADR-0061](adr/0061-sast-deterministic-finding-source.md)) — opengrep runs
 inside the runner over the PR's changed files, best-effort/non-fatal, never a second poster.
