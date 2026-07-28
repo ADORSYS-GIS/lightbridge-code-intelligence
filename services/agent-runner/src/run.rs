@@ -508,7 +508,7 @@ async fn perform_review(
         status.set_phase(Phase::Finalizing);
     }
 
-    finalize_review_outcome(outcome, review, &context.preset, client, task_id).await
+    finalize_review_outcome(outcome, review, &context.entry_point, client, task_id).await
 }
 
 /// Map a finished agent run onto a visible PR artifact and the top-level summary/detail (#137). Net
@@ -526,7 +526,7 @@ async fn perform_review(
 async fn finalize_review_outcome(
     outcome: anyhow::Result<review::ReviewOutcome>,
     review: &ReviewConfig,
-    preset: &str,
+    entry_point: &str,
     client: &ControlPlaneClient,
     task_id: Uuid,
 ) -> anyhow::Result<(String, Option<String>)> {
@@ -538,28 +538,31 @@ async fn finalize_review_outcome(
             ("review posted".to_string(), None)
         }
         Ok(review::ReviewOutcome::Exhausted) => {
-            // Preset framing at exhaustion is presentation, not review behavior (ADR-0103 only mandates
-            // gate/tool uniformity) — keyed on the platform-default preset NAME here as a transitional
-            // check; story #495 replaces this with the task's own `entry_point`, which is the actual
-            // thing this framing decision should depend on.
-            if preset == "fast" {
-                // FAST preset: a run that ends without `finish` is normal, not "out of
+            // Framing at exhaustion is presentation, not review behavior (ADR-0103 only mandates
+            // gate/tool uniformity) — keyed on `entry_point`, NOT preset. A preset name is
+            // operator-defined (ADR-0103) and can't be relied on to signal "this was the automatic
+            // on-open pass" (story #495 / PR #529 made the same fix in
+            // `control-plane/src/http/internal.rs`'s `context.entry_point == "pr_open"` check; this
+            // was the one call site it missed).
+            if entry_point == "pr_open" {
+                // Automatic on-open pass: a run that ends without `finish` is normal, not "out of
                 // budget." The quick-pass framing — the 🅵 banner + the "mention @handle for a deeper
                 // review" pointer — is rendered CONTROL-PLANE-SIDE at finalize, where the real GitHub
                 // App handle lives (the runner doesn't have it, and hardcoded the wrong `@lightbridge`
                 // before). So DON'T set a summary here: an exhausted fast pass just finalizes, and
-                // finalize composes the fast body from the task tier + whatever the run buffered
-                // (inline findings still post). A finished fast run is the same — its `finish` verdict
-                // becomes the summary the fast body wraps. The outcome is still "exhausted" — honest —
-                // so a zero-findings exhausted fast pass POSTS its banner review rather than 👍-ing an
-                // incomplete pass as clean (ADR-0068).
+                // finalize composes the fast body from the task's entry point + whatever the run
+                // buffered (inline findings still post). A finished fast run is the same — its `finish`
+                // verdict becomes the summary the fast body wraps. The outcome is still "exhausted" —
+                // honest — so a zero-findings exhausted fast pass POSTS its banner review rather than
+                // 👍-ing an incomplete pass as clean (ADR-0068).
                 client.finalize_review(task_id, "exhausted").await?;
                 (
                     "review posted (fast pass)".to_string(),
                     Some("fast pass exhausted; framed control-plane-side".to_string()),
                 )
             } else {
-                // DEEP tier: the honest truncation note with its real budget.
+                // Any other entry point (`mention`/`a2a`/…): the honest truncation note with its real
+                // budget.
                 let note = format!(
                     "⚠️ Review hit its step budget ({} turns) — posting the findings gathered so \
                      far; some areas may be unreviewed.",
@@ -615,5 +618,123 @@ async fn report(
 ) {
     if let Err(error) = client.report_status(config.task_id, status, detail).await {
         tracing::warn!(%error, task_id = %config.task_id, status, "failed to report status");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use super::*;
+    use crate::bootstrap::config::ResilienceConfig;
+
+    /// A minimal `ReviewConfig` — only `max_turns` is read by `finalize_review_outcome` (in the
+    /// truncation-note branch); the rest are placeholder values a real config would never leave at.
+    fn review_config() -> ReviewConfig {
+        ReviewConfig {
+            base_url: "https://gateway.internal/v1".to_string(),
+            api_key: "key".to_string(),
+            model: "m".to_string(),
+            system_prompt: "You are a reviewer.".to_string(),
+            max_diff_chars: 60_000,
+            max_turns: 40,
+            max_batch_size: 8,
+            max_files_read: 30,
+            max_searches: 15,
+            max_batches: 6,
+            max_coverage_bounces: 3,
+            max_cycles: 8,
+            context_window: None,
+            temperature: None,
+            top_p: None,
+            max_tokens: None,
+            extra: serde_json::Map::new(),
+            stream: false,
+            resilience: ResilienceConfig::default(),
+            tools: None,
+            opencode_overlay: None,
+        }
+    }
+
+    async fn mock_finalize_and_summary() -> MockServer {
+        let cp = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(format!(
+                "/internal/tasks/{}/review/finalize",
+                Uuid::nil()
+            )))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&cp)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(format!(
+                "/internal/tasks/{}/review/summary",
+                Uuid::nil()
+            )))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&cp)
+            .await;
+        cp
+    }
+
+    // The whole point of story #495 / PR #529's `internal.rs` fix, mirrored here: preset names are
+    // operator-defined (ADR-0103) and can't signal "this was the automatic on-open pass" — only
+    // `entry_point` can. A custom-named preset on the `pr_open` entry point must still get the
+    // fast-style banner, never the deep-tier truncation note.
+    #[tokio::test]
+    async fn exhausted_pr_open_entry_point_gets_fast_banner_even_under_a_custom_preset_name() {
+        let cp = mock_finalize_and_summary().await;
+        let client = ControlPlaneClient::new(cp.uri(), "tok");
+        let review = review_config();
+
+        let (message, detail) = finalize_review_outcome(
+            Ok(review::ReviewOutcome::Exhausted),
+            &review,
+            "pr_open",
+            &client,
+            Uuid::nil(),
+        )
+        .await
+        .expect("finalize_review_outcome");
+
+        assert_eq!(message, "review posted (fast pass)");
+        assert_eq!(
+            detail.as_deref(),
+            Some("fast pass exhausted; framed control-plane-side")
+        );
+        // The fast path must NOT set a summary — the banner is composed control-plane-side at finalize.
+        assert!(
+            cp.received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .all(|req| !req.url.path().ends_with("/review/summary")),
+            "fast pass must not post a review summary"
+        );
+    }
+
+    // Any other entry point (`mention`/`a2a`/…) keeps the honest truncation-note framing, regardless of
+    // what the preset happens to be named.
+    #[tokio::test]
+    async fn exhausted_non_pr_open_entry_point_gets_truncation_note() {
+        let cp = mock_finalize_and_summary().await;
+        let client = ControlPlaneClient::new(cp.uri(), "tok");
+        let review = review_config();
+
+        let (message, detail) = finalize_review_outcome(
+            Ok(review::ReviewOutcome::Exhausted),
+            &review,
+            "mention",
+            &client,
+            Uuid::nil(),
+        )
+        .await
+        .expect("finalize_review_outcome");
+
+        assert_eq!(message, "review posted (truncated at step budget)");
+        let detail = detail.expect("truncation note");
+        assert!(detail.contains("step budget"));
+        assert!(detail.contains("40 turns"));
     }
 }
