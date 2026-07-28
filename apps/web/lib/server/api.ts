@@ -9,13 +9,17 @@ import type { Review, Task } from "@/lib/domain/tasks";
  * token as a Bearer credential — the same token the control plane validates (ADR-0014).
  */
 
-/** Control-plane base URL. `AUTH_BACKEND_URL` is the in-cluster Service name set by the chart. */
+/**
+ * Control-plane base URL, including the versioned API path prefix.
+ * Set `CONTROL_PLANE_URL` (or the legacy `AUTH_BACKEND_URL`) to the bare service origin;
+ * the `/api/v2` prefix is appended here so every fetch call in this file stays unchanged.
+ */
 function controlPlaneUrl(): string {
   return (
-    process.env.CONTROL_PLANE_URL ??
-    process.env.AUTH_BACKEND_URL ??
-    "http://localhost:8080"
-  ).replace(/\/+$/, "");
+    (process.env.CONTROL_PLANE_URL ??
+      process.env.AUTH_BACKEND_URL ??
+      "http://localhost:8080") + "/api/v2"
+  ).replace(/([^:])\/{2,}/g, "$1/"); // collapse any double-slash introduced by a trailing slash
 }
 
 /** Discriminated result so pages can render honest states instead of throwing. */

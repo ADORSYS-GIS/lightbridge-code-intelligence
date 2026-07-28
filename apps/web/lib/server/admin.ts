@@ -9,12 +9,17 @@ import type { ApiResult } from "@/lib/server/api";
  * (returns 403 for non-admins). Used by the admin approval screen.
  */
 
+/**
+ * Control-plane base URL, including the versioned API path prefix.
+ * Set `CONTROL_PLANE_URL` (or the legacy `AUTH_BACKEND_URL`) to the bare service origin;
+ * the `/api/v2` prefix is appended here so every fetch call in this file stays unchanged.
+ */
 function controlPlaneUrl(): string {
   return (
-    process.env.CONTROL_PLANE_URL ??
-    process.env.AUTH_BACKEND_URL ??
-    "http://localhost:8080"
-  ).replace(/\/+$/, "");
+    (process.env.CONTROL_PLANE_URL ??
+      process.env.AUTH_BACKEND_URL ??
+      "http://localhost:8080") + "/api/v2"
+  ).replace(/([^:])\/{2,}/g, "$1/");
 }
 
 /** The dotted claim path the caller's permissions live under (ADR-0023). Mirrors the control plane's
