@@ -309,35 +309,27 @@ fn db_readiness(has_pool: bool, ping_ok: bool, allow_no_db: bool) -> DbReadiness
     }
 }
 
-/// All versioned API routes under `/api/v2`.
-///
-/// Three auth models live here, grouped by prefix:
-/// - `/webhook/*`  — unauthenticated (HMAC-verified) platform ingress
-/// - `/me`, `/tasks/*`, `/repositories`, `/admin/*` — OIDC-gated dashboard routes
-/// - `/internal/*` — shared-bearer runner API (ADR-0017 / ADR-0092)
+/// All routes under `/api/v2`.
 ///
 /// Health probes (`/healthz`, `/readyz`) and `/metrics` stay at the root — they are internal
-/// cluster probes not consumed by any API client, and moving them would break liveness checks
-/// on every existing Deployment without any benefit.
+/// cluster probes not consumed by any API client.
 fn api_v2_router() -> Router<AppState> {
     Router::new()
-        // --- Webhook ingress (Epic #492 / #507): path-scoped per forge, no header-sniffing ---
-        // GitHub: singleton, secret from GITHUB_WEBHOOK_SECRET.
+        // Webhook ingress: path-scoped per forge, no header-sniffing.
         .route(
             "/webhook/github",
             post(webhook::github_webhook).layer(DefaultBodyLimit::max(webhook::MAX_BODY_BYTES)),
         )
-        // GitLab: per-installation, keyed by the project-id path segment.
         .route(
             "/webhook/gitlab/{installation_id}",
             post(webhook::gitlab_webhook).layer(DefaultBodyLimit::max(webhook::MAX_BODY_BYTES)),
         )
-        // Bitbucket: per-repo, keyed by the stable_id_from_key path segment (Epic #353).
+        // Bitbucket: per-repo, keyed by the stable_id_from_key path segment.
         .route(
             "/webhook/bitbucket/{installation_id}",
             post(webhook::bitbucket_webhook).layer(DefaultBodyLimit::max(webhook::MAX_BODY_BYTES)),
         )
-        // --- OIDC-gated dashboard routes ---
+        // OIDC-gated dashboard routes.
         .route("/me", get(jwt::me))
         .route("/tasks", get(tasks::list))
         .route("/tasks/{id}", get(tasks::get))
@@ -345,11 +337,11 @@ fn api_v2_router() -> Router<AppState> {
         .route("/tasks/{id}/feedback", get(tasks::get_feedback))
         .route("/tasks/{id}/cancel", post(tasks::cancel))
         .route("/repositories", get(tasks::list_repositories))
-        // Admin API (approval gate, Epic #75) — gated by the `Admin` extractor (admin realm role).
+        // Admin API (approval gate) — gated by the `Admin` extractor (admin realm role).
         .route("/admin/repositories", get(admin::list_repositories))
         .route("/admin/repositories/{id}/approve", post(admin::approve))
         .route("/admin/repositories/{id}/deny", post(admin::deny))
-        // --- Internal runner API (shared-bearer, not OIDC) — the agent Job's lifecycle callbacks ---
+        // Internal runner API (shared-bearer, not OIDC) — the agent Job's lifecycle callbacks.
         .route("/internal/tasks/{id}", get(internal::get_context))
         .route(
             "/internal/tasks/{id}/status",
@@ -440,13 +432,9 @@ fn api_v2_router() -> Router<AppState> {
 
 fn app(state: AppState) -> Router {
     Router::new()
-        // Infra probes stay at root: cluster liveness/readiness checks and Prometheus scrape are
-        // consumed by k8s and Alloy respectively — not by any API client — so versioning them
-        // under /api/v2 would break existing Deployments with no benefit.
         .route("/healthz", get(liveness))
         .route("/readyz", get(readiness))
         .route("/metrics", get(metrics_endpoint))
-        // All versioned API routes: dashboard, runner-internal, and webhook ingress.
         .nest("/api/v2", api_v2_router())
         .layer(axum::middleware::from_fn(track_http_metrics))
         .with_state(state)
@@ -932,21 +920,10 @@ mod tests {
         assert!(!env_flag_value(None));
     }
 
-    // Epic #492 / #506 — verify the old flat paths are gone and the versioned ones exist.
-    // Uses axum's `TestClient`-free approach: inspect the router by checking matched routes
-    // rather than sending HTTP — we just confirm the `app()` structure compiles and nests correctly.
+    // Compile-time guard: these three handler symbols must exist (used in `api_v2_router`);
+    // if the old unified handlers were accidentally re-introduced the build would fail.
     #[test]
     fn api_v2_prefix_is_applied_and_legacy_paths_removed() {
-        // The test is intentionally compile-time / structural: if `api_v2_router` is accidentally
-        // inlined back at root, the `nest("/api/v2", …)` call in `app()` would be absent and this
-        // assertion about the source would need updating. The real 404 behaviour is verified by
-        // integration tests; here we guard that `app()` and `api_v2_router()` are both present as
-        // distinct functions and that legacy webhook symbols are gone from the public webhook API.
-        //
-        // Compile-time check: `webhook::github_webhook`, `webhook::gitlab_webhook`,
-        // `webhook::bitbucket_webhook` must exist (used in `api_v2_router`); if the old
-        // `webhook::webhook_router` or `webhook::github_webhook_legacy` are referenced here the
-        // build fails, proving they were removed.
         let _ = webhook::github_webhook as fn(_, _, _) -> _;
         let _ = webhook::gitlab_webhook as fn(_, _, _, _) -> _;
         let _ = webhook::bitbucket_webhook as fn(_, _, _, _) -> _;

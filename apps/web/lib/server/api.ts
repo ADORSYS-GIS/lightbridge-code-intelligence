@@ -8,18 +8,12 @@ import type { Review, Task } from "@/lib/domain/tasks";
  * Components / route handlers: it reads the httpOnly session cookie and forwards the OIDC access
  * token as a Bearer credential — the same token the control plane validates (ADR-0014).
  */
-
-/**
- * Control-plane base URL, including the versioned API path prefix.
- * Set `CONTROL_PLANE_URL` (or the legacy `AUTH_BACKEND_URL`) to the bare service origin;
- * the `/api/v2` prefix is appended here so every fetch call in this file stays unchanged.
- */
 function controlPlaneUrl(): string {
   return (
-    (process.env.CONTROL_PLANE_URL ??
-      process.env.AUTH_BACKEND_URL ??
-      "http://localhost:8080") + "/api/v2"
-  ).replace(/([^:])\/{2,}/g, "$1/"); // collapse any double-slash introduced by a trailing slash
+    process.env.CONTROL_PLANE_URL ??
+    process.env.AUTH_BACKEND_URL ??
+    "http://localhost:8080/api/v2"
+  ).replace(/\/+$/, "");
 }
 
 /** Discriminated result so pages can render honest states instead of throwing. */

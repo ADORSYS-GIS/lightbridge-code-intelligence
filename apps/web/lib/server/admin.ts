@@ -4,25 +4,19 @@ import type { Repository } from "@/lib/domain/repos";
 import type { ApiResult } from "@/lib/server/api";
 
 /**
- * Server-only client for the control plane's **admin** API (the approval gate, Epic #75). Like
- * lib/api it forwards the session's OIDC token; the control plane enforces the admin realm role
- * (returns 403 for non-admins). Used by the admin approval screen.
+ * Server-only client for the control plane's admin API (the approval gate). Like lib/api it
+ * forwards the session's OIDC token; the control plane enforces the admin realm role.
  */
 
-/**
- * Control-plane base URL, including the versioned API path prefix.
- * Set `CONTROL_PLANE_URL` (or the legacy `AUTH_BACKEND_URL`) to the bare service origin;
- * the `/api/v2` prefix is appended here so every fetch call in this file stays unchanged.
- */
 function controlPlaneUrl(): string {
   return (
-    (process.env.CONTROL_PLANE_URL ??
-      process.env.AUTH_BACKEND_URL ??
-      "http://localhost:8080") + "/api/v2"
-  ).replace(/([^:])\/{2,}/g, "$1/");
+    process.env.CONTROL_PLANE_URL ??
+    process.env.AUTH_BACKEND_URL ??
+    "http://localhost:8080/api/v2"
+  ).replace(/\/+$/, "");
 }
 
-/** The dotted claim path the caller's permissions live under (ADR-0023). Mirrors the control plane's
+/** The dotted claim path the caller's permissions live under. Mirrors the control plane's
  * `PERMISSIONS_CLAIM`. */
 export function permissionsClaim(): string {
   return process.env.PERMISSIONS_CLAIM?.trim() || "permissions";

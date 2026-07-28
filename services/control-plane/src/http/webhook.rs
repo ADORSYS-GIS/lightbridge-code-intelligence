@@ -1,4 +1,4 @@
-//! Path-scoped webhook receivers (Epic #492 / #506 / #507).
+//! Webhook receivers for GitHub, GitLab, and Bitbucket.
 //!
 //! Three public handlers — one per forge — are mounted under `/api/v2/webhook/` by `main.rs`:
 //!
@@ -6,19 +6,16 @@
 //! - `POST /api/v2/webhook/gitlab/{installation_id}`    → [`gitlab_webhook`]
 //! - `POST /api/v2/webhook/bitbucket/{installation_id}` → [`bitbucket_webhook`]
 //!
-//! Platform is now known at the routing layer — no header-sniffing needed. Each handler verifies
-//! its own signature (GitHub against `GITHUB_WEBHOOK_SECRET`; GitLab/Bitbucket against the
-//! per-project/per-repo secret in `control-plane.json`, keyed by the path's `installation_id`),
-//! dedupes on the platform's delivery ID via the shared [`record_or_dedup`] helper (itself
-//! wrapped in the `StepRuntime` seam, ADR-0107/#502), then hands off to the same platform-specific
-//! event routing as before. With a database, dedup + persistence happen atomically via the
-//! `webhook_deliveries` PRIMARY KEY; without one (dev) it falls back to an in-memory set.
+//! Platform is known at the routing layer — no header-sniffing. Each handler verifies its own
+//! signature (GitHub against `GITHUB_WEBHOOK_SECRET`; GitLab/Bitbucket against the per-project
+//! secret in `control-plane.json`, keyed by the path's `installation_id`), dedupes on the
+//! platform's delivery ID via the shared [`record_or_dedup`] helper, then hands off to
+//! platform-specific event routing. With a database, dedup + persistence happen atomically via
+//! the `webhook_deliveries` PRIMARY KEY; without one (dev) it falls back to an in-memory set.
 //!
-//! The old unified `/webhook` and legacy `/github/webhook` routes are removed (Epic #492 hard
-//! cutover). Existing webhook configurations must be repointed before deploying — see the rollout
-//! checklist in EPIC_492_REPORT.md §5.2. Bitbucket's `installation_id` path segment is the
-//! `platform::stable_id_from_key("workspace/repo_slug")` value (Bitbucket has no native numeric
-//! project id like GitLab's), same identity `BitbucketRegistry` is keyed by.
+//! The old unified `/webhook` and legacy `/github/webhook` routes are removed. Existing webhook
+//! configurations must be repointed before deploying. Bitbucket's `installation_id` path segment
+//! is the `platform::stable_id_from_key("workspace/repo_slug")` value.
 
 use axum::body::Bytes;
 use axum::extract::{Path, State};
@@ -39,10 +36,10 @@ type HmacSha256 = Hmac<Sha256>;
 /// read `project.id` for per-project secret selection; this caps attacker-controlled parse cost.
 pub const MAX_BODY_BYTES: usize = 1024 * 1024;
 
-/// `POST /api/v2/webhook/github` — GitHub webhook receiver (Epic #492 / #507).
+/// `POST /api/v2/webhook/github` — GitHub webhook receiver.
 ///
-/// Platform is now known at the path level; no header-sniffing. Verifies the HMAC-SHA256
-/// signature via `GITHUB_WEBHOOK_SECRET`, dedupes, then routes to [`route_github_event`].
+/// Verifies the HMAC-SHA256 signature via `GITHUB_WEBHOOK_SECRET`, dedupes, then routes to
+/// [`route_github_event`].
 ///
 /// This is the ROOT span of the webhook→task→Job→turns→egress trace (ticket #246).
 pub async fn github_webhook(
@@ -108,11 +105,11 @@ async fn github_webhook_body(state: AppState, headers: HeaderMap, body: Bytes) -
     (StatusCode::ACCEPTED, "accepted").into_response()
 }
 
-/// `POST /api/v2/webhook/gitlab/{installation_id}` — GitLab webhook receiver (Epic #492 / #507).
+/// `POST /api/v2/webhook/gitlab/{installation_id}` — GitLab webhook receiver.
 ///
-/// The path now carries the installation (project) ID explicitly — no need to sniff it from the
-/// JSON body before signature verification. Verifies the per-project token via the GitLab registry,
-/// dedupes, then routes to [`route_gitlab_event`].
+/// The path carries the installation (project) ID explicitly — no body pre-parse before
+/// verification. Verifies the per-project token via the GitLab registry, dedupes, then routes
+/// to [`route_gitlab_event`].
 pub async fn gitlab_webhook(
     State(state): State<AppState>,
     Path(installation_id): Path<i64>,
@@ -184,8 +181,7 @@ async fn gitlab_webhook_body(
     (StatusCode::ACCEPTED, "accepted").into_response()
 }
 
-/// `POST /api/v2/webhook/bitbucket/{installation_id}` — Bitbucket webhook receiver (Epic #492 /
-/// #507, activated by Epic #353's Bitbucket `CodePlatform` implementation).
+/// `POST /api/v2/webhook/bitbucket/{installation_id}` — Bitbucket webhook receiver.
 ///
 /// `installation_id` is `platform::stable_id_from_key("workspace/repo_slug")` — Bitbucket has no
 /// native numeric project id like GitLab's, so the operator's webhook URL carries this derived
@@ -318,10 +314,6 @@ enum GitlabPayloadError {
 }
 
 /// Parse and verify a GitLab webhook payload using the installation ID from the request path.
-///
-/// The `installation_id` (project ID) comes from the URL path segment
-/// `/api/v2/webhook/gitlab/{installation_id}`, so we no longer need to pre-parse the body to
-/// extract `project.id` before signature verification — the path already carries it.
 fn verified_gitlab_payload_for_installation(
     state: &AppState,
     installation_id: i64,
@@ -349,9 +341,6 @@ fn verified_gitlab_payload_for_installation(
 }
 
 /// Verify a GitLab webhook's `X-Gitlab-Token` against the per-project secret in the registry.
-///
-/// `project_id` now comes from the URL path segment rather than the JSON payload, so we no
-/// longer need to parse the body before verification.
 fn verify_gitlab_project_webhook_with_registry(
     registry: Option<&crate::integrations::gitlab::GitlabRegistry>,
     headers: &HeaderMap,
