@@ -93,11 +93,11 @@ impl Tool for ProposePrTool {
         Box::pin(async move {
             let args = match parse::<Args>(&call.function.arguments) {
                 Ok(args) => args,
-                Err(error) => return ToolOutcome::Continue(error),
+                Err(error) => return ToolOutcome::Continue(error.to_string()),
             };
             let root = match resolve_root(cx).await {
                 Ok(root) => root.to_path_buf(),
-                Err(error) => return ToolOutcome::Continue(error),
+                Err(error) => return ToolOutcome::Continue(error.to_string()),
             };
             // No silent default: capturing `HEAD~1..HEAD` would ship only the last commit for a
             // multi-commit branch while the PR targets `base`. Require the caller to name the base.

@@ -25,6 +25,7 @@ pub struct FileConfig {
     pub embeddings: EmbeddingsSection,
     pub knowledge_tools: KnowledgeToolsSection,
     pub gitlab: GitlabSection,
+    pub bitbucket: BitbucketSection,
     /// Back-compat tombstone (ADR-0093): the Restate egress pilot (ADR-0074) is gone — the reconciler
     /// `outbox` drain is the sole egress again. This field exists ONLY to absorb a leftover `egress:`
     /// block from a ConfigMap not yet updated, so `deny_unknown_fields` can't brick control-plane boot
@@ -146,6 +147,159 @@ impl GitlabSection {
                     "GitLab project {} webhook_secret is not a valid header value",
                     project.project_id
                 );
+            }
+        }
+
+        Ok(())
+    }
+}
+
+/// Bitbucket Cloud repos configured from the mounted control-plane file only — like GitLab, there is
+/// intentionally no `BITBUCKET_*` env fallback, since Bitbucket (like GitLab) is naturally
+/// multi-tenant: each repo carries its own credentials rather than one App-wide secret (ADR-0108).
+///
+/// Auth model: **API tokens**, not App Passwords. Atlassian deprecated Bitbucket Cloud App
+/// Passwords in phases through 2026 (creation blocked 2026-09-09, brownout from 2026-06-09, fully
+/// removed 2026-07-28) in favor of API tokens — HTTP Basic auth with the Atlassian account **email**
+/// as the username and a scoped API token as the password (`read:repository:bitbucket` +
+/// `write:repository:bitbucket`, plus the pull-request scopes, created under Atlassian account
+/// settings → Security → API tokens with scopes). This was originally implemented against App
+/// Passwords and corrected before merge after a bot review caught that the deprecation deadline had
+/// already passed. Git clone over HTTPS uses the literal placeholder username
+/// `x-bitbucket-api-token-auth` (Bitbucket's documented substitute, distinct from GitHub's
+/// `x-access-token`), not the account email.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct BitbucketSection {
+    /// Explicit opt-in. When true, at least one valid project must be configured.
+    pub enabled: bool,
+    /// Shared default for projects that omit `api_url`.
+    pub default_api_url: Option<String>,
+    /// Shared default for projects that omit `bot_handle`.
+    pub default_bot_handle: Option<String>,
+    #[serde(default)]
+    pub projects: Vec<BitbucketProjectConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BitbucketProjectConfig {
+    /// Bitbucket workspace slug, e.g. `myteam` (the first segment of a repo's URL).
+    pub workspace: String,
+    /// Bitbucket repository slug within the workspace, e.g. `my-repo`.
+    pub repo_slug: String,
+    /// Optional per-project API base URL, e.g. `https://api.bitbucket.org/2.0`.
+    pub api_url: Option<String>,
+    /// The Atlassian account email paired with `api_token` for HTTP Basic auth against Bitbucket
+    /// Cloud's REST API v2.0. NOT used for the clone URL — cloning uses the literal
+    /// `x-bitbucket-api-token-auth` placeholder username instead.
+    pub email: String,
+    /// A scoped Bitbucket Cloud API token (`read:repository:bitbucket` +
+    /// `write:repository:bitbucket`, plus pull-request scopes) — the replacement for the retired
+    /// App Password, used for both REST API basic auth and the HTTPS clone URL.
+    pub api_token: String,
+    /// Per-repo webhook signing secret. Bitbucket Cloud's HMAC-SHA256 webhook signing feature signs
+    /// the raw request body with this secret (`X-Hub-Signature`, `sha256=<hex>` — the same
+    /// format GitHub uses); confirm this against the actual configured webhook before relying on it
+    /// in production, since it's new integration surface with no prior byte-for-byte reference in
+    /// this codebase.
+    pub webhook_secret: String,
+    /// Optional per-project bot handle for @mention deep-review requests.
+    pub bot_handle: Option<String>,
+}
+
+impl BitbucketProjectConfig {
+    /// `"workspace/repo_slug"` — Bitbucket's equivalent of GitHub's `owner/repo` full name.
+    pub fn full_name(&self) -> String {
+        format!("{}/{}", self.workspace, self.repo_slug)
+    }
+
+    /// A stable numeric identity for this project, used as `RepoRef.installation_id` /
+    /// `tasks.installation_id` (see [`crate::integrations::platform::stable_id_from_key`] for why
+    /// this is SHA-256-derived rather than a `Hash`-trait-based hash). Bitbucket has no native
+    /// numeric project id like GitLab's `project.id` to reuse here, and `RepoRef.installation_id`
+    /// stays `i64` and unchanged for GitHub/GitLab — this derives a stable `i64` from the one
+    /// natural identity Bitbucket does have, the `workspace/repo_slug` pair.
+    pub fn stable_id(&self) -> i64 {
+        crate::integrations::platform::stable_id_from_key(&self.full_name())
+    }
+}
+
+impl BitbucketSection {
+    pub fn default_api_url(&self) -> &str {
+        self.default_api_url
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or("https://api.bitbucket.org/2.0")
+    }
+
+    pub fn default_bot_handle(&self) -> &str {
+        self.default_bot_handle
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or("lightbridge-bot")
+    }
+
+    pub fn resolved_api_url<'a>(&'a self, project: &'a BitbucketProjectConfig) -> &'a str {
+        project
+            .api_url
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| self.default_api_url())
+    }
+
+    pub fn resolved_bot_handle<'a>(&'a self, project: &'a BitbucketProjectConfig) -> &'a str {
+        project
+            .bot_handle
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| self.default_bot_handle())
+    }
+
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+        if self.projects.is_empty() {
+            anyhow::bail!(
+                "bitbucket.enabled=true requires at least one bitbucket.projects[] entry"
+            );
+        }
+
+        let mut seen = std::collections::HashSet::new();
+        for project in &self.projects {
+            let full_name = project.full_name();
+            if !seen.insert(full_name.clone()) {
+                anyhow::bail!("duplicate Bitbucket project {}", full_name);
+            }
+            if project.workspace.trim().is_empty() {
+                anyhow::bail!("Bitbucket project has empty workspace");
+            }
+            if project.repo_slug.trim().is_empty() {
+                anyhow::bail!("Bitbucket project {} has empty repo_slug", full_name);
+            }
+            let api_url = self.resolved_api_url(project);
+            let parsed_api_url = reqwest::Url::parse(api_url).map_err(|error| {
+                anyhow::anyhow!(
+                    "Bitbucket project {} api_url is not a valid URL: {}",
+                    full_name,
+                    error
+                )
+            })?;
+            if !matches!(parsed_api_url.scheme(), "http" | "https") {
+                anyhow::bail!(
+                    "Bitbucket project {} api_url must use http or https",
+                    full_name
+                );
+            }
+            if project.email.trim().is_empty() {
+                anyhow::bail!("Bitbucket project {} has empty email", full_name);
+            }
+            if project.api_token.trim().is_empty() {
+                anyhow::bail!("Bitbucket project {} has empty api_token", full_name);
+            }
+            if project.webhook_secret.trim().is_empty() {
+                anyhow::bail!("Bitbucket project {} has empty webhook_secret", full_name);
             }
         }
 
@@ -454,6 +608,151 @@ mod tests {
         let config: FileConfig = serde_json::from_str(json).expect("config parses");
         let err = config.gitlab.validate().expect_err("invalid api_url fails");
         assert!(err.to_string().contains("api_url must use http or https"));
+    }
+
+    #[test]
+    fn bitbucket_disabled_allows_no_projects() {
+        let config: FileConfig =
+            serde_json::from_str(r#"{"bitbucket":{"enabled":false}}"#).expect("config parses");
+        config
+            .bitbucket
+            .validate()
+            .expect("disabled Bitbucket needs no project config");
+    }
+
+    #[test]
+    fn bitbucket_enabled_requires_at_least_one_project() {
+        let config: FileConfig =
+            serde_json::from_str(r#"{"bitbucket":{"enabled":true,"projects":[]}}"#)
+                .expect("config parses");
+        let err = config
+            .bitbucket
+            .validate()
+            .expect_err("empty projects fail");
+        assert!(err.to_string().contains("requires at least one"));
+    }
+
+    #[test]
+    fn bitbucket_rejects_duplicate_projects() {
+        let json = r#"{
+          "bitbucket": {
+            "enabled": true,
+            "projects": [
+              {
+                "workspace": "myteam",
+                "repo_slug": "my-repo",
+                "email": "bot@example.com",
+                "api_token": "token-a",
+                "webhook_secret": "secret-a"
+              },
+              {
+                "workspace": "myteam",
+                "repo_slug": "my-repo",
+                "email": "bot@example.com",
+                "api_token": "token-b",
+                "webhook_secret": "secret-b"
+              }
+            ]
+          }
+        }"#;
+        let config: FileConfig = serde_json::from_str(json).expect("config parses");
+        let err = config
+            .bitbucket
+            .validate()
+            .expect_err("duplicate project fails");
+        assert!(err.to_string().contains("duplicate"));
+    }
+
+    #[test]
+    fn bitbucket_rejects_empty_project_secret_fields() {
+        let json = r#"{
+          "bitbucket": {
+            "enabled": true,
+            "projects": [
+              {
+                "workspace": "myteam",
+                "repo_slug": "my-repo",
+                "email": "bot@example.com",
+                "api_token": "",
+                "webhook_secret": "secret-a"
+              }
+            ]
+          }
+        }"#;
+        let config: FileConfig = serde_json::from_str(json).expect("config parses");
+        let err = config
+            .bitbucket
+            .validate()
+            .expect_err("empty api_token fails");
+        assert!(err.to_string().contains("empty api_token"));
+    }
+
+    #[test]
+    fn bitbucket_rejects_invalid_api_url() {
+        let json = r#"{
+          "bitbucket": {
+            "enabled": true,
+            "projects": [
+              {
+                "workspace": "myteam",
+                "repo_slug": "my-repo",
+                "api_url": "htps://api.bitbucket.org/2.0",
+                "email": "bot@example.com",
+                "api_token": "pw",
+                "webhook_secret": "secret"
+              }
+            ]
+          }
+        }"#;
+        let config: FileConfig = serde_json::from_str(json).expect("config parses");
+        let err = config
+            .bitbucket
+            .validate()
+            .expect_err("invalid api_url fails");
+        assert!(err.to_string().contains("api_url must use http or https"));
+    }
+
+    #[test]
+    fn bitbucket_resolves_project_defaults() {
+        let json = r#"{
+          "bitbucket": {
+            "enabled": true,
+            "default_api_url": "https://api.bitbucket.example.com/2.0",
+            "default_bot_handle": "lb",
+            "projects": [
+              {
+                "workspace": "myteam",
+                "repo_slug": "my-repo",
+                "email": "bot@example.com",
+                "api_token": "pw",
+                "webhook_secret": "secret"
+              }
+            ]
+          }
+        }"#;
+        let config: FileConfig = serde_json::from_str(json).expect("config parses");
+        config.bitbucket.validate().expect("valid project config");
+        let project = &config.bitbucket.projects[0];
+        assert_eq!(
+            config.bitbucket.resolved_api_url(project),
+            "https://api.bitbucket.example.com/2.0"
+        );
+        assert_eq!(config.bitbucket.resolved_bot_handle(project), "lb");
+        assert_eq!(project.full_name(), "myteam/my-repo");
+    }
+
+    #[test]
+    fn bitbucket_stable_id_is_deterministic() {
+        let project = BitbucketProjectConfig {
+            workspace: "myteam".to_string(),
+            repo_slug: "my-repo".to_string(),
+            api_url: None,
+            email: "bot@example.com".to_string(),
+            api_token: "pw".to_string(),
+            webhook_secret: "secret".to_string(),
+            bot_handle: None,
+        };
+        assert_eq!(project.stable_id(), project.stable_id());
     }
 
     #[test]

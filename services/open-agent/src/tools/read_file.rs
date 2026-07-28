@@ -61,15 +61,15 @@ impl Tool for ReadFileTool {
         Box::pin(async move {
             let args = match parse::<Args>(&call.function.arguments) {
                 Ok(args) => args,
-                Err(error) => return ToolOutcome::Continue(error),
+                Err(error) => return ToolOutcome::Continue(error.to_string()),
             };
             let root = match resolve_root(cx).await {
                 Ok(root) => root,
-                Err(error) => return ToolOutcome::Continue(error),
+                Err(error) => return ToolOutcome::Continue(error.to_string()),
             };
             let path = match resolve_read(root, &args.path) {
                 Ok(path) => path,
-                Err(error) => return ToolOutcome::Continue(error),
+                Err(error) => return ToolOutcome::Continue(error.to_string()),
             };
             ToolOutcome::Continue(read(&path, &args.path, args.start_line, args.end_line).await)
         })

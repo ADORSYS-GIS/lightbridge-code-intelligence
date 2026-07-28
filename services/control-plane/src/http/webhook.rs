@@ -1,26 +1,32 @@
-//! Path-scoped webhook receivers (Epic #492 / #507).
+//! Path-scoped webhook receivers (Epic #492 / #506 / #507).
 //!
 //! Three public handlers — one per forge — are mounted under `/api/v2/webhook/` by `main.rs`:
 //!
-//! - `POST /api/v2/webhook/github`                   → [`github_webhook`]
-//! - `POST /api/v2/webhook/gitlab/{installation_id}` → [`gitlab_webhook`]
-//! - `POST /api/v2/webhook/bitbucket/{installation_id}` → [`bitbucket_webhook`] (stub, 501)
+//! - `POST /api/v2/webhook/github`                      → [`github_webhook`]
+//! - `POST /api/v2/webhook/gitlab/{installation_id}`    → [`gitlab_webhook`]
+//! - `POST /api/v2/webhook/bitbucket/{installation_id}` → [`bitbucket_webhook`]
 //!
 //! Platform is now known at the routing layer — no header-sniffing needed. Each handler verifies
-//! its own signature, dedupes on the platform's delivery ID, then hands off to the same
-//! platform-specific event routing as before. With a database, dedup + persistence happen
-//! atomically via the `webhook_deliveries` PRIMARY KEY; without one (dev) it falls back to an
-//! in-memory set.
+//! its own signature (GitHub against `GITHUB_WEBHOOK_SECRET`; GitLab/Bitbucket against the
+//! per-project/per-repo secret in `control-plane.json`, keyed by the path's `installation_id`),
+//! dedupes on the platform's delivery ID via the shared [`record_or_dedup`] helper (itself
+//! wrapped in the `StepRuntime` seam, ADR-0107/#502), then hands off to the same platform-specific
+//! event routing as before. With a database, dedup + persistence happen atomically via the
+//! `webhook_deliveries` PRIMARY KEY; without one (dev) it falls back to an in-memory set.
 //!
 //! The old unified `/webhook` and legacy `/github/webhook` routes are removed (Epic #492 hard
 //! cutover). Existing webhook configurations must be repointed before deploying — see the rollout
-//! checklist in EPIC_492_REPORT.md §5.2.
+//! checklist in EPIC_492_REPORT.md §5.2. Bitbucket's `installation_id` path segment is the
+//! `platform::stable_id_from_key("workspace/repo_slug")` value (Bitbucket has no native numeric
+//! project id like GitLab's), same identity `BitbucketRegistry` is keyed by.
 
 use axum::body::Bytes;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use hmac::{Hmac, KeyInit, Mac};
+use lci_agent_step::{Passthrough, StepError, StepRuntime};
+use lci_agent_types::StepName;
 use sha2::Sha256;
 use tracing::Instrument;
 
@@ -133,22 +139,22 @@ async fn gitlab_webhook_body(
 ) -> Response {
     // Parse + verify in one step: the registry looks up the per-project secret by project ID,
     // which now comes from the path rather than needing a pre-parse of the body.
-    let payload = match verified_gitlab_payload_for_installation(
-        &state,
-        installation_id,
-        &headers,
-        &body,
-    ) {
-        Ok(p) => p,
-        Err(GitlabPayloadError::InvalidJson) => {
-            return (StatusCode::BAD_REQUEST, "invalid json payload").into_response();
-        }
-        Err(GitlabPayloadError::InvalidSignature) => {
-            crate::http::metrics::webhook_signature_failure("gitlab");
-            tracing::warn!(platform = "gitlab", installation_id, "invalid webhook signature");
-            return (StatusCode::UNAUTHORIZED, "invalid signature").into_response();
-        }
-    };
+    let payload =
+        match verified_gitlab_payload_for_installation(&state, installation_id, &headers, &body) {
+            Ok(p) => p,
+            Err(GitlabPayloadError::InvalidJson) => {
+                return (StatusCode::BAD_REQUEST, "invalid json payload").into_response();
+            }
+            Err(GitlabPayloadError::InvalidSignature) => {
+                crate::http::metrics::webhook_signature_failure("gitlab");
+                tracing::warn!(
+                    platform = "gitlab",
+                    installation_id,
+                    "invalid webhook signature"
+                );
+                return (StatusCode::UNAUTHORIZED, "invalid signature").into_response();
+            }
+        };
 
     let delivery_id = header(&headers, "x-gitlab-event-uuid");
     if delivery_id.is_empty() {
@@ -178,22 +184,94 @@ async fn gitlab_webhook_body(
     (StatusCode::ACCEPTED, "accepted").into_response()
 }
 
-/// `POST /api/v2/webhook/bitbucket/{installation_id}` — Bitbucket webhook receiver stub.
+/// `POST /api/v2/webhook/bitbucket/{installation_id}` — Bitbucket webhook receiver (Epic #492 /
+/// #507, activated by Epic #353's Bitbucket `CodePlatform` implementation).
 ///
-/// Returns 501 Not Implemented until Epic #353 ships the Bitbucket `CodePlatform` implementation.
-/// The route is registered now so Bitbucket webhook configurations can be set up and validated
-/// before the full implementation lands.
-pub async fn bitbucket_webhook(Path(_installation_id): Path<String>) -> impl IntoResponse {
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        "bitbucket webhooks not yet supported (Epic #353)",
-    )
+/// `installation_id` is `platform::stable_id_from_key("workspace/repo_slug")` — Bitbucket has no
+/// native numeric project id like GitLab's, so the operator's webhook URL carries this derived
+/// value instead (see [`crate::integrations::bitbucket`] and `docs/runbooks/bitbucket-platform-setup.md`).
+/// Verifies the per-repo secret via the Bitbucket registry, dedupes, then routes to
+/// [`route_bitbucket_event`].
+pub async fn bitbucket_webhook(
+    State(state): State<AppState>,
+    Path(installation_id): Path<i64>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let span = tracing::info_span!(
+        "webhook.receive",
+        platform = "bitbucket",
+        installation_id,
+        event = tracing::field::Empty,
+        delivery_id = tracing::field::Empty,
+    );
+    bitbucket_webhook_body(state, installation_id, headers, body)
+        .instrument(span)
+        .await
+}
+
+async fn bitbucket_webhook_body(
+    state: AppState,
+    installation_id: i64,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let payload =
+        match verified_bitbucket_payload_for_installation(&state, installation_id, &headers, &body)
+        {
+            Ok(p) => p,
+            Err(BitbucketPayloadError::InvalidJson) => {
+                return (StatusCode::BAD_REQUEST, "invalid json payload").into_response();
+            }
+            Err(BitbucketPayloadError::InvalidSignature) => {
+                crate::http::metrics::webhook_signature_failure("bitbucket");
+                tracing::warn!(
+                    platform = "bitbucket",
+                    installation_id,
+                    "invalid webhook signature"
+                );
+                return (StatusCode::UNAUTHORIZED, "invalid signature").into_response();
+            }
+        };
+
+    let delivery_id = header(&headers, "x-request-uuid");
+    if delivery_id.is_empty() {
+        return (StatusCode::BAD_REQUEST, "missing delivery id").into_response();
+    }
+    let event = header(&headers, "x-event-key");
+    tracing::Span::current()
+        .record("delivery_id", &delivery_id)
+        .record("event", &event);
+
+    match record_or_dedup(&state, Platform::Bitbucket, &delivery_id, &event, &payload).await {
+        None => return (StatusCode::INTERNAL_SERVER_ERROR, "persistence error").into_response(),
+        Some(false) => {
+            crate::http::metrics::webhook_duplicate("bitbucket");
+            tracing::info!(delivery_id, "bitbucket: duplicate delivery");
+            return (StatusCode::ACCEPTED, "duplicate delivery").into_response();
+        }
+        Some(true) => {}
+    }
+
+    crate::http::metrics::webhook_delivery("bitbucket", &event);
+    tracing::info!(delivery_id, %event, installation_id, "bitbucket: accepted webhook");
+
+    if state.db.is_some() {
+        route_bitbucket_event(&state, &event, &payload, &delivery_id).await;
+    }
+    (StatusCode::ACCEPTED, "accepted").into_response()
 }
 
 /// Dedup helper shared by all per-forge handlers.
 ///
 /// Returns `Some(true)` for a new delivery, `Some(false)` for a duplicate, `None` on a
 /// persistence error (the caller should return 500).
+///
+/// The DB write is wrapped in the `StepRuntime` seam (ADR-0107/#502), keyed by the delivery's own
+/// identity — `Passthrough` is the only runtime any role constructs today (`CheckpointRuntime`
+/// promotion stays blocked on #363 regardless), and `Passthrough::step` is a bare `f().await`, so
+/// this is a no-op wrap ahead of that promotion, applied uniformly across all three forges since
+/// they now share this one helper.
 async fn record_or_dedup(
     state: &AppState,
     platform: Platform,
@@ -203,9 +281,23 @@ async fn record_or_dedup(
 ) -> Option<bool> {
     match &state.db {
         Some(pool) => {
-            crate::db::record_delivery(pool, platform, delivery_id, event, payload)
-                .await
-                .map_err(|error| {
+            let step_name = StepName::from(format!("webhook:{delivery_id}"));
+            let step_result: Result<bool, StepError> = Passthrough
+                .step(step_name, async || {
+                    crate::db::record_delivery(pool, platform, delivery_id, event, payload)
+                        .await
+                        .map_err(|error| StepError::terminal(error.to_string()))
+                })
+                .await;
+            step_result
+                .map_err(|step_error| {
+                    // The closure above only ever constructs `Terminal` (from the sqlx error's own
+                    // Display text); `Transient` is unreachable today but handled so this stays
+                    // exhaustive without silently swallowing a future variant.
+                    let error = match step_error {
+                        StepError::Terminal { reason } => reason,
+                        StepError::Transient { source, .. } => source.to_string(),
+                    };
                     tracing::error!(%error, delivery_id, "failed to persist delivery");
                 })
                 .ok()
@@ -281,6 +373,71 @@ fn verify_gitlab_project_webhook_with_registry(
     project.client.verify_webhook(headers, body)
 }
 
+enum BitbucketPayloadError {
+    InvalidJson,
+    InvalidSignature,
+}
+
+/// Parse and verify a Bitbucket webhook payload using the installation ID from the request path.
+///
+/// Mirrors [`verified_gitlab_payload_for_installation`]: the `installation_id`
+/// (`platform::stable_id_from_key("workspace/repo_slug")`) comes from the URL path segment
+/// `/api/v2/webhook/bitbucket/{installation_id}`, so we don't need to pre-parse the body to
+/// derive the repo identity before signature verification — the path already carries it.
+fn verified_bitbucket_payload_for_installation(
+    state: &AppState,
+    installation_id: i64,
+    headers: &HeaderMap,
+    body: &[u8],
+) -> Result<serde_json::Value, BitbucketPayloadError> {
+    let payload = match serde_json::from_slice(body) {
+        Ok(p) => p,
+        Err(error) => {
+            tracing::error!(%error, installation_id, "bitbucket webhook: invalid json payload");
+            return Err(BitbucketPayloadError::InvalidJson);
+        }
+    };
+
+    if !verify_bitbucket_project_webhook_with_registry(
+        state.bitbucket.as_ref(),
+        headers,
+        body,
+        installation_id,
+    ) {
+        return Err(BitbucketPayloadError::InvalidSignature);
+    }
+
+    Ok(payload)
+}
+
+/// Verify a Bitbucket webhook's `X-Hub-Signature` against the per-repo secret in the registry.
+///
+/// `installation_id` now comes from the URL path segment rather than the JSON payload, so we no
+/// longer need to parse the body (or extract `repository.full_name`) before verification.
+fn verify_bitbucket_project_webhook_with_registry(
+    registry: Option<&crate::integrations::bitbucket::BitbucketRegistry>,
+    headers: &HeaderMap,
+    body: &[u8],
+    installation_id: i64,
+) -> bool {
+    let Some(registry) = registry else {
+        tracing::warn!(
+            installation_id,
+            "Bitbucket webhook received but Bitbucket is not configured"
+        );
+        return false;
+    };
+    let Some(project) = registry.get(installation_id) else {
+        tracing::warn!(
+            installation_id,
+            "Bitbucket webhook for unconfigured repository"
+        );
+        return false;
+    };
+
+    project.client.verify_webhook(headers, body)
+}
+
 /// GitHub webhook → internal action mapping (the only events that do anything beyond being
 /// persisted):
 ///
@@ -339,6 +496,37 @@ async fn route_gitlab_event(
     }
 }
 
+/// Bitbucket Cloud webhook → internal action mapping (`X-Event-Key` values):
+///
+///   pullrequest:created          → review task (the automatic FIRST review)
+///   pullrequest:fulfilled        → cancel the PR's active tasks (merged)
+///   pullrequest:rejected         → cancel the PR's active tasks (declined)
+///   pullrequest:updated          → nothing (re-review via @mention)
+///   pullrequest:comment_created  → task: PR re-review, or an issue answer (@<handle> mention)
+///   repo:push                    → re-index task when the default branch moves
+///
+/// Bitbucket has no installation events — repos are registered as pending via the admin console
+/// (manual approval, same as GitHub/GitLab's approval gate, Epic #75).
+async fn route_bitbucket_event(
+    state: &AppState,
+    event: &str,
+    payload: &serde_json::Value,
+    delivery_id: &str,
+) {
+    match event {
+        "pullrequest:created" | "pullrequest:fulfilled" | "pullrequest:rejected" => {
+            handle_bitbucket_pullrequest(state, event, payload, delivery_id).await
+        }
+        "repo:push" => handle_bitbucket_push(state, payload, delivery_id).await,
+        "pullrequest:comment_created" => {
+            handle_bitbucket_comment(state, payload, delivery_id).await
+        }
+        _ => {
+            tracing::debug!(%delivery_id, %event, "Bitbucket event type not handled; persisted only");
+        }
+    }
+}
+
 /// Split a GitLab `path_with_namespace` (e.g. `group/subgroup/repo`) into `(owner, name)`.
 /// `owner` is everything before the last `/`; `name` is the last segment. This way
 /// `format!("{}/{}", owner, name)` reconstructs the full path.
@@ -354,6 +542,18 @@ fn gitlab_project_identity(project: &serde_json::Value) -> Option<(i64, &str, &s
     let default_branch = project["default_branch"].as_str().unwrap_or("main");
     let (owner, name) = gitlab_path_split(path)?;
     Some((project_id, owner, name, default_branch))
+}
+
+/// Extract `(full_name, workspace, repo_slug)` from a Bitbucket webhook `repository` object's
+/// `full_name` field (`"workspace/repo_slug"`).
+fn bitbucket_repo_identity(payload: &serde_json::Value) -> Option<(String, String, String)> {
+    let full_name = payload["repository"]["full_name"].as_str()?.to_string();
+    let (workspace, repo_slug) = full_name.rsplit_once('/')?;
+    Some((
+        full_name.clone(),
+        workspace.to_string(),
+        repo_slug.to_string(),
+    ))
 }
 
 /// `Merge Request Hook`: `open` → the automatic first review. `close` → cancel the MR's active
@@ -734,6 +934,346 @@ async fn handle_gitlab_note(
     create_explicit_review_task(pool, task, delivery_id).await;
 }
 
+/// Bitbucket Cloud webhook payloads don't reliably carry the repo's default branch (unlike
+/// GitHub/GitLab, whose `repository`/`project` objects always include it) — so this fetches it via
+/// the configured `BitbucketClient`, mirroring `handle_gitlab_merge_request`'s on-demand API
+/// fallback for missing `diff_refs`. Falls back to `"main"` on any error (unconfigured project, API
+/// failure) — a review/index task should never be dropped over a cosmetic field.
+async fn bitbucket_default_branch_or_fallback(
+    state: &crate::AppState,
+    installation_id: i64,
+    full_name: &str,
+) -> String {
+    let Some(client) = state
+        .bitbucket
+        .as_ref()
+        .and_then(|registry| registry.client_for_project(installation_id))
+    else {
+        return "main".to_string();
+    };
+    let repo_ref = RepoRef {
+        platform: Platform::Bitbucket,
+        full_name: full_name.to_string(),
+        platform_repo_id: installation_id,
+        installation_id,
+    };
+    match CodePlatform::default_branch(client, &repo_ref).await {
+        Ok(branch) => branch,
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                repo = full_name,
+                "Bitbucket: failed to fetch default branch; falling back to 'main'"
+            );
+            "main".to_string()
+        }
+    }
+}
+
+/// `pullrequest:created` → the automatic first review. `pullrequest:fulfilled` (merged) /
+/// `pullrequest:rejected` (declined) → cancel the PR's active tasks. Other actions (e.g.
+/// `pullrequest:updated`) do nothing — a re-review is requested with an `@<handle>` comment
+/// ([`handle_bitbucket_comment`]). Mirrors [`handle_gitlab_merge_request`] / [`handle_pull_request`].
+async fn handle_bitbucket_pullrequest(
+    state: &crate::AppState,
+    event: &str,
+    payload: &serde_json::Value,
+    delivery_id: &str,
+) {
+    let Some(pool) = state.db.as_ref() else {
+        return;
+    };
+    let Some((full_name, workspace, repo_slug)) = bitbucket_repo_identity(payload) else {
+        tracing::warn!(
+            delivery_id,
+            "Bitbucket PR payload missing repository.full_name; skipping"
+        );
+        return;
+    };
+    let Some(pr_number) = payload["pullrequest"]["id"].as_i64() else {
+        tracing::warn!(
+            delivery_id,
+            "Bitbucket PR payload missing pullrequest.id; skipping"
+        );
+        return;
+    };
+    // Bitbucket has no numeric project id (unlike GitLab's `project.id`) — derive a stable one from
+    // `workspace/repo_slug` and use it as both the platform repo id and the installation id, the
+    // same dual role GitLab's `project_id` plays.
+    let installation_id = crate::integrations::platform::stable_id_from_key(&full_name);
+    let default_branch =
+        bitbucket_default_branch_or_fallback(state, installation_id, &full_name).await;
+    let repository_id = match crate::db::upsert_repository(
+        pool,
+        Platform::Bitbucket,
+        installation_id,
+        &workspace,
+        &repo_slug,
+        &default_branch,
+        Some(installation_id),
+    )
+    .await
+    {
+        Ok(id) => id,
+        Err(error) => {
+            tracing::error!(%error, delivery_id, "Bitbucket: failed to upsert repository");
+            return;
+        }
+    };
+
+    match event {
+        "pullrequest:created" => {
+            // Approval gate (Epic #75): a repo must be admin-approved before any review runs.
+            if !approved_or_skip(pool, repository_id, delivery_id, pr_number).await {
+                return;
+            }
+            let pr = &payload["pullrequest"];
+            // RFC-0003: skip bot-authored PRs. Bitbucket has no clean `type: "Bot"` field either —
+            // reuse the same bot-suffix heuristic GitLab uses (`should_skip_gitlab_bot_review`),
+            // applied to the PR author's nickname/display name. Fails open on an empty/garbled
+            // author, same as GitLab and GitHub.
+            let author = pr["author"]["nickname"]
+                .as_str()
+                .or_else(|| pr["author"]["display_name"].as_str())
+                .unwrap_or("");
+            if should_skip_gitlab_bot_review(state.review.skip_bot_authored_prs(), author) {
+                tracing::info!(
+                    delivery_id,
+                    pr = pr_number,
+                    repository_id,
+                    "Bitbucket PR author appears to be a bot; skipping automatic review"
+                );
+                crate::http::metrics::review_skipped_bot_author();
+                return;
+            }
+            let base_sha = pr["destination"]["commit"]["hash"]
+                .as_str()
+                .map(str::to_string);
+            let head_sha = pr["source"]["commit"]["hash"].as_str().map(str::to_string);
+            let task = crate::db::NewTask {
+                repository_id,
+                installation_id,
+                webhook_delivery_id: delivery_id.to_string(),
+                target_type: "pull_request".to_string(),
+                target_id: pr_number,
+                command_text: "review".to_string(),
+                base_sha,
+                head_sha,
+                run_epoch: 0,
+                tier: "fast".to_string(),
+                trigger_comment_id: None,
+                trace_context: lci_observability::current_traceparent(),
+            };
+            create_review_task(pool, task, delivery_id).await;
+        }
+        "pullrequest:fulfilled" | "pullrequest:rejected" => {
+            match crate::db::cancel_active_tasks_for_pr(pool, repository_id, pr_number).await {
+                Ok(ids) if !ids.is_empty() => tracing::info!(
+                    delivery_id,
+                    pr = pr_number,
+                    cancelled = ids.len(),
+                    "Bitbucket PR closed; cancelled active tasks"
+                ),
+                Ok(_) => {}
+                Err(error) => tracing::error!(
+                    %error, delivery_id, pr = pr_number, "Bitbucket: failed to cancel PR tasks"
+                ),
+            }
+        }
+        _ => {}
+    }
+}
+
+/// `repo:push`: re-index the repo when its **default branch** moves, same as GitHub/GitLab push
+/// events.
+async fn handle_bitbucket_push(
+    state: &crate::AppState,
+    payload: &serde_json::Value,
+    delivery_id: &str,
+) {
+    let Some(pool) = state.db.as_ref() else {
+        return;
+    };
+    let Some((full_name, workspace, repo_slug)) = bitbucket_repo_identity(payload) else {
+        tracing::warn!(
+            delivery_id,
+            "Bitbucket push payload missing repository.full_name; skipping"
+        );
+        return;
+    };
+    let installation_id = crate::integrations::platform::stable_id_from_key(&full_name);
+    let default_branch =
+        bitbucket_default_branch_or_fallback(state, installation_id, &full_name).await;
+
+    let Some(changes) = payload["push"]["changes"].as_array() else {
+        tracing::warn!(
+            delivery_id,
+            "Bitbucket push payload missing push.changes; skipping"
+        );
+        return;
+    };
+    // Only a push that moves the default branch re-indexes (a branch deletion carries `new: null`).
+    let moves_default_branch = changes.iter().any(|change| {
+        !change["new"].is_null() && change["new"]["name"].as_str() == Some(default_branch.as_str())
+    });
+    if !moves_default_branch {
+        return;
+    }
+
+    let repository_id = match crate::db::upsert_repository(
+        pool,
+        Platform::Bitbucket,
+        installation_id,
+        &workspace,
+        &repo_slug,
+        &default_branch,
+        Some(installation_id),
+    )
+    .await
+    {
+        Ok(id) => id,
+        Err(error) => {
+            tracing::error!(%error, delivery_id, "Bitbucket push: failed to upsert repository");
+            return;
+        }
+    };
+    // Approval gate (Epic #75).
+    if !approved_or_skip(pool, repository_id, delivery_id, 0).await {
+        return;
+    }
+    match crate::db::create_index_task(pool, repository_id, installation_id).await {
+        Ok(Some(task_id)) => tracing::info!(
+            delivery_id, repo = %full_name, %task_id,
+            "Bitbucket default-branch push → re-index queued"
+        ),
+        Ok(None) => tracing::info!(
+            delivery_id, repo = %full_name,
+            "Bitbucket default-branch push → index already in flight; skipped"
+        ),
+        Err(error) => {
+            tracing::error!(%error, delivery_id, "Bitbucket push: failed to create index task")
+        }
+    }
+}
+
+/// `pullrequest:comment_created` whose body starts with `@<handle>` → a manual re-review run.
+/// Mirrors [`handle_gitlab_note`] / [`handle_issue_comment`]; Bitbucket's Issue Tracker comments are
+/// out of scope here (this project's minimal Bitbucket slice covers PR comments only).
+async fn handle_bitbucket_comment(
+    state: &crate::AppState,
+    payload: &serde_json::Value,
+    delivery_id: &str,
+) {
+    let Some(pool) = state.db.as_ref() else {
+        return;
+    };
+    let Some((full_name, workspace, repo_slug)) = bitbucket_repo_identity(payload) else {
+        tracing::warn!(
+            delivery_id,
+            "Bitbucket comment payload missing repository.full_name; skipping"
+        );
+        return;
+    };
+    let installation_id = crate::integrations::platform::stable_id_from_key(&full_name);
+    let body = payload["comment"]["content"]["raw"]
+        .as_str()
+        .unwrap_or_default();
+    let Some(bot_handle) = state
+        .bitbucket
+        .as_ref()
+        .and_then(|registry| registry.bot_handle(installation_id))
+    else {
+        tracing::warn!(
+            delivery_id,
+            repo = %full_name,
+            "Bitbucket comment repo is not configured; skipping"
+        );
+        return;
+    };
+    if !mentions_handle(body, bot_handle) {
+        return;
+    }
+    let Some(pr_number) = payload["pullrequest"]["id"].as_i64() else {
+        tracing::warn!(
+            delivery_id,
+            "Bitbucket comment payload missing pullrequest.id; skipping"
+        );
+        return;
+    };
+    let default_branch =
+        bitbucket_default_branch_or_fallback(state, installation_id, &full_name).await;
+    let repository_id = match crate::db::upsert_repository(
+        pool,
+        Platform::Bitbucket,
+        installation_id,
+        &workspace,
+        &repo_slug,
+        &default_branch,
+        Some(installation_id),
+    )
+    .await
+    {
+        Ok(id) => id,
+        Err(error) => {
+            tracing::error!(%error, delivery_id, "Bitbucket: failed to upsert repository");
+            return;
+        }
+    };
+    // Approval gate (Epic #75): even an explicit @mention can't run on an unapproved repo.
+    if !approved_or_skip(pool, repository_id, delivery_id, pr_number).await {
+        return;
+    }
+
+    let Some(client) = state
+        .bitbucket
+        .as_ref()
+        .and_then(|registry| registry.client_for_project(installation_id))
+    else {
+        tracing::warn!(
+            delivery_id,
+            "Bitbucket project client not configured; cannot fetch PR SHAs"
+        );
+        return;
+    };
+    let repo_ref = RepoRef {
+        platform: Platform::Bitbucket,
+        full_name: full_name.clone(),
+        platform_repo_id: installation_id,
+        installation_id,
+    };
+    let (base_sha, head_sha) = match CodePlatform::pr_shas(client, &repo_ref, pr_number).await {
+        Ok(shas) => shas,
+        Err(error) => {
+            tracing::error!(%error, delivery_id, pr = pr_number, "Bitbucket: fetch PR SHAs failed");
+            return;
+        }
+    };
+
+    let command_text = command_from_comment(body);
+    let trigger_comment_id = payload["comment"]["id"].as_i64();
+    let task = crate::db::NewTask {
+        repository_id,
+        installation_id,
+        webhook_delivery_id: delivery_id.to_string(),
+        target_type: "pull_request".to_string(),
+        target_id: pr_number,
+        command_text,
+        base_sha,
+        head_sha,
+        run_epoch: 0,
+        tier: "deep".to_string(),
+        trigger_comment_id,
+        trace_context: lci_observability::current_traceparent(),
+    };
+    tracing::info!(
+        delivery_id,
+        target = pr_number,
+        kind = "pull_request",
+        "Bitbucket @mention requested"
+    );
+    create_explicit_review_task(pool, task, delivery_id).await;
+}
+
 /// RFC-0003 for GitLab: skip the automatic fast-tier review for bot-authored MRs. GitLab doesn't
 /// have a clean `type: "Bot"` field like GitHub; we check the commit author name for a `_bot`
 /// suffix or known bot patterns. Absent/garbled signals **fail open** (treated as human).
@@ -1024,21 +1564,20 @@ async fn handle_issue_comment(
     // A PR re-review needs the base/head SHAs to scope the diff (the comment payload omits them); a
     // plain issue has no diff, so the agent answers against the default branch.
     let (base_sha, head_sha) = if is_pr {
-        let Some(app) = state.github.as_ref() else {
+        let Some(github) = state.platforms.get(&Platform::GitHub) else {
             tracing::warn!(
                 delivery_id,
                 "github app not configured; cannot fetch PR SHAs"
             );
             return;
         };
-        let token = match app.installation_token(installation_id).await {
-            Ok(token) => token,
-            Err(error) => {
-                tracing::error!(%error, delivery_id, "mint token for re-review failed");
-                return;
-            }
+        let repo_ref = RepoRef {
+            platform: Platform::GitHub,
+            full_name: format!("{owner}/{name}"),
+            platform_repo_id: github_repo_id,
+            installation_id,
         };
-        match app.pull_request_shas(&token, owner, name, number).await {
+        match github.pr_shas(&repo_ref, number).await {
             Ok(shas) => shas,
             Err(error) => {
                 tracing::error!(%error, delivery_id, pr = number, "fetch PR SHAs failed");
@@ -1422,6 +1961,85 @@ mod tests {
         assert!(!verify_signature(b"secret", b"payload", "sha256=deadbeef"));
     }
 
+    /// `github_webhook_body` verifies against `state.github_webhook_secret` directly (Epic #492 /
+    /// #507's path-scoped design never routes GitHub's signature check through `state.platforms` /
+    /// the `CodePlatform` trait at all) — so, unlike the old unified `/webhook` route, there is no
+    /// separate "GitHub App not configured" fallback path to test here; a deployment with only
+    /// `GITHUB_WEBHOOK_SECRET` set (no `GITHUB_APP_ID`/`GITHUB_APP_PRIVATE_KEY`) verifies exactly
+    /// the same way as a fully-configured one, by construction.
+    fn github_secret_only_state(secret: &str) -> AppState {
+        AppState {
+            github_webhook_secret: std::sync::Arc::new(secret.to_string()),
+            seen_deliveries: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashSet::new(),
+            )),
+            jwt: None,
+            db: None,
+            allow_no_db: true,
+            github: None,
+            gitlab: None,
+            bitbucket: None,
+            platforms: std::collections::HashMap::new(),
+            runner_token_signer: None,
+            neo4j: None,
+            metrics: crate::http::metrics::install(),
+            review: std::sync::Arc::new(crate::config::ReviewSection::default()),
+            knowledge_tools: std::sync::Arc::new(crate::config::KnowledgeToolsSection::default()),
+            app_handle: std::sync::Arc::new("lightbridge-assistant".to_string()),
+            permissions_claim: std::sync::Arc::new("permissions".to_string()),
+        }
+    }
+
+    fn github_request(secret: &[u8], body: &[u8], delivery_id: &str) -> (HeaderMap, Bytes) {
+        let mut mac = HmacSha256::new_from_slice(secret).unwrap();
+        mac.update(body);
+        let sig = format!("sha256={}", hex::encode(mac.finalize().into_bytes()));
+        let mut headers = HeaderMap::new();
+        headers.insert("x-github-event", "ping".parse().unwrap());
+        headers.insert("x-github-delivery", delivery_id.parse().unwrap());
+        headers.insert("x-hub-signature-256", sig.parse().unwrap());
+        (headers, Bytes::from(body.to_vec()))
+    }
+
+    #[tokio::test]
+    async fn github_webhook_body_verifies_a_correctly_signed_request_with_secret_only_state() {
+        let state = github_secret_only_state("wh-secret");
+        let body = br#"{"zen":"hi"}"#;
+        let (headers, body) = github_request(b"wh-secret", body, "no-app-delivery-1");
+
+        let response = github_webhook_body(state, headers, body).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::ACCEPTED,
+            "a validly-signed webhook must verify against the raw secret regardless of whether a \
+             GitHub App is configured"
+        );
+    }
+
+    #[tokio::test]
+    async fn github_webhook_body_rejects_a_tampered_signature() {
+        let state = github_secret_only_state("wh-secret");
+        let body = br#"{"zen":"hi"}"#;
+        let (mut headers, body) = github_request(b"wh-secret", body, "no-app-delivery-2");
+        headers.insert("x-hub-signature-256", "sha256=deadbeef".parse().unwrap());
+
+        let response = github_webhook_body(state, headers, body).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn github_webhook_body_rejects_when_secret_is_unconfigured() {
+        // No webhook secret at all — verify_signature fails closed (empty secret => reject),
+        // surfacing as the same 401 an invalid signature would, not a separate 503 branch (there
+        // is none in this path-scoped design — GitHub verification never consults `state.platforms`).
+        let state = github_secret_only_state("");
+        let body = br#"{"zen":"hi"}"#;
+        let (headers, body) = github_request(b"anything", body, "no-app-delivery-3");
+
+        let response = github_webhook_body(state, headers, body).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
     #[test]
     fn pr_author_is_bot_detects_type_bot() {
         let pr = serde_json::json!({ "user": { "login": "dependabot[bot]", "type": "Bot" } });
@@ -1474,6 +2092,134 @@ mod tests {
         mac.update(b"payload");
         let sig = format!("sha256={}", hex::encode(mac.finalize().into_bytes()));
         assert!(verify_signature(b"secret", b"payload", &sig));
+    }
+
+    #[test]
+    fn bitbucket_repo_identity_parses_full_name() {
+        let payload = serde_json::json!({ "repository": { "full_name": "myteam/my-repo" } });
+        assert_eq!(
+            bitbucket_repo_identity(&payload),
+            Some((
+                "myteam/my-repo".to_string(),
+                "myteam".to_string(),
+                "my-repo".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn bitbucket_repo_identity_missing_full_name() {
+        assert_eq!(bitbucket_repo_identity(&serde_json::json!({})), None);
+        assert_eq!(
+            bitbucket_repo_identity(
+                &serde_json::json!({ "repository": { "full_name": "noslash" } })
+            ),
+            None
+        );
+    }
+
+    fn bitbucket_registry() -> crate::integrations::bitbucket::BitbucketRegistry {
+        let section = crate::config::BitbucketSection {
+            enabled: true,
+            default_api_url: Some("https://api.bitbucket.example.com/2.0".to_string()),
+            default_bot_handle: Some("lightbridge-bot".to_string()),
+            projects: vec![
+                crate::config::BitbucketProjectConfig {
+                    workspace: "myteam".to_string(),
+                    repo_slug: "repo-a".to_string(),
+                    api_url: None,
+                    email: "bot@example.com".to_string(),
+                    api_token: "token-a".to_string(),
+                    webhook_secret: "secret-a".to_string(),
+                    bot_handle: None,
+                },
+                crate::config::BitbucketProjectConfig {
+                    workspace: "myteam".to_string(),
+                    repo_slug: "repo-b".to_string(),
+                    api_url: None,
+                    email: "bot@example.com".to_string(),
+                    api_token: "token-b".to_string(),
+                    webhook_secret: "secret-b".to_string(),
+                    bot_handle: None,
+                },
+            ],
+        };
+        crate::integrations::bitbucket::BitbucketRegistry::from_config(&section)
+            .expect("valid config")
+            .expect("enabled registry")
+    }
+
+    fn bitbucket_repo_a_id() -> i64 {
+        crate::integrations::platform::stable_id_from_key("myteam/repo-a")
+    }
+
+    #[test]
+    fn bitbucket_project_webhook_accepts_matching_repo_secret() {
+        let registry = bitbucket_registry();
+        let body = br#"{"repository":{"full_name":"myteam/repo-a"}}"#;
+
+        use hmac::{Hmac, KeyInit, Mac};
+        use sha2::Sha256;
+        type HmacSha256 = Hmac<Sha256>;
+        let mut mac = HmacSha256::new_from_slice(b"secret-a").unwrap();
+        mac.update(body);
+        let sig = format!("sha256={}", hex::encode(mac.finalize().into_bytes()));
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-hub-signature", sig.parse().unwrap());
+
+        assert!(verify_bitbucket_project_webhook_with_registry(
+            Some(&registry),
+            &headers,
+            body,
+            bitbucket_repo_a_id(), // installation_id from the URL path, not the payload
+        ));
+    }
+
+    #[test]
+    fn bitbucket_project_webhook_rejects_wrong_repo_secret() {
+        let registry = bitbucket_registry();
+        let body = br#"{"repository":{"full_name":"myteam/repo-a"}}"#;
+
+        use hmac::{Hmac, KeyInit, Mac};
+        use sha2::Sha256;
+        type HmacSha256 = Hmac<Sha256>;
+        // Signed with repo-b's secret, but the path identifies repo-a.
+        let mut mac = HmacSha256::new_from_slice(b"secret-b").unwrap();
+        mac.update(body);
+        let sig = format!("sha256={}", hex::encode(mac.finalize().into_bytes()));
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-hub-signature", sig.parse().unwrap());
+
+        assert!(!verify_bitbucket_project_webhook_with_registry(
+            Some(&registry),
+            &headers,
+            body,
+            bitbucket_repo_a_id(),
+        ));
+    }
+
+    #[test]
+    fn bitbucket_project_webhook_rejects_unconfigured_or_unknown_repo() {
+        let headers = HeaderMap::new();
+
+        // No Bitbucket registry at all (platform not configured).
+        assert!(!verify_bitbucket_project_webhook_with_registry(
+            None,
+            &headers,
+            b"{}",
+            bitbucket_repo_a_id(),
+        ));
+
+        // A registry exists, but this installation_id isn't in it.
+        let registry = bitbucket_registry();
+        assert!(!verify_bitbucket_project_webhook_with_registry(
+            Some(&registry),
+            &headers,
+            b"{}",
+            9999,
+        ));
     }
 
     fn gitlab_registry() -> crate::integrations::gitlab::GitlabRegistry {
@@ -1627,5 +2373,117 @@ mod tests {
     #[test]
     fn gitlab_bot_review_disabled_knob_never_skips() {
         assert!(!should_skip_gitlab_bot_review(false, "dependabot_bot"));
+    }
+
+    // ── #502 webhook-ingress step wrap: proves wrapping the delivery dedup+persist write in
+    // `Passthrough.step(...)` is a pure naming exercise, not a behavior change (needs Postgres via
+    // `DATABASE_URL`) — mirrors the ADR-0107 proof style in `queue::dispatcher`/`queue::reconciler`
+    // ────────────────────────────────────────────────────────────────────────────────────────────
+
+    use sqlx::PgPool;
+
+    /// Build a minimal `AppState` wired only for a GitLab per-project webhook — the dedup+persist
+    /// block under test is shared code, platform-agnostic, and GitLab's own signature check goes
+    /// through `state.gitlab` rather than `state.platforms`, so no GitHub App / `platforms` entry is
+    /// needed to exercise it.
+    fn gitlab_only_state(pool: PgPool) -> AppState {
+        AppState {
+            github_webhook_secret: std::sync::Arc::new(String::new()),
+            seen_deliveries: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashSet::new(),
+            )),
+            jwt: None,
+            db: Some(pool),
+            allow_no_db: true,
+            github: None,
+            gitlab: Some(gitlab_registry()),
+            bitbucket: None,
+            platforms: std::collections::HashMap::new(),
+            runner_token_signer: None,
+            neo4j: None,
+            metrics: crate::http::metrics::install(),
+            review: std::sync::Arc::new(crate::config::ReviewSection::default()),
+            knowledge_tools: std::sync::Arc::new(crate::config::KnowledgeToolsSection::default()),
+            app_handle: std::sync::Arc::new("lightbridge-assistant".to_string()),
+            permissions_claim: std::sync::Arc::new("permissions".to_string()),
+        }
+    }
+
+    /// A GitLab webhook whose event type (`Job Hook`) `route_gitlab_event` doesn't handle — it falls
+    /// into the catch-all debug-log arm — so the request exercises only the dedup+persist block under
+    /// test, not the downstream MR/push/note handling.
+    fn gitlab_job_hook_request() -> (HeaderMap, Bytes) {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-gitlab-event", "Job Hook".parse().unwrap());
+        headers.insert("x-gitlab-token", "secret-a".parse().unwrap());
+        headers.insert("x-gitlab-event-uuid", "wrap-test-uuid".parse().unwrap());
+        let body = Bytes::from(
+            serde_json::to_vec(&serde_json::json!({ "project": { "id": 1001 } })).unwrap(),
+        );
+        (headers, body)
+    }
+
+    /// The wrapped dedup+persist write behaves exactly as the un-wrapped code did: a fresh delivery
+    /// is accepted and persisted, and a replay of the *same* delivery id is deduped — no second row —
+    /// proving `Passthrough.step(...)` (verbatim `f().await`) changed nothing observable.
+    #[sqlx::test]
+    async fn webhook_ingress_step_wrap_dedups_a_replayed_delivery(pool: PgPool) {
+        let state = gitlab_only_state(pool.clone());
+        let (headers, body) = gitlab_job_hook_request();
+
+        let first = gitlab_webhook_body(state.clone(), 1001, headers.clone(), body.clone()).await;
+        assert_eq!(first.status(), StatusCode::ACCEPTED);
+
+        let count: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM webhook_deliveries WHERE delivery_id = $1")
+                .bind("wrap-test-uuid")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(count, 1, "the fresh delivery is persisted exactly once");
+
+        let second = gitlab_webhook_body(state, 1001, headers, body).await;
+        assert_eq!(
+            second.status(),
+            StatusCode::ACCEPTED,
+            "a replayed delivery id is still a 202 (duplicate delivery), same as before the wrap"
+        );
+
+        let count_after_replay: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM webhook_deliveries WHERE delivery_id = $1")
+                .bind("wrap-test-uuid")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            count_after_replay, 1,
+            "the replay must not insert a second row — the wrap must not change dedup semantics"
+        );
+    }
+
+    /// A persistence error inside the wrapped step still surfaces as the same 500 the un-wrapped code
+    /// returned. A payload containing a bare NUL byte is rejected by Postgres's `jsonb` input
+    /// ("unsupported Unicode escape sequence"), giving a real, deterministic `sqlx::Error` without
+    /// tearing down the pool — the same failure mode `record_delivery` can hit in production.
+    #[sqlx::test]
+    async fn webhook_ingress_step_wrap_surfaces_persistence_errors_as_500(pool: PgPool) {
+        let state = gitlab_only_state(pool);
+        let mut headers = HeaderMap::new();
+        headers.insert("x-gitlab-event", "Job Hook".parse().unwrap());
+        headers.insert("x-gitlab-token", "secret-a".parse().unwrap());
+        headers.insert("x-gitlab-event-uuid", "wrap-error-uuid".parse().unwrap());
+        let body = Bytes::from(
+            serde_json::to_vec(
+                &serde_json::json!({ "project": { "id": 1001 }, "poison": "\u{0000}" }),
+            )
+            .unwrap(),
+        );
+
+        let response = gitlab_webhook_body(state, 1001, headers, body).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "a persistence failure inside the step wrap still returns 500, same as before the wrap"
+        );
     }
 }

@@ -35,7 +35,7 @@ pub fn task_state_from_status(status: &str) -> TaskState {
 
 /// Why a `review` submission could not be parsed off the inbound message. Distinct variants so the
 /// handler can answer a malformed request with a precise `INVALID_PARAMS`.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum ParseError {
     /// No structured `data` part carrying the review target (ADR-0078). A `text`-only message
     /// (natural-language instruction, no `data`) lands here: the role holds no forge credentials, so
@@ -43,34 +43,19 @@ pub enum ParseError {
     /// minimum precise fields the caller must supply and points at the calling guide, rather than a
     /// bare "no data part" dead-end. (Phase 4 upgrades this exact branch to an `input-required`
     /// clarify-then-confirm loop.)
+    #[error(
+        "no structured `data` part with the review target: an A2A review needs the precise \
+         target in a `data` part — at minimum `repo` (\"owner/name\"), `pr`, and `headSha`. A \
+         natural-language `text` part sets the review's emphasis only, never its target or scope. \
+         See docs/a2a-review-skill.md."
+    )]
     NoTargetData,
     /// The requested skill is not `review` (the only Phase-1 skill).
+    #[error("unsupported skill {0:?}; only `review` is available in this phase")]
     UnsupportedSkill(String),
     /// A required field was missing or malformed. Carries the field name for the error detail.
+    #[error("missing or invalid field: {0}")]
     BadField(&'static str),
-}
-
-impl std::fmt::Display for ParseError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ParseError::NoTargetData => {
-                write!(
-                    f,
-                    "no structured `data` part with the review target: an A2A review needs the \
-                     precise target in a `data` part — at minimum `repo` (\"owner/name\"), `pr`, \
-                     and `headSha`. A natural-language `text` part sets the review's emphasis only, \
-                     never its target or scope. See docs/a2a-review-skill.md."
-                )
-            }
-            ParseError::UnsupportedSkill(s) => {
-                write!(
-                    f,
-                    "unsupported skill {s:?}; only `review` is available in this phase"
-                )
-            }
-            ParseError::BadField(field) => write!(f, "missing or invalid field: {field}"),
-        }
-    }
 }
 
 /// The parsed input for the `review` skill. Repo identity is resolved against our DB later. Both

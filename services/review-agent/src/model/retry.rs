@@ -45,19 +45,15 @@ impl RetryPolicy {
 
 /// Why a turn failed, so the loop can decide whether a transient error is worth a retry/failover vs.
 /// a deterministic one that should fail fast.
-#[derive(Debug)]
+#[derive(thiserror::Error, Debug)]
+#[error("{error:#}")]
 pub struct ChatError {
+    #[source]
     pub error: anyhow::Error,
     /// `true` for connect/timeout, HTTP 429, or HTTP 5xx — the loop retries/fails over on these only.
     pub transient: bool,
     /// `Retry-After` seconds parsed off a 429, when present — the loop honours it over its own backoff.
     pub retry_after: Option<Duration>,
-}
-
-impl std::fmt::Display for ChatError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:#}", self.error)
-    }
 }
 
 /// Map a classified transport failure onto the engine's [`StepError`]. Transient failures carry the

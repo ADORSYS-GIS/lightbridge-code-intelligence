@@ -92,7 +92,7 @@ impl Tool for FindTool {
                         .graph_find_symbol(cx.task_id, &args.term, clamp_limit(args.limit))
                         .await,
                 )),
-                Err(error) => ToolOutcome::Continue(error),
+                Err(error) => ToolOutcome::Continue(error.to_string()),
             }
         })
     }
@@ -118,7 +118,7 @@ impl Tool for CallersTool {
                         .graph_get_callers(cx.task_id, &args.node_id, clamp_limit(args.limit))
                         .await,
                 )),
-                Err(error) => ToolOutcome::Continue(error),
+                Err(error) => ToolOutcome::Continue(error.to_string()),
             }
         })
     }

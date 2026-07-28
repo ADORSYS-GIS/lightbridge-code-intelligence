@@ -22,6 +22,7 @@ lci-agent-tools = { path = "../agent-tools" }
 lci-agent-types = { path = "../agent-types" }
 serde.workspace = true
 serde_json.workspace = true
+thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 uuid.workspace = true

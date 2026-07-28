@@ -141,16 +141,9 @@ fn requeue_backoff(attempts: i32) -> Duration {
 
 /// A failed webhook send — every failure is retriable (the loop backs off and eventually
 /// dead-letters), so this carries only a human-readable cause, never the token or response body.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
 pub struct SendError(pub String);
-
-impl std::fmt::Display for SendError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-impl std::error::Error for SendError {}
 
 /// The actual outbound POST, abstracted so the delivery loop is testable without real egress (a mock
 /// records calls and returns programmed outcomes) while the real impl is the hardened, IP-pinned,

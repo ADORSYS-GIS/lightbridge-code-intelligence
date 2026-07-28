@@ -36,44 +36,59 @@ impl Workspace for SandboxWorkspace {
     }
 }
 
+/// Why a sandbox-relative path was rejected, either lexically (before touching the filesystem) or
+/// after canonicalizing it against the workdir.
+#[derive(Debug, thiserror::Error)]
+pub enum PathError {
+    #[error("error: {0:?} must be a path relative to the sandbox workdir (no leading `/`).")]
+    Absolute(String),
+    #[error("error: {0:?} must not contain `..` (path traversal rejected).")]
+    Traversal(String),
+    #[error("error: {0:?} is not a valid file path.")]
+    NotAFilePath(String),
+    #[error("error: sandbox workdir is not accessible.")]
+    WorkdirInaccessible,
+    #[error("error: could not open {0:?} (file not found or unreadable).")]
+    NotFound(String),
+    #[error("error: {0:?} resolves outside the sandbox workdir (symlink escape rejected).")]
+    ReadEscape(String),
+    #[error(
+        "error: {0:?} resolves outside the sandbox workdir (symlink/traversal escape rejected)."
+    )]
+    WriteEscape(String),
+}
+
 /// Lexically reject the two escapes that need no filesystem lookup: an absolute path (`/etc/passwd`)
 /// and any `..` component (path traversal). Returns the cleaned, workdir-relative path.
-fn lexical_clean(rel: &str) -> Result<PathBuf, String> {
+fn lexical_clean(rel: &str) -> Result<PathBuf, PathError> {
     let mut cleaned = PathBuf::new();
     for component in Path::new(rel).components() {
         match component {
             Component::RootDir | Component::Prefix(_) => {
-                return Err(format!(
-                    "error: {rel:?} must be a path relative to the sandbox workdir (no leading `/`)."
-                ));
+                return Err(PathError::Absolute(rel.to_string()));
             }
             Component::ParentDir => {
-                return Err(format!(
-                    "error: {rel:?} must not contain `..` (path traversal rejected)."
-                ));
+                return Err(PathError::Traversal(rel.to_string()));
             }
             Component::CurDir => {}
             Component::Normal(part) => cleaned.push(part),
         }
     }
     if cleaned.as_os_str().is_empty() {
-        return Err(format!("error: {rel:?} is not a valid file path."));
+        return Err(PathError::NotAFilePath(rel.to_string()));
     }
     Ok(cleaned)
 }
 
 /// Resolve a path for **reading**: the file must exist, and its fully-canonicalized real path must lie
 /// within the canonical workdir. Rejects `..`, absolute paths, and symlink escapes.
-pub fn resolve_read(root: &Path, rel: &str) -> Result<PathBuf, String> {
+pub fn resolve_read(root: &Path, rel: &str) -> Result<PathBuf, PathError> {
     let cleaned = lexical_clean(rel)?;
-    let canonical_root = std::fs::canonicalize(root)
-        .map_err(|_| "error: sandbox workdir is not accessible.".to_string())?;
+    let canonical_root = std::fs::canonicalize(root).map_err(|_| PathError::WorkdirInaccessible)?;
     let canonical = std::fs::canonicalize(canonical_root.join(&cleaned))
-        .map_err(|_| format!("error: could not open {rel:?} (file not found or unreadable)."))?;
+        .map_err(|_| PathError::NotFound(rel.to_string()))?;
     if !canonical.starts_with(&canonical_root) {
-        return Err(format!(
-            "error: {rel:?} resolves outside the sandbox workdir (symlink escape rejected)."
-        ));
+        return Err(PathError::ReadEscape(rel.to_string()));
     }
     Ok(canonical)
 }
@@ -84,10 +99,9 @@ pub fn resolve_read(root: &Path, rel: &str) -> Result<PathBuf, String> {
 /// workdir (a naive `target.starts_with(root)` on the un-canonicalized join would wrongly pass), and a
 /// final component that is itself an outside-pointing symlink canonicalizes to its target and is caught
 /// the same way. Returns the concrete path to write (rooted at the canonical workdir).
-pub fn resolve_write(root: &Path, rel: &str) -> Result<PathBuf, String> {
+pub fn resolve_write(root: &Path, rel: &str) -> Result<PathBuf, PathError> {
     let cleaned = lexical_clean(rel)?;
-    let canonical_root = std::fs::canonicalize(root)
-        .map_err(|_| "error: sandbox workdir is not accessible.".to_string())?;
+    let canonical_root = std::fs::canonicalize(root).map_err(|_| PathError::WorkdirInaccessible)?;
     let target = canonical_root.join(&cleaned);
 
     // Walk up to the deepest ancestor that exists on disk and canonicalize it. `canonicalize` follows
@@ -100,14 +114,12 @@ pub fn resolve_write(root: &Path, rel: &str) -> Result<PathBuf, String> {
                 Some(parent) => probe = parent,
                 // We started from `canonical_root.join(...)`, so the root itself always canonicalizes;
                 // reaching here would mean the workdir vanished mid-call.
-                None => return Err("error: sandbox workdir is not accessible.".to_string()),
+                None => return Err(PathError::WorkdirInaccessible),
             },
         }
     };
     if !real_existing.starts_with(&canonical_root) {
-        return Err(format!(
-            "error: {rel:?} resolves outside the sandbox workdir (symlink/traversal escape rejected)."
-        ));
+        return Err(PathError::WriteEscape(rel.to_string()));
     }
     Ok(target)
 }
@@ -122,11 +134,13 @@ mod tests {
         assert!(
             resolve_write(root.path(), "../escape")
                 .unwrap_err()
+                .to_string()
                 .contains("traversal")
         );
         assert!(
             resolve_write(root.path(), "a/../../escape")
                 .unwrap_err()
+                .to_string()
                 .contains("traversal")
         );
         assert!(resolve_write(root.path(), "/etc/passwd").is_err());
@@ -151,7 +165,9 @@ mod tests {
         // `dir` inside the workdir is a symlink to a directory OUTSIDE it. Writing `dir/evil` would
         // escape via the symlink — the naive prefix check on the un-canonicalized join would pass.
         symlink(outside.path(), root.path().join("dir")).unwrap();
-        let err = resolve_write(root.path(), "dir/evil").unwrap_err();
+        let err = resolve_write(root.path(), "dir/evil")
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("escape"), "unexpected: {err}");
     }
 
@@ -166,7 +182,9 @@ mod tests {
         // A file inside the workdir that is itself a symlink pointing outside: writing through it would
         // clobber the outside file.
         symlink(&secret, root.path().join("alias.txt")).unwrap();
-        let err = resolve_write(root.path(), "alias.txt").unwrap_err();
+        let err = resolve_write(root.path(), "alias.txt")
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("escape"), "unexpected: {err}");
     }
 
@@ -189,6 +207,7 @@ mod tests {
         assert!(
             resolve_read(root.path(), "missing.txt")
                 .unwrap_err()
+                .to_string()
                 .contains("not found")
         );
     }

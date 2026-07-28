@@ -158,7 +158,21 @@ pub struct Flags {
 mod toml_min {
     use super::FileConfig;
 
-    pub fn parse(raw: &str) -> Result<FileConfig, String> {
+    /// The distinct parse failures `toml_min::parse` can report. One variant per line-level defect;
+    /// each `#[error(...)]` text is verbatim what the old `Result<_, String>` returned, so swapping
+    /// this in is a pure typing change (the `Display` impl `thiserror` derives is what callers that
+    /// interpolate the error into a message actually observe).
+    #[derive(Debug, thiserror::Error)]
+    pub enum ConfigParseError {
+        #[error("line {line}: expected `key = value`")]
+        ExpectedKeyValue { line: usize },
+        #[error("line {line}: port must be a number")]
+        InvalidPort { line: usize },
+        #[error("line {line}: unknown key `{key}`")]
+        UnknownKey { line: usize, key: String },
+    }
+
+    pub fn parse(raw: &str) -> Result<FileConfig, ConfigParseError> {
         let mut cfg = FileConfig::default();
         for (lineno, line) in raw.lines().enumerate() {
             let line = strip_comment(line).trim();
@@ -167,7 +181,7 @@ mod toml_min {
             }
             let (key, value) = line
                 .split_once('=')
-                .ok_or_else(|| format!("line {}: expected `key = value`", lineno + 1))?;
+                .ok_or(ConfigParseError::ExpectedKeyValue { line: lineno + 1 })?;
             let key = key.trim();
             let value = unquote(value.trim());
             match key {
@@ -179,10 +193,15 @@ mod toml_min {
                     cfg.port = Some(
                         value
                             .parse()
-                            .map_err(|_| format!("line {}: port must be a number", lineno + 1))?,
+                            .map_err(|_| ConfigParseError::InvalidPort { line: lineno + 1 })?,
                     )
                 }
-                other => return Err(format!("line {}: unknown key `{other}`", lineno + 1)),
+                other => {
+                    return Err(ConfigParseError::UnknownKey {
+                        line: lineno + 1,
+                        key: other.to_string(),
+                    });
+                }
             }
         }
         Ok(cfg)

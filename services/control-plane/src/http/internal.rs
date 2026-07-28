@@ -249,6 +249,26 @@ pub async fn get_context(
             // GitlabClient::clone_url() embeds the project token (oauth2:<token>@host).
             (gitlab.clone_url(&repo_ref), String::new())
         }
+        Platform::Bitbucket => {
+            let Some(registry) = state.bitbucket.as_ref() else {
+                return (StatusCode::SERVICE_UNAVAILABLE, "bitbucket not configured")
+                    .into_response();
+            };
+            let Some(bitbucket) = registry.client_for_repo(&repo_ref) else {
+                tracing::warn!(
+                    task_id = %id,
+                    project_id = context.installation_id,
+                    "Bitbucket project config missing for task context"
+                );
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "bitbucket project not configured",
+                )
+                    .into_response();
+            };
+            // BitbucketClient::clone_url() embeds the API token (x-bitbucket-api-token-auth:token@host).
+            (bitbucket.clone_url(&repo_ref), String::new())
+        }
     };
 
     // Reuse the latest indexed snapshot if the repo has one (ADR-0050): a review skips the full
@@ -1592,6 +1612,25 @@ pub async fn finalize_review(
                         return (
                             StatusCode::SERVICE_UNAVAILABLE,
                             "gitlab project not configured",
+                        )
+                            .into_response();
+                    };
+                    handle
+                }
+                crate::integrations::platform::Platform::Bitbucket => {
+                    let Some(handle) = state
+                        .bitbucket
+                        .as_ref()
+                        .and_then(|registry| registry.bot_handle(context.installation_id))
+                    else {
+                        tracing::error!(
+                            task_id = %id,
+                            project_id = context.installation_id,
+                            "Bitbucket bot handle missing for fast review rendering"
+                        );
+                        return (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "bitbucket project not configured",
                         )
                             .into_response();
                     };

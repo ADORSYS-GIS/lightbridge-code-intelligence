@@ -119,7 +119,7 @@ impl Tool for ProgressTool {
                     tracing::info!(note=%args.note,"review agent progress");
                     ToolOutcome::Continue("acknowledged".into())
                 }
-                Err(error) => ToolOutcome::Continue(error),
+                Err(error) => ToolOutcome::Continue(error.to_string()),
             }
         })
     }
@@ -138,7 +138,7 @@ impl Tool for AbortTool {
         Box::pin(async move {
             match parse::<AbortArgs>(&call.function.arguments) {
                 Ok(args) => ToolOutcome::Abort(args.reason),
-                Err(error) => ToolOutcome::Continue(error),
+                Err(error) => ToolOutcome::Continue(error.to_string()),
             }
         })
     }

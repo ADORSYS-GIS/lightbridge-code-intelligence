@@ -23,16 +23,32 @@ pub const DEFAULT_RETENTION: Duration = Duration::from_secs(6 * 60 * 60);
 /// How often the TTL sweep runs. The sweep is a single indexed `DELETE`, so a frequent tick is cheap.
 const SWEEP_INTERVAL: Duration = Duration::from_secs(300);
 
+/// Why a configured `DURABLE_STEP_RETENTION` was rejected (ADR-0087's required load-time guard).
+/// Scoped to this module: both distinct string-error cases the old `Result<_, String>` signature
+/// carried, now typed so a caller gets a real `std::error::Error` (and `?`/`anyhow` interop) instead
+/// of a bare string.
+#[derive(Debug, thiserror::Error)]
+pub enum ReplayConfigError {
+    /// A zero or negative retention makes the age cutoff `now()`, which would sweep EVERY in-flight
+    /// run's journal on the next tick and silently disable resume — a config footgun caught here, at
+    /// load, not as a runtime surprise.
+    #[error(
+        "DURABLE_STEP_RETENTION must be > 0 seconds (got {secs}); a non-positive retention would \
+         sweep in-flight durable-step state on every tick and disable resume (ADR-0087)"
+    )]
+    NonPositive { secs: i64 },
+    /// The raw env value did not parse as an integer number of seconds.
+    #[error("DURABLE_STEP_RETENTION must be an integer number of seconds (got {raw:?})")]
+    NotAnInteger { raw: String },
+}
+
 /// Validate a configured retention (ADR-0087's **required load-time guard**): it MUST be `> 0`. A
 /// zero or negative retention makes the age cutoff `now()`, which would sweep EVERY in-flight run's
 /// journal on the next tick and silently disable resume — a config footgun caught here, at load, not
 /// as a runtime surprise. Pure, so the guard is unit-tested without a DB.
-pub fn retention_from_secs(secs: i64) -> Result<Duration, String> {
+pub fn retention_from_secs(secs: i64) -> Result<Duration, ReplayConfigError> {
     if secs <= 0 {
-        return Err(format!(
-            "DURABLE_STEP_RETENTION must be > 0 seconds (got {secs}); a non-positive retention would \
-             sweep in-flight durable-step state on every tick and disable resume (ADR-0087)"
-        ));
+        return Err(ReplayConfigError::NonPositive { secs });
     }
     Ok(Duration::from_secs(secs as u64))
 }
@@ -40,12 +56,13 @@ pub fn retention_from_secs(secs: i64) -> Result<Duration, String> {
 /// Read `DURABLE_STEP_RETENTION` (seconds) into a validated `Duration`. An unset/unparseable value
 /// falls back to [`DEFAULT_RETENTION`]; a **set but non-positive** value is REJECTED (the required
 /// guard) rather than silently clamped, so a misconfiguration fails loud at startup.
-pub fn retention_from_env() -> Result<Duration, String> {
+pub fn retention_from_env() -> Result<Duration, ReplayConfigError> {
     match std::env::var("DURABLE_STEP_RETENTION") {
         Ok(raw) => {
-            let secs: i64 = raw.trim().parse().map_err(|_| {
-                format!("DURABLE_STEP_RETENTION must be an integer number of seconds (got {raw:?})")
-            })?;
+            let secs: i64 = raw
+                .trim()
+                .parse()
+                .map_err(|_| ReplayConfigError::NotAnInteger { raw })?;
             retention_from_secs(secs)
         }
         Err(_) => Ok(DEFAULT_RETENTION),
@@ -105,7 +122,7 @@ mod tests {
 
     #[test]
     fn rejection_message_names_the_knob_and_the_hazard() {
-        let err = retention_from_secs(0).unwrap_err();
+        let err = retention_from_secs(0).unwrap_err().to_string();
         assert!(
             err.contains("DURABLE_STEP_RETENTION"),
             "names the knob: {err}"

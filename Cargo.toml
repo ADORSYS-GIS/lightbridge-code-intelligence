@@ -57,6 +57,9 @@ tokio = { version = "1.52.3", features = ["full"] }
 mimalloc = "0.1.52"
 tracing = "0.1.31"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
+# Typed per-crate error enums at internal boundaries (ADR-0083/ADR-0107); `anyhow` stays at role
+# `main.rs` entry points.
+thiserror = "2.0.19"
 # Distributed tracing → Tempo (ADR pending, ticket #246). `tracing-opentelemetry` bridges any
 # `tracing::Span` into an OTel span once its layer is registered; `opentelemetry-otlp`'s `http-proto`
 # feature ships over plain `reqwest`/HTTP rather than `tonic`/gRPC so it reuses each binary's own
