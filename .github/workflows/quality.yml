@@ -1,6 +1,8 @@
 name: Quality
 
 # Trigger on PRs, pushes to main, scheduled scans, and manual dispatch.
+# Note: All external actions are pinned to commit SHAs (not floating tags).
+# Before updating versions, check: https://github.com/{owner}/{repo}/releases
 on:
   pull_request:
     types: [opened, synchronize, reopened]

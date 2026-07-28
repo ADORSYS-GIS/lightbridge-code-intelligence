@@ -14,10 +14,12 @@ This document specifies all required tools, databases, and configurations for of
 
 ## Tool Inventory
 
+**⚠️ Version Update Guidance**: The versions below reflect the latest releases as of February 2025. Before deploying, check GitHub release pages for newer versions. See "Checking for Latest Versions" section below.
+
 ### 1. Semgrep (SAST)
 
-- **Version**: 1.45.0+
-- **Installation**: `pip install semgrep` (or from package manager)
+- **Recommended Version**: 1.45.0+ (check https://github.com/returntocorp/semgrep/releases for latest)
+- **Installation**: `pip install semgrep==<VERSION>` (or from package manager)
 - **Offline mode**: No external downloads. Rules are provided locally in `.ci/rules/semgrep/`.
 - **Validation**:
   ```bash
@@ -27,7 +29,7 @@ This document specifies all required tools, databases, and configurations for of
 
 ### 2. Trivy (Dependency & Container Scanning)
 
-- **Version**: 0.51.0+
+- **Recommended Version**: 0.51.0+ (check https://github.com/aquasecurity/trivy/releases for latest)
 - **Installation**: Download from official releases (no auto-update in workflow)
 - **Binary location**: `/usr/local/bin/trivy`
 - **Offline flags used in workflow**:
@@ -57,7 +59,7 @@ This is **not** part of the GitHub Actions workflow; databases are expected to b
 
 ### 3. Gitleaks (Secret Scanning)
 
-- **Version**: 8.18.0+
+- **Recommended Version**: 8.18.0+ (check https://github.com/gitleaks/gitleaks/releases for latest)
 - **Installation**: `brew install gitleaks` (macOS) or download binary
 - **Binary location**: `/usr/local/bin/gitleaks`
 - **Offline mode**: Uses built-in pattern library; no external rule downloads.
@@ -68,7 +70,7 @@ This is **not** part of the GitHub Actions workflow; databases are expected to b
 
 ### 4. Hadolint (Dockerfile Linting)
 
-- **Version**: 2.12.0+
+- **Recommended Version**: 2.12.0+ (check https://github.com/hadolint/hadolint/releases for latest)
 - **Installation**: `brew install hadolint` (macOS) or download binary
 - **Binary location**: `/usr/local/bin/hadolint`
 - **Offline mode**: Uses built-in rules; no external downloads.
@@ -79,7 +81,7 @@ This is **not** part of the GitHub Actions workflow; databases are expected to b
 
 ### 5. Reviewdog (PR Reporting)
 
-- **Version**: 0.17.0+
+- **Recommended Version**: 0.17.0+ (check https://github.com/reviewdog/reviewdog/releases for latest)
 - **Installation**: `go install github.com/reviewdog/reviewdog/cmd/reviewdog@latest`
 - **Binary location**: `~/go/bin/reviewdog` (or in PATH)
 - **Requires**:
@@ -93,7 +95,7 @@ This is **not** part of the GitHub Actions workflow; databases are expected to b
 
 ### 6. Biome (JavaScript/TypeScript Linting)
 
-- **Version**: 2.0.0+ (from `package.json` devDependencies)
+- **Recommended Version**: 2.0.0+ (pinned in `package.json` devDependencies; check current with `pnpm exec biome --version`)
 - **Installation**: Managed by pnpm. Run `pnpm install` in the repository root.
 - **Offline mode**: Uses workspace-local configuration (biome.json).
 - **Invoked via**: `pnpm exec biome check .`
@@ -101,6 +103,31 @@ This is **not** part of the GitHub Actions workflow; databases are expected to b
   ```bash
   pnpm exec biome --version
   ```
+
+---
+
+## Checking for Latest Versions
+
+Before provisioning the runner, verify the latest tool releases:
+
+```bash
+# Semgrep: https://github.com/returntocorp/semgrep/releases/latest
+curl -s https://api.github.com/repos/returntocorp/semgrep/releases/latest | jq -r '.tag_name'
+
+# Trivy: https://github.com/aquasecurity/trivy/releases/latest
+curl -s https://api.github.com/repos/aquasecurity/trivy/releases/latest | jq -r '.tag_name'
+
+# Gitleaks: https://github.com/gitleaks/gitleaks/releases/latest
+curl -s https://api.github.com/repos/gitleaks/gitleaks/releases/latest | jq -r '.tag_name'
+
+# Hadolint: https://github.com/hadolint/hadolint/releases/latest
+curl -s https://api.github.com/repos/hadolint/hadolint/releases/latest | jq -r '.tag_name'
+
+# Reviewdog: https://github.com/reviewdog/reviewdog/releases/latest
+curl -s https://api.github.com/repos/reviewdog/reviewdog/releases/latest | jq -r '.tag_name'
+```
+
+Update the versions in this manifest and the GitHub Actions workflow before deploying if any newer releases are available.
 
 ---
 
