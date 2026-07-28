@@ -12,14 +12,12 @@ use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use hmac::{Hmac, KeyInit, Mac};
-use sha2::Sha256;
+use lci_agent_step::{Passthrough, StepError, StepRuntime};
+use lci_agent_types::StepName;
 use tracing::Instrument;
 
 use crate::AppState;
 use crate::integrations::platform::{CodePlatform, Platform, RepoRef};
-
-type HmacSha256 = Hmac<Sha256>;
 
 /// Maximum webhook body size before HMAC / JSON verification. GitLab must parse JSON pre-auth to
 /// read `project.id` for per-project secret selection; this caps attacker-controlled parse cost.
@@ -92,17 +90,21 @@ async fn webhook_router_body(state: AppState, headers: HeaderMap, body: Bytes) -
         None
     };
 
-    // Verify GitHub signature. GitLab verification happens in `verified_gitlab_payload`.
-    if platform == Platform::GitHub
-        && !verify_signature(
-            state.github_webhook_secret.as_bytes(),
-            &body,
-            &header(&headers, "x-hub-signature-256"),
-        )
-    {
-        crate::http::metrics::webhook_signature_failure(&platform.to_string());
-        tracing::warn!(%platform, "invalid webhook signature");
-        return (StatusCode::UNAUTHORIZED, "invalid signature").into_response();
+    // Verify GitHub signature via the CodePlatform trait (ADR-0072/0108): the same HMAC-SHA256 +
+    // constant-time compare `GithubApp::verify_webhook` runs internally, reading
+    // `GITHUB_WEBHOOK_SECRET` — the same env var `state.github_webhook_secret` was built from.
+    // GitLab verification happens in `verified_gitlab_payload`.
+    if platform == Platform::GitHub {
+        let Some(github) = state.platforms.get(&Platform::GitHub) else {
+            tracing::error!(%platform, "no platform implementation configured for github webhooks");
+            return (StatusCode::SERVICE_UNAVAILABLE, "github platform not configured")
+                .into_response();
+        };
+        if !github.verify_webhook(&headers, &body) {
+            crate::http::metrics::webhook_signature_failure(&platform.to_string());
+            tracing::warn!(%platform, "invalid webhook signature");
+            return (StatusCode::UNAUTHORIZED, "invalid signature").into_response();
+        }
     }
 
     // Delivery ID for dedup — platform-specific header.
@@ -138,9 +140,30 @@ async fn webhook_router_body(state: AppState, headers: HeaderMap, body: Bytes) -
     // delivery id — platforms retry, so this is the exactly-once guard.
     let is_new = match &state.db {
         Some(pool) => {
-            match crate::db::record_delivery(pool, platform, &delivery_id, &event, &payload).await {
+            // ADR-0107/#502 webhook-ingress slice: the delivery dedup+persist write is the
+            // state-changing transition, keyed by the delivery's own identity. `Passthrough` is the
+            // only runtime this role can construct today — `CheckpointRuntime` promotion stays
+            // blocked on #363 regardless of the state-machine backbone landing — so this wrap is a
+            // no-op seam (`Passthrough::step` is a bare `f().await`) ahead of that promotion.
+            let step_name = StepName::from(format!("webhook:{delivery_id}"));
+            let step_result: Result<bool, StepError> = Passthrough
+                .step(step_name, async || {
+                    crate::db::record_delivery(pool, platform, &delivery_id, &event, &payload)
+                        .await
+                        .map_err(|error| StepError::terminal(error.to_string()))
+                })
+                .await;
+            match step_result {
                 Ok(is_new) => is_new,
-                Err(error) => {
+                Err(step_error) => {
+                    // The closure above only ever constructs `Terminal` (from the sqlx error's own
+                    // Display text), so extracting `reason` reconstructs the exact error string the
+                    // un-wrapped code logged. `Transient` is unreachable today but handled so this
+                    // stays exhaustive without silently swallowing a future variant.
+                    let error = match step_error {
+                        StepError::Terminal { reason } => reason,
+                        StepError::Transient { source, .. } => source.to_string(),
+                    };
                     tracing::error!(%error, %delivery_id, "failed to persist delivery");
                     return (StatusCode::INTERNAL_SERVER_ERROR, "persistence error")
                         .into_response();
@@ -978,21 +1001,20 @@ async fn handle_issue_comment(
     // A PR re-review needs the base/head SHAs to scope the diff (the comment payload omits them); a
     // plain issue has no diff, so the agent answers against the default branch.
     let (base_sha, head_sha) = if is_pr {
-        let Some(app) = state.github.as_ref() else {
+        let Some(github) = state.platforms.get(&Platform::GitHub) else {
             tracing::warn!(
                 delivery_id,
                 "github app not configured; cannot fetch PR SHAs"
             );
             return;
         };
-        let token = match app.installation_token(installation_id).await {
-            Ok(token) => token,
-            Err(error) => {
-                tracing::error!(%error, delivery_id, "mint token for re-review failed");
-                return;
-            }
+        let repo_ref = RepoRef {
+            platform: Platform::GitHub,
+            full_name: format!("{owner}/{name}"),
+            platform_repo_id: github_repo_id,
+            installation_id,
         };
-        match app.pull_request_shas(&token, owner, name, number).await {
+        match github.pr_shas(&repo_ref, number).await {
             Ok(shas) => shas,
             Err(error) => {
                 tracing::error!(%error, delivery_id, pr = number, "fetch PR SHAs failed");
@@ -1271,24 +1293,32 @@ fn header(headers: &HeaderMap, name: &str) -> String {
         .to_string()
 }
 
-/// Constant-time HMAC-SHA256 verification of the GitHub webhook signature.
-/// An unset secret rejects everything (fail closed) rather than accepting all traffic.
-fn verify_signature(secret: &[u8], body: &[u8], signature: &str) -> bool {
-    if secret.is_empty() {
-        return false;
-    }
-    let Ok(mut mac) = HmacSha256::new_from_slice(secret) else {
-        return false;
-    };
-    mac.update(body);
-    let expected = format!("sha256={}", hex::encode(mac.finalize().into_bytes()));
-    use subtle::ConstantTimeEq;
-    expected.as_bytes().ct_eq(signature.as_bytes()).into()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hmac::{Hmac, KeyInit, Mac};
+    use sha2::Sha256;
+
+    type HmacSha256 = Hmac<Sha256>;
+
+    /// Constant-time HMAC-SHA256 verification of the GitHub webhook signature — the raw algorithm
+    /// `GithubApp::verify_webhook` (integrations/github.rs) also implements. Kept here, test-only,
+    /// as a standalone proof of the HMAC-SHA256 + constant-time-compare algorithm's correctness now
+    /// that production code calls the trait method instead of this local helper (#504); moved under
+    /// `#[cfg(test)]` (rather than deleted) so these accept/reject/tamper tests keep exercising the
+    /// exact same algorithm unchanged, without leaving the helper as dead code in a non-test build.
+    fn verify_signature(secret: &[u8], body: &[u8], signature: &str) -> bool {
+        if secret.is_empty() {
+            return false;
+        }
+        let Ok(mut mac) = HmacSha256::new_from_slice(secret) else {
+            return false;
+        };
+        mac.update(body);
+        let expected = format!("sha256={}", hex::encode(mac.finalize().into_bytes()));
+        use subtle::ConstantTimeEq;
+        expected.as_bytes().ct_eq(signature.as_bytes()).into()
+    }
 
     #[test]
     fn mention_must_lead_the_comment() {
@@ -1599,5 +1629,112 @@ mod tests {
     #[test]
     fn gitlab_bot_review_disabled_knob_never_skips() {
         assert!(!should_skip_gitlab_bot_review(false, "dependabot_bot"));
+    }
+
+    // ── #502 webhook-ingress step wrap: proves wrapping the delivery dedup+persist write in
+    // `Passthrough.step(...)` is a pure naming exercise, not a behavior change (needs Postgres via
+    // `DATABASE_URL`) — mirrors the ADR-0107 proof style in `queue::dispatcher`/`queue::reconciler`
+    // ────────────────────────────────────────────────────────────────────────────────────────────
+
+    use sqlx::PgPool;
+
+    /// Build a minimal `AppState` wired only for a GitLab per-project webhook — the dedup+persist
+    /// block under test is shared code, platform-agnostic, and GitLab's own signature check goes
+    /// through `state.gitlab` rather than `state.platforms`, so no GitHub App / `platforms` entry is
+    /// needed to exercise it.
+    fn gitlab_only_state(pool: PgPool) -> AppState {
+        AppState {
+            github_webhook_secret: std::sync::Arc::new(String::new()),
+            seen_deliveries: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            jwt: None,
+            db: Some(pool),
+            allow_no_db: true,
+            github: None,
+            gitlab: Some(gitlab_registry()),
+            platforms: std::collections::HashMap::new(),
+            runner_token_signer: None,
+            neo4j: None,
+            metrics: crate::http::metrics::install(),
+            review: std::sync::Arc::new(crate::config::ReviewSection::default()),
+            knowledge_tools: std::sync::Arc::new(crate::config::KnowledgeToolsSection::default()),
+            app_handle: std::sync::Arc::new("lightbridge-assistant".to_string()),
+            permissions_claim: std::sync::Arc::new("permissions".to_string()),
+        }
+    }
+
+    /// A GitLab webhook whose event type (`Job Hook`) `route_gitlab_event` doesn't handle — it falls
+    /// into the catch-all debug-log arm — so the request exercises only the dedup+persist block under
+    /// test, not the downstream MR/push/note handling.
+    fn gitlab_job_hook_request() -> (HeaderMap, Bytes) {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-gitlab-event", "Job Hook".parse().unwrap());
+        headers.insert("x-gitlab-token", "secret-a".parse().unwrap());
+        headers.insert("x-gitlab-event-uuid", "wrap-test-uuid".parse().unwrap());
+        let body = Bytes::from(serde_json::to_vec(&serde_json::json!({ "project": { "id": 1001 } })).unwrap());
+        (headers, body)
+    }
+
+    /// The wrapped dedup+persist write behaves exactly as the un-wrapped code did: a fresh delivery
+    /// is accepted and persisted, and a replay of the *same* delivery id is deduped — no second row —
+    /// proving `Passthrough.step(...)` (verbatim `f().await`) changed nothing observable.
+    #[sqlx::test]
+    async fn webhook_ingress_step_wrap_dedups_a_replayed_delivery(pool: PgPool) {
+        let state = gitlab_only_state(pool.clone());
+        let (headers, body) = gitlab_job_hook_request();
+
+        let first = webhook_router_body(state.clone(), headers.clone(), body.clone()).await;
+        assert_eq!(first.status(), StatusCode::ACCEPTED);
+
+        let count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM webhook_deliveries WHERE delivery_id = $1",
+        )
+        .bind("wrap-test-uuid")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 1, "the fresh delivery is persisted exactly once");
+
+        let second = webhook_router_body(state, headers, body).await;
+        assert_eq!(
+            second.status(),
+            StatusCode::ACCEPTED,
+            "a replayed delivery id is still a 202 (duplicate delivery), same as before the wrap"
+        );
+
+        let count_after_replay: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM webhook_deliveries WHERE delivery_id = $1",
+        )
+        .bind("wrap-test-uuid")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            count_after_replay, 1,
+            "the replay must not insert a second row — the wrap must not change dedup semantics"
+        );
+    }
+
+    /// A persistence error inside the wrapped step still surfaces as the same 500 the un-wrapped code
+    /// returned. A payload containing a bare NUL byte is rejected by Postgres's `jsonb` input
+    /// ("unsupported Unicode escape sequence"), giving a real, deterministic `sqlx::Error` without
+    /// tearing down the pool — the same failure mode `record_delivery` can hit in production.
+    #[sqlx::test]
+    async fn webhook_ingress_step_wrap_surfaces_persistence_errors_as_500(pool: PgPool) {
+        let state = gitlab_only_state(pool);
+        let mut headers = HeaderMap::new();
+        headers.insert("x-gitlab-event", "Job Hook".parse().unwrap());
+        headers.insert("x-gitlab-token", "secret-a".parse().unwrap());
+        headers.insert("x-gitlab-event-uuid", "wrap-error-uuid".parse().unwrap());
+        let body = Bytes::from(
+            serde_json::to_vec(&serde_json::json!({ "project": { "id": 1001 }, "poison": "\u{0000}" }))
+                .unwrap(),
+        );
+
+        let response = webhook_router_body(state, headers, body).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "a persistence failure inside the step wrap still returns 500, same as before the wrap"
+        );
     }
 }

@@ -1,18 +1,14 @@
 //! Platform abstraction: a single trait that GitHub and GitLab both implement.
 //!
-//! The control plane talks to a code-hosting platform (GitHub today, GitLab tomorrow) through this
-//! trait. Each implementation encapsulates its own auth model (GitHub App installation tokens vs
-//! a static GitLab access token) and API shape, so the webhook handler, outbox, and reconciler
-//! stay platform-agnostic.
+//! The control plane talks to a code-hosting platform (GitHub, GitLab) through this trait. Each
+//! implementation encapsulates its own auth model (GitHub App installation tokens vs a static
+//! GitLab access token) and API shape, so the webhook handler, outbox, and reconciler stay
+//! platform-agnostic.
 //!
-//! Phase 0 (this file + `impl CodePlatform for GithubApp`): the trait is introduced and GitHub is
-//! refactored behind it. No behavior changes — GitHub works exactly as before.
-//!
-//! The types and trait here are not yet wired into the webhook handler, outbox, or reconciler —
-//! that happens in Phases 2–3. Until then, `#[allow(dead_code)]` suppresses the "never used"
-//! warnings that `-D warnings` would otherwise turn into errors.
-
-#![allow(dead_code)]
+//! ADR-0072/ADR-0108: fully wired in. `http::webhook` looks up `state.platforms` for GitHub
+//! webhook-signature verification and the `@mention` re-review PR-SHA fetch; `db::outbox` and
+//! `queue::reconciler` dispatch outbound posts/reactions through it per row; `http::internal`
+//! dispatches per-task the same way.
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
