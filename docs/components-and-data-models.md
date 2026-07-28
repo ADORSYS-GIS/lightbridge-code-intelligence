@@ -147,7 +147,7 @@ consequence names `status`/`completed_at` here as the fix for gating `latest_ind
 ### `tasks` — system of record + work queue
 
 The central table. Created by `0001_init.sql`, then extended by several migrations into a
-Postgres-backed work queue (RFC-0001) and the carrier of run kind/tier.
+Postgres-backed work queue (RFC-0001) and the carrier of run kind/preset.
 
 | Column | Source | Notes |
 |---|---|---|
@@ -163,15 +163,20 @@ Postgres-backed work queue (RFC-0001) and the carrier of run kind/tier.
 | `attempts`, `run_after`, `run_epoch`, `lease_owner`, `lease_expires_at`, `job_name` | 0003 | queue mechanics + lease + the k8s Job name |
 | `kind` | 0011 | [ADR-0033](adr/0033-inbound-command-parsing-and-run-kinds.md): `review` (diff-scoped) or `ask` (conversational); default `review` |
 | `error_detail` | 0016 | runner's free-text failure/no-op reason; `NULL` = clean success ([ADR-0056](adr/0056-control-plane-owns-the-posted-output.md)) |
-| `tier` | 0021 | [ADR-0062](adr/0062-two-tier-review-fast-auto-deep-on-demand.md): `fast` or `deep`; default `deep` |
+| `preset` | 0021 / 0033 (column added as `tier` by 0021, renamed to `preset` by 0033) | [ADR-0103](adr/0103-repo-configurable-opencode-review-presets.md): the resolved review preset name (`fast`/`deep` by platform default, or any operator-defined name); default `deep` |
+| `entry_point` | 0033 | [ADR-0103](adr/0103-repo-configurable-opencode-review-presets.md): which trigger created the task — `pr_open` / `mention` / `a2a`; default `mention` |
 
-**Two-tier review keying** ([ADR-0062](adr/0062-two-tier-review-fast-auto-deep-on-demand.md)): the
-webhook sets `tier` per trigger — `pull_request opened` → `fast` (cheap model, SAST + a lean
-diff-only LLM pass, no retrieval, a small per-tier tool allowlist `review.<tier>.tools`, short turn
-cap — `max_turns` clamped to ≤5, not 1);
-`@mention` → `deep` (strong model, full retrieval, multi-turn, long timeout). `index` tasks ignore
-`tier`. The model is operator-tuned per tier in `ai-helm-values` and **churns — never assume a
-specific model name**.
+**Preset resolution, per entry point** ([ADR-0103](adr/0103-repo-configurable-opencode-review-presets.md),
+superseding the old fixed [ADR-0062](adr/0062-two-tier-review-fast-auto-deep-on-demand.md) split): the
+webhook resolves `preset` per trigger from the repo's `.lightbridge-code-review.jsonc`
+([ADR-0030](adr/0030-repo-review-config.md)), falling back to a platform-default mapping when the repo
+declares nothing — `pull_request opened` (`entry_point = pr_open`) → `fast` by default (cheap model,
+SAST + a lean diff-only LLM pass, no retrieval, a small tool allowlist
+`review.presets.fast.tools`, a small `max_turns`); `@mention` (`entry_point = mention`) → `deep` by
+default (strong model, full retrieval, multi-turn, long timeout). `index` tasks ignore `preset`. The
+model is operator-tuned per preset in `ai-helm-values` and **churns — never assume a specific model
+name**. `preset` and `entry_point` are kept as separate columns because a preset name is now
+operator-defined and can't reliably signal which trigger created the task.
 
 **Idempotency** (`0003_task_queue.sql`):
 

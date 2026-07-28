@@ -1,7 +1,7 @@
 # Jobs and task lifecycle
 
-How work flows through Lightbridge: what triggers a task, the two job kinds, the **tier** a review
-runs at, the states a task moves through, how it's gated behind a fresh index, and how cancellation +
+How work flows through Lightbridge: what triggers a task, the two job kinds, the **preset** a review
+runs under, the states a task moves through, how it's gated behind a fresh index, and how cancellation +
 data purge work. Diagrams are Mermaid (rendered by GitHub).
 
 > **Migrating to v2 ([RFC-0007](rfc/0007-control-plane-v2-planes.md)) — partially landed.** The two
@@ -68,7 +68,8 @@ data purge work. Diagrams are Mermaid (rendered by GitHub).
 > [ADR-0055](adr/0055-review-waits-for-index-readiness.md) (the `waiting_for_index` gate),
 > [ADR-0050](adr/0050-retrieval-pins-to-latest-indexed-snapshot.md) (review reuses the latest
 > snapshot), [ADR-0052](adr/0052-index-snapshot-pruning.md) (snapshot pruning),
-> [ADR-0062](adr/0062-two-tier-review-fast-auto-deep-on-demand.md) (two-tier review).
+> [ADR-0103](adr/0103-repo-configurable-opencode-review-presets.md) (repo-configurable review presets,
+> superseding [ADR-0062](adr/0062-two-tier-review-fast-auto-deep-on-demand.md)'s fixed two-tier split).
 
 ## The two job kinds
 
@@ -79,7 +80,7 @@ kind is the task's `command_text` (stored on the `tasks` row):
 | Job | `command_text` | `target_type` | Triggered by |
 |---|---|---|---|
 | **Index** | `index` | `repository` | A repo is **approved** by an admin, **or a push to the default branch** (e.g. a merged PR) keeps the base index fresh — both go through `create_index_task`. Indexes the default-branch HEAD; deduped against an in-flight index. |
-| **Review / ask** | `review` (or the mention's text) | `pull_request` / `issue` | A PR is **opened** (the automatic first review, FAST tier), or a comment **`@<app-handle> …`** requests a review/answer (DEEP tier). |
+| **Review / ask** | `review` (or the mention's text) | `pull_request` / `issue` | A PR is **opened** (the automatic first review, entry point `pr_open`, `fast` by platform default), or a comment **`@<app-handle> …`** requests a review/answer (entry point `mention`, `deep` by platform default). |
 
 Run **kind** is a second axis ([ADR-0033](adr/0033-inbound-command-parsing-and-run-kinds.md), the
 `kind` column): `review` (diff-scoped findings) or `ask` (a conversational answer on a non-PR target).
@@ -154,19 +155,30 @@ creation, the dispatcher routing for `open`, the ticket→prompt pipeline in the
 retrieval, and the reconciler's credentialed branch push + PR open. Until those land, `open` is a
 recorded, tested shape — not a running mode.
 
-## The review tier (ADR-0062)
+## The review preset (ADR-0103)
 
-A review task also carries a `tier` ([ADR-0062](adr/0062-two-tier-review-fast-auto-deep-on-demand.md),
-the `tier` column), set when the task is created and read by the runner from the task context:
+A review task also carries a **`preset`** and an **`entry_point`**
+([ADR-0103](adr/0103-repo-configurable-opencode-review-presets.md), superseding the old fixed
+[ADR-0062](adr/0062-two-tier-review-fast-auto-deep-on-demand.md) split; both are columns on `tasks`, set
+when the task is created and read by the runner from the task context). `entry_point` records which
+trigger created the task (`pr_open` / `mention` / `a2a`); `preset` is then *resolved* for that entry
+point — never hardcoded — by `services/control-plane/src/preset.rs`'s `resolve_preset`/
+`resolve_preset_or_default`, which reads the repo's `.lightbridge-code-review.jsonc`
+([ADR-0030](adr/0030-repo-review-config.md)) and falls back to a platform-default mapping when the repo
+declares nothing:
 
-| Tier | Set when | Behaviour |
-|---|---|---|
-| **fast** | automatic `pull_request opened` (`handle_pull_request` hardcodes `tier: "fast"`) | a cheap model, deterministic SAST + a **lean diff-only LLM pass**, **no retrieval**, a small per-tier tool allowlist, a short turn cap (`max_turns` clamped to ≤5, not 1 — `FAST_TIER_MAX_TURNS`) |
-| **deep** | any `@mention` (`create_explicit_task` sets `tier: "deep"`) | a strong model, full retrieval (graph + pgvector), multi-turn, a long timeout |
+| Entry point | Set when | Platform-default preset | Behaviour (under the default preset) |
+|---|---|---|---|
+| **`pr_open`** | automatic `pull_request opened` (`handle_pull_request` calls `resolve_preset_or_default`) | `fast` | a cheap model, deterministic SAST + a **lean diff-only LLM pass**, **no retrieval**, a small tool allowlist, a small `max_turns` — set by that preset's own config, no code-level cap |
+| **`mention`** | any `@mention` (`create_explicit_task`'s caller resolves the preset before constructing the task) | `deep` | a strong model, full retrieval (graph + pgvector), multi-turn, a long timeout |
 
-Index tasks don't set a tier (the column defaults to `deep` and is ignored). The model, tool
-allowlist, prompt, and timeouts are per-tier **operator config** that lives in the agent's mounted
-`agent.json` (and `ai-helm-values`); they churn — never assume a specific model name is permanent.
+A repo can override either mapping (or add its own preset name entirely) via
+`.lightbridge-code-review.jsonc`'s `preset`/`entry_points` fields — the table above is only what an
+unconfigured repo gets. Index tasks don't set a preset (the column defaults to `deep` and is ignored).
+Every preset — platform-default or operator-declared — runs the **same** gates/tool-dispatch code
+(ADR-0103); the model, tool allowlist, prompt, and timeouts are per-preset **operator config** that
+lives in the agent's mounted `agent.json` under `review.presets.<name>` (and `ai-helm-values`); they
+churn — never assume a specific model name is permanent.
 
 ## End-to-end flow
 
@@ -189,7 +201,7 @@ flowchart TD
     end
 
     subgraph JOB["Agent runner Job (per task)"]
-        WORK["clone @ snapshot · (re)index if cold/index task ·<br/>review at the task's tier (OpenCode-over-ACP host; native loop = fallback)"]
+        WORK["clone @ snapshot · (re)index if cold/index task ·<br/>review under the task's resolved preset (OpenCode-over-ACP host; native loop = fallback)"]
         POLL["self-cancel: poll own status every 10s"]
         REPORT["report_status → running / posting_result /<br/>succeeded / failed"]
     end

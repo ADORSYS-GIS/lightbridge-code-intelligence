@@ -155,16 +155,20 @@ free text only steers reasoning; write-back is still diff-validated.
 
 ## Webhook → task: the per-event handlers
 
-### `pull_request` → fast review or cancel (`handle_pull_request`)
+### `pull_request` → automatic review or cancel (`handle_pull_request`)
 
 Only `opened` and `closed` do anything (`synchronize`/`reopened` are ignored — a re-review is an
 `@mention`). The repo is upserted (`upsert_repository`), recording the `installation.id` so the
 index-on-approve path can later mint a clone token.
 
-- **`opened`** — passes the **approval gate** (`approved_or_skip`; Epic #75) then creates a task with
-  `command_text = "review"`, `run_epoch = 0`, and **`tier = "fast"`**. This is the automatic first
-  review: SAST + a lean diff-only LLM pass, no retrieval, short turn cap (≤5 turns)
-  ([ADR-0062](adr/0062-two-tier-review-fast-auto-deep-on-demand.md)). It goes through `create_task`,
+- **`opened`** — passes the **approval gate** (`approved_or_skip`; Epic #75), resolves the review preset
+  for entry point `pr_open` (`crate::preset::resolve_preset_or_default` — the repo's
+  `.lightbridge-code-review.jsonc`, [ADR-0030](adr/0030-repo-review-config.md), or the platform default
+  `fast` when it declares nothing), then creates a task with `command_text = "review"`, `run_epoch = 0`,
+  **`preset` = the resolved name**, and **`entry_point = "pr_open"`**. Under the `fast` platform default
+  this is the automatic first review: SAST + a lean diff-only LLM pass, no retrieval, a small `max_turns`
+  ([ADR-0103](adr/0103-repo-configurable-opencode-review-presets.md), superseding
+  [ADR-0062](adr/0062-two-tier-review-fast-auto-deep-on-demand.md)). It goes through `create_task`,
   the **content-idempotent** path.
 - **`closed`** — `cancel_active_tasks_for_pr` moves the PR's `queued`/`running`/`posting_result`
   tasks to `cancelled`; the reaper then stops their Jobs (the serve role has no Kubernetes client —
@@ -187,7 +191,7 @@ fresh. Guards, in order:
 `run_epoch` in the same statement and treats a concurrent unique-violation as a benign dedup
 (returns `None`).
 
-### `issue_comment` → deep re-review or issue answer (`handle_issue_comment`)
+### `issue_comment` → mention-triggered re-review or issue answer (`handle_issue_comment`)
 
 Only `created` comments that pass `mentions_handle`. The target type is decided by the payload:
 
@@ -197,9 +201,12 @@ Only `created` comments that pass `mentions_handle`. The target type is decided 
 - a **plain issue** → `target_type = "issue"`: no diff, so the agent answers against the default
   branch and finalize posts a single reply ([ADR-0033](adr/0033-inbound-command-parsing-and-run-kinds.md)).
 
-After the approval gate, it builds a task with the full comment as `command_text` and
-**`tier = "deep"`** (full retrieval, multi-turn, long timeout — [ADR-0062](adr/0062-two-tier-review-fast-auto-deep-on-demand.md)),
-then inserts it via `create_explicit_task`.
+After the approval gate, the handler resolves the review preset for entry point `mention`
+(`crate::preset::resolve_preset_or_default` — repo config or the platform default `deep`: full
+retrieval, multi-turn, long timeout — [ADR-0103](adr/0103-repo-configurable-opencode-review-presets.md),
+superseding [ADR-0062](adr/0062-two-tier-review-fast-auto-deep-on-demand.md)), builds a task with the
+full comment as `command_text`, **the resolved `preset`**, and **`entry_point = "mention"`**, then
+inserts it via `create_explicit_task`.
 
 An `@mention` is an explicit human command, so it **always** lands a task — it is **not**
 content-deduped. True redeliveries are already collapsed upstream by the `github_deliveries`
@@ -227,8 +234,8 @@ fills in.
 
 | Path | Used by | Idempotency | Epoch |
 |---|---|---|---|
-| `create_task` | auto `pull_request opened`, `tier=fast` | `ON CONFLICT (repository_id, target_type, target_id, command_text, head_sha, run_epoch) DO NOTHING` → returns `None` on collision | passed in (`0`) |
-| `create_explicit_task` | `@mention`, `tier=deep` | always inserts; retries `23505` | computed in INSERT |
+| `create_task` | auto `pull_request opened`, entry point `pr_open` (preset resolved beforehand) | `ON CONFLICT (repository_id, target_type, target_id, command_text, head_sha, run_epoch) DO NOTHING` → returns `None` on collision | passed in (`0`) |
+| `create_explicit_task` | `@mention`, entry point `mention` (preset resolved beforehand) | always inserts; retries `23505` | computed in INSERT |
 | `create_index_task` | default-branch push, `index` | `WHERE NOT EXISTS (in-flight index)` | computed in INSERT |
 
 All three set the initial status via `INITIAL_TASK_STATUS_SQL`: a non-`index` task starts
@@ -236,7 +243,9 @@ All three set the initial status via `INITIAL_TASK_STATUS_SQL`: a non-`index` ta
 a half-written snapshot — [ADR-0055](adr/0055-review-waits-for-index-readiness.md)); otherwise it
 starts `queued` and notifies the dispatcher over `pg_notify(TASK_QUEUED_CHANNEL)`. A `NewTask`
 carries `repository_id`, `installation_id`, `github_delivery_id`, `target_type`/`target_id`,
-`command_text`, `base_sha`/`head_sha`, `run_epoch`, and `tier`.
+`command_text`, `base_sha`/`head_sha`, `run_epoch`, and the already-resolved **`preset`** +
+**`entry_point`** (§ above — `create_task`/`create_explicit_task` themselves are preset-agnostic; the
+webhook handler resolves the preset before constructing the `NewTask`).
 
 On a real insert (any review path), the handler **spawns** `react_seen` — a best-effort 👀 reaction
 on the PR — so the GitHub round-trip can't block the webhook. The reaction is **enqueued to the
