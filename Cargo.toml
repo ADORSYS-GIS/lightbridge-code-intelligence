@@ -182,6 +182,14 @@ ipnet = "2.12"
 # control-plane's `main`), so `ring::aead` reuses an audited, already-compiled primitive — it adds no
 # new crypto crate and no second provider. Version-matched to the transitive `ring` sqlx already pulls.
 ring = "0.17.14"
+# Tolerant JSONC (comments + trailing commas) parsing for `.lightbridge-code-review.jsonc` (ADR-0030),
+# untrusted repo-authored input. The one hand-rolled comment stripper already in this workspace
+# (`review-agent/src/opencode/config.rs`) is explicitly documented as tuned for the trusted, comma-clean
+# checked-in base config — not safe to reuse on arbitrary repo content. `serde` feature's
+# `parse_to_serde_value` deserializes straight into our typed config (or `serde_json::Value`), with
+# unknown-field rejection handled by `#[serde(deny_unknown_fields)]` on the target type — no second AST
+# layer to hand-walk.
+jsonc-parser = { version = "0.33.1", features = ["serde"] }
 
 # --- Dev / test only ---
 tempfile = "3.27"

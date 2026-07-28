@@ -71,6 +71,9 @@ const MIN_BLOCK_CHARS: usize = 1_000;
 const PRIORS_BLOCK_CHAR_CEIL: usize = 8_000;
 const MEMORY_BLOCK_CHAR_CEIL: usize = 4_000;
 const INSTRUCTIONS_BLOCK_CHAR_CEIL: usize = 32 * 1024;
+/// The repo's OWN explicit review config (`.lightbridge-code-review.jsonc`, ADR-0030) — small by
+/// design (conventions/architecture/instructions prose), so a modest ceiling suffices.
+const REPO_CONFIG_BLOCK_CHAR_CEIL: usize = 8_000;
 
 /// Char budgets for the static context blocks of one run (ADR-0070). The per-block constants (and the
 /// operator's `max_diff_chars`) were tuned for the current ~1M-window models; pointed at a small-window
@@ -83,6 +86,7 @@ struct PromptBudgets {
     priors: usize,
     memory: usize,
     instructions: usize,
+    repo_config: usize,
 }
 
 impl PromptBudgets {
@@ -104,6 +108,7 @@ impl PromptBudgets {
             priors: share(0.02, PRIORS_BLOCK_CHAR_CEIL),
             memory: share(0.01, MEMORY_BLOCK_CHAR_CEIL),
             instructions: share(0.02, INSTRUCTIONS_BLOCK_CHAR_CEIL),
+            repo_config: share(0.02, REPO_CONFIG_BLOCK_CHAR_CEIL),
         }
     }
 }
@@ -161,6 +166,7 @@ pub fn build_messages(
     repo_instructions: Option<&str>,
     prior_reviews: Option<&str>,
     repo_memory: Option<&str>,
+    repo_config_context: Option<&str>,
 ) -> Vec<ChatMessage> {
     let system = format!("{}\n\n{TOOL_PROTOCOL}", config.system_prompt);
 
@@ -171,7 +177,8 @@ pub fn build_messages(
         && (budgets.diff < config.max_diff_chars
             || budgets.priors < PRIORS_BLOCK_CHAR_CEIL
             || budgets.memory < MEMORY_BLOCK_CHAR_CEIL
-            || budgets.instructions < INSTRUCTIONS_BLOCK_CHAR_CEIL)
+            || budgets.instructions < INSTRUCTIONS_BLOCK_CHAR_CEIL
+            || budgets.repo_config < REPO_CONFIG_BLOCK_CHAR_CEIL)
     {
         tracing::info!(
             context_window = config.context_window,
@@ -179,6 +186,7 @@ pub fn build_messages(
             priors_chars = budgets.priors,
             memory_chars = budgets.memory,
             instructions_chars = budgets.instructions,
+            repo_config_chars = budgets.repo_config,
             "prompt budgets: window-proportional caps active (ADR-0070)"
         );
     }
@@ -256,6 +264,20 @@ pub fn build_messages(
         ));
     }
 
+    // The repo's OWN explicit review config (`.lightbridge-code-review.jsonc`, ADR-0030): conventions/
+    // architecture/instructions the repo owner deliberately declared for review. TRUSTED, explicit
+    // config — unlike `repo_instructions` below (AGENTS.md-style prose folded in with an untrusted-
+    // content guardrail), this is data the repo owner opted into for exactly this purpose, so it carries
+    // no such header. Placed before `repo_instructions` (config first, ambient convention prose second).
+    if let Some(repo_config) = repo_config_context {
+        user.push_str("\n\n");
+        user.push_str(&cap_prompt_block(
+            repo_config,
+            budgets.repo_config,
+            "repository review configuration",
+        ));
+    }
+
     // Repo-native agent instructions (ADR-0036), kept in the user message as untrusted context (it is
     // already labelled and the tool-protocol/mission in the system message stays authoritative).
     if let Some(instructions) = repo_instructions {
@@ -293,6 +315,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0].role, "system");
@@ -315,7 +338,7 @@ mod tests {
         let config = prompt_config();
         let prior = "## Your previous review of this pull request\nPrior verdict: looks fine.";
 
-        let with_prior = build_messages(&config, "review again", None, None, Some(prior), None);
+        let with_prior = build_messages(&config, "review again", None, None, Some(prior), None, None);
         let user = with_prior[1].content.as_deref().expect("user content");
         assert!(
             user.contains("Your previous review of this pull request"),
@@ -329,6 +352,7 @@ mod tests {
             None,
             None,
             Some("## Memory: findings rejected here before (👎)\n- a.rs:1 — bogus nit"),
+            None,
         );
         assert!(
             with_mem[1]
@@ -339,11 +363,51 @@ mod tests {
             "repo-memory block reaches prompt"
         );
 
-        let without = build_messages(&config, "review again", None, None, None, None);
+        let without = build_messages(&config, "review again", None, None, None, None, None);
         let user = without[1].content.as_deref().expect("user content");
         assert!(
             !user.contains("previous review"),
             "no prior-review block on a first review: {user}"
+        );
+    }
+
+    // ADR-0030: the repo's own `.lightbridge-code-review.jsonc` context block is injected when
+    // present, before the untrusted `repo_instructions` (AGENTS.md-style) block, and absent otherwise.
+    #[test]
+    fn build_messages_injects_repo_config_context_before_repo_instructions() {
+        let config = prompt_config();
+        let repo_config_context = "## Repository review configuration (`.lightbridge-code-review.jsonc`)\n### Architecture\nA Rust workspace.";
+        let repo_instructions = "## Repository agent instructions (untrusted)\nUse tabs.";
+
+        let msgs = build_messages(
+            &config,
+            "review",
+            None,
+            Some(repo_instructions),
+            None,
+            None,
+            Some(repo_config_context),
+        );
+        let user = msgs[1].content.as_deref().expect("user content");
+        assert!(
+            user.contains("A Rust workspace."),
+            "repo config context block reaches the prompt: {user}"
+        );
+        let config_at = user.find("Repository review configuration").unwrap();
+        let instructions_at = user.find("Repository agent instructions").unwrap();
+        assert!(
+            config_at < instructions_at,
+            "repo config context precedes repo_instructions: {user}"
+        );
+
+        let without = build_messages(&config, "review", None, None, None, None, None);
+        assert!(
+            !without[1]
+                .content
+                .as_deref()
+                .unwrap()
+                .contains("Repository review configuration"),
+            "no repo config block when not provided"
         );
     }
 
@@ -384,6 +448,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         let user = msgs[1].content.as_deref().expect("user content");
 
@@ -420,7 +485,7 @@ mod tests {
         );
 
         config.context_window = None;
-        let msgs = build_messages(&config, "review", None, None, Some(&long_prior), None);
+        let msgs = build_messages(&config, "review", None, None, Some(&long_prior), None, None);
         let user = msgs[1].content.as_deref().unwrap();
         assert!(
             user.contains(&long_prior),
@@ -428,7 +493,7 @@ mod tests {
         );
 
         config.context_window = Some(8_192);
-        let msgs = build_messages(&config, "review", None, None, Some(&long_prior), None);
+        let msgs = build_messages(&config, "review", None, None, Some(&long_prior), None, None);
         let user = msgs[1].content.as_deref().unwrap();
         assert!(
             !user.contains(&long_prior),

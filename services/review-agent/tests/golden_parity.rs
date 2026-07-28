@@ -83,7 +83,7 @@ async fn drive(scenario: GoldenScenario) -> (LegacyTrace, Vec<String>) {
         max_diff_chars: 60_000,
         context_window: settings.context_window,
     };
-    let messages = prompt::build_messages(&config, "review", diff, None, None, None);
+    let messages = prompt::build_messages(&config, "review", diff, None, None, None, None);
     let initial_names = tool_defs()
         .into_iter()
         .filter(|spec| settings.diff_present || spec.function.name != ADD_REVIEW_COMMENT)
@@ -109,6 +109,7 @@ async fn drive(scenario: GoldenScenario) -> (LegacyTrace, Vec<String>) {
         Arc::new(embedder),
         [],
         RuntimeCaps::default(),
+        None,
         None,
     )
     .unwrap();

@@ -57,6 +57,11 @@ reqwest.workspace = true
 uuid.workspace = true
 # Regex selectors for the per-tier `mcp__<server>__<tool>` tool allowlist (ADR-0066).
 regex.workspace = true
+# Tolerant JSONC parsing for the repo-owned `.lightbridge-code-review.jsonc` (ADR-0030).
+jsonc-parser.workspace = true
+# `focus`/`ignore` glob filtering for the repo config (ADR-0030), same gitignore-semantics engine
+# `lci-codegraph`'s `IgnoreList` already uses for an operator-configurable glob list.
+ignore.workspace = true
 # Run-config audit trail (ADR-0034/0062/0066): base64-encode the redacted resolved review config;
 # url strips userinfo/query credentials from the persisted base_url.
 base64.workspace = true

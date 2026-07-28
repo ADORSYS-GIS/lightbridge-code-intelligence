@@ -250,6 +250,7 @@ mod tests {
             services: ReviewServices {
                 client: Arc::new(ControlPlaneClient::new(cp_uri, "tok")),
                 embedder: Arc::new(EmbeddingsClient::new("http://unused", "key", "model")),
+                min_priority: None,
             },
             config,
             changed_files,

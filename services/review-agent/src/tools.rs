@@ -37,6 +37,9 @@ pub(crate) const MAX_LIMIT: i64 = 100;
 pub(crate) struct ReviewServices {
     pub client: Arc<ControlPlaneClient>,
     pub embedder: Arc<EmbeddingsClient>,
+    /// Repo `severity.min` (ADR-0030): the minimum priority (`"P0"`/`"P1"`/`"P2"`) a finding must meet
+    /// to actually be recorded. `None` = no filter (record everything, today's behavior).
+    pub min_priority: Option<String>,
 }
 
 /// Why a tool call's raw JSON arguments failed to parse into the tool's typed `Args`.
@@ -108,8 +111,13 @@ pub fn tool_registry(
     discovered: impl IntoIterator<Item = ToolSpec>,
     caps: RuntimeCaps,
     sast: Option<SastToolConfig>,
+    min_priority: Option<String>,
 ) -> Result<ToolRegistry, RegistryError> {
-    let services = ReviewServices { client, embedder };
+    let services = ReviewServices {
+        client,
+        embedder,
+        min_priority,
+    };
     let mut registry = ToolRegistry::new();
     vector::register(&mut registry, &services, caps)?;
     graph::register(&mut registry, &services, caps)?;
@@ -162,15 +170,25 @@ impl Tools {
         checkout_root: &Path,
         discovered: impl IntoIterator<Item = ToolSpec>,
     ) -> Result<Self, RegistryError> {
-        Self::with_sast(client, embedder, task_id, checkout_root, discovered, None)
+        Self::with_sast(
+            client,
+            embedder,
+            task_id,
+            checkout_root,
+            discovered,
+            None,
+            None,
+        )
     }
 
-    /// Like [`Self::new`], but also registers the `run_sast` tool (ADR-0073) when `sast` is `Some`. Used
-    /// by the OpenCode review path's stdio MCP server (`lci-review-mcp`): `run_sast` runs in that
-    /// separate process exactly as it does in the native loop, reusing `lci-agent-sast` verbatim. `None`
-    /// leaves the tool unregistered — the opt-in surface rule (allowlisted + SAST enabled + a diff) is
-    /// enforced by the caller only passing `Some` when all three hold, so an un-offered `run_sast` never
-    /// reaches `tools/list` or dispatch.
+    /// Like [`Self::new`], but also registers the `run_sast` tool (ADR-0073) when `sast` is `Some`, and
+    /// applies the repo's `severity.min` (ADR-0030) when `min_priority` is `Some`. Used by the OpenCode
+    /// review path's stdio MCP server (`lci-review-mcp`): `run_sast` runs in that separate process
+    /// exactly as it does in the native loop, reusing `lci-agent-sast` verbatim. `sast: None` leaves the
+    /// tool unregistered — the opt-in surface rule (allowlisted + SAST enabled + a diff) is enforced by
+    /// the caller only passing `Some` when all three hold, so an un-offered `run_sast` never reaches
+    /// `tools/list` or dispatch.
+    #[allow(clippy::too_many_arguments)]
     pub fn with_sast(
         client: &ControlPlaneClient,
         embedder: &EmbeddingsClient,
@@ -178,6 +196,7 @@ impl Tools {
         checkout_root: &Path,
         discovered: impl IntoIterator<Item = ToolSpec>,
         sast: Option<SastToolConfig>,
+        min_priority: Option<String>,
     ) -> Result<Self, RegistryError> {
         Ok(Self {
             registry: tool_registry(
@@ -186,6 +205,7 @@ impl Tools {
                 discovered,
                 RuntimeCaps::default(),
                 sast,
+                min_priority,
             )?,
             workspace: EagerWorkspace(checkout_root.to_path_buf()),
             task_id,

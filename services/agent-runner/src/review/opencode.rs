@@ -99,6 +99,11 @@ pub struct McpEnv<'a> {
     pub embed_url: &'a str,
     pub embed_key: &'a str,
     pub embed_model: &'a str,
+    /// The repo's `severity.min` (ADR-0030), when declared — the `add_review_comment` tool inside
+    /// `lci-review-mcp` skips recording a finding below this priority. `None` = no filter (record
+    /// everything). Threaded as an env var (`LCI_MCP_MIN_PRIORITY`) since the MCP server is a separate
+    /// process, not a function call.
+    pub min_priority: Option<&'a str>,
 }
 
 /// Run one review on OpenCode. Renders the per-task config, spawns `opencode acp`, drives the review
@@ -114,6 +119,7 @@ pub async fn run_opencode_agent(
     repo_instructions: Option<&str>,
     prior_reviews: Option<&str>,
     repo_memory: Option<&str>,
+    repo_config_context: Option<&str>,
     // The resolved SAST config (ADR-0073), forwarded to the `run_sast` tool that runs inside
     // `lci-review-mcp`. `None` when SAST is off; even when set, the tool is only offered if it also
     // clears the diff-present + per-tier-allowlist gate (see below) — same rule as the native surface.
@@ -142,6 +148,7 @@ pub async fn run_opencode_agent(
         repo_instructions,
         prior_reviews,
         repo_memory,
+        repo_config_context,
     );
     // The system message is OpenCode's agent `prompt`; the user message(s) are the `session/prompt`.
     let system_prompt = messages
@@ -258,6 +265,11 @@ pub async fn run_opencode_agent(
         ("LCI_GATE_TERMINAL_TOOL".into(), "lightbridge_finish".into()),
         ("LCI_GATE_REQUIRED_TOOLS".into(), String::new()),
     ];
+    // Repo `severity.min` (ADR-0030): tells `lci-review-mcp`'s `add_review_comment` tool to skip
+    // recording a finding below this priority. Absent when the repo declared no severity filter.
+    if let Some(min_priority) = mcp_env.min_priority {
+        env.push(("LCI_MCP_MIN_PRIORITY".into(), min_priority.to_string()));
+    }
     // ⚠️ Internal-CA trust for opencode's HTTPS to the eaig gateway. The native Rust clients
     // `add_root_certificate` the mounted CA (via EMBEDDINGS_CA_CERT, ADR-0018); opencode (bun) does
     // NOT read that — without NODE_EXTRA_CA_CERTS its session/prompt fails "unable to verify the first

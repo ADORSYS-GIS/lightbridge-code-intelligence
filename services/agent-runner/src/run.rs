@@ -448,9 +448,27 @@ async fn perform_review(
         return Ok(("review disabled".to_string(), None));
     };
 
+    // Repo-owned review config (`.lightbridge-code-review.jsonc`, ADR-0030): conventions/architecture/
+    // instructions (prompt context), focus/ignore (diff filtering), and severity.min (finding filter,
+    // threaded to the MCP subprocess below) all come from this one read.
+    let repo_config = review::repo_config::read_repo_review_config(checkout).await;
+    let diff_filter = match repo_config.as_ref().map(|c| c.diff_filter(checkout)) {
+        Some(Ok(filter)) => filter,
+        Some(Err(error)) => {
+            tracing::warn!(%error, "repo config focus/ignore globs failed to compile; reviewing unfiltered");
+            None
+        }
+        None => None,
+    };
+    let repo_config_context = repo_config.as_ref().and_then(|c| c.render_context_block());
+    let min_priority = repo_config
+        .as_ref()
+        .and_then(|c| c.severity)
+        .map(|s| s.min.as_str());
+
     // Scope to the PR's change set when we can compute it (best-effort; an unavailable base commit
     // just yields an unscoped run).
-    let diff = clone::pr_diff(checkout, context).await;
+    let diff = clone::pr_diff(checkout, context, diff_filter.as_ref()).await;
 
     // Repo-native agent instructions (ADR-0036): read the repo's AGENTS.md/CLAUDE.md/… and fold them
     // into the prompt as untrusted context so the review respects house rules.
@@ -469,6 +487,7 @@ async fn perform_review(
         embed_url: &embeddings_config.base_url,
         embed_key: &embeddings_config.api_key,
         embed_model: &embeddings_config.model,
+        min_priority,
     };
     let outcome = review::opencode::run_opencode_agent(
         review,
@@ -477,6 +496,7 @@ async fn perform_review(
         repo_instructions.as_deref(),
         context.prior_reviews.as_deref(),
         context.repo_memory.as_deref(),
+        repo_config_context.as_deref(),
         sast_config,
         attribution,
         &mcp_env,

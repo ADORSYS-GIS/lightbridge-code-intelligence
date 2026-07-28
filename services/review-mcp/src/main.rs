@@ -19,6 +19,9 @@
 //!   LCI_MCP_CP_URL, LCI_MCP_RUNNER_TOKEN, LCI_MCP_TASK_ID, LCI_MCP_CHECKOUT,
 //!   LCI_MCP_EMBED_URL, LCI_MCP_EMBED_KEY, LCI_MCP_EMBED_MODEL
 //!
+//! `LCI_MCP_MIN_PRIORITY` (optional, ADR-0030): the repo's `severity.min`, when declared — a finding
+//! below this priority is acknowledged to the model but never sent to the control plane.
+//!
 //! SAST (ADR-0073) is opt-in and off unless the supervisor sets the `LCI_MCP_SAST_*` group (the
 //! [`SastConfig`] round-trip) AND `LCI_MCP_SAST_CHANGED_FILES` (the diff's file set to scope a scan to).
 //! It only sets those when `run_sast` cleared the allowlist + diff-present + enabled gate, so their mere
@@ -169,6 +172,10 @@ async fn build_tools() -> Result<Tools> {
         .context("LCI_MCP_TASK_ID is not a valid UUID")?;
     let checkout = PathBuf::from(env("LCI_MCP_CHECKOUT")?);
     let sast = resolve_sast_tool_config()?;
+    // Repo `severity.min` (ADR-0030) — absent unless the repo declared one.
+    let min_priority = std::env::var("LCI_MCP_MIN_PRIORITY")
+        .ok()
+        .filter(|v| !v.is_empty());
 
     // ADR-0066 external-knowledge MCP tools: discover whatever MCP servers the control plane is
     // configured with (owner-managed in ai-helm-values) and fold them into the registry as mediated
@@ -198,6 +205,7 @@ async fn build_tools() -> Result<Tools> {
         &checkout,
         filter_discovered(discovered),
         sast,
+        min_priority,
     )
     .map_err(|error| anyhow::anyhow!("building the review tool registry: {error}"))
 }
