@@ -167,7 +167,10 @@ if command -v hadolint &>/dev/null; then
   while IFS= read -r dockerfile; do
     dockerfile_hash=$(echo "$dockerfile" | md5sum | cut -d' ' -f1)
     hadolint --format json "$dockerfile" > "${REPORTS_DIR}/hadolint-${dockerfile_hash}.json" 2>&1 || true
-    ((dockerfile_count++))
+    # NOT ((dockerfile_count++)): post-increment from 0 evaluates the *pre*-increment value (0) as
+    # the command's exit status, which set -e treats as failure — confirmed by reproducing this
+    # exact silent-death-under-set-e locally before switching to plain arithmetic assignment.
+    dockerfile_count=$((dockerfile_count + 1))
   done < <(find "$REPO_ROOT" -name "Dockerfile*" -type f)
 
   if [[ $dockerfile_count -gt 0 ]]; then
