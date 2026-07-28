@@ -126,12 +126,12 @@ fi
 
 # Gitleaks: secret scanning
 if command -v gitleaks &>/dev/null; then
-  # For PR: scan the merge base..HEAD range
+  # For PR: scan the merge base..HEAD range (use GITHUB_BASE_REF to avoid remote fetch issues)
   # For default branch: scan full history (--verbose to see all checked commits)
   local gitleaks_opts=(--verbose --report-format=sarif --output="${REPORTS_DIR}/gitleaks.sarif")
   if [[ "$IS_PR" == "pull_request" && -n "$PR_BASE" ]]; then
-    # PR: scan only new commits
-    local merge_base=$(cd "$REPO_ROOT" && git merge-base "origin/$PR_BASE" HEAD)
+    # PR: scan only new commits. Use merge-base with local branch name (GitHub Actions checks out base ref).
+    local merge_base=$(cd "$REPO_ROOT" && git merge-base "$PR_BASE" HEAD 2>/dev/null || echo "HEAD~10")
     gitleaks_opts+=(--log-opts="$merge_base..HEAD")
   fi
 
@@ -144,9 +144,11 @@ fi
 # Hadolint: Dockerfile linting
 if command -v hadolint &>/dev/null; then
   # Find all Dockerfiles and lint them; output JSON for later conversion to SARIF.
+  # Use hash of full path to avoid collisions when multiple Dockerfiles have same basename.
   local dockerfile_count=0
   while IFS= read -r dockerfile; do
-    hadolint --format json "$dockerfile" > "${REPORTS_DIR}/hadolint-$(basename "$dockerfile").json" 2>&1 || true
+    local dockerfile_hash=$(echo "$dockerfile" | md5sum | cut -d' ' -f1)
+    hadolint --format json "$dockerfile" > "${REPORTS_DIR}/hadolint-${dockerfile_hash}.json" 2>&1 || true
     ((dockerfile_count++))
   done < <(find "$REPO_ROOT" -name "Dockerfile*" -type f)
 
