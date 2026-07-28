@@ -388,7 +388,7 @@ mod tests {
         let mut app = test_app();
         let repo = RepositoryRow {
             id: 1,
-            github_repo_id: 1,
+            platform_repo_id: 1,
             owner: "o".into(),
             name: "r".into(),
             default_branch: "main".into(),

@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 /// this column (verified against `services/control-plane/migrations/`), so adding `Bitbucket` here
 /// needs no migration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, sqlx::Type)]
+#[serde(rename_all = "lowercase")]
 #[sqlx(type_name = "TEXT", rename_all = "lowercase")]
 pub enum Platform {
     GitHub,
