@@ -32,3 +32,5 @@ Each scanner must be pre-provisioned on the self-hosted runner:
 - `pnpm` v11.5.2+ (for biome; already present via toolchain)
 
 See `.ci/baselines/runner-manifest.md` for full versioning and provisioning steps.
+
+<!-- test PR: verifying quality.yml workflow executes on real self-hosted runner -->
