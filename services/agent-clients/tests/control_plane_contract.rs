@@ -135,7 +135,9 @@ async fn submit_review_telemetry_posts_tools_and_config_with_bearer() {
     ]);
     // Pin the wire shape the control plane's `record_review_telemetry` deserializes: `{ tools, config_b64 }`.
     Mock::given(method("POST"))
-        .and(path(format!("/api/v2/internal/tasks/{task_id}/review/telemetry")))
+        .and(path(format!(
+            "/api/v2/internal/tasks/{task_id}/review/telemetry"
+        )))
         .and(bearer_token("runner-secret"))
         .and(body_json(serde_json::json!({
             "tools": tools,
@@ -305,7 +307,9 @@ async fn review_and_knowledge_endpoints_preserve_their_wire_contracts() {
     .mount(&server)
     .await;
     Mock::given(method("POST"))
-        .and(path(format!("/api/v2/internal/tasks/{task_id}/graph/query")))
+        .and(path(format!(
+            "/api/v2/internal/tasks/{task_id}/graph/query"
+        )))
         .and(bearer_token("runner-secret"))
         .and(body_json(serde_json::json!({
             "op": "find_symbol",
@@ -324,7 +328,9 @@ async fn review_and_knowledge_endpoints_preserve_their_wire_contracts() {
         .mount(&server)
         .await;
     Mock::given(method("GET"))
-        .and(path(format!("/api/v2/internal/tasks/{task_id}/knowledge/tools")))
+        .and(path(format!(
+            "/api/v2/internal/tasks/{task_id}/knowledge/tools"
+        )))
         .and(bearer_token("runner-secret"))
         .respond_with(
             ResponseTemplate::new(200).set_body_json(serde_json::json!([{
@@ -337,7 +343,9 @@ async fn review_and_knowledge_endpoints_preserve_their_wire_contracts() {
         .mount(&server)
         .await;
     Mock::given(method("POST"))
-        .and(path(format!("/api/v2/internal/tasks/{task_id}/knowledge/call")))
+        .and(path(format!(
+            "/api/v2/internal/tasks/{task_id}/knowledge/call"
+        )))
         .and(bearer_token("runner-secret"))
         .and(body_json(serde_json::json!({
             "tool": "mcp__docs__lookup",

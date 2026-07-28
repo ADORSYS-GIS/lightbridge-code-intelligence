@@ -182,7 +182,9 @@ async fn run_sast_lists_and_executes_over_the_real_stdio_boundary() {
     let task_id = Uuid::new_v4();
     let cp = MockServer::start().await;
     Mock::given(method("POST"))
-        .and(wm_path(format!("/internal/tasks/{task_id}/review/inline")))
+        .and(wm_path(format!(
+            "/api/v2/internal/tasks/{task_id}/review/inline"
+        )))
         .respond_with(ResponseTemplate::new(204))
         .mount(&cp)
         .await;

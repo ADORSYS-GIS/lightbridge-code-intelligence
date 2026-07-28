@@ -893,19 +893,19 @@
   ],
   "control_plane_writes": [
     {
-      "endpoint": "/internal/tasks/00000000-0000-0000-0000-000000000000/review/summary",
+      "endpoint": "/api/v2/internal/tasks/00000000-0000-0000-0000-000000000000/review/summary",
       "body": {
         "body": "done"
       }
     },
     {
-      "endpoint": "/internal/tasks/00000000-0000-0000-0000-000000000000/review/summary",
+      "endpoint": "/api/v2/internal/tasks/00000000-0000-0000-0000-000000000000/review/summary",
       "body": {
         "body": "done"
       }
     },
     {
-      "endpoint": "/internal/tasks/00000000-0000-0000-0000-000000000000/review/summary",
+      "endpoint": "/api/v2/internal/tasks/00000000-0000-0000-0000-000000000000/review/summary",
       "body": {
         "body": "done\n\n> ⚠️ **Coverage note (automated):** this run examined 0 of 1 changed files. Never opened or commented on:\n> - a.rs"
       }

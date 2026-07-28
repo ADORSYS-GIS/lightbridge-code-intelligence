@@ -102,7 +102,9 @@ mod fetch_step_wire_contract {
         let server = MockServer::start().await;
         let task_id = Uuid::new_v4();
         Mock::given(method("POST"))
-            .and(path(format!("/api/v2/internal/tasks/{task_id}/steps/fetch")))
+            .and(path(format!(
+                "/api/v2/internal/tasks/{task_id}/steps/fetch"
+            )))
             .and(bearer_token("tok"))
             .respond_with(ResponseTemplate::new(404))
             .mount(&server)
@@ -130,7 +132,9 @@ mod fetch_step_wire_contract {
             "content_hash": "sha256:cafe",
         });
         Mock::given(method("POST"))
-            .and(path(format!("/api/v2/internal/tasks/{task_id}/steps/fetch")))
+            .and(path(format!(
+                "/api/v2/internal/tasks/{task_id}/steps/fetch"
+            )))
             .and(bearer_token("tok"))
             .respond_with(ResponseTemplate::new(200).set_body_json(stored))
             .mount(&server)
@@ -157,7 +161,9 @@ mod fetch_step_wire_contract {
         let server = MockServer::start().await;
         let task_id = Uuid::new_v4();
         Mock::given(method("POST"))
-            .and(path(format!("/api/v2/internal/tasks/{task_id}/steps/fetch")))
+            .and(path(format!(
+                "/api/v2/internal/tasks/{task_id}/steps/fetch"
+            )))
             .and(bearer_token("tok"))
             .respond_with(ResponseTemplate::new(500))
             .mount(&server)
