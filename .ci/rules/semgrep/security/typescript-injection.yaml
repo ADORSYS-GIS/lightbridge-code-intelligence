@@ -14,12 +14,8 @@ rules:
         - "https://semgrep.dev/r/javascript.security.eval"
 
   - id: typescript-sql-injection-template
-    pattern-either:
-      - pattern-regex: |
-          (query|sql|execute)\s*\(\s*[`'"].*\$\{.*\}.*[`'"]\s*\)
-      - pattern: |
-          sqlx.query($X)
-          where $X is not a string literal
+    pattern-regex: |
+      (query|sql|execute)\s*\(\s*[`'"].*\$\{.*\}.*[`'"]\s*\)
     message: "Potential SQL injection via template literal or unsanitized input. Use parameterized queries."
     languages: [typescript, javascript]
     severity: WARNING

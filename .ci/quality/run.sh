@@ -81,6 +81,11 @@ run_scanner() {
       return 0
     else
       log_error "$scanner_name exited with code $exit_code (likely configuration or environment error)."
+      # Surface the captured output directly in the CI log — it's otherwise only visible via the
+      # uploaded report artifact, which may itself be unavailable (e.g. storage-quota failures).
+      log_error "--- ${scanner_name} output (${REPORTS_DIR}/${report_file}) ---"
+      tail -n 50 "${REPORTS_DIR}/${report_file}" >&2 || true
+      log_error "--- end ${scanner_name} output ---"
       SCANNER_RESULTS["${scanner_name}"]="${exit_code}|${report_file}|${report_kind}"
       return 1
     fi
@@ -107,10 +112,11 @@ log_section "Running scanners"
 
 # Semgrep SAST
 if command -v semgrep &>/dev/null; then
+  # --json and --sarif are mutually exclusive output formats; --sarif alone is what merge-sarif.sh
+  # consumes (confirmed by reproducing "Mutually exclusive options" locally before this fix).
   run_scanner "semgrep-sast" "semgrep.sarif" "sarif" \
     semgrep \
       --config="${RULES_DIR}/semgrep" \
-      --json \
       --sarif \
       --output="${REPORTS_DIR}/semgrep.sarif" \
       "$REPO_ROOT" || true
@@ -220,7 +226,7 @@ fi
 log_section "Quality gate evaluation"
 
 # Invoke the gate script; it decides pass/fail based on findings and severity.
-bash "${REPO_ROOT}/.ci/quality/gate.sh" "${REPORTS_DIR}" "$IS_PR" "$GITHUB_REF" || {
+bash "${REPO_ROOT}/.ci/quality/gate.sh" "${REPORTS_DIR}" "$IS_PR" "$GITHUB_REF" "$PR_BASE" || {
   gate_code=$?
   log_error "Quality gate failed with exit code $gate_code."
   exit "$gate_code"

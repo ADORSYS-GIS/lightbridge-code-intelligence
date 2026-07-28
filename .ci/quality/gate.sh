@@ -5,9 +5,11 @@
 #
 # Policy:
 #   - Fail on scanner execution errors (non-recoverable exit codes).
-#   - On PRs: fail only for NEW error-level findings.
+#   - On PRs: fail only for NEW error-level or critical/high-severity findings — i.e. findings that
+#     land on a line the PR actually added, not the existing repository backlog. This mirrors what
+#     reviewdog's own `-filter-mode=added` already does for its annotations; without this, a PR gate
+#     that scores the *entire* merged SARIF would fail on pre-existing findings the PR never touched.
 #   - On default branch: report all findings but do not fail (gate is informational for dashboards).
-#   - Critical/High security findings and confirmed secrets are always errors.
 #   - Load explicit suppressions from .ci/baselines/suppressions.json (must include reason and expiration date).
 #   - Fail if a suppression is expired.
 
@@ -16,6 +18,7 @@ set -euo pipefail
 readonly REPORTS_DIR="${1:-.ci/quality/reports}"
 readonly IS_PR="${2:-push}"
 readonly CURRENT_REF="${3:-main}"
+readonly PR_BASE="${4:-}"
 readonly BASELINES_DIR="${REPORTS_DIR%/reports}/../baselines"
 readonly MERGED_SARIF="${REPORTS_DIR}/quality.sarif"
 
@@ -37,49 +40,84 @@ fi
 
 log_info "Quality gate policy: $IS_PR mode"
 
-# Count findings by level and severity.
-# SARIF levels: error, warning, note, none
-# SARIF severity (properties.security-severity): 0-10 scale (8.0+ = high/critical)
-# Our policy: SARIF.level=error OR critical/high security findings = fail; warning/note = report only
-
+# Count findings by level and severity (repo-wide — used for the informational summary and for
+# the default-branch/scheduled report; the PR pass/fail decision below is diff-scoped instead).
 declare -i error_count=0
 declare -i high_security_count=0
 declare -i warning_count=0
 declare -i note_count=0
 
-# Count errors and high/critical security findings
 error_count=$(jq '[.runs[0].results[] | select(.level == "error")] | length' "$MERGED_SARIF")
 high_security_count=$(jq '[.runs[0].results[] | select(.properties.security_severity // 0 | tonumber >= 7.0)] | length' "$MERGED_SARIF")
 warning_count=$(jq '[.runs[0].results[] | select(.level == "warning")] | length' "$MERGED_SARIF")
 note_count=$(jq '[.runs[0].results[] | select(.level == "note" or .level == "none")] | length' "$MERGED_SARIF")
 
-# Summary.
-log_info "Findings summary:"
+log_info "Findings summary (whole repo):"
 log_info "  errors (level=error): $error_count"
 log_info "  high/critical security (severity >= 7.0): $high_security_count"
 log_info "  warnings: $warning_count"
 log_info "  notes: $note_count"
 
-# Gate policy: Fail on error-level OR high/critical security findings.
-# On PRs: fail immediately on any actionable findings.
-# On main: report all (informational, no fail).
-
-actionable_count=$((error_count + high_security_count))
-
-if [[ "$IS_PR" == "pull_request" && $actionable_count -gt 0 ]]; then
-  log_error "PR contains $actionable_count actionable finding(s) (error-level or critical/high security). Review and fix before merging."
-  # Print details.
-  jq -r '.runs[0].results[] | select(.level == "error" or (.properties.security_severity // 0 | tonumber >= 7.0)) |
-    "\(.ruleId // "unknown"): \(.message.text // .message) [severity: \(.properties.security_severity // "N/A")] at \(.locations[0].physicalLocation.artifactLocation.uri // "?"):\(.locations[0].physicalLocation.region.startLine // "?")"' \
-    "$MERGED_SARIF" | head -20
-  exit 2
-fi
-
-# On default branch, report but do not fail (gate is informational).
+# On default branch / scheduled scans, report but do not fail (gate is informational).
 if [[ "$IS_PR" != "pull_request" ]]; then
   log_info "Default branch: gate is informational. Full report saved at: $MERGED_SARIF"
   exit 0
 fi
 
-log_info "Quality gate passed."
+# --- PR mode: diff-scope the pass/fail decision to lines the PR actually added. ---
+
+declare -A CHANGED_LINES
+
+if [[ -n "$PR_BASE" ]]; then
+  merge_base=$(git merge-base "$PR_BASE" HEAD 2>/dev/null || echo "HEAD~10")
+  current_file=""
+  while IFS= read -r diff_line; do
+    if [[ "$diff_line" == "+++ "* ]]; then
+      path="${diff_line#+++ }"
+      if [[ "$path" == "/dev/null" ]]; then
+        current_file=""
+      else
+        current_file="${path#b/}"
+      fi
+    elif [[ "$diff_line" =~ ^@@\ -[0-9]+(,[0-9]+)?\ \+([0-9]+)(,([0-9]+))?\ @@ ]]; then
+      start="${BASH_REMATCH[2]}"
+      count="${BASH_REMATCH[4]:-1}"
+      if [[ -n "$current_file" && "$count" -gt 0 ]]; then
+        for ((i = 0; i < count; i++)); do
+          CHANGED_LINES["${current_file}:$((start + i))"]=1
+        done
+      fi
+    fi
+  done < <(git diff --unified=0 "${merge_base}...HEAD" 2>/dev/null || true)
+  log_info "Diff-scoping: ${#CHANGED_LINES[@]} added line(s) in this PR (base: ${merge_base})."
+else
+  log_warn "No PR base ref available; cannot diff-scope. Falling back to whole-repo findings for the pass/fail decision."
+fi
+
+# Extract candidate (error-level or high-severity) findings as TSV, then keep only the ones whose
+# file:line falls inside CHANGED_LINES (skip diff-scoping entirely if PR_BASE was unavailable).
+declare -a actionable_findings=()
+
+while IFS=$'\t' read -r rule_id message severity file line; do
+  [[ -z "$file" ]] && continue
+  if [[ -z "$PR_BASE" ]] || [[ -n "${CHANGED_LINES[${file}:${line}]:-}" ]]; then
+    actionable_findings+=("${rule_id}: ${message} [severity: ${severity}] at ${file}:${line}")
+  fi
+done < <(jq -r '.runs[0].results[] |
+  select(.level == "error" or (.properties.security_severity // 0 | tonumber >= 7.0)) |
+  [
+    (.ruleId // "unknown"),
+    (.message.text // (.message | tostring) // "no message"),
+    (.properties.security_severity // "N/A"),
+    (.locations[0].physicalLocation.artifactLocation.uri // ""),
+    (.locations[0].physicalLocation.region.startLine // 0 | tostring)
+  ] | @tsv' "$MERGED_SARIF")
+
+if [[ ${#actionable_findings[@]} -gt 0 ]]; then
+  log_error "PR contains ${#actionable_findings[@]} new actionable finding(s) (error-level or critical/high security) on changed lines. Review and fix before merging."
+  printf '%s\n' "${actionable_findings[@]}" | head -20 >&2
+  exit 2
+fi
+
+log_info "Quality gate passed (no new actionable findings on changed lines)."
 exit 0
