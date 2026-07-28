@@ -19,6 +19,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use lci_agent_step::{Passthrough, StepError, StepRuntime};
+use lci_agent_types::StepName;
 use sqlx::PgPool;
 use sqlx::postgres::PgListener;
 use tracing::Instrument;
@@ -170,42 +172,65 @@ async fn drain_once(
         // independently-sampled root rather than failing.
         let span = tracing::info_span!("egress.deliver", outbox_id = row.id, kind = %row.kind);
         lci_observability::set_remote_parent(&span, row.trace_context.as_deref());
-        match deliver(pool, platform.as_ref(), &repo, review, &row)
-            .instrument(span)
-            .await
-        {
-            Ok(platform_id) => {
-                let outcome = if platform_id.is_some() {
-                    "posted"
-                } else {
-                    "skipped"
-                };
-                if let Err(error) = crate::db::mark_outbox_posted(pool, row.id, platform_id).await {
-                    tracing::warn!(%error, outbox_id = row.id, "marking outbox posted failed");
+        // ADR-0107: the per-row delivery + mark-posted/mark-failed transition, keyed by the
+        // outbox row's own identity. `Passthrough` is the only runtime this role can construct
+        // today (promotion to `CheckpointRuntime` stays blocked on #363), so this wrap is a no-op
+        // seam — `Passthrough::step` is a bare `f().await` — kept solely to make the transition
+        // boundary explicit ahead of that promotion.
+        let step_name = StepName::from(format!("outbox:{}", row.id));
+        let step_result = Passthrough
+            .step(step_name, async || {
+                match deliver(pool, platform.as_ref(), &repo, review, &row)
+                    .instrument(span)
+                    .await
+                {
+                    Ok(platform_id) => {
+                        let outcome = if platform_id.is_some() {
+                            "posted"
+                        } else {
+                            "skipped"
+                        };
+                        if let Err(error) =
+                            crate::db::mark_outbox_posted(pool, row.id, platform_id).await
+                        {
+                            tracing::warn!(%error, outbox_id = row.id, "marking outbox posted failed");
+                        }
+                        crate::http::metrics::outbox_delivery(
+                            &row.platform.to_string(),
+                            &row.kind,
+                            outcome,
+                        );
+                        if platform_id.is_some() {
+                            posted += 1;
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            %error,
+                            outbox_id = row.id,
+                            kind = %row.kind,
+                            "outbox delivery failed (will back off)"
+                        );
+                        let _ =
+                            crate::db::mark_outbox_failed(pool, row.id, &error.to_string()).await;
+                        crate::http::metrics::outbox_delivery(
+                            &row.platform.to_string(),
+                            &row.kind,
+                            "failed",
+                        );
+                    }
                 }
-                crate::http::metrics::outbox_delivery(
-                    &row.platform.to_string(),
-                    &row.kind,
-                    outcome,
-                );
-                if platform_id.is_some() {
-                    posted += 1;
-                }
-            }
-            Err(error) => {
-                tracing::warn!(
-                    %error,
-                    outbox_id = row.id,
-                    kind = %row.kind,
-                    "outbox delivery failed (will back off)"
-                );
-                let _ = crate::db::mark_outbox_failed(pool, row.id, &error.to_string()).await;
-                crate::http::metrics::outbox_delivery(
-                    &row.platform.to_string(),
-                    &row.kind,
-                    "failed",
-                );
-            }
+                Ok::<(), StepError>(())
+            })
+            .await;
+        // Should be impossible: `Passthrough::step` never fails on its own, it only returns
+        // whatever the closure returns, and the closure above always returns `Ok(())`.
+        if let Err(error) = step_result {
+            tracing::warn!(
+                %error,
+                outbox_id = row.id,
+                "outbox step wrapper returned an unexpected error"
+            );
         }
     }
     Ok(posted)
@@ -536,4 +561,97 @@ async fn poll_once(
         }
     }
     Ok(checked)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// ADR-0107: `drain_once`'s per-row delivery block now runs through
+    /// `Passthrough.step(StepName::from(format!("outbox:{}", row.id)), ...)`. This proves that
+    /// wrap is behavior-neutral for the exact shape used there — a closure that mutably captures
+    /// the outer `posted` counter and conditionally increments it based on an `Option<i64>`
+    /// "platform id" — by checking `Passthrough::step` (a bare `f().await`, see
+    /// `services/agent-step/src/lib.rs`) neither swallows, duplicates, nor reorders that mutation
+    /// relative to calling the same closure body directly with no step wrap at all.
+    #[tokio::test]
+    async fn outbox_step_wrap_preserves_posted_increment_on_delivery() {
+        let outbox_id = 42_i64;
+        let step_name = StepName::from(format!("outbox:{outbox_id}"));
+
+        let mut posted_via_step = 0;
+        Passthrough
+            .step(step_name, async || {
+                let platform_id: Option<i64> = Some(7);
+                if platform_id.is_some() {
+                    posted_via_step += 1;
+                }
+                Ok::<(), StepError>(())
+            })
+            .await
+            .unwrap();
+
+        let mut posted_unwrapped = 0;
+        {
+            let platform_id: Option<i64> = Some(7);
+            if platform_id.is_some() {
+                posted_unwrapped += 1;
+            }
+        }
+
+        assert_eq!(
+            posted_via_step, posted_unwrapped,
+            "Passthrough.step must not change how many times/whether the closure's side effect runs"
+        );
+        assert_eq!(posted_via_step, 1);
+    }
+
+    /// The `deliver` "skipped" branch (e.g. a `reaction` intent, which never returns a platform
+    /// id) must not increment `posted` — proven through the step wrap the same way.
+    #[tokio::test]
+    async fn outbox_step_wrap_does_not_increment_posted_on_skip() {
+        let step_name = StepName::from(format!("outbox:{}", 7_i64));
+        let mut posted = 0;
+        Passthrough
+            .step(step_name, async || {
+                let platform_id: Option<i64> = None;
+                if platform_id.is_some() {
+                    posted += 1;
+                }
+                Ok::<(), StepError>(())
+            })
+            .await
+            .unwrap();
+        assert_eq!(posted, 0);
+    }
+
+    /// The `deliver` failure branch never touches `posted` either way; the step wrap must
+    /// propagate that unchanged (no increment, no swallowed error since the closure itself
+    /// always resolves `Ok(())` — the failure is handled *inside* the closure, mirroring
+    /// `drain_once`, and only surfaces through `mark_outbox_failed`/metrics, not the step's own
+    /// `Result`).
+    #[tokio::test]
+    async fn outbox_step_wrap_does_not_increment_posted_on_delivery_failure() {
+        let step_name = StepName::from(format!("outbox:{}", 9_i64));
+        let mut posted = 0;
+        let result = Passthrough
+            .step(step_name, async || {
+                // Mirrors the `Err(error)` arm of `drain_once`: `mark_outbox_failed` runs,
+                // `posted` is never touched, and the step call itself still resolves `Ok(())`.
+                let delivery_succeeded = false;
+                if delivery_succeeded {
+                    posted += 1;
+                }
+                Ok::<(), StepError>(())
+            })
+            .await;
+        assert!(result.is_ok());
+        assert_eq!(posted, 0);
+    }
+
+    #[test]
+    fn outbox_step_name_is_keyed_by_row_id() {
+        let name = StepName::from(format!("outbox:{}", 123_i64));
+        assert_eq!(name.as_str(), "outbox:123");
+    }
 }

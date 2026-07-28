@@ -56,7 +56,7 @@ impl Tool for ReadFileTool {
         Box::pin(async move {
             let args = match parse::<Args>(&call.function.arguments) {
                 Ok(args) => args,
-                Err(error) => return ToolOutcome::Continue(error),
+                Err(error) => return ToolOutcome::Continue(error.to_string()),
             };
             let root = match cx.workspace.root().await {
                 Ok(root) => root,
@@ -79,7 +79,7 @@ async fn read(
 ) -> String {
     let resolved = match resolve(root, rel) {
         Ok(path) => path,
-        Err(error) => return error,
+        Err(error) => return error.to_string(),
     };
     let canonical_root = match tokio::fs::canonicalize(root).await {
         Ok(path) => path,
@@ -143,26 +143,33 @@ async fn read(
     }
 }
 
-fn resolve(root: &Path, rel: &str) -> Result<PathBuf, String> {
+/// Why a `path` argument to `read_file` was rejected before ever touching the filesystem.
+#[derive(Debug, thiserror::Error)]
+enum ResolveError {
+    #[error("error: {0:?} must be a path relative to the repo root (no leading `/`).")]
+    Absolute(String),
+    #[error("error: {0:?} must not contain `..` (path traversal).")]
+    Traversal(String),
+    #[error("error: {0:?} is not a file path.")]
+    NotAFilePath(String),
+}
+
+fn resolve(root: &Path, rel: &str) -> Result<PathBuf, ResolveError> {
     let mut cleaned = PathBuf::new();
     for component in Path::new(rel).components() {
         match component {
             Component::RootDir | Component::Prefix(_) => {
-                return Err(format!(
-                    "error: {rel:?} must be a path relative to the repo root (no leading `/`)."
-                ));
+                return Err(ResolveError::Absolute(rel.to_string()));
             }
             Component::ParentDir => {
-                return Err(format!(
-                    "error: {rel:?} must not contain `..` (path traversal)."
-                ));
+                return Err(ResolveError::Traversal(rel.to_string()));
             }
             Component::CurDir => {}
             Component::Normal(part) => cleaned.push(part),
         }
     }
     if cleaned.as_os_str().is_empty() {
-        return Err(format!("error: {rel:?} is not a file path."));
+        return Err(ResolveError::NotAFilePath(rel.to_string()));
     }
     Ok(root.join(cleaned))
 }
@@ -175,6 +182,7 @@ mod tests {
         assert!(
             resolve(Path::new("/tmp/root"), "../secret")
                 .unwrap_err()
+                .to_string()
                 .contains("traversal")
         );
         assert!(resolve(Path::new("/tmp/root"), "/etc/passwd").is_err());

@@ -57,11 +57,11 @@ impl Tool for FindFilesTool {
         Box::pin(async move {
             let args = match parse::<Args>(&call.function.arguments) {
                 Ok(args) => args,
-                Err(error) => return ToolOutcome::Continue(error),
+                Err(error) => return ToolOutcome::Continue(error.to_string()),
             };
             let root = match resolve_root(cx).await {
                 Ok(root) => root.to_path_buf(),
-                Err(error) => return ToolOutcome::Continue(error),
+                Err(error) => return ToolOutcome::Continue(error.to_string()),
             };
             let needle = args.name_contains.clone();
             let found = tokio::task::spawn_blocking(move || walk(&root, &needle))

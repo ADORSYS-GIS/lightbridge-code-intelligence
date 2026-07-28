@@ -39,12 +39,15 @@ pub(crate) struct ReviewServices {
     pub embedder: Arc<EmbeddingsClient>,
 }
 
-pub(crate) fn parse<T: serde::de::DeserializeOwned>(arguments: &str) -> Result<T, String> {
-    serde_json::from_str::<T>(arguments).map_err(|error| {
-        format!(
-            "error: invalid arguments — {error}. Re-call with arguments matching the tool's schema."
-        )
-    })
+/// Why a tool call's raw JSON arguments failed to parse into the tool's typed `Args`.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum ParseError {
+    #[error("error: invalid arguments — {0}. Re-call with arguments matching the tool's schema.")]
+    InvalidArguments(#[from] serde_json::Error),
+}
+
+pub(crate) fn parse<T: serde::de::DeserializeOwned>(arguments: &str) -> Result<T, ParseError> {
+    Ok(serde_json::from_str::<T>(arguments)?)
 }
 
 pub(crate) fn render<T: serde::Serialize>(tool: &str, result: anyhow::Result<T>) -> String {

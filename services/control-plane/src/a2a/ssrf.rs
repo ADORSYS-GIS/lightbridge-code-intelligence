@@ -24,7 +24,6 @@
 // non-test build has no caller yet, so silence dead-code until slice 2 wires it in.
 #![allow(dead_code)]
 
-use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
 
 use ipnet::IpNet;
@@ -66,43 +65,30 @@ pub struct ValidatedWebhook {
 
 /// Why a webhook URL was rejected. Variants are precise so the handler can map them to a clear
 /// caller-facing error (slice 2) and so tests assert the exact failure.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum SsrfError {
     /// The string did not parse as a URL at all.
+    #[error("webhook URL did not parse")]
     InvalidUrl,
     /// The scheme was not exactly `https` (e.g. `http`, `file`, `ftp`, `gopher`).
+    #[error("webhook URL must use the https scheme")]
     NotHttps,
     /// The URL had no host component.
+    #[error("webhook URL has no host")]
     MissingHost,
     /// The port was present and not 443.
+    #[error("webhook URL port {0} is not allowed (only 443)")]
     DisallowedPort(u16),
     /// The host could not be resolved (DNS failure / injected resolver error).
+    #[error("webhook host could not be resolved")]
     Resolution,
     /// A resolved (or literal) address fell in a blocked range — the offending address is carried.
+    #[error("webhook host resolves to a blocked address {0}")]
     BlockedAddress(IpAddr),
     /// The host resolved to zero addresses.
+    #[error("webhook host resolved to no addresses")]
     NoAddresses,
 }
-
-impl fmt::Display for SsrfError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            SsrfError::InvalidUrl => write!(f, "webhook URL did not parse"),
-            SsrfError::NotHttps => write!(f, "webhook URL must use the https scheme"),
-            SsrfError::MissingHost => write!(f, "webhook URL has no host"),
-            SsrfError::DisallowedPort(p) => {
-                write!(f, "webhook URL port {p} is not allowed (only 443)")
-            }
-            SsrfError::Resolution => write!(f, "webhook host could not be resolved"),
-            SsrfError::BlockedAddress(ip) => {
-                write!(f, "webhook host resolves to a blocked address {ip}")
-            }
-            SsrfError::NoAddresses => write!(f, "webhook host resolved to no addresses"),
-        }
-    }
-}
-
-impl std::error::Error for SsrfError {}
 
 /// Validate a caller-supplied webhook URL against the SSRF policy.
 ///

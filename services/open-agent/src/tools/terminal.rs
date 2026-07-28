@@ -51,7 +51,7 @@ impl Tool for AbortTool {
         Box::pin(async move {
             match parse::<Args>(&call.function.arguments) {
                 Ok(args) => ToolOutcome::Abort(args.reason),
-                Err(error) => ToolOutcome::Continue(error),
+                Err(error) => ToolOutcome::Continue(error.to_string()),
             }
         })
     }
