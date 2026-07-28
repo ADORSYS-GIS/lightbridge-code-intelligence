@@ -148,6 +148,35 @@ async fn review_is_queued_when_no_index_in_flight(pool: PgPool) {
     assert_eq!(task_status(&pool, review).await, "queued");
 }
 
+/// Regression guard (ported from `frontend/gitlab-repo-url`): `list_tasks` and `get_task` must include
+/// `r.platform AS repo_platform` in their SELECT projection, otherwise `TaskRow::repo_platform` fails
+/// with `ColumnNotFound` at decode time (sqlx::FromRow needs the column even for `Option<T>`). The
+/// dashboard relies on this field to build platform-correct deep links (MR vs PR, GitLab vs GitHub).
+#[sqlx::test]
+async fn task_queries_include_repo_platform(pool: PgPool) {
+    let repo_id = seed(&pool).await;
+
+    let task_id = create_task(&pool, &pr_task(repo_id, "head"))
+        .await
+        .unwrap()
+        .expect("task created");
+
+    // list_tasks must decode repo_platform correctly
+    let tasks = list_tasks(&pool, 10).await.unwrap();
+    let task = tasks
+        .iter()
+        .find(|t| t.id == task_id)
+        .expect("task in list");
+    assert_eq!(task.repo_platform, Some(Platform::GitHub));
+
+    // get_task must decode repo_platform correctly
+    let fetched = get_task(&pool, task_id)
+        .await
+        .unwrap()
+        .expect("task exists");
+    assert_eq!(fetched.repo_platform, Some(Platform::GitHub));
+}
+
 /// ADR-0055: a FAILED index still releases waiting reviews — a failed index must never strand them.
 #[sqlx::test]
 async fn a_failed_index_still_releases_waiting_reviews(pool: PgPool) {

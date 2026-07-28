@@ -1,10 +1,18 @@
 //! The review flow: compose the review policies in their exact order, run the engine loop, and flush
-//! the post-loop coverage disclosure. This is the review-specific assembly the host (and the golden
-//! parity test) drive — behaviour-preserving with the legacy `run_native_agent` loop.
+//! the post-loop coverage disclosure. This is the review-specific assembly the host (and its own test
+//! module below) drive.
+//!
+//! ADR-0103: every preset (however an operator names it) runs through this SAME policy composition —
+//! the same tools, the same gates, the same prompt text. A preset varies the review ONLY through the
+//! numeric budgets in [`ReviewRunParams`] (`max_turns`, `max_files_read`, …) the host resolves from its
+//! config; nothing here branches on which preset is running (the old FAST-tier structural narrowing —
+//! `FastTierGuard`, a hardcoded 5-turn cap, and skipping the coverage/refute/SAST-anchor gates — was
+//! retired for exactly this reason: PR #488 already proved gate parity works, this makes divergence
+//! structurally impossible instead of a discipline).
 //!
 //! The host injects the runtime, model, sink, tool registry, seeded conversation, and the numeric
-//! [`ReviewRunParams`]; this module owns the policy vector, the [`LoopLimits`], the FAST-tier turn cap,
-//! and the coverage flush — nothing that couples it back to the runner's config.
+//! [`ReviewRunParams`]; this module owns the policy vector, the [`LoopLimits`], and the coverage flush —
+//! nothing that couples it back to the runner's config.
 
 use std::path::PathBuf;
 
@@ -17,28 +25,19 @@ use lci_agent_step::StepRuntime;
 use lci_agent_tools::{ToolCx, ToolRegistry, TurnFilter};
 
 use crate::policies::{
-    CoverageGate, FastTierGuard, FindingFinishNudge, RefuteGate, SastAnchorGate, SastLeadSink,
+    CoverageGate, FindingFinishNudge, RefuteGate, SastAnchorGate, SastLeadSink,
     ScratchpadLoopGuard, render_fast_refusal,
 };
 pub use crate::tools::EagerWorkspace;
 use crate::tools::{RETRACT_FINDING, tool_defs};
-
-/// Turn ceiling for the FAST tier (ADR-0062). The fast tier's cheapness comes from **no retrieval** + a
-/// cheap model + short timeout — NOT from a single turn. One turn is too few: the model's first action is
-/// also its last, so it can't both act and then `finish` (whose summary becomes the review body) — a
-/// 1-turn fast pass posted an empty review on a PR with changes (vymalo-shop#301). A few no-retrieval
-/// turns let it record findings via `add_review_comment` and `finish`. The fast block's own `max_turns`
-/// (if set) lowers this; this caps it so an unset fast block can't inherit the generous default (40).
-/// Applied here (not just via the golden `GoldenSettings`, which pre-cap) because it's a real production
-/// requirement the byte-frozen traces don't exercise.
-const FAST_TIER_MAX_TURNS: usize = 5;
 
 /// The review-agent-owned numeric envelope for one run. The host maps its `ReviewConfig` onto this at
 /// the call boundary, so `review-agent` depends on nothing in the runner. `diff_present` / `diff_files`
 /// carry the change set the winddown filter and coverage gate need.
 #[derive(Debug, Clone)]
 pub struct ReviewRunParams {
-    /// Requested turn ceiling (the FAST cap in [`FAST_TIER_MAX_TURNS`] is applied inside [`run_review`]).
+    /// Requested turn ceiling — the preset's own `max_turns` (or the default), applied as-is: no
+    /// structural per-tier cap (ADR-0103).
     pub max_turns: usize,
     /// Max read-only tool calls run concurrently within one turn (ADR-0042).
     pub max_batch_size: usize,
@@ -54,8 +53,6 @@ pub struct ReviewRunParams {
     pub circuit_breaker_threshold: u32,
     /// Model context window in tokens (ADR-0045); `None` disables budgeting.
     pub context_window: Option<usize>,
-    /// FAST tier (ADR-0062): single diff-only pass, no retrieval, no investigation loop.
-    pub fast: bool,
     /// Whether a PR diff is present — gates the winddown filter's inline-tool restriction.
     pub diff_present: bool,
     /// The changed-file set the coverage gate tracks engagement against.
@@ -95,13 +92,7 @@ where
     R: StepRuntime,
     M: ModelClient,
 {
-    // FAST tier (ADR-0062): cap the turn budget so an unset fast block can't inherit the generous deep
-    // default. A no-op for deep, and for the goldens (which pre-cap via `GoldenSettings`).
-    let max_turns = if params.fast {
-        params.max_turns.min(FAST_TIER_MAX_TURNS)
-    } else {
-        params.max_turns
-    };
+    let max_turns = params.max_turns;
 
     // Wind-down inline-tool gate: with a diff, the wind-down tail keeps the full (convergence-narrowed)
     // set; without one, drop the inline `retract_finding` too — a no-diff run has no inline findings to
@@ -127,35 +118,25 @@ where
     );
 
     // Policy order is a behavioural contract (registration order = evaluation order in the engine):
-    // context trim → wind-down → read budgets → turn budget → fast guard → scratchpad guard → coverage
-    // gate → refute gate → SAST anchor gate → finding-finish nudge.
+    // context trim → wind-down → read budgets → turn budget → scratchpad guard → coverage gate →
+    // refute gate → SAST anchor gate → finding-finish nudge.
     //
-    // The coverage/refute/SAST-anchor gates themselves no longer know about `fast` (fast-tier parity
-    // with deep on the OpenCode path, see ADR-0062's amendment) — but on THIS native/legacy loop,
-    // `FastTierGuard` still strips retrieval (`read_file`/vector/graph) every turn for fast, so
-    // composing gates that DEMAND engagement the model has no way to satisfy would just bounce it
-    // uselessly forever. Keep native's fast tier skipping these three, exactly as before, by leaving
-    // them out of the policy vec rather than re-threading a `fast` flag through the shared gate types.
-    let mut policies: Vec<Box<dyn TurnPolicy>> = vec![
+    // ADR-0103: every preset composes the SAME policy set, always enabled — a tight-budget preset
+    // (what used to be the structurally-distinct FAST tier) converges quickly because its own
+    // `max_turns`/`max_files_read`/`max_searches` are small, not because gates are skipped for it. The
+    // coverage/refute/SAST-anchor gates already ran identically for both tiers on the OpenCode path
+    // (fast-tier-parity, see `ReviewGates`); this brings the native/legacy loop to the same guarantee.
+    let policies: Vec<Box<dyn TurnPolicy>> = vec![
         Box::new(ContextWindowTrim::new(params.context_window)),
-        Box::new(
-            WindDown::new(max_turns, params.max_batches)
-                .disabled(params.fast)
-                .with_filter(winddown_filter),
-        ),
-        Box::new(
-            ReadBudgets::new(params.max_files_read, params.max_searches).disabled(params.fast),
-        ),
-        Box::new(TurnBudget::new(max_turns).disabled(params.fast)),
-        Box::new(FastTierGuard::new(params.fast)),
+        Box::new(WindDown::new(max_turns, params.max_batches).with_filter(winddown_filter)),
+        Box::new(ReadBudgets::new(params.max_files_read, params.max_searches)),
+        Box::new(TurnBudget::new(max_turns)),
         Box::new(ScratchpadLoopGuard::new()),
+        Box::new(coverage),
+        Box::new(RefuteGate::new()),
+        Box::new(SastAnchorGate::new(params.sast_leads)),
+        Box::new(FindingFinishNudge::new()),
     ];
-    if !params.fast {
-        policies.push(Box::new(coverage));
-        policies.push(Box::new(RefuteGate::new()));
-        policies.push(Box::new(SastAnchorGate::new(params.sast_leads)));
-    }
-    policies.push(Box::new(FindingFinishNudge::new(params.fast)));
 
     let mut agent = AgentLoop::new(
         runtime,
@@ -231,10 +212,10 @@ mod tests {
         call_turn("fin", FINISH, r#"{"summary":"done"}"#)
     }
 
-    /// Drive `run_review` to a clean `finish` over the deterministic testkit. The finish tool records
-    /// its summary control-plane-side, so a wiremock accepts that one write; a fast / no-diff run raises
-    /// no coverage disclosure, so no other write is needed.
-    async fn drive_to_finish(fast: bool, diff_present: bool) -> LoopOutcome {
+    /// Drive `run_review` to a clean `finish` over the deterministic testkit, with the given model
+    /// script. The finish tool records its summary control-plane-side, so a wiremock accepts that one
+    /// write; a no-diff run raises no coverage disclosure, so no other write is needed.
+    async fn drive_to_finish(diff_present: bool, script: Vec<AssistantTurn>) -> LoopOutcome {
         let cp = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path(format!(
@@ -245,6 +226,11 @@ mod tests {
             .mount(&cp)
             .await;
         let checkout = tempfile::tempdir().unwrap();
+        if diff_present {
+            tokio::fs::write(checkout.path().join("a.rs"), "one\ntwo\nthree\n")
+                .await
+                .unwrap();
+        }
         let client = ControlPlaneClient::new(cp.uri(), "tok");
         let embedder = EmbeddingsClient::new("http://unused", "key", "model");
         let registry = tool_registry(
@@ -279,7 +265,6 @@ mod tests {
             max_coverage_bounces: 3,
             circuit_breaker_threshold: 3,
             context_window: None,
-            fast,
             diff_present,
             diff_files: if diff_present {
                 vec!["a.rs".to_string()]
@@ -290,7 +275,7 @@ mod tests {
         };
         run_review(
             Passthrough,
-            ScriptedModel::new([finish_turn()]),
+            ScriptedModel::new(script),
             Box::new(CapturingSink::default()),
             &cx,
             registry,
@@ -302,20 +287,28 @@ mod tests {
         .unwrap()
     }
 
-    // A deep no-diff run: the winddown filter takes its diff-absent branch (dropping the inline
-    // `retract_finding`) and the 40-turn budget is never capped; a first-turn finish converges cleanly
-    // with no coverage disclosure (empty change set).
+    // A no-diff run: the winddown filter takes its diff-absent branch (dropping the inline
+    // `retract_finding`), the coverage gate has nothing to bounce against (empty change set), and a
+    // first-turn finish converges cleanly with no disclosure.
     #[tokio::test]
-    async fn deep_no_diff_run_converges_on_finish() {
-        assert_eq!(drive_to_finish(false, false).await, LoopOutcome::Finished);
+    async fn no_diff_run_converges_on_finish() {
+        assert_eq!(
+            drive_to_finish(false, vec![finish_turn()]).await,
+            LoopOutcome::Finished
+        );
     }
 
-    // A fast run with a diff: the winddown filter takes its diff-present branch, the FAST turn cap +
-    // `FastTierGuard` are in force, and coverage bounces are disabled — so a first-turn finish still
-    // converges (and raises no disclosure, so no control-plane write).
+    // ADR-0103: every preset runs the SAME gates — with a diff present, the coverage gate is always
+    // in force (no tier-based skip), so the model must actually engage the changed file before
+    // `finish` converges; a tight-budget ("what used to be fast") preset gets there via a short
+    // script exactly like a generous-budget one would.
     #[tokio::test]
-    async fn fast_run_with_diff_converges_on_finish() {
-        assert_eq!(drive_to_finish(true, true).await, LoopOutcome::Finished);
+    async fn diff_run_converges_on_finish_once_the_changed_file_is_engaged() {
+        let script = vec![
+            call_turn("read", READ_FILE, r#"{"path":"a.rs"}"#),
+            finish_turn(),
+        ];
+        assert_eq!(drive_to_finish(true, script).await, LoopOutcome::Finished);
     }
 
     // Regression for #407: WindDown strips every ReadOnly tool once it converges, so if RefuteGate
@@ -384,7 +377,6 @@ mod tests {
             max_coverage_bounces: 0,
             circuit_breaker_threshold: 3,
             context_window: None,
-            fast: false,
             diff_present: true,
             diff_files: vec!["a.rs".to_string()],
             sast_leads: Arc::new(Mutex::new(Vec::new())),

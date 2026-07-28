@@ -9,6 +9,7 @@ import { CommandSnippet } from "@/components/ui/command-snippet";
 import { ApiErrorLine, StatusLine } from "@/components/ui/states";
 import { StatusPill } from "@/components/ui/status-pill";
 import { currentClaims } from "@/lib/auth/session";
+import { gitlabLinkConfig } from "@/lib/domain/gitlab-links";
 import {
   absoluteTime,
   duration,
@@ -20,7 +21,7 @@ import {
   triggerLabel,
 } from "@/lib/domain/tasks";
 import { hasPermission } from "@/lib/server/admin";
-import { getReview, getTask } from "@/lib/server/api";
+import { getDeploymentConfig, getReview, getTask } from "@/lib/server/api";
 import { cancelRunAction } from "./actions";
 
 export const dynamic = "force-dynamic";
@@ -58,6 +59,11 @@ export default async function RunDetail({ params }: { params: Promise<{ id: stri
 
   const task = result.data;
   const now = Date.now();
+  const cfg = await getDeploymentConfig();
+  const gitlabLinks = gitlabLinkConfig(
+    cfg.ok ? cfg.data.gitlab_base_url : null,
+    cfg.ok ? cfg.data.gitlab_project_base_urls : null,
+  );
   const variant = statusVisual(task.status).variant;
   const isError = variant === "error";
   // A run that finished "succeeded" but recorded a reason posted nothing (#137): a silent no-op, not
@@ -114,9 +120,9 @@ export default async function RunDetail({ params }: { params: Promise<{ id: stri
         </CardHeader>
         <CardBody>
           <dl className="grid grid-cols-1 gap-x-8 gap-y-3 sm:grid-cols-2">
-            <Field label="Repository" value={repoLabel(task)} href={repoUrl(task)} />
+            <Field label="Repository" value={repoLabel(task)} href={repoUrl(task, gitlabLinks)} />
             <Field label="Branch" value={task.repo_default_branch ?? "—"} />
-            <Field label="Trigger" value={triggerLabel(task)} href={targetUrl(task)} />
+            <Field label="Trigger" value={triggerLabel(task)} href={targetUrl(task, gitlabLinks)} />
             <Field label="Delivery" value={task.webhook_delivery_id ?? "—"} mono />
             <Field label="Base SHA" value={shortSha(task.base_sha) ?? "—"} mono />
             <Field label="Head SHA" value={shortSha(task.head_sha) ?? "—"} mono />
@@ -141,7 +147,7 @@ export default async function RunDetail({ params }: { params: Promise<{ id: stri
           </CardBody>
         ) : review ? (
           <CardBody>
-            <ReviewOutput review={review} />
+            <ReviewOutput review={review} repoPlatform={task.repo_platform} />
           </CardBody>
         ) : (
           <StatusLine>

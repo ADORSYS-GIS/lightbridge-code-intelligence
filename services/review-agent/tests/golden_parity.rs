@@ -1,7 +1,7 @@
 //! Golden byte-parity for the review flow (R1e).
 //!
 //! Drives [`lci_review_agent::flows::run_review`] over the deterministic testkit (scripted model,
-//! failing-runtime step journal, capturing sink) and a wiremock control plane, for all six frozen
+//! failing-runtime step journal, capturing sink) and a wiremock control plane, for all five frozen
 //! [`GoldenScenario`]s, and asserts the produced [`LegacyTrace`] is byte-identical to the checked-in
 //! fixture. After the legacy `run_native_agent` loop is deleted this is the surviving merge bar: it
 //! locks the exact chat requests (messages + per-turn tool schemas), the dispatched tool calls and
@@ -17,10 +17,9 @@ use lci_agent_testkit::{
     ObservedWrite, ScriptedModel,
 };
 use lci_agent_tools::{RuntimeCaps, ToolCx, TurnFilter};
-use lci_agent_types::ToolOutcome;
 use lci_review_agent::flows::{self, ReviewRunParams};
 use lci_review_agent::prompt::{self, PrDiffRef, PromptConfig};
-use lci_review_agent::tools::{self, ADD_REVIEW_COMMENT, READ_FILE, fast_refusal, tool_defs};
+use lci_review_agent::tools::{self, ADD_REVIEW_COMMENT, tool_defs};
 use serde_json::json;
 use uuid::Uuid;
 use wiremock::matchers::{method, path};
@@ -128,7 +127,6 @@ async fn drive(scenario: GoldenScenario) -> (LegacyTrace, Vec<String>) {
         max_coverage_bounces: settings.max_coverage_bounces,
         circuit_breaker_threshold: 3,
         context_window: settings.context_window,
-        fast: settings.fast,
         diff_present: settings.diff_present,
         diff_files: if settings.diff_present {
             diff_files.clone()
@@ -215,19 +213,10 @@ async fn drive(scenario: GoldenScenario) -> (LegacyTrace, Vec<String>) {
 }
 
 #[tokio::test]
-async fn flows_run_review_matches_all_six_frozen_traces() {
+async fn flows_run_review_matches_all_five_frozen_traces() {
     for scenario in GoldenScenario::ALL {
         let (trace, steps) = drive(scenario).await;
 
-        // FAST tier (ADR-0062): a call to a non-offered tool is refused with the review layer's exact
-        // steer, never dispatched — keeping the pass truly diff-only.
-        if scenario == GoldenScenario::FastTierRefusal {
-            assert_eq!(
-                trace.calls[0].outcome,
-                ToolOutcome::Continue(fast_refusal(READ_FILE)),
-                "fast tier refuses the non-offered tool with the review steer"
-            );
-        }
         // Provider round-trip fidelity: the opaque signature on the recorded finding + its tool_call_id
         // survive verbatim into the follow-up request the model sees.
         if scenario == GoldenScenario::PlainConvergeFinish {
@@ -267,7 +256,6 @@ async fn flows_run_review_matches_all_six_frozen_traces() {
                 "llm_turn:3",
                 "tool:3:trim-finish",
             ],
-            GoldenScenario::FastTierRefusal => &["llm_turn:0"],
             GoldenScenario::CoverageBounce => &[
                 "llm_turn:0",
                 "tool:0:coverage-finish-1",

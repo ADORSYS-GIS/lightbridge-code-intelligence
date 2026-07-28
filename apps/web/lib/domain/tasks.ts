@@ -1,3 +1,5 @@
+import { type GitlabLinkConfig, gitlabBaseUrlForProject } from "@/lib/domain/gitlab-links";
+
 /**
  * Task-run domain types + presentation logic for the dashboard (ADR-0016). Mirrors the control
  * plane's `/tasks` payload (`TaskRow` in `services/control-plane/src/db.rs`). Pure + Edge-safe.
@@ -11,6 +13,7 @@ export interface Task {
   /** `null` for admin-initiated tasks (e.g. index-on-approve) that had no originating webhook. */
   webhook_delivery_id: string | null;
   target_type: string;
+  /** For GitHub, the PR or issue number. For GitLab, the project-scoped `iid` (not the global id), required for deep-linking. */
   target_id: number;
   command_text: string;
   base_sha: string | null;
@@ -23,6 +26,7 @@ export interface Task {
   repo_owner: string | null;
   repo_name: string | null;
   repo_default_branch: string | null;
+  repo_platform: "github" | "gitlab" | null;
   /** The dispatched Kubernetes Job name, used to stream the run's logs. `null` before dispatch or
    * after the Job is cleaned up. */
   job_name: string | null;
@@ -99,32 +103,43 @@ export function repoLabel(task: Task): string {
   return `repo #${task.repository_id}`;
 }
 
-/** GitHub URL of the task's repository, or `null` when the repo identity join came back empty. */
-export function repoUrl(task: Task): string | null {
+/** Platform-specific URL of the task's repository, or `null` when the repo identity join came back empty. */
+export function repoUrl(task: Task, gitlab: GitlabLinkConfig): string | null {
   if (!task.repo_owner || !task.repo_name) return null;
-  return `https://github.com/${task.repo_owner}/${task.repo_name}`;
+  switch (task.repo_platform) {
+    case "gitlab":
+      return `${gitlabBaseUrlForProject(gitlab, task.installation_id)}/${task.repo_owner}/${task.repo_name}`;
+    default:
+      return `https://github.com/${task.repo_owner}/${task.repo_name}`;
+  }
 }
 
-/** GitHub URL of the run's target — the PR or issue — for a deep link; `null` when not applicable
+/** Platform-specific URL of the run's target — the PR or MR or issue — for a deep link; `null` when not applicable
  * (e.g. a `repository` index task, which has no PR/issue) or the repo identity is missing. */
-export function targetUrl(task: Task): string | null {
-  const base = repoUrl(task);
+export function targetUrl(task: Task, gitlab: GitlabLinkConfig): string | null {
+  const base = repoUrl(task, gitlab);
   if (!base) return null;
   switch (task.target_type) {
     case "pull_request":
-      return `${base}/pull/${task.target_id}`;
+      return task.repo_platform === "gitlab"
+        ? `${base}/-/merge_requests/${task.target_id}`
+        : `${base}/pull/${task.target_id}`;
     case "issue":
-      return `${base}/issues/${task.target_id}`;
+      return task.repo_platform === "gitlab"
+        ? `${base}/-/issues/${task.target_id}`
+        : `${base}/issues/${task.target_id}`;
     default:
       return null;
   }
 }
 
-/** What triggered the run, e.g. `review · PR #123`. */
+/** What triggered the run, e.g. `review · PR #123` (GitHub) or `review · MR #15` (GitLab). */
 export function triggerLabel(task: Task): string {
   const target =
     task.target_type === "pull_request"
-      ? `PR #${task.target_id}`
+      ? task.repo_platform === "gitlab"
+        ? `MR #${task.target_id}`
+        : `PR #${task.target_id}`
       : `${task.target_type} #${task.target_id}`;
   return `${task.command_text} · ${target}`;
 }

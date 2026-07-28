@@ -45,6 +45,11 @@ pub struct TaskRow {
     pub repo_owner: Option<String>,
     pub repo_name: Option<String>,
     pub repo_default_branch: Option<String>,
+    /// The platform the task's repository lives on (`github`/`gitlab`), surfaced from the joined
+    /// `repositories.platform` so the dashboard can build platform-correct deep links (MR vs PR,
+    /// GitLab project URL vs GitHub). Added by branch `frontend/gitlab-repo-url`; ported here from
+    /// the retired `db.rs` during the main→branch merge (main split `db.rs` into `db/`).
+    pub repo_platform: Option<Platform>,
     /// The Kubernetes Job name (set once dispatched), so the console can stream the run's logs. `None`
     /// before dispatch or after the Job is reaped/TTL'd.
     pub job_name: Option<String>,
@@ -413,7 +418,7 @@ pub async fn renew_lease(pool: &PgPool, id: Uuid, lease: Duration) -> Result<boo
 pub async fn list_tasks(pool: &PgPool, limit: i64) -> Result<Vec<TaskRow>, sqlx::Error> {
     sqlx::query_as::<_, TaskRow>(
         "SELECT t.*, r.owner AS repo_owner, r.name AS repo_name, \
-         r.default_branch AS repo_default_branch \
+         r.default_branch AS repo_default_branch, r.platform AS repo_platform \
          FROM tasks t LEFT JOIN repositories r ON r.id = t.repository_id \
          ORDER BY t.created_at DESC, t.id DESC LIMIT $1",
     )
@@ -426,7 +431,7 @@ pub async fn list_tasks(pool: &PgPool, limit: i64) -> Result<Vec<TaskRow>, sqlx:
 pub async fn get_task(pool: &PgPool, id: Uuid) -> Result<Option<TaskRow>, sqlx::Error> {
     sqlx::query_as::<_, TaskRow>(
         "SELECT t.*, r.owner AS repo_owner, r.name AS repo_name, \
-         r.default_branch AS repo_default_branch \
+         r.default_branch AS repo_default_branch, r.platform AS repo_platform \
          FROM tasks t LEFT JOIN repositories r ON r.id = t.repository_id \
          WHERE t.id = $1",
     )

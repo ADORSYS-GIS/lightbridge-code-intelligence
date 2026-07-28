@@ -60,8 +60,11 @@ pub struct Claims {
 #[derive(Debug, Clone, Deserialize)]
 pub struct RepositoryRow {
     pub id: i64,
-    #[serde(default)]
-    pub github_repo_id: i64,
+    /// Platform-agnostic numeric repository ID (renamed from `github_repo_id` in migration 0024).
+    /// The `alias` preserves backward compatibility with older server responses that still emit the
+    /// old field name — serde accepts either without requiring a server/client simultaneous deploy.
+    #[serde(default, alias = "github_repo_id")]
+    pub platform_repo_id: i64,
     pub owner: String,
     pub name: String,
     #[serde(default)]
@@ -374,7 +377,33 @@ mod tests {
 
     #[test]
     fn parses_repository_row_fixture() {
-        let json = r#"[{
+        // Current server emits the renamed field.
+        let json_new = r#"[{
+            "id": 7,
+            "platform_repo_id": 999001,
+            "owner": "vymalo",
+            "name": "lightbridge-code-intelligence",
+            "default_branch": "main",
+            "status": "pending",
+            "active": false,
+            "approved_at": null,
+            "approved_by": null,
+            "task_count": 12,
+            "last_task_at": "2026-07-02T10:15:30Z",
+            "installation_id": 42
+        }]"#;
+        let rows: Vec<RepositoryRow> = serde_json::from_str(json_new).unwrap();
+        assert_eq!(rows.len(), 1);
+        let r = &rows[0];
+        assert_eq!(r.platform_repo_id, 999001);
+        assert_eq!(r.owner, "vymalo");
+        assert_eq!(r.status, "pending");
+        assert_eq!(r.task_count, 12);
+        assert!(r.approved_at.is_none());
+        assert!(r.last_task_at.is_some());
+
+        // Older server still emits `github_repo_id` — alias must accept it.
+        let json_legacy = r#"[{
             "id": 7,
             "github_repo_id": 999001,
             "owner": "vymalo",
@@ -388,14 +417,11 @@ mod tests {
             "last_task_at": "2026-07-02T10:15:30Z",
             "installation_id": 42
         }]"#;
-        let rows: Vec<RepositoryRow> = serde_json::from_str(json).unwrap();
-        assert_eq!(rows.len(), 1);
-        let r = &rows[0];
-        assert_eq!(r.owner, "vymalo");
-        assert_eq!(r.status, "pending");
-        assert_eq!(r.task_count, 12);
-        assert!(r.approved_at.is_none());
-        assert!(r.last_task_at.is_some());
+        let rows_legacy: Vec<RepositoryRow> = serde_json::from_str(json_legacy).unwrap();
+        assert_eq!(
+            rows_legacy[0].platform_repo_id, 999001,
+            "alias backward compat"
+        );
     }
 
     #[test]

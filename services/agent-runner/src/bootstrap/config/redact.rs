@@ -68,8 +68,6 @@ impl ReviewConfig {
                 "max_retries": self.resilience.max_retries,
                 "circuit_breaker_threshold": self.resilience.circuit_breaker_threshold,
             },
-            "fast": self.fast,
-            "tier": if self.fast { "fast" } else { "deep" },
             "tools": tools,
             // The operator OpenCode overlay (ADR-0099) is auditable config — WHICH custom agents/models
             // were active is exactly the churn the owner wants recorded — but it's raw operator JSON that
@@ -253,7 +251,6 @@ mod tests {
             extra,
             stream: true,
             resilience: ResilienceConfig::default(),
-            fast: false,
             tools: Some(tools),
             // An operator overlay (ADR-0099) carrying a misconfigured INLINE credential (secrets are
             // meant to ride `{env:}`, but defend in depth) plus a non-secret custom sub-agent — the
@@ -342,7 +339,6 @@ mod tests {
             serde_json::json!("https://gateway.internal/v1")
         );
         assert_eq!(value["stream"], serde_json::json!(true));
-        assert_eq!(value["tier"], serde_json::json!("deep"));
         let prompt = value["system_prompt"].as_str().unwrap();
         assert!(
             prompt.contains("careful reviewer"),

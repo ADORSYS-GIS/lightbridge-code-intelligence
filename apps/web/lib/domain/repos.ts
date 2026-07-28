@@ -3,12 +3,15 @@
  * `/repositories` payload (`RepositoryRow` in `services/control-plane/src/db.rs`). Edge-safe.
  */
 
+import { type GitlabLinkConfig, gitlabBaseUrlForProject } from "@/lib/domain/gitlab-links";
 import type { StatusVariant } from "@/lib/domain/tasks";
 
 /** A connected repository plus its run-activity summary. */
 export interface Repository {
   id: number;
-  github_repo_id: number;
+  /** Platform-agnostic numeric repository ID. */
+  platform_repo_id: number;
+  platform: "github" | "gitlab";
   owner: string;
   name: string;
   default_branch: string;
@@ -27,9 +30,14 @@ export function repoSlug(repo: Repository): string {
   return `${repo.owner}/${repo.name}`;
 }
 
-/** GitHub URL of the repository. */
-export function repoUrl(repo: Repository): string {
-  return `https://github.com/${repo.owner}/${repo.name}`;
+/** Platform-specific URL of the repository. */
+export function repoUrl(repo: Repository, gitlab: GitlabLinkConfig): string {
+  switch (repo.platform) {
+    case "gitlab":
+      return `${gitlabBaseUrlForProject(gitlab, repo.platform_repo_id)}/${repo.owner}/${repo.name}`;
+    default:
+      return `https://github.com/${repo.owner}/${repo.name}`;
+  }
 }
 
 /** Map the approval `status` (Epic #75) to a status-pill variant + label (ADR-0015/0016 tokens). */

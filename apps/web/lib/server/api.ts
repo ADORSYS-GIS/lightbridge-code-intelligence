@@ -104,3 +104,21 @@ export async function listRepositories(): Promise<ApiResult<Repository[]>> {
     return { ok: false, reason: "unavailable" };
   }
 }
+
+/** Non-sensitive deployment settings for the console (GitLab web base URL, etc.). */
+export interface DeploymentConfig {
+  gitlab_base_url: string;
+  gitlab_project_base_urls: Record<string, string>;
+}
+
+/** `GET /config` — deployment settings for the console (sourced from the control plane, not env). */
+export async function getDeploymentConfig(): Promise<ApiResult<DeploymentConfig>> {
+  try {
+    const res = await authedFetch("/config");
+    if (!res) return { ok: false, reason: "unauthenticated" };
+    if (!res.ok) return { ok: false, reason: classify(res.status), status: res.status };
+    return { ok: true, data: (await res.json()) as DeploymentConfig };
+  } catch {
+    return { ok: false, reason: "unavailable" };
+  }
+}

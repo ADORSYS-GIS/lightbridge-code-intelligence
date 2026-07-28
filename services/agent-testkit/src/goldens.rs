@@ -14,17 +14,15 @@ pub enum GoldenScenario {
     PlainConvergeFinish,
     WindDownEntry,
     ContextTrimTrigger,
-    FastTierRefusal,
     CoverageBounce,
     ExhaustedBackstop,
 }
 
 impl GoldenScenario {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 5] = [
         Self::PlainConvergeFinish,
         Self::WindDownEntry,
         Self::ContextTrimTrigger,
-        Self::FastTierRefusal,
         Self::CoverageBounce,
         Self::ExhaustedBackstop,
     ];
@@ -33,7 +31,6 @@ impl GoldenScenario {
             Self::PlainConvergeFinish => include_str!("../goldens/plain_converge_finish.json"),
             Self::WindDownEntry => include_str!("../goldens/wind_down_entry.json"),
             Self::ContextTrimTrigger => include_str!("../goldens/context_trim_trigger.json"),
-            Self::FastTierRefusal => include_str!("../goldens/fast_tier_refusal.json"),
             Self::CoverageBounce => include_str!("../goldens/coverage_bounce.json"),
             Self::ExhaustedBackstop => include_str!("../goldens/exhausted_backstop.json"),
         }
@@ -89,12 +86,6 @@ impl GoldenScenario {
                 ),
                 call("trim-finish", "finish", r#"{"summary":"done"}"#, None),
             ],
-            Self::FastTierRefusal => vec![call(
-                "fast-illegal",
-                "read_file",
-                r#"{"path":"a.rs"}"#,
-                None,
-            )],
             Self::CoverageBounce => vec![
                 call(
                     "coverage-finish-1",
@@ -122,7 +113,6 @@ impl GoldenScenario {
             Self::ContextTrimTrigger => GoldenSettings::new(5)
                 .with_diff()
                 .with_context_window(2_000),
-            Self::FastTierRefusal => GoldenSettings::new(1).with_diff().fast(),
             Self::CoverageBounce => GoldenSettings::new(5).with_diff().with_coverage_bounces(1),
             Self::ExhaustedBackstop => GoldenSettings::new(2),
         }
@@ -139,7 +129,6 @@ pub struct GoldenSettings {
     pub max_turns: usize,
     pub diff_present: bool,
     pub context_window: Option<usize>,
-    pub fast: bool,
     pub max_coverage_bounces: usize,
 }
 
@@ -149,7 +138,6 @@ impl GoldenSettings {
             max_turns,
             diff_present: false,
             context_window: None,
-            fast: false,
             max_coverage_bounces: 3,
         }
     }
@@ -161,11 +149,6 @@ impl GoldenSettings {
 
     fn with_context_window(mut self, context_window: usize) -> Self {
         self.context_window = Some(context_window);
-        self
-    }
-
-    fn fast(mut self) -> Self {
-        self.fast = true;
         self
     }
 
@@ -234,7 +217,7 @@ mod tests {
 
     #[test]
     fn scenario_list_is_frozen() {
-        assert_eq!(GoldenScenario::ALL.len(), 6);
+        assert_eq!(GoldenScenario::ALL.len(), 5);
         for scenario in GoldenScenario::ALL {
             let trace = GoldenHarness::expected(scenario);
             assert_eq!(trace.scenario, scenario);
