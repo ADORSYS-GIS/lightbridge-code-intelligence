@@ -6,9 +6,7 @@ use std::collections::HashSet;
 
 use lci_agent_clients::ControlPlaneClient;
 use lci_agent_types::ToolSpec;
-use lci_review_agent::tools::{
-    ABORT, ADD_COMMENT, ADD_REVIEW_COMMENT, FINISH, RETRACT_FINDING, RUN_SAST, tool_defs,
-};
+use lci_review_agent::tools::{ADD_REVIEW_COMMENT, FINISH, RUN_SAST, tool_defs};
 use uuid::Uuid;
 
 use crate::bootstrap::config::{McpToolPattern, ReviewConfig, ReviewTool, ReviewToolSelector};
@@ -117,37 +115,6 @@ pub(crate) async fn resolve_offered_tools(
     (offered, dispatch_discovered)
 }
 
-/// The reduced tool set offered once a run enters wind-down (#137), used ONLY for the run-start
-/// telemetry snapshot of a FAST run: the write tools + `finish`/`abort`, dropping retrieval/read_file.
-/// `add_review_comment`/`retract_finding`/`run_sast` are kept only when a diff is present (an inline tool
-/// can't anchor without one, and there's nothing to scope a scan to). Mirrors the engine's convergence
-/// narrowing (`convergence_filter`, which drops by `ToolKind` — every Write tool here, `run_sast`
-/// included, survives it since none of them are `ReadOnly`/`Progress`).
-pub(crate) fn winddown_tool_defs(base: &[ToolSpec], diff_present: bool) -> Vec<ToolSpec> {
-    base.iter()
-        .filter(|spec| match spec.function.name.as_str() {
-            ADD_REVIEW_COMMENT | RETRACT_FINDING | RUN_SAST => diff_present,
-            ADD_COMMENT | FINISH | ABORT => true,
-            _ => false,
-        })
-        .cloned()
-        .collect()
-}
-
-/// The tool set turn 0 will ACTUALLY offer for the telemetry snapshot: a FAST run WITHOUT an explicit
-/// allowlist runs every turn on the wind-down write/finish set (the `FastTierGuard` narrows to it), so
-/// snapshotting the full surface there would record retrieval/read_file/MCP tools the model never gets.
-pub(crate) fn run_start_tool_defs<'a>(
-    review: &ReviewConfig,
-    defs: &'a [ToolSpec],
-    winddown_defs: &'a [ToolSpec],
-) -> &'a [ToolSpec] {
-    if review.fast && review.tools.is_none() {
-        winddown_defs
-    } else {
-        defs
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -181,7 +148,6 @@ mod tests {
             extra: serde_json::Map::new(),
             stream: false,
             resilience: ResilienceConfig::default(),
-            fast: false,
             tools,
             opencode_overlay: None,
         }

@@ -10,17 +10,21 @@ use crate::tools::ADD_REVIEW_COMMENT;
 pub struct FindingFinishNudge {
     findings: usize,
     nudged: bool,
-    fast: bool,
 }
 
 impl FindingFinishNudge {
     #[must_use]
-    pub fn new(fast: bool) -> Self {
+    pub fn new() -> Self {
         Self {
             findings: 0,
             nudged: false,
-            fast,
         }
+    }
+}
+
+impl Default for FindingFinishNudge {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -51,11 +55,9 @@ impl TurnPolicy for FindingFinishNudge {
             return actions;
         }
         self.nudged = true;
-        let nudge = if self.fast {
-            "You've recorded a finding. Record any others on changed lines with add_review_comment, then call `finish` with your overall verdict to post the review."
-        } else {
-            "You have recorded at least one finding. When your investigation is complete, call `finish` with your overall verdict to post everything you've buffered — don't keep investigating past the point of useful work."
-        };
+        // ADR-0103: one nudge text for every preset — the numeric turn/read budgets a preset
+        // configures are what actually shorten a tight-budget run, not a different prompt.
+        let nudge = "You have recorded at least one finding. When your investigation is complete, call `finish` with your overall verdict to post everything you've buffered — don't keep investigating past the point of useful work.";
         actions.extend([
             PolicyAction::Record {
                 name: None,

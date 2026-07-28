@@ -105,7 +105,7 @@ mod tests {
     #[tokio::test]
     async fn covered_review_finishes_in_one_cycle() {
         let mut session = FakeSession::new(vec![read_and_finish()]);
-        let mut driver = ReviewDriver::new(ReviewGates::new(vec!["a.rs".into()], 3, 40, false), 8);
+        let mut driver = ReviewDriver::new(ReviewGates::new(vec!["a.rs".into()], 3, 40), 8);
         let resolution = run_review_loop(&mut session, &mut driver, "review this PR")
             .await
             .unwrap();
@@ -118,7 +118,7 @@ mod tests {
     async fn coverage_bounce_reprompts_then_finishes() {
         // Cycle 1 finishes without touching a.rs → bounced; cycle 2 reads it → finished.
         let mut session = FakeSession::new(vec![bare_finish(), read_and_finish()]);
-        let mut driver = ReviewDriver::new(ReviewGates::new(vec!["a.rs".into()], 3, 40, false), 8);
+        let mut driver = ReviewDriver::new(ReviewGates::new(vec!["a.rs".into()], 3, 40), 8);
         let resolution = run_review_loop(&mut session, &mut driver, "review this PR")
             .await
             .unwrap();
@@ -140,7 +140,7 @@ mod tests {
             )]
         };
         let mut session = FakeSession::new(vec![idle(), idle(), idle()]);
-        let mut driver = ReviewDriver::new(ReviewGates::new(vec![], 3, 40, false), 2);
+        let mut driver = ReviewDriver::new(ReviewGates::new(vec![], 3, 40), 2);
         let resolution = run_review_loop(&mut session, &mut driver, "review this PR")
             .await
             .unwrap();
@@ -152,7 +152,7 @@ mod tests {
     async fn a_transport_error_propagates() {
         // No scripted cycles → the fake errors on the first prompt, and the loop surfaces it.
         let mut session = FakeSession::new(vec![]);
-        let mut driver = ReviewDriver::new(ReviewGates::new(vec![], 3, 40, false), 8);
+        let mut driver = ReviewDriver::new(ReviewGates::new(vec![], 3, 40), 8);
         assert!(
             run_review_loop(&mut session, &mut driver, "review this PR")
                 .await

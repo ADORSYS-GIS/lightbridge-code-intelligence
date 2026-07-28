@@ -157,7 +157,7 @@ pub async fn run_native_agent(
     .await;
 
     // ── Run-start telemetry (ADR-0034/0062/0066), recorded at run START ─────────────────────────────
-    telemetry::submit_run_start_telemetry(client, task_id, review, &offered, diff_present).await;
+    telemetry::submit_run_start_telemetry(client, task_id, review, &offered).await;
 
     // ── Seed the conversation ────────────────────────────────────────────────────────────────────
     let prompt_config = PromptConfig {
@@ -235,7 +235,6 @@ pub async fn run_native_agent(
         max_coverage_bounces: review.max_coverage_bounces,
         circuit_breaker_threshold: review.resilience.circuit_breaker_threshold,
         context_window: review.context_window,
-        fast: review.fast,
         diff_present,
         diff_files: diff.map(|pr| pr.files.clone()).unwrap_or_default(),
         sast_leads,

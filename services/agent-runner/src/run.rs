@@ -15,6 +15,7 @@
 
 use std::path::Path;
 
+use anyhow::Context as _;
 use tracing::Instrument;
 use uuid::Uuid;
 
@@ -103,9 +104,10 @@ async fn run_once_body(mode: Option<Mode>) -> std::process::ExitCode {
     // The embeddings client is built inside `run()` once the task context is known, so it can carry
     // the per-project attribution headers (epic #89).
 
-    // Review is optional (no model → indexing-only). But if it's half-configured, surface it. Two-tier
-    // review (ADR-0062): resolve BOTH tiers up front; the runner picks one per task by its tier.
-    let review_configs = match ReviewConfig::resolve_tiers(file_config.as_ref()) {
+    // Review is optional (no model → indexing-only). But if it's half-configured, surface it. Named
+    // presets (ADR-0103): resolve every configured preset up front; the runner picks one per task by
+    // its resolved preset name.
+    let review_configs = match ReviewConfig::resolve_presets(file_config.as_ref()) {
         Ok(cfgs) => cfgs,
         Err(error) => {
             let detail = error.to_string();
@@ -412,11 +414,11 @@ async fn perform_indexing(
 /// finalize. Returns `(review_summary, review_detail)` — the summary always folds into the top-level
 /// task summary; the
 /// detail (when `Some`) is the review-failure/exhaustion/abort reason attached to the FINAL terminal
-/// status (#137). `Ok(("review disabled", None))` when this is an `index` task or the task's tier has
+/// status (#137). `Ok(("review disabled", None))` when this is an `index` task or the task's preset has
 /// no review model configured (a standalone `index` task — target_type `repository`, Epic #75 — has no
-/// PR, so it skips review regardless of LLM config). Two-tier review (ADR-0062): the per-tier config is
-/// picked by the task's tier (`fast` → single diff-only turn, no retrieval; `deep` → full run); the
-/// selected fast config already carries the structural `fast` flag (set in `resolve_tiers`).
+/// PR, so it skips review regardless of LLM config). Named presets (ADR-0103): the config is picked by
+/// the task's resolved preset name; an unknown preset name fails the task rather than silently running
+/// under another preset.
 #[allow(clippy::too_many_arguments)]
 async fn perform_review(
     is_index: bool,
@@ -435,10 +437,14 @@ async fn perform_review(
     task_id: Uuid,
     status: Option<&StatusHandle>,
 ) -> anyhow::Result<(String, Option<String>)> {
-    let Some(review) = (!is_index)
-        .then(|| review_configs.for_tier(&context.tier))
-        .flatten()
-    else {
+    let resolved = if is_index {
+        None
+    } else {
+        review_configs
+            .for_preset(&context.tier)
+            .with_context(|| format!("resolving review preset {:?}", context.tier))?
+    };
+    let Some(review) = resolved else {
         return Ok(("review disabled".to_string(), None));
     };
 
@@ -482,7 +488,7 @@ async fn perform_review(
         status.set_phase(Phase::Finalizing);
     }
 
-    finalize_review_outcome(outcome, review, client, task_id).await
+    finalize_review_outcome(outcome, review, &context.tier, client, task_id).await
 }
 
 /// Map a finished agent run onto a visible PR artifact and the top-level summary/detail (#137). Net
@@ -500,6 +506,7 @@ async fn perform_review(
 async fn finalize_review_outcome(
     outcome: anyhow::Result<review::ReviewOutcome>,
     review: &ReviewConfig,
+    preset: &str,
     client: &ControlPlaneClient,
     task_id: Uuid,
 ) -> anyhow::Result<(String, Option<String>)> {
@@ -511,8 +518,12 @@ async fn finalize_review_outcome(
             ("review posted".to_string(), None)
         }
         Ok(review::ReviewOutcome::Exhausted) => {
-            if review.fast {
-                // FAST tier (ADR-0062): a fast run that ends without `finish` is normal, not "out of
+            // Preset framing at exhaustion is presentation, not review behavior (ADR-0103 only mandates
+            // gate/tool uniformity) — keyed on the platform-default preset NAME here as a transitional
+            // check; story #495 replaces this with the task's own `entry_point`, which is the actual
+            // thing this framing decision should depend on.
+            if preset == "fast" {
+                // FAST preset: a run that ends without `finish` is normal, not "out of
                 // budget." The quick-pass framing — the 🅵 banner + the "mention @handle for a deeper
                 // review" pointer — is rendered CONTROL-PLANE-SIDE at finalize, where the real GitHub
                 // App handle lives (the runner doesn't have it, and hardcoded the wrong `@lightbridge`

@@ -157,15 +157,17 @@ pub async fn run_opencode_agent(
         .join("\n\n");
 
     // ── Render the config (base + injection + operator overlay), and pick the workdir ────────────
-    // ADR-0099: the base is the checked-in `review.jsonc`; the supervisor injects the tier/headers and
-    // deep-merges the trusted operator overlay (`review.opencode`) with full override. A relaxation of
-    // the coverage/read-only floor is WARNED (and disclosed below), never blocked.
+    // ADR-0099/0103: the base is the checked-in `review.jsonc`; the supervisor injects the
+    // reasoning/headers and deep-merges the trusted operator overlay (`review.opencode`) with full
+    // override. There is no structural tier flag any more — the reasoning-capable model turns on purely
+    // from `review.extra` carrying `reasoning_effort`. A relaxation of the coverage/read-only floor is
+    // WARNED (and disclosed below), never blocked.
     let rendered = render_review_config(
-        review.fast,
         review.temperature,
-        // The tier's provider-passthrough params (`review.extra` — `reasoning_effort:"high"` for deep,
-        // ADR-0069). The native path merges this same map into the chat body; the OpenCode path merges
-        // it into the reviewer model's `options` so eaig receives the SAME keys (native-path parity).
+        // The preset's provider-passthrough params (`review.extra` — `reasoning_effort:"high"` for a
+        // reasoning preset, ADR-0069). The native path merges this same map into the chat body; the
+        // OpenCode path merges it into the reviewer model's `options` so eaig receives the SAME keys
+        // (native-path parity).
         &review.extra,
         attribution,
         review.opencode_overlay.as_ref(),
@@ -317,12 +319,7 @@ pub async fn run_opencode_agent(
 
     // ── Drive the review to resolution ──────────────────────────────────────────────────────────
     let diff_files = diff.map(|pr| pr.files.clone()).unwrap_or_default();
-    let gates = ReviewGates::new(
-        diff_files,
-        review.max_coverage_bounces,
-        review.max_turns,
-        review.fast,
-    );
+    let gates = ReviewGates::new(diff_files, review.max_coverage_bounces, review.max_turns);
     // The Rust-side re-prompt ceiling (fast-tier-parity plan): opencode's own `maxSteps` doesn't cap
     // anything over ACP (see the `e2e` module below), so `review.max_cycles` — tier-configurable, fast
     // smaller than deep — is what actually stops a stuck/adversarial model.
@@ -552,7 +549,7 @@ mod e2e {
             .await
             .expect("session/new");
 
-        let gates = ReviewGates::new(vec!["a.rs".to_string()], 3, 40, false);
+        let gates = ReviewGates::new(vec!["a.rs".to_string()], 3, 40);
         let mut driver = ReviewDriver::new(gates, 8);
         let mut session = OpencodeReviewSession::new(acp, session_id, recorder_path.clone());
 
@@ -649,8 +646,7 @@ mod e2e {
             "agent": { "explore": { "mode": "subagent", "description": "read-only helper" } },
             "permission": { "bash": "allow" }
         });
-        let rendered =
-            render_review_config(false, None, &serde_json::Map::new(), &[], Some(&overlay));
+        let rendered = render_review_config(None, &serde_json::Map::new(), &[], Some(&overlay));
         // Our floor diff must have flagged the bash relaxation (surfaced, not blocked).
         assert!(
             rendered

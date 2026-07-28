@@ -101,7 +101,7 @@ mod tests {
     /// Finished.
     #[test]
     fn driver_bounces_then_finalizes_finished() {
-        let gates = ReviewGates::new(vec!["a.rs".into()], 3, 40, false);
+        let gates = ReviewGates::new(vec!["a.rs".into()], 3, 40);
         let mut driver = ReviewDriver::new(gates, 8);
 
         let premature = cycle_turn_outcome(&[
@@ -139,7 +139,7 @@ mod tests {
     /// Driver: an abort short-circuits straight to Aborted, without consulting the gates.
     #[test]
     fn driver_finalizes_aborted_immediately() {
-        let gates = ReviewGates::new(vec!["a.rs".into()], 3, 40, false);
+        let gates = ReviewGates::new(vec!["a.rs".into()], 3, 40);
         let mut driver = ReviewDriver::new(gates, 8);
         let abort = cycle_turn_outcome(&[
             before(
@@ -161,7 +161,7 @@ mod tests {
     #[tokio::test]
     async fn repeated_bounces_are_capped_by_max_cycles() {
         // Coverage bounce budget 10 ≫ max_cycles 2, so the gate would keep bouncing if unchecked.
-        let gates = ReviewGates::new(vec!["a.rs".into()], 10, 40, false);
+        let gates = ReviewGates::new(vec!["a.rs".into()], 10, 40);
         let mut driver = ReviewDriver::new(gates, 2);
         let premature = cycle_turn_outcome(&[
             before(
@@ -187,7 +187,7 @@ mod tests {
     /// then finalized as Exhausted once the re-prompt budget is spent — buffered findings still post.
     #[test]
     fn driver_exhausts_after_budget_of_no_finish_cycles() {
-        let gates = ReviewGates::new(vec![], 3, 40, false);
+        let gates = ReviewGates::new(vec![], 3, 40);
         let mut driver = ReviewDriver::new(gates, 2);
         let idle = cycle_turn_outcome(&[before(
             "lightbridge_report_progress",

@@ -85,7 +85,6 @@ fn review_config(base_url: String) -> ReviewConfig {
         extra: serde_json::Map::new(),
         stream: false,
         resilience: ResilienceConfig::default(),
-        fast: false,
         tools: Some(vec![
             ReviewToolSelector::Builtin(ReviewTool::RunSast),
             ReviewToolSelector::Builtin(ReviewTool::AddReviewComment),
