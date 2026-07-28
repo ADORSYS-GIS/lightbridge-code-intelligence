@@ -28,9 +28,9 @@ jobs:
     timeout-minutes: 30
     steps:
       # Fetch repository code with full history (depth: 0) for accurate PR diffs in reviewdog.
-      # Pinned to v4.2.0 (commit SHA: 11bd71901afe44af187055612f316e63f77d3e91)
+      # Pinned to v4.4.0 (commit SHA: 11d5960a326750d5838078e36cf38b85af677262)
       # Check for updates: https://github.com/actions/checkout/releases
-      - uses: actions/checkout@11bd71901afe44af187055612f316e63f77d3e91
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           fetch-depth: 0
 
@@ -44,11 +44,11 @@ jobs:
           bash .ci/quality/run.sh
 
       # Upload individual reports and merged SARIF as artifacts for debugging/auditing.
-      # Pinned to v4.7.0 (commit SHA: 97a0fdd30d330287a78c2239ea01e15720c0e5a3)
+      # Pinned to v4.6.2 (commit SHA: ea165f8d65b6e75b540449e92b4886f43607fa02)
       # Check for updates: https://github.com/actions/upload-artifact/releases
       - name: Upload reports
         if: always()
-        uses: actions/upload-artifact@97a0fdd30d330287a78c2239ea01e15720c0e5a3
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: quality-reports
           path: .ci/quality/reports/
@@ -74,7 +74,7 @@ jobs:
       # Optional: Upload merged SARIF to GitHub Code Scanning (if enabled per configuration).
       # GitHub Code Scanning provides a centralized UI for tracking findings across the repository.
       # This is disabled by default and requires explicit enablement via repository variable.
-      # Pinned to v3.25.0 (commit SHA: 9fa7e86e37b0d1da3b80c8a1b9a2f0ede7e8d9e0)
+      # Pinned to v4.37.3 (commit SHA: e4fba868fa4b1b91e1fdab776edc8cfbe6e9fb81)
       # Check for updates: https://github.com/github/codeql-action/releases
       - name: Upload to GitHub Code Scanning
         if: |
@@ -82,7 +82,7 @@ jobs:
           github.ref == 'refs/heads/main' &&
           vars.ENABLE_CODE_SCANNING == 'true' &&
           hashFiles('.ci/quality/reports/quality.sarif') != ''
-        uses: github/codeql-action/upload-sarif@9fa7e86e37b0d1da3b80c8a1b9a2f0ede7e8d9e0
+        uses: github/codeql-action/upload-sarif@e4fba868fa4b1b91e1fdab776edc8cfbe6e9fb81
         with:
           sarif_file: .ci/quality/reports/quality.sarif
           category: "quality-pipeline"
