@@ -29,9 +29,12 @@ This document specifies all required tools, databases, and configurations for of
 
 ### 2. Trivy (Dependency & Container Scanning)
 
-- **Recommended Version**: 0.51.0+ (check https://github.com/aquasecurity/trivy/releases for latest)
-- **Installation**: Download from official releases (no auto-update in workflow)
-- **Binary location**: `/usr/local/bin/trivy`
+- **Recommended Version**: v0.72.0 (check https://github.com/aquasecurity/trivy/releases for latest — verified against the API at time of writing, not assumed from memory)
+- **Binary installation**: the workflow installs the trivy *binary* itself via
+  `aquasecurity/setup-trivy` (pinned commit, `cache: true`), so it's a cache hit — no network
+  fetch — on every run after the first for a given pinned version. This does **not** replace the
+  database provisioning below; the binary and the vulnerability database are provisioned
+  independently.
 - **Offline flags used in workflow**:
   - `--skip-db-update` — Do not check for newer DB
   - `--skip-java-db-update` — Do not fetch Java vulnerability DB
@@ -181,12 +184,23 @@ Used in `.github/workflows/quality.yml` (all pinned to commit SHAs for reproduci
 
 - [ ] Ensure runner has `vymalo-vps` label applied
 - [ ] Verify base image includes: rustup (stable), cargo-llvm-cov, pnpm, Node.js 22+
-- [ ] Install Semgrep: `pip install semgrep==1.45.0` (or latest stable)
-- [ ] Install Trivy: `curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin v0.51.0`
-- [ ] Install Gitleaks: `curl -L https://github.com/gitleaks/gitleaks/releases/download/v8.18.0/gitleaks-linux-x64 -o /usr/local/bin/gitleaks && chmod +x /usr/local/bin/gitleaks`
-- [ ] Install Hadolint: `curl -L https://github.com/hadolint/hadolint/releases/download/v2.12.0/hadolint-Linux-x86_64 -o /usr/local/bin/hadolint && chmod +x /usr/local/bin/hadolint`
-- [ ] Install Reviewdog: `go install github.com/reviewdog/reviewdog/cmd/reviewdog@v0.17.0`
-- [ ] Pre-cache Trivy DBs: `trivy image --download-db-only`
+- [ ] Install Semgrep: `pip install semgrep==1.45.0` (or latest stable — verify against
+      https://github.com/returntocorp/semgrep/releases before installing)
+- [ ] Install Trivy on the runner HOST itself (separate from the in-workflow binary — this copy is
+      only needed so the host's own cron job can pre-cache the vulnerability database; the
+      workflow provisions its own trivy binary via the pinned `aquasecurity/setup-trivy` action,
+      see `.github/workflows/quality.yml`): install per
+      https://aquasecurity.github.io/trivy/latest/getting-started/installation/, pinned to a
+      specific release verified against https://github.com/aquasecurity/trivy/releases (do not
+      assume the version number in this doc is current — check first)
+- [ ] Install Gitleaks: verify latest at https://github.com/gitleaks/gitleaks/releases, then
+      download the matching `gitleaks-linux-x64` (or platform-appropriate) release asset and place
+      on PATH
+- [ ] Install Hadolint: verify latest at https://github.com/hadolint/hadolint/releases, then
+      download the matching release asset and place on PATH
+- [ ] Install Reviewdog: verify latest at https://github.com/reviewdog/reviewdog/releases before
+      installing
+- [ ] Pre-cache Trivy DBs on the runner host: `trivy image --download-db-only`
 - [ ] Verify all tools: `semgrep --version && trivy --version && gitleaks version && hadolint --version && reviewdog --version`
 
 ### Daily Maintenance

@@ -34,6 +34,19 @@ jobs:
         with:
           fetch-depth: 0
 
+      # Install the trivy BINARY via a pinned, cached action rather than a raw `curl` step.
+      # NOTE: this only provisions the trivy executable — it does NOT fetch trivy's vulnerability
+      # database. The database (~600MB+) must still be pre-cached on the runner at
+      # $HOME/.cache/trivy/db/ per .ci/baselines/runner-manifest.md; run.sh passes
+      # --skip-db-update and will fail loudly if that cache is missing. `cache: true` + a pinned
+      # version means this step is a cache hit (no network) on every run after the first.
+      # Pinned to v0.3.1 (commit SHA: 81e514348e19b6112ce2a7e3ecbafe19c1e1f567)
+      # Check for updates: https://github.com/aquasecurity/setup-trivy/releases
+      - uses: aquasecurity/setup-trivy@81e514348e19b6112ce2a7e3ecbafe19c1e1f567
+        with:
+          version: v0.72.0
+          cache: true
+
       # Run all quality scanners (SAST, secrets, dependency, infra, linting).
       - name: Run quality scanners
         env:
