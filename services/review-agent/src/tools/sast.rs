@@ -83,7 +83,7 @@ impl Tool for RunSastTool {
         Box::pin(async move {
             let args = match parse::<Args>(&call.function.arguments) {
                 Ok(args) => args,
-                Err(error) => return ToolOutcome::Continue(error),
+                Err(error) => return ToolOutcome::Continue(error.to_string()),
             };
             let root = match cx.workspace.root().await {
                 Ok(root) => root,

@@ -1,6 +1,5 @@
 //! Stable-order owner of the complete tool surface, and the guarded per-turn dispatcher.
 
-use std::fmt;
 use std::sync::Arc;
 
 use lci_agent_types::{ToolCallReq, ToolOutcome, ToolSpec};
@@ -8,25 +7,13 @@ use lci_agent_types::{ToolCallReq, ToolOutcome, ToolSpec};
 use crate::{ReplaySafety, RuntimeCaps, Tool, ToolCx, ToolKind, TurnFilter};
 
 /// Registration failures are startup errors, before a model can invoke a tool.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum RegistryError {
+    #[error("tool {0:?} is already registered")]
     DuplicateName(String),
+    #[error("tool {0:?} needs a per-call dedup key, but the runtime cannot provide one")]
     MissingDedupCapability(String),
 }
-
-impl fmt::Display for RegistryError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::DuplicateName(name) => write!(formatter, "tool {name:?} is already registered"),
-            Self::MissingDedupCapability(name) => write!(
-                formatter,
-                "tool {name:?} needs a per-call dedup key, but the runtime cannot provide one"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for RegistryError {}
 
 /// Stable-order owner of the complete tool surface.
 #[derive(Default)]

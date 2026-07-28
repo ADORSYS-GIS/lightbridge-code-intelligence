@@ -15,6 +15,11 @@ path = "src/main.rs"
 anyhow.workspace = true
 lci-config = { path = "../config" }
 lci-observability = { path = "../observability" }
+# StepRuntime seam (ADR-0107): generalizes the durability boundary proven by the review/open agent
+# loop (ADR-0087) to webhook ingress, the dispatcher, the reconciler, and A2A task lifecycle.
+lci-agent-step = { path = "../agent-step" }
+lci-agent-types = { path = "../agent-types" }
+thiserror.workspace = true
 mimalloc.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -57,7 +62,3 @@ a2a-server-lf.workspace = true
 # Test-only: generate an RSA keypair at runtime so no private key is committed (see src/jwt.rs).
 rsa.workspace = true
 rand_08.workspace = true
-# Test-only (ADR-0087 durable_step round-trip): the REAL journaled step-result types, so the sqlx
-# test proves `from_value::<AssistantTurn>` / `Vec<(usize, ToolOutcome)>` rehydrate through jsonb —
-# not a hand-authored Value that could drift from what the loop actually serializes.
-lci-agent-types = { path = "../agent-types" }

@@ -67,7 +67,7 @@ impl Tool for VectorTool {
         Box::pin(async move {
             let args = match parse::<Args>(&call.function.arguments) {
                 Ok(args) => args,
-                Err(error) => return ToolOutcome::Continue(error),
+                Err(error) => return ToolOutcome::Continue(error.to_string()),
             };
             let result = async {
                 let mut vectors = self.services.embedder.embed(&[&args.query]).await?;

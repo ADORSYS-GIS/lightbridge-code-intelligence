@@ -59,14 +59,14 @@ impl Tool for GrepTool {
         Box::pin(async move {
             let args = match parse::<Args>(&call.function.arguments) {
                 Ok(args) => args,
-                Err(error) => return ToolOutcome::Continue(error),
+                Err(error) => return ToolOutcome::Continue(error.to_string()),
             };
             if args.query.is_empty() {
                 return ToolOutcome::Continue("error: query must not be empty.".into());
             }
             let root = match resolve_root(cx).await {
                 Ok(root) => root.to_path_buf(),
-                Err(error) => return ToolOutcome::Continue(error),
+                Err(error) => return ToolOutcome::Continue(error.to_string()),
             };
             let query = args.query.clone();
             let hits = tokio::task::spawn_blocking(move || search(&root, &query))

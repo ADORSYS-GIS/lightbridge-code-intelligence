@@ -664,8 +664,7 @@ async fn run_replay(state: AppState) -> anyhow::Result<()> {
         .db
         .clone()
         .ok_or_else(|| anyhow::anyhow!("replay role requires DATABASE_URL"))?;
-    let retention =
-        queue::replay::retention_from_env().map_err(|reason| anyhow::anyhow!(reason))?;
+    let retention = queue::replay::retention_from_env()?;
     // Headless role: stand up the metrics-only listener like the dispatcher/reconciler.
     spawn_metrics_server(state.metrics.clone());
     queue::replay::run(pool, retention).await

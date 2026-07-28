@@ -65,16 +65,16 @@ impl Tool for EditFileTool {
         Box::pin(async move {
             let args = match parse::<Args>(&call.function.arguments) {
                 Ok(args) => args,
-                Err(error) => return ToolOutcome::Continue(error),
+                Err(error) => return ToolOutcome::Continue(error.to_string()),
             };
             let root = match resolve_root(cx).await {
                 Ok(root) => root,
-                Err(error) => return ToolOutcome::Continue(error),
+                Err(error) => return ToolOutcome::Continue(error.to_string()),
             };
             // The path-safety boundary: reject `..` + out-of-workdir symlink escapes (ADR-0088).
             let target = match resolve_write(root, &args.path) {
                 Ok(target) => target,
-                Err(error) => return ToolOutcome::Continue(error),
+                Err(error) => return ToolOutcome::Continue(error.to_string()),
             };
             ToolOutcome::Continue(write(&target, &args.path, &args.content).await)
         })

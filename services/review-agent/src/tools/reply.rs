@@ -59,7 +59,7 @@ impl Tool for ReplyTool {
                         ToolOutcome::Continue(format!("error: could not record comment: {error:#}"))
                     }
                 },
-                Err(error) => ToolOutcome::Continue(error),
+                Err(error) => ToolOutcome::Continue(error.to_string()),
             }
         })
     }

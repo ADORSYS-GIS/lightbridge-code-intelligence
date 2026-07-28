@@ -63,6 +63,28 @@ impl Host {
     }
 }
 
+/// The distinct rejection reasons [`validate`] can return. One variant per rejected matrix cell;
+/// each `#[error(...)]` text is verbatim what the old `Result<_, String>` returned, so this is a
+/// pure typing change — callers that interpolate the error into a message (e.g. `agent-plane`'s
+/// `{reason}` in its startup `eprintln!`) see byte-identical output via the derived `Display`.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum PlaneValidationError {
+    /// `open` + `serve` — permanent structural rejection (never becomes legal, even after slice 5
+    /// builds `serve`).
+    #[error(
+        "open mode cannot run under the serve host: it executes untrusted and generated code, \
+         and a shared serve tenant cannot sandbox arbitrary execution — namespaces isolate \
+         files, not execution (ADR-0085). open is run-once only."
+    )]
+    OpenUnderServeForbidden,
+    /// any other mode + `serve` — temporary, lands in slice 5.
+    #[error(
+        "the serve host is not implemented yet: it arrives in slice 5. index and review run \
+         under run-once today (ADR-0085)."
+    )]
+    ServeNotYetImplemented,
+}
+
 /// The mode×host routing guard (ADR-0085 §"The mode × host matrix and its routing rules").
 ///
 /// Returns `Ok(())` iff the pair is admissible for **this** slice. The arms encode the whole matrix
@@ -79,21 +101,12 @@ impl Host {
 ///   `serve` re-owns concurrency bounding / stale reclaim / (for execution) sandboxing that k8s Jobs
 ///   give free, so it is opt-in and gated on a measurement.
 /// - **`index` | `review` + `run-once` — admitted.** Behaviour-identical to today's Jobs.
-pub fn validate(mode: Mode, host: Host) -> Result<(), String> {
+pub fn validate(mode: Mode, host: Host) -> Result<(), PlaneValidationError> {
     match (mode, host) {
         // Permanent structural rule — never becomes legal, even after slice 5 builds `serve`.
-        (Mode::Open, Host::Serve) => Err(
-            "open mode cannot run under the serve host: it executes untrusted and generated code, \
-             and a shared serve tenant cannot sandbox arbitrary execution — namespaces isolate \
-             files, not execution (ADR-0085). open is run-once only."
-                .to_string(),
-        ),
+        (Mode::Open, Host::Serve) => Err(PlaneValidationError::OpenUnderServeForbidden),
         // Temporary — lands in slice 5.
-        (_, Host::Serve) => Err(
-            "the serve host is not implemented yet: it arrives in slice 5. index and review run \
-             under run-once today (ADR-0085)."
-                .to_string(),
-        ),
+        (_, Host::Serve) => Err(PlaneValidationError::ServeNotYetImplemented),
         // The admitted cells for this slice: index/review/open under run-once. `open` routing is a
         // security property (ADR-0088: open → run-once, always); its host execution is still dormant.
         (Mode::Index | Mode::Review | Mode::Open, Host::RunOnce) => Ok(()),
@@ -115,7 +128,9 @@ mod tests {
 
     #[test]
     fn open_under_serve_is_a_permanent_structural_rejection() {
-        let err = validate(Mode::Open, Host::Serve).expect_err("open+serve must be rejected");
+        let err = validate(Mode::Open, Host::Serve)
+            .expect_err("open+serve must be rejected")
+            .to_string();
         // The message names the *structural* reason (execution isolation), not "not implemented",
         // so a future reader doesn't mistake it for a slice-5 gap that will open up.
         assert!(err.contains("run-once only"), "unexpected reason: {err}");
@@ -132,7 +147,9 @@ mod tests {
     #[test]
     fn serve_is_deferred_to_slice_5_for_built_modes() {
         for mode in [Mode::Index, Mode::Review] {
-            let err = validate(mode, Host::Serve).expect_err("serve host is unbuilt this slice");
+            let err = validate(mode, Host::Serve)
+                .expect_err("serve host is unbuilt this slice")
+                .to_string();
             assert!(
                 err.contains("slice 5"),
                 "unexpected reason for {mode:?}: {err}"
@@ -144,7 +161,7 @@ mod tests {
     fn open_serve_stays_forbidden_while_open_run_once_is_admitted() {
         // The permanent structural rule (open+serve forbidden) must NOT relax just because slice 4
         // admitted open+run-once: the serve arm stays forever, the run-once arm is now legal.
-        let serve = validate(Mode::Open, Host::Serve).unwrap_err();
+        let serve = validate(Mode::Open, Host::Serve).unwrap_err().to_string();
         assert!(
             serve.contains("run-once only"),
             "unexpected reason: {serve}"

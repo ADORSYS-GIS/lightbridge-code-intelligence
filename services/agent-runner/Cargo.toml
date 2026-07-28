@@ -47,6 +47,7 @@ lci-observability = { path = "../observability" }
 mimalloc.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+thiserror.workspace = true
 tokio.workspace = true
 futures.workspace = true
 tracing.workspace = true
