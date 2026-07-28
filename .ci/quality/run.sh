@@ -183,20 +183,36 @@ else
   log_warn "Hadolint not available; skipping Dockerfile linting."
 fi
 
-# Biome: JavaScript/TypeScript linting (uses workspace pnpm)
+# Biome: JavaScript/TypeScript linting (uses workspace pnpm).
+# Biome 2.x has a native `--reporter=sarif`; confirmed against a real install (2.5.0) rather than
+# hand-rolling a JSON->SARIF converter for an assumed --json schema that turned out not to exist
+# ("--json is not expected in this context" on the real CLI). Its SARIF output uses absolute
+# artifactLocation.uri paths, not repo-relative — merge-sarif.sh normalizes that for every scanner.
+#
+# NOT run via run_scanner(): that wrapper redirects the command's own stdout to the same path
+# passed as the report file, which is fine for semgrep/trivy/gitleaks (they write their report via
+# their own --output/--report-path flag and print little/nothing else to stdout) but empirically
+# corrupts Biome's SARIF — Biome's progress banner text gets interleaved with its own
+# --reporter-file write to the identical path. Confirmed by reproducing the corruption locally
+# before switching to a separate console-log path for Biome's own stdout/stderr.
 if [[ -f "${REPO_ROOT}/package.json" ]] && command -v pnpm &>/dev/null; then
   log_scanner_start "biome-lint"
-  if cd "$REPO_ROOT" && pnpm exec biome check --json . > "${REPORTS_DIR}/biome.json" 2>&1; then
-    SCANNER_RESULTS["biome"]="0|biome.json|json"
-    log_scanner_end "biome" "biome.json"
+  if pnpm --dir "$REPO_ROOT" exec biome check --reporter=sarif \
+      --reporter-file="${REPORTS_DIR}/biome.sarif" "$REPO_ROOT" \
+      > "${REPORTS_DIR}/biome-console.log" 2>&1; then
+    SCANNER_RESULTS["biome"]="0|biome.sarif|sarif"
+    log_scanner_end "biome" "biome.sarif"
   else
     biome_exit_code=$?
     if [[ $biome_exit_code -eq 1 ]]; then
-      SCANNER_RESULTS["biome"]="1|biome.json|json"
-      log_scanner_end "biome" "biome.json"
+      SCANNER_RESULTS["biome"]="1|biome.sarif|sarif"
+      log_scanner_end "biome" "biome.sarif"
     else
       log_error "Biome linting failed with exit code $biome_exit_code (config or toolchain error)."
-      SCANNER_RESULTS["biome"]="${biome_exit_code}|biome.json|json"
+      log_error "--- biome-lint output (${REPORTS_DIR}/biome-console.log) ---"
+      tail -n 50 "${REPORTS_DIR}/biome-console.log" >&2 || true
+      log_error "--- end biome-lint output ---"
+      SCANNER_RESULTS["biome"]="${biome_exit_code}|biome.sarif|sarif"
       exit 1
     fi
   fi
@@ -213,17 +229,10 @@ if find "${REPORTS_DIR}" -name "hadolint-*.json" -type f &>/dev/null; then
   fi
 fi
 
-# Convert Biome JSON to SARIF (if present).
-if [[ -f "${REPORTS_DIR}/biome.json" ]]; then
-  if ! bash "${REPO_ROOT}/.ci/quality/biome-to-sarif.sh" "${REPORTS_DIR}"; then
-    log_warn "Biome JSON to SARIF conversion failed; continuing without Biome results."
-  fi
-fi
-
 log_section "Merging SARIF reports"
 
 # Invoke the SARIF merge script.
-if ! bash "${REPO_ROOT}/.ci/quality/merge-sarif.sh" "${REPORTS_DIR}"; then
+if ! bash "${REPO_ROOT}/.ci/quality/merge-sarif.sh" "${REPORTS_DIR}" "${REPO_ROOT}"; then
   log_error "SARIF merge failed."
   exit 1
 fi

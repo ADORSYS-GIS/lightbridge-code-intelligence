@@ -22,7 +22,7 @@ GitHub Actions Workflow (quality.yml)
 │  ├─ Trivy (dependencies/containers) → trivy-fs.sarif
 │  ├─ Gitleaks (secrets) → gitleaks.sarif
 │  ├─ Hadolint (Dockerfile) → hadolint-*.json
-│  └─ Biome (TypeScript/JavaScript linting) → biome.json
+│  └─ Biome (TypeScript/JavaScript linting) → biome.sarif (native --reporter=sarif)
 ├─ .ci/quality/merge-sarif.sh (deduplicate + merge all SARIF)
 │  └─ .ci/quality/reports/quality.sarif (single canonical report)
 ├─ .ci/quality/gate.sh (evaluate findings; fail/warn based on severity)

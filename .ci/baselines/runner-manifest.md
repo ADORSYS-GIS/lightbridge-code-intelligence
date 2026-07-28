@@ -117,7 +117,7 @@ This is **not** part of the GitHub Actions workflow; databases are expected to b
 
 - **Recommended Version**: 2.0.0+ (pinned in `package.json` devDependencies; check current with `pnpm exec biome --version`)
 - **Installation**: Managed by pnpm. Run `pnpm install` in the repository root.
-- **Offline mode**: Uses workspace-local configuration (biome.json).
+- **Offline mode**: Uses workspace-local configuration (biome.json). Outputs SARIF natively via `--reporter=sarif` (Biome 2.x).
 - **Invoked via**: `pnpm exec biome check .`
 - **Validation**:
   ```bash

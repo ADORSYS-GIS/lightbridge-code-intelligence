@@ -116,7 +116,7 @@ python3 -c "import yaml; yaml.safe_load(open('.github/workflows/quality.yml'))" 
 
 ```bash
 # From repository root:
-ls -la .ci/quality/{run,merge-sarif,gate,hadolint-to-sarif,biome-to-sarif}.sh
+ls -la .ci/quality/{run,merge-sarif,gate,hadolint-to-sarif}.sh
 
 # All should be executable (have 'x' permission).
 # Verify:

@@ -10,6 +10,7 @@
 set -euo pipefail
 
 readonly REPORTS_DIR="${1:-.ci/quality/reports}"
+readonly REPO_ROOT="${2:-.}"
 
 if [[ ! -d "$REPORTS_DIR" ]]; then
   echo "ERROR: Reports directory not found: $REPORTS_DIR" >&2
@@ -47,13 +48,29 @@ EOF
   exit 0
 fi
 
-# Merge SARIF files using jq: extract all results, deduplicate, and reassemble.
+# Merge SARIF files using jq: extract all results, normalize paths, deduplicate, and reassemble.
 # Deduplication key: (ruleId, message, path, startLine).
+#
+# Path normalization: some tools (confirmed for Biome's native --reporter=sarif) emit absolute
+# artifactLocation.uri paths rather than repo-relative ones. Strip a leading $REPO_ROOT prefix so
+# every result uses a repo-relative POSIX path, matching every other scanner's convention.
 
-jq -s '
-  # Collect all results from all runs.
+readonly ROOT_ABS="$(cd "$REPO_ROOT" && pwd)"
+
+jq -s --arg root "$ROOT_ABS" '
+  def normalize_path:
+    if . != null and startswith($root + "/")
+    then .[($root | length) + 1:]
+    else .
+    end;
+
+  # Collect all results from all runs, normalizing absolute paths to repo-relative first.
   [.[].runs[].results[] |
-   select(. != null)] |
+   select(. != null) |
+   .locations = (.locations // [] | map(
+     .physicalLocation.artifactLocation.uri |= normalize_path
+   ))
+  ] |
   # Deduplicate: keep first occurrence of each (ruleId, message, path, region.startLine).
   # group_by generates groups; first(.location.physicalLocation.artifactLocation.uri) as path key.
   (
