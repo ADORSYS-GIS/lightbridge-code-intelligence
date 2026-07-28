@@ -63,7 +63,7 @@ use jwt::JwtValidator;
 // Bring the grouped modules into scope under their bare names. `crate::` is required to
 // disambiguate from the extern `http` / `metrics` crates pulled in by axum.
 use crate::http::{admin, internal, metrics, webhook};
-use crate::integrations::{github, gitlab, k8s, neo4j};
+use crate::integrations::{bitbucket, github, gitlab, k8s, neo4j};
 use crate::queue::{dispatcher, tasks};
 
 #[derive(Clone)]
@@ -86,8 +86,12 @@ pub struct AppState {
     /// File-configured GitLab projects. `None` when `gitlab.enabled` is false in
     /// `control-plane.json`. There is intentionally no `GITLAB_*` env fallback.
     pub gitlab: Option<gitlab::GitlabRegistry>,
+    /// File-configured Bitbucket repos. `None` when `bitbucket.enabled` is false in
+    /// `control-plane.json`. There is intentionally no `BITBUCKET_*` env fallback (ADR-0108, same
+    /// rationale as GitLab: Bitbucket is naturally multi-tenant).
+    pub bitbucket: Option<bitbucket::BitbucketRegistry>,
     /// Platform dispatch table (ADR-0072): maps each configured `Platform` to its `CodePlatform`
-    /// implementation. Built once at startup from the configured GitHub App + GitLab client; shared
+    /// implementation. Built once at startup from the configured GitHub App + GitLab/Bitbucket clients; shared
     /// by the HTTP handlers (e.g. `finalize_review`) and the reconciler so both pick the right
     /// implementation per task. Empty when no platform is configured (the reconciler bails in that
     /// case; HTTP handlers return 503).
@@ -148,6 +152,10 @@ impl AppState {
             .as_ref()
             .map(|f| f.gitlab.clone())
             .unwrap_or_default();
+        let bitbucket_config = file_config
+            .as_ref()
+            .map(|f| f.bitbucket.clone())
+            .unwrap_or_default();
         let db = db::connect_from_env().await?;
         // Embedding-dimension safety (ADR-0018): if configured and the live column differs, either
         // reindex-from-scratch (when allowed) or fail loud — never silently mismatch.
@@ -193,6 +201,17 @@ impl AppState {
                 None
             }
         };
+        // Same isolation for Bitbucket: a bad `bitbucket:` block degrades only Bitbucket.
+        let bitbucket = match bitbucket::BitbucketRegistry::from_config(&bitbucket_config) {
+            Ok(registry) => registry,
+            Err(error) => {
+                tracing::error!(
+                    %error,
+                    "invalid Bitbucket config in control-plane.json; Bitbucket integration disabled"
+                );
+                None
+            }
+        };
         // Build the platform dispatch table (ADR-0072) once, from the configured implementations.
         // Shared by the HTTP handlers and the reconciler so both pick the right implementation per task.
         let mut platforms: std::collections::HashMap<
@@ -212,6 +231,13 @@ impl AppState {
                     as Arc<dyn integrations::platform::CodePlatform>,
             );
         }
+        if let Some(registry) = bitbucket.clone() {
+            platforms.insert(
+                integrations::platform::Platform::Bitbucket,
+                Arc::new(bitbucket::BitbucketPlatformRouter::new(registry))
+                    as Arc<dyn integrations::platform::CodePlatform>,
+            );
+        }
 
         Ok(Self {
             github_webhook_secret: Arc::new(
@@ -223,6 +249,7 @@ impl AppState {
             allow_no_db,
             github,
             gitlab,
+            bitbucket,
             platforms,
             runner_token_signer: runner_token::RunnerTokenSigner::from_env().map(Arc::new),
             neo4j,
@@ -457,17 +484,23 @@ async fn track_http_metrics(req: Request, next: Next) -> Response {
 /// a misconfigured pod is not handed traffic it would only reject: no webhook platform configured,
 /// missing OIDC issuer / unreachable JWKS, or a configured-but-unreachable database.
 async fn readiness(State(state): State<AppState>) -> impl IntoResponse {
-    // At least one webhook platform must be configured. GitHub still uses an env secret; GitLab is
-    // configured only through `control-plane.json`.
+    // At least one webhook platform must be configured. GitHub still uses an env secret; GitLab and
+    // Bitbucket are configured only through `control-plane.json` (so a Bitbucket-only deployment
+    // doesn't fail readiness just because GITHUB_WEBHOOK_SECRET and gitlab.projects[] are unset).
     let github_configured = !state.github_webhook_secret.is_empty();
     let gitlab_configured = state
         .gitlab
         .as_ref()
         .is_some_and(gitlab::GitlabRegistry::is_configured);
-    if !github_configured && !gitlab_configured {
+    let bitbucket_configured = state
+        .bitbucket
+        .as_ref()
+        .is_some_and(bitbucket::BitbucketRegistry::is_configured);
+    if !github_configured && !gitlab_configured && !bitbucket_configured {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
-            "no webhook platform configured (set GITHUB_WEBHOOK_SECRET or configure gitlab.projects[] in control-plane.json)",
+            "no webhook platform configured (set GITHUB_WEBHOOK_SECRET, or configure gitlab.projects[] \
+             or bitbucket.projects[] in control-plane.json)",
         );
     }
     match &state.jwt {
@@ -606,9 +639,9 @@ fn mint_runner_token_cli() -> anyhow::Result<()> {
 /// as ONE replica so egress isn't double-posted and reactions aren't double-polled.
 ///
 /// Platform dispatch: the reconciler receives a `HashMap<Platform, Arc<dyn CodePlatform>>` mapping
-/// each configured platform to its implementation. Both GitHub (`GithubApp`) and GitLab
-/// (`GitlabClient`) are wired; an outbox row whose `platform` has no registered implementation is
-/// backed off with a clear error rather than crashing the loop.
+/// each configured platform to its implementation. GitHub (`GithubApp`), GitLab (`GitlabClient`),
+/// and Bitbucket (`BitbucketClient`) are all wired; an outbox row whose `platform` has no
+/// registered implementation is backed off with a clear error rather than crashing the loop.
 async fn run_reconciler(state: AppState) -> anyhow::Result<()> {
     let pool = state
         .db
@@ -621,7 +654,7 @@ async fn run_reconciler(state: AppState) -> anyhow::Result<()> {
         anyhow::bail!(
             "reconciler requires at least one platform implementation \
              (set GITHUB_APP_ID + GITHUB_APP_PRIVATE_KEY for GitHub, \
-             or configure gitlab.projects[] in control-plane.json for GitLab)"
+             or configure gitlab.projects[] / bitbucket.projects[] in control-plane.json)"
         );
     }
     spawn_metrics_server(state.metrics.clone());

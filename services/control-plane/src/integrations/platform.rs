@@ -15,13 +15,16 @@ use serde::{Deserialize, Serialize};
 
 /// Which code-hosting platform a repository lives on.
 ///
-/// Stored as a `TEXT` column in the database (values: `"github"`, `"gitlab"`). Existing rows default
-/// to `"github"` via the Phase 1 migration.
+/// Stored as a `TEXT` column in the database (values: `"github"`, `"gitlab"`, `"bitbucket"`).
+/// Existing rows default to `"github"` via the Phase 1 migration. No `CHECK` constraint guards
+/// this column (verified against `services/control-plane/migrations/`), so adding `Bitbucket` here
+/// needs no migration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, sqlx::Type)]
 #[sqlx(type_name = "TEXT", rename_all = "lowercase")]
 pub enum Platform {
     GitHub,
     GitLab,
+    Bitbucket,
 }
 
 impl std::fmt::Display for Platform {
@@ -29,6 +32,7 @@ impl std::fmt::Display for Platform {
         match self {
             Platform::GitHub => write!(f, "github"),
             Platform::GitLab => write!(f, "gitlab"),
+            Platform::Bitbucket => write!(f, "bitbucket"),
         }
     }
 }
@@ -39,6 +43,7 @@ impl std::str::FromStr for Platform {
         match s.to_ascii_lowercase().as_str() {
             "github" => Ok(Platform::GitHub),
             "gitlab" => Ok(Platform::GitLab),
+            "bitbucket" => Ok(Platform::Bitbucket),
             other => Err(format!("unknown platform: {other}")),
         }
     }
@@ -54,9 +59,11 @@ impl Platform {
 
 /// A reference to a repository, platform-agnostic.
 ///
-/// `full_name` is `"owner/repo"` on GitHub or `"namespace/path"` on GitLab — the same `"/"`-split
-/// shape. `installation_id` is the GitHub App installation ID on GitHub, or the GitLab project ID
-/// on GitLab (GitLab has no installation concept; the project ID serves as the scope for API calls).
+/// `full_name` is `"owner/repo"` on GitHub, `"namespace/path"` on GitLab, or `"workspace/repo_slug"`
+/// on Bitbucket — the same `"/"`-split shape. `installation_id` is the GitHub App installation ID on
+/// GitHub, the GitLab project ID on GitLab (GitLab has no installation concept; the project ID
+/// serves as the scope for API calls), or a [`stable_id_from_key`]-derived identity on Bitbucket
+/// (Bitbucket has no native numeric project id like GitLab's `project.id`).
 #[derive(Debug, Clone)]
 pub struct RepoRef {
     pub platform: Platform,
@@ -75,6 +82,19 @@ impl RepoRef {
             None => (&self.full_name, ""),
         }
     }
+}
+
+/// Derive a stable, deterministic `i64` identity from an opaque string key (e.g. a Bitbucket
+/// `"workspace/repo_slug"` pair), for platforms with no native numeric project id like GitLab's
+/// `project.id`. Used as `RepoRef.installation_id` / `tasks.installation_id` for Bitbucket, so this
+/// must stay stable forever once a repo is configured — hence SHA-256 rather than
+/// `std::collections::hash_map::DefaultHasher`, whose algorithm the standard library explicitly does
+/// NOT guarantee to stay the same across Rust versions (a toolchain upgrade could silently reshuffle
+/// every configured Bitbucket repo's identity).
+pub fn stable_id_from_key(key: &str) -> i64 {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(key.as_bytes());
+    i64::from_be_bytes(digest[0..8].try_into().expect("sha256 digest is >= 8 bytes"))
 }
 
 /// A changed file in a PR/MR diff. `patch` is the unified-diff text (absent for binary/huge files).
@@ -266,4 +286,32 @@ pub trait CodePlatform: Send + Sync {
 
     /// Build the clone URL with credentials for the agent-runner.
     fn clone_url(&self, repo: &RepoRef) -> String;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn platform_display_and_parse_roundtrip() {
+        for (platform, text) in [
+            (Platform::GitHub, "github"),
+            (Platform::GitLab, "gitlab"),
+            (Platform::Bitbucket, "bitbucket"),
+        ] {
+            assert_eq!(platform.to_string(), text);
+            assert_eq!(Platform::parse(text), Some(platform));
+            assert_eq!(Platform::parse(&text.to_ascii_uppercase()), Some(platform));
+        }
+        assert_eq!(Platform::parse("unknown"), None);
+    }
+
+    #[test]
+    fn stable_id_from_key_is_deterministic_and_distinguishes_keys() {
+        let a = stable_id_from_key("myteam/my-repo");
+        let b = stable_id_from_key("myteam/my-repo");
+        let c = stable_id_from_key("myteam/other-repo");
+        assert_eq!(a, b, "same key must always derive the same id");
+        assert_ne!(a, c, "different keys must (in practice) derive different ids");
+    }
 }
