@@ -135,24 +135,43 @@ Update the versions in this manifest and the GitHub Actions workflow before depl
 
 ### GitHub Actions
 
-Used in `.github/workflows/quality.yml`:
+Used in `.github/workflows/quality.yml` (all pinned to commit SHAs for reproducibility):
 
-1. **actions/checkout@v4**
-   - SHA: `11bd71901afe44af187055612f316e63f77d3e91`
-   - Release: v4.2.0
-   - Purpose: Check out repository code
+1. **actions/checkout**
+   - **Current Version**: v4.2.0 (SHA: `11bd71901afe44af187055612f316e63f77d3e91`)
+   - **Latest Releases**: https://github.com/actions/checkout/releases
+   - **Purpose**: Check out repository code
+   - **Check for updates**:
+     ```bash
+     curl -s https://api.github.com/repos/actions/checkout/releases/latest | jq -r '.tag_name'
+     ```
 
-2. **actions/upload-artifact@v4**
-   - SHA: `97a0fdd30d330287a78c2239ea01e15720c0e5a3`
-   - Release: v4.7.0
-   - Purpose: Upload quality reports as CI artifacts
+2. **actions/upload-artifact**
+   - **Current Version**: v4.7.0 (SHA: `97a0fdd30d330287a78c2239ea01e15720c0e5a3`)
+   - **Latest Releases**: https://github.com/actions/upload-artifact/releases
+   - **Purpose**: Upload quality reports as CI artifacts
+   - **Check for updates**:
+     ```bash
+     curl -s https://api.github.com/repos/actions/upload-artifact/releases/latest | jq -r '.tag_name'
+     ```
 
-3. **github/codeql-action/upload-sarif@v3** (conditional, only if `vars.ENABLE_CODE_SCANNING == 'true'`)
-   - SHA: `9fa7e86e37b0d1da3b80c8a1b9a2f0ede7e8d9e0`
-   - Release: v3.25.0
-   - Purpose: Upload merged SARIF to GitHub Code Scanning
+3. **github/codeql-action/upload-sarif**
+   - **Current Version**: v3.25.0 (SHA: `9fa7e86e37b0d1da3b80c8a1b9a2f0ede7e8d9e0`)
+   - **Conditional**: Only runs if `vars.ENABLE_CODE_SCANNING == 'true'`
+   - **Latest Releases**: https://github.com/github/codeql-action/releases
+   - **Purpose**: Upload merged SARIF to GitHub Code Scanning
+   - **Check for updates**:
+     ```bash
+     curl -s https://api.github.com/repos/github/codeql-action/releases/latest | jq -r '.tag_name'
+     ```
 
-All actions are pinned to full commit SHAs to ensure reproducibility and offline operation. Checksum verification is not strictly necessary for GitHub-hosted actions, but commit-level pinning prevents supply-chain surprises.
+**Pinning strategy**: All actions are pinned to full commit SHAs (not floating tags like `@v4` or `@latest`) to ensure reproducibility, security, and offline operation. Commit-level pinning prevents unexpected behavior changes from new releases.
+
+**Updating GitHub Actions**:
+1. Check the latest release for each action using the links above
+2. Find the commit SHA for the target version in the release page
+3. Update `.github/workflows/quality.yml` with the new SHA and version comment
+4. Test the workflow on a feature branch before merging
 
 ---
 
