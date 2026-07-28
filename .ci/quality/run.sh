@@ -55,18 +55,29 @@ verify_scanner_availability() {
   fi
 }
 
-# Run a scanner and capture its output. Handles non-zero exits gracefully (findings are not errors).
+# Run a scanner and capture its console output. Handles non-zero exits gracefully (findings are
+# not errors).
+#
+# IMPORTANT: `report_file` must already be the target of the scanner's OWN report-output flag
+# (--output/--report-path/--reporter-file, already wired into each call site below), never a
+# redirect target for this function. Redirecting the command's stdout/stderr to the same path the
+# tool itself writes its report to actively corrupts the report: confirmed by reproducing this for
+# both semgrep (its scan-summary banner gets appended into the same fd as its own --output write)
+# and Biome (same issue, worse interleaving) before switching to a dedicated console log per
+# scanner. Trivy's --quiet happened to make the naive double-redirect look safe in a quick test,
+# but relying on that per-tool/version-specific behavior is exactly the kind of assumption that
+# already broke twice here — every scanner gets its own separate console log unconditionally.
 run_scanner() {
   local scanner_name=$1
   local report_file=$2
   local report_kind=$3  # sarif | json | txt | etc.
   shift 3
   local cmd=("$@")
+  local console_log="${REPORTS_DIR}/${scanner_name}-console.log"
 
   log_scanner_start "$scanner_name"
 
-  # Redirect output to the report file, allowing non-zero exits (findings = exit code 1).
-  if "${cmd[@]}" > "${REPORTS_DIR}/${report_file}" 2>&1; then
+  if "${cmd[@]}" > "${console_log}" 2>&1; then
     # Exit code 0: no findings or scanner succeeded with no issues.
     SCANNER_RESULTS["${scanner_name}"]="0|${report_file}|${report_kind}"
     log_scanner_end "$scanner_name" "$report_file"
@@ -81,11 +92,12 @@ run_scanner() {
       return 0
     else
       log_error "$scanner_name exited with code $exit_code (likely configuration or environment error)."
-      # Surface the captured output directly in the CI log — it's otherwise only visible via the
-      # uploaded report artifact, which may itself be unavailable (e.g. storage-quota failures).
-      log_error "--- ${scanner_name} output (${REPORTS_DIR}/${report_file}) ---"
-      tail -n 50 "${REPORTS_DIR}/${report_file}" >&2 || true
-      log_error "--- end ${scanner_name} output ---"
+      # Surface the captured console output directly in the CI log — it's otherwise only visible
+      # via the uploaded report artifact, which may itself be unavailable (e.g. storage-quota
+      # failures, as happened on this exact pipeline).
+      log_error "--- ${scanner_name} console output (${console_log}) ---"
+      tail -n 50 "${console_log}" >&2 || true
+      log_error "--- end ${scanner_name} console output ---"
       SCANNER_RESULTS["${scanner_name}"]="${exit_code}|${report_file}|${report_kind}"
       return 1
     fi
