@@ -1,0 +1,12 @@
+{
+  "suppressions": [
+    {
+      "ruleId": "example-rule-to-suppress",
+      "path": "path/to/file.ts",
+      "reason": "Example suppression. Replace with real findings. Reason must explain why this is not actionable.",
+      "expiresAt": "2026-10-31T23:59:59Z",
+      "approved_by": "maintainer@example.com",
+      "ticket": "#EXAMPLE"
+    }
+  ]
+}

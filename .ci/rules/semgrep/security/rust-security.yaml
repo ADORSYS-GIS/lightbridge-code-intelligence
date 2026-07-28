@@ -1,0 +1,39 @@
+rules:
+  - id: rust-unsafe-block-undocumented
+    pattern: |
+      unsafe { ... }
+    message: "unsafe block detected without documentation. Document SAFETY properties: why it's safe and what invariants must hold."
+    languages: [rust]
+    severity: WARNING
+    metadata:
+      cwe: "CWE-698: Execution with Unnecessary Privileges"
+      category: "security"
+      references:
+        - "https://doc.rust-lang.org/nomicon/safe-unsafe-choosing.html"
+
+  - id: rust-unwrap-unchecked
+    pattern-either:
+      - pattern: |
+          $X.unwrap()
+      - pattern: |
+          $X.expect(...)
+    message: "unwrap() or expect() can panic. Use Result::ok(), Result::and_then, or if let for error handling."
+    languages: [rust]
+    severity: WARNING
+    metadata:
+      cwe: "CWE-248: Uncaught Exception"
+      category: "reliability"
+      references:
+        - "https://doc.rust-lang.org/std/result/"
+
+  - id: rust-no-panic
+    pattern-either:
+      - pattern: panic!(...)
+      - pattern: |
+          panic_any(...)
+    message: "panic!() terminates the program. Use Result/Option for recoverable errors; log and shutdown gracefully for fatal errors."
+    languages: [rust]
+    severity: ERROR
+    metadata:
+      cwe: "CWE-248: Uncaught Exception"
+      category: "reliability"

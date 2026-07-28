@@ -1,0 +1,128 @@
+name: Quality
+
+# Trigger on PRs, pushes to main, scheduled scans, and manual dispatch.
+# Note: All external actions are pinned to commit SHAs (not floating tags).
+# Before updating versions, check: https://github.com/{owner}/{repo}/releases
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  push:
+    branches: [main]
+  schedule:
+    # Full scan weekly (Monday 02:00 UTC)
+    - cron: "0 2 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  checks: write
+  pull-requests: write
+
+concurrency:
+  group: quality-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    runs-on: [self-hosted, vymalo-vps]
+    timeout-minutes: 30
+    steps:
+      # Fetch repository code with full history (depth: 0) for accurate PR diffs in reviewdog.
+      # Pinned to v4.4.0 (commit SHA: 11d5960a326750d5838078e36cf38b85af677262)
+      # Check for updates: https://github.com/actions/checkout/releases
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+
+      # Install the trivy BINARY via a pinned, cached action rather than a raw `curl` step.
+      # NOTE: this only provisions the trivy executable — it does NOT fetch trivy's vulnerability
+      # database. The database (~600MB+) must still be pre-cached on the runner at
+      # $HOME/.cache/trivy/db/ per .ci/baselines/runner-manifest.md; run.sh passes
+      # --skip-db-update and will fail loudly if that cache is missing. `cache: true` + a pinned
+      # version means this step is a cache hit (no network) on every run after the first.
+      # Pinned to v0.3.1 (commit SHA: 81e514348e19b6112ce2a7e3ecbafe19c1e1f567)
+      # Check for updates: https://github.com/aquasecurity/setup-trivy/releases
+      - uses: aquasecurity/setup-trivy@81e514348e19b6112ce2a7e3ecbafe19c1e1f567
+        with:
+          version: v0.72.0
+          cache: true
+
+      # Install gitleaks: no trustworthy binary-only installer action exists for it (unlike
+      # trivy), and the official gitleaks/gitleaks-action requires a paid license for
+      # organization-owned repos (this one) and dictates its own scan invocation — see
+      # .ci/quality/install-gitleaks.sh for the full rationale. Cache the extracted binary keyed
+      # on the pinned version so this is a cache hit (no network) on every run after the first.
+      - name: Cache gitleaks binary
+        id: gitleaks-cache
+        uses: actions/cache@9255dc7a253b0ccc959486e2bca901246202afeb # v5.0.1
+        with:
+          path: ${{ runner.tool_cache }}/gitleaks-bin
+          key: gitleaks-bin-8.30.1-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Install gitleaks (checksum-verified)
+        if: steps.gitleaks-cache.outputs.cache-hit != 'true'
+        run: bash .ci/quality/install-gitleaks.sh "${{ runner.tool_cache }}/gitleaks-bin"
+
+      - name: Add gitleaks to PATH
+        run: echo "${{ runner.tool_cache }}/gitleaks-bin" >> "$GITHUB_PATH"
+
+      # Run all quality scanners (SAST, secrets, dependency, infra, linting).
+      - name: Run quality scanners
+        env:
+          CI: "true"
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+          GITHUB_BASE_REF: ${{ github.base_ref }}
+        run: |
+          bash .ci/quality/run.sh
+
+      # Upload individual reports and merged SARIF as artifacts for debugging/auditing.
+      # continue-on-error: artifact storage is best-effort ("where the repo's GitHub setup
+      # permits it") — an org-level storage-quota failure (confirmed real: "Artifact storage
+      # quota has been hit") is an operational/billing concern, not a code-quality signal, and
+      # must not block the PR gate below it.
+      # Pinned to v4.6.2 (commit SHA: ea165f8d65b6e75b540449e92b4886f43607fa02)
+      # Check for updates: https://github.com/actions/upload-artifact/releases
+      - name: Upload reports
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: quality-reports
+          path: .ci/quality/reports/
+          retention-days: 30
+
+      # Report merged findings to GitHub PR via reviewdog (PR context only).
+      - name: Report findings to PR (reviewdog)
+        if: |
+          always() &&
+          github.event_name == 'pull_request' &&
+          hashFiles('.ci/quality/reports/quality.sarif') != ''
+        env:
+          # reviewdog's github-pr-check reporter specifically requires REVIEWDOG_GITHUB_API_TOKEN,
+          # not GITHUB_TOKEN — confirmed by the real error: "environment variable
+          # $REVIEWDOG_GITHUB_API_TOKEN is not set" (GITHUB_TOKEN alone was silently ignored).
+          REVIEWDOG_GITHUB_API_TOKEN: ${{ github.token }}
+        run: |
+          reviewdog \
+            -f sarif \
+            -reporter github-pr-check \
+            -filter-mode added \
+            -fail-on-error \
+            -name "Quality Gate" \
+            < .ci/quality/reports/quality.sarif
+
+      # Optional: Upload merged SARIF to GitHub Code Scanning (if enabled per configuration).
+      # GitHub Code Scanning provides a centralized UI for tracking findings across the repository.
+      # This is disabled by default and requires explicit enablement via repository variable.
+      # Pinned to v4.37.3 (commit SHA: e4fba868fa4b1b91e1fdab776edc8cfbe6e9fb81)
+      # Check for updates: https://github.com/github/codeql-action/releases
+      - name: Upload to GitHub Code Scanning
+        if: |
+          always() &&
+          github.ref == 'refs/heads/main' &&
+          vars.ENABLE_CODE_SCANNING == 'true' &&
+          hashFiles('.ci/quality/reports/quality.sarif') != ''
+        uses: github/codeql-action/upload-sarif@e4fba868fa4b1b91e1fdab776edc8cfbe6e9fb81
+        with:
+          sarif_file: .ci/quality/reports/quality.sarif
+          category: "quality-pipeline"
