@@ -385,6 +385,52 @@ impl GithubApp {
             .context("repository response missing default_branch")
     }
 
+    /// Fetch a single file's raw text content at `ref_` via the Contents API, or `None` when it
+    /// doesn't exist there (404) — used to resolve `.lightbridge-code-review.jsonc` (ADR-0030) before
+    /// any clone exists. GitHub base64-encodes the content with embedded newlines (RFC 2045 style); we
+    /// strip them before decoding.
+    pub async fn repository_file_content(
+        &self,
+        token: &str,
+        owner: &str,
+        repo: &str,
+        ref_: &str,
+        path: &str,
+    ) -> anyhow::Result<Option<String>> {
+        use anyhow::Context;
+        use base64::Engine;
+        let response = self
+            .http
+            .get(format!(
+                "https://api.github.com/repos/{owner}/{repo}/contents/{path}?ref={ref_}"
+            ))
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Accept", "application/vnd.github+json")
+            .header("User-Agent", "lightbridge-code-intelligence")
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .send()
+            .await
+            .context("fetching repository file content")?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let value: serde_json::Value = response
+            .error_for_status()
+            .context("github rejected the file-content request")?
+            .json()
+            .await
+            .context("parsing file-content response")?;
+        let Some(encoded) = value["content"].as_str() else {
+            // A directory (not a file) response has no `content` — treat as absent.
+            return Ok(None);
+        };
+        let stripped: String = encoded.chars().filter(|c| !c.is_whitespace()).collect();
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(stripped)
+            .context("decoding base64 file content")?;
+        Ok(Some(String::from_utf8_lossy(&decoded).into_owned()))
+    }
+
     /// Fetch a PR's base + head SHAs. Used by the `@mention` re-review path, where the
     /// `issue_comment` payload has no SHAs (unlike the `pull_request` event).
     pub async fn pull_request_shas(
@@ -660,6 +706,18 @@ impl CodePlatform for GithubApp {
         let (owner, name) = repo.owner_repo();
         let token = self.token_for(repo).await?;
         self.pull_request_shas(&token, owner, name, pr_number).await
+    }
+
+    async fn get_repo_file(
+        &self,
+        repo: &RepoRef,
+        ref_: &str,
+        path: &str,
+    ) -> anyhow::Result<Option<String>> {
+        let (owner, name) = repo.owner_repo();
+        let token = self.token_for(repo).await?;
+        self.repository_file_content(&token, owner, name, ref_, path)
+            .await
     }
 
     async fn post_review(

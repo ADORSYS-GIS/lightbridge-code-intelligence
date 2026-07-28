@@ -315,6 +315,15 @@ impl CodePlatform for BitbucketPlatformRouter {
         self.client(repo)?.pr_shas(repo, pr_number).await
     }
 
+    async fn get_repo_file(
+        &self,
+        repo: &RepoRef,
+        ref_: &str,
+        path: &str,
+    ) -> anyhow::Result<Option<String>> {
+        self.client(repo)?.get_repo_file(repo, ref_, path).await
+    }
+
     async fn post_review(
         &self,
         repo: &RepoRef,
@@ -505,6 +514,26 @@ impl CodePlatform for BitbucketClient {
             .and_then(|n| n.as_str())
             .map(|s| s.to_string())
             .ok_or_else(|| anyhow::anyhow!("Bitbucket repository: missing 'mainbranch.name'"))
+    }
+
+    async fn get_repo_file(
+        &self,
+        _repo: &RepoRef,
+        ref_: &str,
+        path: &str,
+    ) -> anyhow::Result<Option<String>> {
+        let url = self.url(&format!("{}/src/{ref_}/{path}", self.repo_base()));
+        let response = self
+            .http
+            .get(&url)
+            .basic_auth(&self.email, Some(&self.api_token))
+            .send()
+            .await?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let text = response.error_for_status()?.text().await?;
+        Ok(Some(text))
     }
 
     async fn pr_shas(

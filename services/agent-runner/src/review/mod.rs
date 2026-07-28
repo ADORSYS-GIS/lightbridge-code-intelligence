@@ -23,6 +23,7 @@
 
 pub mod instructions;
 pub mod opencode;
+pub mod repo_config;
 
 mod model_client;
 mod telemetry;
@@ -176,6 +177,9 @@ pub async fn run_native_agent(
         repo_instructions,
         prior_reviews,
         repo_memory,
+        // Retired/legacy path (`run_native_agent`, removed in a follow-up) — not worth wiring the new
+        // ADR-0030 repo-config context block through code on its way out.
+        None,
     );
     let initial_names: Vec<String> = offered
         .iter()
@@ -223,6 +227,9 @@ pub async fn run_native_agent(
         dispatch_discovered,
         runtime_caps,
         sast_tool_config,
+        // Retired/legacy path (`run_native_agent`, removed in a follow-up) — not worth wiring the new
+        // ADR-0030 severity filter through code on its way out.
+        None,
     )
     .context("assembling review tool registry")?;
 

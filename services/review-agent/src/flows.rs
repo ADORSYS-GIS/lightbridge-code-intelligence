@@ -239,6 +239,7 @@ mod tests {
             [],
             RuntimeCaps::default(),
             None,
+            None,
         )
         .unwrap();
         let workspace = eager_workspace(checkout.path().to_path_buf());
@@ -356,6 +357,7 @@ mod tests {
             Arc::new(embedder),
             [],
             RuntimeCaps::default(),
+            None,
             None,
         )
         .unwrap();

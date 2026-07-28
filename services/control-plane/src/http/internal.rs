@@ -134,10 +134,11 @@ pub struct TaskContextResponse {
     /// Run kind (ADR-0033): `review` (diff-scoped findings, the default) or `ask` (a conversational
     /// answer posted as a single reply comment). The runner branches on this.
     pub kind: String,
-    /// Review tier (ADR-0062): `fast` (automatic `pull_request opened` — SAST + one diff-only LLM turn,
-    /// no retrieval) or `deep` (`@mention` — full retrieval, multi-turn). The runner shapes its loop on
-    /// this. Defaults to `deep` (the full/safe behavior) for any task that didn't set it.
-    pub tier: String,
+    /// Resolved review preset (ADR-0103) — the runner resolves its `ReviewConfig` by this name.
+    pub preset: String,
+    /// Which entry point created this task (`"pr_open"`/`"mention"`/`"a2a"`, ADR-0103) — used for
+    /// framing decisions that must not key off the (operator-defined) preset name.
+    pub entry_point: String,
     pub base_sha: Option<String>,
     pub head_sha: Option<String>,
     /// Whether the repo has a reusable semantic index — i.e. a latest indexed snapshot exists
@@ -175,7 +176,8 @@ impl std::fmt::Debug for TaskContextResponse {
             .field("target_id", &self.target_id)
             .field("command", &self.command)
             .field("kind", &self.kind)
-            .field("tier", &self.tier)
+            .field("preset", &self.preset)
+            .field("entry_point", &self.entry_point)
             .field("base_sha", &self.base_sha)
             .field("head_sha", &self.head_sha)
             .field("repo_indexed", &self.repo_indexed)
@@ -346,7 +348,8 @@ pub async fn get_context(
         target_id: context.target_id,
         command: context.command_text,
         kind: context.kind,
-        tier: context.tier,
+        preset: context.preset,
+        entry_point: context.entry_point,
         base_sha: context.base_sha,
         head_sha: context.head_sha,
         repo_indexed,
@@ -1582,19 +1585,21 @@ pub async fn finalize_review(
         let findings_json = serde_json::to_value(&findings).unwrap_or_default();
 
         let validated = crate::review::validate(findings, &commentable);
-        // FAST tier (ADR-0062): mark the body as a quick pass — a blockquote banner that names what the
-        // pass is and points to the deep review via the App's REAL handle (`state.app_handle`, which only
-        // exists control-plane-side; the runner hardcoded the wrong `@lightbridge`). The stored `summary`
-        // (re-injected as prior-review context on a later run) stays the verdict/default; only the posted
-        // body differs. DEEP keeps the full authoritative review body.
-        // On an all-deduped run the FAST banner must not stand alone — the truthful "no NEW findings"
-        // note is the whole point of the post, so it rides as the fast body's verdict too.
+        // Automatic on-open pass (ADR-0103 — was "FAST tier", ADR-0062): mark the body as a quick pass —
+        // a blockquote banner that names what the pass is and points to a full review via the App's REAL
+        // handle (`state.app_handle`, which only exists control-plane-side; the runner hardcoded the
+        // wrong `@lightbridge`). The stored `summary` (re-injected as prior-review context on a later
+        // run) stays the verdict/default; only the posted body differs. Any other entry point keeps the
+        // full authoritative review body. Keyed on `entry_point`, NOT `preset` — a preset name is
+        // operator-defined (ADR-0103) and can't be relied on to signal "this was the automatic pass".
+        // On an all-deduped run the banner must not stand alone — the truthful "no NEW findings" note is
+        // the whole point of the post, so it rides as the banner body's verdict too.
         let fast_summary = if all_deduped {
             Some(summary.as_str())
         } else {
             real_summary
         };
-        let body = if context.tier == "fast" {
+        let body = if context.entry_point == "pr_open" {
             // Platform-aware bot handle (Phase 6): GitLab reviews must name the GitLab bot, not the
             // GitHub App handle, so the "request a deep review" @mention resolves on the right platform.
             let handle = match context.platform {

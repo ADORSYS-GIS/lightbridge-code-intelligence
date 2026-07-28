@@ -8,6 +8,8 @@ use std::process::Output;
 
 use lci_agent_clients::TaskContext;
 
+use crate::review::repo_config::DiffFilter;
+
 /// Clone the task's repo at the relevant commit into `{workdir}/repo` and return that path.
 ///
 /// We `init` + `fetch --depth 1 <ref>` rather than a full clone: a PR review only needs the head
@@ -71,7 +73,15 @@ pub struct PrDiff {
 /// Best-effort: returns `None` when we lack both SHAs, they're equal, the commits aren't present (their
 /// fetch is itself best-effort in [`checkout`]), or git produces an empty diff — in every such case the
 /// caller falls back to an unscoped review rather than failing the task.
-pub async fn pr_diff(checkout: &Path, ctx: &TaskContext) -> Option<PrDiff> {
+///
+/// `filter`, when `Some` (the repo declared `focus`/`ignore` globs, ADR-0030), drops non-matching
+/// changed files from both the file list and the diff text itself — never a security control (findings
+/// are still diff-validated at write-back, ADR-0022), just review-quality noise reduction.
+pub async fn pr_diff(
+    checkout: &Path,
+    ctx: &TaskContext,
+    filter: Option<&DiffFilter>,
+) -> Option<PrDiff> {
     let base = ctx.base_sha.as_deref()?;
     let head = ctx.head_sha.as_deref()?;
     if base == head {
@@ -97,14 +107,66 @@ pub async fn pr_diff(checkout: &Path, ctx: &TaskContext) -> Option<PrDiff> {
     let names = git(checkout, &["diff", "--name-only", "-z", &range], &ctx.token)
         .await
         .ok()?;
-    let files = String::from_utf8_lossy(&names.stdout)
+    let files: Vec<String> = String::from_utf8_lossy(&names.stdout)
         .split('\0')
         .map(str::trim)
         .filter(|l| !l.is_empty())
         .map(str::to_string)
         .collect();
 
+    let (diff, files) = match filter {
+        Some(filter) => filter_diff(&diff, files, filter),
+        None => (diff, files),
+    };
+    if diff.is_empty() {
+        return None;
+    }
+
     Some(PrDiff { diff, files })
+}
+
+/// Drop every per-file section of `diff` (and the matching entry in `files`) that [`DiffFilter::keep`]
+/// rejects. `diff` is a `git diff` unified-diff concatenation of one `diff --git a/<old> b/<new>` section
+/// per changed file; splitting on that exact marker (git's own section delimiter — never appears inside
+/// a hunk body) can't accidentally cut mid-hunk.
+fn filter_diff(diff: &str, files: Vec<String>, filter: &DiffFilter) -> (String, Vec<String>) {
+    const SECTION_MARKER: &str = "diff --git ";
+    let kept_files: Vec<String> = files.into_iter().filter(|f| filter.keep(f)).collect();
+
+    // Re-attach the marker to each section (split drops the delimiter); the first "section" before the
+    // first marker is empty for a well-formed `git diff` output.
+    let mut kept_sections: Vec<&str> = Vec::new();
+    let mut first = true;
+    for chunk in diff.split(SECTION_MARKER) {
+        if first {
+            first = false;
+            if chunk.is_empty() {
+                continue;
+            }
+            // Malformed/unexpected leading content (shouldn't happen for real `git diff` output) —
+            // keep it verbatim rather than silently dropping bytes we don't understand.
+            kept_sections.push(chunk);
+            continue;
+        }
+        // The section's path is the `b/<path>` side of `a/<old> b/<new>` (renames use the new path).
+        let path = chunk
+            .lines()
+            .next()
+            .and_then(|header| header.rsplit_once(" b/"))
+            .map(|(_, new_path)| new_path.trim());
+        let keep = path.is_none_or(|p| filter.keep(p));
+        if keep {
+            kept_sections.push(chunk);
+        }
+    }
+    let mut rebuilt = String::new();
+    for (i, section) in kept_sections.iter().enumerate() {
+        if i > 0 || diff.starts_with(SECTION_MARKER) {
+            rebuilt.push_str(SECTION_MARKER);
+        }
+        rebuilt.push_str(section);
+    }
+    (rebuilt.trim().to_string(), kept_files)
 }
 
 /// The commit to diff `head` against: the merge-base of `base` and `head` when we can find it, else
@@ -197,6 +259,59 @@ fn redact(args: &[&str], token: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::review::repo_config::DiffFilter;
+
+    fn section(path: &str, body: &str) -> String {
+        format!("diff --git a/{path} b/{path}\n{body}")
+    }
+
+    // ADR-0030 focus/ignore: an ignored file's WHOLE section is dropped from the diff text, not just
+    // its name — a naive files-list-only filter would still leak its content into the prompt.
+    #[test]
+    fn filter_diff_drops_the_whole_section_of_an_ignored_file() {
+        let diff = format!(
+            "{}{}",
+            section("src/a.rs", "@@ -1,1 +1,1 @@\n-old\n+new\n"),
+            section("vendor/lib.rs", "@@ -1,1 +1,1 @@\n-old\n+new\n"),
+        );
+        let filter = DiffFilter::build_for_test(&[], &["vendor/**".to_string()]);
+        let (filtered_diff, files) = filter_diff(
+            &diff,
+            vec!["src/a.rs".to_string(), "vendor/lib.rs".to_string()],
+            &filter,
+        );
+        assert_eq!(files, vec!["src/a.rs".to_string()]);
+        assert!(filtered_diff.contains("src/a.rs"));
+        assert!(
+            !filtered_diff.contains("vendor/lib.rs"),
+            "the ignored file's section must not survive: {filtered_diff}"
+        );
+    }
+
+    // `focus` always wins over `ignore` for the same path.
+    #[test]
+    fn filter_diff_focus_wins_over_a_matching_ignore_glob() {
+        let diff = section("vendor/important.rs", "@@ -1,1 +1,1 @@\n-old\n+new\n");
+        let filter =
+            DiffFilter::build_for_test(&["vendor/important.rs".to_string()], &["vendor/**".to_string()]);
+        let (filtered_diff, files) =
+            filter_diff(&diff, vec!["vendor/important.rs".to_string()], &filter);
+        assert_eq!(files, vec!["vendor/important.rs".to_string()]);
+        assert!(filtered_diff.contains("vendor/important.rs"));
+    }
+
+    // A rename's diff header carries two paths (`a/<old> b/<new>`) — the filter must key off the NEW
+    // (`b/`) path, matching `git diff --name-only`'s own reporting for renames.
+    #[test]
+    fn filter_diff_keys_a_rename_by_its_new_path() {
+        let diff = "diff --git a/old_name.rs b/vendor/new_name.rs\nsimilarity index 100%\n\
+             rename from old_name.rs\nrename to vendor/new_name.rs\n"
+            .to_string();
+        let filter = DiffFilter::build_for_test(&[], &["vendor/**".to_string()]);
+        let (filtered_diff, files) = filter_diff(&diff, vec!["vendor/new_name.rs".to_string()], &filter);
+        assert!(files.is_empty());
+        assert!(filtered_diff.is_empty());
+    }
 
     #[test]
     fn scrub_removes_the_token() {

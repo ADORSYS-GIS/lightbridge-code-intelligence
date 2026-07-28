@@ -11,6 +11,17 @@ use super::{ReviewServices, parse};
 pub const ADD_REVIEW_COMMENT: &str = "add_review_comment";
 pub const RETRACT_FINDING: &str = "retract_finding";
 
+/// Rank a `P0`/`P1`/`P2` priority string, most → least severe (`P0` = 0). An unrecognized value ranks
+/// below `P2` — permissive on a malformed value rather than filtering it out by mistake.
+fn priority_rank(priority: &str) -> u8 {
+    match priority {
+        "P0" => 0,
+        "P1" => 1,
+        "P2" => 2,
+        _ => 3,
+    }
+}
+
 #[derive(Deserialize)]
 struct AddArgs {
     file: String,
@@ -111,6 +122,17 @@ impl Tool for AddTool {
                     ));
                 }
             };
+            // Repo `severity.min` (ADR-0030): a finding below the repo's configured floor is never
+            // sent to the control plane at all — the model still gets an acknowledgement (so it doesn't
+            // retry the call), just not one that claims the finding was recorded.
+            if let Some(min) = self.services.min_priority.as_deref()
+                && priority_rank(&args.priority) > priority_rank(min)
+            {
+                return ToolOutcome::Continue(format!(
+                    "not recorded: {} is below this repo's configured minimum severity ({min}) — {}:{}",
+                    args.priority, args.file, args.line
+                ));
+            }
             let body = match args
                 .evidence
                 .as_deref()
@@ -185,5 +207,116 @@ impl Tool for RetractTool {
                 )),
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use lci_agent_clients::{ControlPlaneClient, EmbeddingsClient};
+    use lci_agent_types::FunctionCallReq;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use super::*;
+    use crate::tools::EagerWorkspace;
+
+    fn call(priority: &str) -> ToolCallReq {
+        ToolCallReq {
+            id: "c1".into(),
+            kind: "function".into(),
+            function: FunctionCallReq {
+                name: ADD_REVIEW_COMMENT.into(),
+                arguments: serde_json::json!({
+                    "file": "a.rs", "line": 2, "title": "t", "priority": priority,
+                    "category": "quality", "body": "b", "evidence": "line 2",
+                })
+                .to_string(),
+            },
+            extra_content: None,
+        }
+    }
+
+    async fn tool(cp: &MockServer, min_priority: Option<&str>) -> AddTool {
+        AddTool {
+            spec: specs()[0].clone(),
+            services: ReviewServices {
+                client: Arc::new(ControlPlaneClient::new(cp.uri(), "tok")),
+                embedder: Arc::new(EmbeddingsClient::new("http://unused", "key", "model")),
+                min_priority: min_priority.map(str::to_string),
+            },
+        }
+    }
+
+    // ADR-0030: a repo's `severity.min` is genuinely enforced — a below-threshold finding is never
+    // POSTed to the control plane at all (not just labelled/downgraded).
+    #[tokio::test]
+    async fn a_finding_below_the_repo_minimum_is_never_sent_to_the_control_plane() {
+        let cp = MockServer::start().await;
+        // No mock mounted for /review/inline — if the tool posts anyway, wiremock 404s (proving a bug).
+        let workspace = EagerWorkspace::new(std::path::PathBuf::from("/tmp"));
+        let cx = ToolCx {
+            task_id: uuid::Uuid::nil(),
+            workspace: &workspace,
+        };
+        let add = tool(&cp, Some("P1")).await;
+        let outcome = add.call(&cx, &call("P2")).await;
+        let ToolOutcome::Continue(msg) = outcome else {
+            panic!("expected Continue");
+        };
+        assert!(
+            msg.contains("not recorded") && msg.contains("P2") && msg.contains("P1"),
+            "acknowledges the filter without claiming it was recorded: {msg}"
+        );
+    }
+
+    // The same finding, with no repo minimum configured, IS sent — proving the filter (not something
+    // else) is what suppressed it above.
+    #[tokio::test]
+    async fn with_no_minimum_configured_every_priority_is_sent() {
+        let cp = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(format!(
+                "/internal/tasks/{}/review/inline",
+                uuid::Uuid::nil()
+            )))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&cp)
+            .await;
+        let workspace = EagerWorkspace::new(std::path::PathBuf::from("/tmp"));
+        let cx = ToolCx {
+            task_id: uuid::Uuid::nil(),
+            workspace: &workspace,
+        };
+        let add = tool(&cp, None).await;
+        let outcome = add.call(&cx, &call("P2")).await;
+        assert_eq!(
+            outcome,
+            ToolOutcome::Continue("recorded finding at a.rs:2".to_string())
+        );
+    }
+
+    // A finding AT or ABOVE the minimum still records normally.
+    #[tokio::test]
+    async fn a_finding_at_the_repo_minimum_is_still_recorded() {
+        let cp = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(format!(
+                "/internal/tasks/{}/review/inline",
+                uuid::Uuid::nil()
+            )))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&cp)
+            .await;
+        let workspace = EagerWorkspace::new(std::path::PathBuf::from("/tmp"));
+        let cx = ToolCx {
+            task_id: uuid::Uuid::nil(),
+            workspace: &workspace,
+        };
+        let add = tool(&cp, Some("P1")).await;
+        let outcome = add.call(&cx, &call("P1")).await;
+        assert_eq!(
+            outcome,
+            ToolOutcome::Continue("recorded finding at a.rs:2".to_string())
+        );
     }
 }
