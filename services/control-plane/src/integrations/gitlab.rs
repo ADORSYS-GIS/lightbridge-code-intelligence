@@ -159,6 +159,8 @@ struct DiffRefs {
 #[derive(Clone)]
 pub struct GitlabProject {
     pub project_id: i64,
+    /// The value used as the `{installation_id}` path segment in the webhook URL.
+    pub installation_id: i64,
     pub bot_handle: String,
     pub web_base_url: String,
     pub client: GitlabClient,
@@ -170,6 +172,8 @@ pub struct GitlabRegistry {
     by_project_id: std::collections::HashMap<i64, GitlabProject>,
     /// Default web (non-API) base URL for projects that omit `api_url`.
     default_web_base_url: String,
+    /// Secondary index: `installation_id` → `project_id`, for fast webhook path-segment lookup.
+    by_installation_id: std::collections::HashMap<i64, i64>,
 }
 
 impl GitlabRegistry {
@@ -180,19 +184,23 @@ impl GitlabRegistry {
         }
 
         let mut by_project_id = std::collections::HashMap::new();
+        let mut by_installation_id = std::collections::HashMap::new();
         for project in &section.projects {
             let api_url = section.resolved_api_url(project).to_string();
             let bot_handle = section.resolved_bot_handle(project).to_string();
             let web_base_url = web_base_url_from_api_url(&api_url);
+            let installation_id = project.effective_installation_id();
             let client = GitlabClient::new(
                 api_url,
                 project.access_token.clone(),
                 project.webhook_secret.clone(),
             )?;
+            by_installation_id.insert(installation_id, project.project_id);
             by_project_id.insert(
                 project.project_id,
                 GitlabProject {
                     project_id: project.project_id,
+                    installation_id,
                     bot_handle,
                     web_base_url,
                     client,
@@ -207,6 +215,7 @@ impl GitlabRegistry {
         Ok(Some(Self {
             by_project_id,
             default_web_base_url: web_base_url_from_api_url(section.default_api_url()),
+            by_installation_id,
         }))
     }
 
@@ -231,6 +240,12 @@ impl GitlabRegistry {
             .iter()
             .map(|(project_id, project)| (project_id.to_string(), project.web_base_url.clone()))
             .collect()
+    }
+
+    /// Look up a project by the `installation_id` value carried in the webhook URL path.
+    pub fn get_by_installation_id(&self, installation_id: i64) -> Option<&GitlabProject> {
+        let project_id = self.by_installation_id.get(&installation_id)?;
+        self.by_project_id.get(project_id)
     }
 
     pub fn client_for_project(&self, project_id: i64) -> Option<&GitlabClient> {
@@ -846,6 +861,7 @@ mod tests {
     fn project(project_id: i64, token: &str, secret: &str) -> GitlabProjectConfig {
         GitlabProjectConfig {
             project_id,
+            installation_id: None,
             api_url: None,
             access_token: token.to_string(),
             webhook_secret: secret.to_string(),

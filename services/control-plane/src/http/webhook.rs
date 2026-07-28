@@ -142,6 +142,10 @@ async fn gitlab_webhook_body(
             Err(GitlabPayloadError::InvalidJson) => {
                 return (StatusCode::BAD_REQUEST, "invalid json payload").into_response();
             }
+            Err(GitlabPayloadError::UnknownInstallationId) => {
+                tracing::warn!(installation_id, "gitlab webhook: unknown installation_id");
+                return (StatusCode::NOT_FOUND, "unknown installation").into_response();
+            }
             Err(GitlabPayloadError::InvalidSignature) => {
                 crate::http::metrics::webhook_signature_failure("gitlab");
                 tracing::warn!(
@@ -310,6 +314,8 @@ async fn record_or_dedup(
 
 enum GitlabPayloadError {
     InvalidJson,
+    /// The `installation_id` path segment does not match any configured project.
+    UnknownInstallationId,
     InvalidSignature,
 }
 
@@ -328,38 +334,57 @@ fn verified_gitlab_payload_for_installation(
         }
     };
 
-    if !verify_gitlab_project_webhook_with_registry(
+    match verify_gitlab_project_webhook_with_registry(
         state.gitlab.as_ref(),
         headers,
         body,
         installation_id,
     ) {
-        return Err(GitlabPayloadError::InvalidSignature);
+        GitlabVerifyResult::Ok => {}
+        GitlabVerifyResult::UnknownInstallationId => {
+            return Err(GitlabPayloadError::UnknownInstallationId);
+        }
+        GitlabVerifyResult::InvalidSignature => {
+            return Err(GitlabPayloadError::InvalidSignature);
+        }
     }
 
     Ok(payload)
 }
 
-/// Verify a GitLab webhook's `X-Gitlab-Token` against the per-project secret in the registry.
+enum GitlabVerifyResult {
+    Ok,
+    UnknownInstallationId,
+    InvalidSignature,
+}
+
+/// Verify a GitLab webhook's `X-Gitlab-Token` against the per-project secret in the registry,
+/// keyed by the `installation_id` from the URL path segment.
 fn verify_gitlab_project_webhook_with_registry(
     registry: Option<&crate::integrations::gitlab::GitlabRegistry>,
     headers: &HeaderMap,
     body: &[u8],
-    project_id: i64,
-) -> bool {
+    installation_id: i64,
+) -> GitlabVerifyResult {
     let Some(registry) = registry else {
         tracing::warn!(
-            project_id,
+            installation_id,
             "GitLab webhook received but GitLab is not configured"
         );
-        return false;
+        return GitlabVerifyResult::UnknownInstallationId;
     };
-    let Some(project) = registry.get(project_id) else {
-        tracing::warn!(project_id, "GitLab webhook for unconfigured project");
-        return false;
+    let Some(project) = registry.get_by_installation_id(installation_id) else {
+        tracing::warn!(
+            installation_id,
+            "GitLab webhook for unconfigured installation_id"
+        );
+        return GitlabVerifyResult::UnknownInstallationId;
     };
-
-    project.client.verify_webhook(headers, body)
+    if project.client.verify_webhook(headers, body) {
+        GitlabVerifyResult::Ok
+    } else {
+        GitlabVerifyResult::InvalidSignature
+    }
 }
 
 enum BitbucketPayloadError {
@@ -2219,6 +2244,7 @@ mod tests {
             projects: vec![
                 crate::config::GitlabProjectConfig {
                     project_id: 1001,
+                    installation_id: None, // defaults to project_id (1001)
                     api_url: None,
                     access_token: "token-a".to_string(),
                     webhook_secret: "secret-a".to_string(),
@@ -2226,6 +2252,7 @@ mod tests {
                 },
                 crate::config::GitlabProjectConfig {
                     project_id: 1002,
+                    installation_id: Some(9000), // explicit custom installation_id
                     api_url: None,
                     access_token: "token-b".to_string(),
                     webhook_secret: "secret-b".to_string(),
@@ -2243,12 +2270,9 @@ mod tests {
         let registry = gitlab_registry();
         let mut headers = HeaderMap::new();
         headers.insert("x-gitlab-token", "secret-a".parse().unwrap());
-
-        assert!(verify_gitlab_project_webhook_with_registry(
-            Some(&registry),
-            &headers,
-            b"{}",
-            1001, // project_id from path, not body
+        assert!(matches!(
+            verify_gitlab_project_webhook_with_registry(Some(&registry), &headers, b"{}", 1001),
+            GitlabVerifyResult::Ok
         ));
     }
 
@@ -2257,26 +2281,54 @@ mod tests {
         let registry = gitlab_registry();
         let mut headers = HeaderMap::new();
         headers.insert("x-gitlab-token", "secret-b".parse().unwrap());
-
-        assert!(!verify_gitlab_project_webhook_with_registry(
-            Some(&registry),
-            &headers,
-            b"{}",
-            1001, // project 1001 has secret-a, not secret-b
+        assert!(matches!(
+            verify_gitlab_project_webhook_with_registry(Some(&registry), &headers, b"{}", 1001),
+            GitlabVerifyResult::InvalidSignature
         ));
     }
 
     #[test]
-    fn gitlab_project_webhook_rejects_unknown_project() {
+    fn gitlab_project_webhook_rejects_unknown_installation_id() {
         let registry = gitlab_registry();
         let mut headers = HeaderMap::new();
         headers.insert("x-gitlab-token", "secret-a".parse().unwrap());
+        assert!(matches!(
+            verify_gitlab_project_webhook_with_registry(Some(&registry), &headers, b"{}", 9999),
+            GitlabVerifyResult::UnknownInstallationId
+        ));
+    }
 
-        assert!(!verify_gitlab_project_webhook_with_registry(
-            Some(&registry),
-            &headers,
-            b"{}",
-            9999, // not in registry
+    #[test]
+    fn gitlab_project_webhook_rejects_raw_project_id_when_custom_installation_id_set() {
+        // project 1002 has installation_id=9000; the raw project_id (1002) must not be accepted.
+        let registry = gitlab_registry();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-gitlab-token", "secret-b".parse().unwrap());
+        assert!(matches!(
+            verify_gitlab_project_webhook_with_registry(Some(&registry), &headers, b"{}", 1002),
+            GitlabVerifyResult::UnknownInstallationId
+        ));
+    }
+
+    #[test]
+    fn gitlab_project_webhook_accepts_custom_installation_id() {
+        // project 1002 is reachable via configured installation_id=9000.
+        let registry = gitlab_registry();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-gitlab-token", "secret-b".parse().unwrap());
+        assert!(matches!(
+            verify_gitlab_project_webhook_with_registry(Some(&registry), &headers, b"{}", 9000),
+            GitlabVerifyResult::Ok
+        ));
+    }
+
+    #[test]
+    fn gitlab_project_webhook_rejects_unconfigured_gitlab() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-gitlab-token", "secret-a".parse().unwrap());
+        assert!(matches!(
+            verify_gitlab_project_webhook_with_registry(None, &headers, b"{}", 1001),
+            GitlabVerifyResult::UnknownInstallationId
         ));
     }
 
