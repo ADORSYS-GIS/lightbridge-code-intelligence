@@ -488,10 +488,10 @@ was the automatic on-open pass") — a comment at the call site in `internal.rs`
   findings still post as review comments. No handle configured → a graceful generic `mention me on this
   PR`, never a dangling `@`.
 
-(The agent-runner side of exhaustion framing — whether it posts "review posted" or "review posted (fast
-pass)" — still transitionally checks `context.preset == "fast"` in `run.rs`'s
-`finalize_review_outcome`; a code comment there flags this as the one remaining preset-name check,
-pending a follow-up to rebase it onto `entry_point` like the control-plane side above.)
+The agent-runner side of exhaustion framing — whether it posts "review posted" or "review posted (fast
+pass)" — is keyed the same way: `finalize_review_outcome` in `run.rs` checks `entry_point == "pr_open"`,
+not the preset name (this was migrated in a follow-up after the control-plane side above, closing the
+one call site the initial ADR-0103 migration missed).
 
 Both paths share `append_finding_sections` (so the finding rendering can't drift) and the
 `REVIEW_DISCLOSURE`. All posted text passes through `strip_model_artifacts`, which removes leaked
