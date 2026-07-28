@@ -62,10 +62,27 @@ This is **not** part of the GitHub Actions workflow; databases are expected to b
 
 ### 3. Gitleaks (Secret Scanning)
 
-- **Recommended Version**: 8.18.0+ (check https://github.com/gitleaks/gitleaks/releases for latest)
-- **Installation**: `brew install gitleaks` (macOS) or download binary
-- **Binary location**: `/usr/local/bin/gitleaks`
-- **Offline mode**: Uses built-in pattern library; no external rule downloads.
+- **Pinned Version**: v8.30.1, checksum-verified (verified against the GitHub API and the
+  release's own published checksums file at the time this was written — check
+  https://github.com/gitleaks/gitleaks/releases for newer versions before bumping)
+- **Installation**: the workflow installs this itself via
+  `.ci/quality/install-gitleaks.sh`, cached by `actions/cache` keyed on the pinned version (cache
+  hit → no network — on every run after the first). No trustworthy binary-only installer action
+  exists for gitleaks (unlike `aquasecurity/setup-trivy` for trivy), and the official
+  `gitleaks/gitleaks-action` requires a **paid license for organization-owned repositories**
+  (confirmed from its EULA — this repo is org-owned) and dictates its own scan invocation rather
+  than letting this pipeline call the binary directly, so it wasn't used.
+- **Checksum**: `551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb` for
+  `gitleaks_8.30.1_linux_x64.tar.gz`, verified by downloading the asset independently and
+  computing its SHA256, not just trusting the published checksums file text.
+- **Offline mode**: uses gitleaks' built-in pattern library; no external rule downloads at scan
+  time (only the one-time/cached binary fetch above).
+- **Updating the pinned version**: get the new version's checksums file
+  (`https://github.com/gitleaks/gitleaks/releases/download/v<version>/gitleaks_<version>_checksums.txt`),
+  cross-verify by downloading the actual release asset and running `sha256sum` on it yourself —
+  don't just copy the checksums file's claimed value — then update both
+  `GITLEAKS_VERSION`/`GITLEAKS_SHA256` in `.ci/quality/install-gitleaks.sh` and the cache key in
+  `.github/workflows/quality.yml`.
 - **Validation**:
   ```bash
   gitleaks version

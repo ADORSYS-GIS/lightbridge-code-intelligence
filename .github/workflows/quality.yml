@@ -47,6 +47,25 @@ jobs:
           version: v0.72.0
           cache: true
 
+      # Install gitleaks: no trustworthy binary-only installer action exists for it (unlike
+      # trivy), and the official gitleaks/gitleaks-action requires a paid license for
+      # organization-owned repos (this one) and dictates its own scan invocation — see
+      # .ci/quality/install-gitleaks.sh for the full rationale. Cache the extracted binary keyed
+      # on the pinned version so this is a cache hit (no network) on every run after the first.
+      - name: Cache gitleaks binary
+        id: gitleaks-cache
+        uses: actions/cache@9255dc7a253b0ccc959486e2bca901246202afeb # v5.0.1
+        with:
+          path: ${{ runner.tool_cache }}/gitleaks-bin
+          key: gitleaks-bin-8.30.1-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Install gitleaks (checksum-verified)
+        if: steps.gitleaks-cache.outputs.cache-hit != 'true'
+        run: bash .ci/quality/install-gitleaks.sh "${{ runner.tool_cache }}/gitleaks-bin"
+
+      - name: Add gitleaks to PATH
+        run: echo "${{ runner.tool_cache }}/gitleaks-bin" >> "$GITHUB_PATH"
+
       # Run all quality scanners (SAST, secrets, dependency, infra, linting).
       - name: Run quality scanners
         env:
