@@ -1,4 +1,4 @@
-#!/bin/zsh
+#!/usr/bin/env bash
 # Convert Hadolint JSON output to SARIF 2.1.0 format.
 #
 # Input: .ci/quality/reports/hadolint-*.json files

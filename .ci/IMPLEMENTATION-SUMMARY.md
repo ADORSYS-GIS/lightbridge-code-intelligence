@@ -170,11 +170,22 @@ All rules are configured with severity levels, CWE/OWASP mappings, and reference
 
 ### Syntax Checks
 - ✓ `.github/workflows/quality.yml` — Valid YAML (Python YAML parser)
-- ✓ `.ci/quality/run.sh` — Valid zsh syntax
-- ✓ `.ci/quality/merge-sarif.sh` — Valid zsh syntax
-- ✓ `.ci/quality/gate.sh` — Valid zsh syntax
-- ✓ `.ci/quality/hadolint-to-sarif.sh` — Valid zsh syntax
-- ✓ `.ci/quality/biome-to-sarif.sh` — Valid zsh syntax
+- ✓ `.ci/quality/run.sh` — Valid bash syntax, execution-tested with fixture data
+- ✓ `.ci/quality/merge-sarif.sh` — Valid bash syntax, execution-tested with fixture data
+- ✓ `.ci/quality/gate.sh` — Valid bash syntax, execution-tested (all 3 policy branches: PR-fail,
+  PR-pass, push-informational)
+- ✓ `.ci/quality/hadolint-to-sarif.sh` — Valid bash syntax, execution-tested with fixture data
+- ✓ `.ci/quality/biome-to-sarif.sh` — Valid bash syntax, execution-tested with fixture data
+
+**Note:** an earlier revision of these scripts used a `#!/bin/zsh` shebang while the workflow
+invokes them with `bash <script>.sh`. Because the GitHub Actions `run:` step ignores a script's
+shebang and always uses the interpreter named in the step, `local` outside a function and
+top-level `return` (both zsh-tolerant, bash-fatal) crashed the pipeline immediately, and a
+malformed `jq` filter in the gate's error-count query threw on every invocation. All of this was
+caught only by actually *executing* the scripts under `bash` with fixture SARIF/JSON — `zsh -n`
+syntax checks are silent on this class of bug because they only parse, never run, the script.
+Fixed by switching every script's shebang to `#!/usr/bin/env bash`, removing the misplaced
+`local`/`return`, and correcting the `jq` filter.
 
 ### SARIF Compliance
 - All scanners configured to output SARIF 2.1.0 (or converted to SARIF via helper scripts)
@@ -205,7 +216,7 @@ All external actions pinned to commit SHAs (not floating tags):
 - `reviewdog` v0.17.0+
 - `pnpm` v11.5.2+ (already on vymalo-vps)
 - `jq` (for SARIF merging)
-- `zsh` (already on runner)
+- `bash` (standard on the Linux runner image; all orchestration scripts target bash explicitly)
 
 ### Databases & Caches (Pre-Provisioned)
 - Trivy vulnerability DB: `$HOME/.cache/trivy/db/` (~600 MB, daily updates)

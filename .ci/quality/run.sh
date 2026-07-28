@@ -1,5 +1,9 @@
-#!/bin/zsh
+#!/usr/bin/env bash
 # Orchestrate all quality scanners: run locally or in CI, capture outputs, and merge reports.
+#
+# Invoked directly via `bash run.sh` (GitHub Actions `run:` steps default to bash on Linux
+# runners), so this script targets bash, not zsh — `local` is only valid inside a function under
+# bash, and top-level flow control must use `exit`, not `return` (this script is never sourced).
 #
 # Exit codes:
 #   0 — all scanners passed (no actionable findings)
@@ -128,10 +132,10 @@ fi
 if command -v gitleaks &>/dev/null; then
   # For PR: scan the merge base..HEAD range (use GITHUB_BASE_REF to avoid remote fetch issues)
   # For default branch: scan full history (--verbose to see all checked commits)
-  local gitleaks_opts=(--verbose --report-format=sarif --output="${REPORTS_DIR}/gitleaks.sarif")
+  gitleaks_opts=(--verbose --report-format=sarif --output="${REPORTS_DIR}/gitleaks.sarif")
   if [[ "$IS_PR" == "pull_request" && -n "$PR_BASE" ]]; then
     # PR: scan only new commits. Use merge-base with local branch name (GitHub Actions checks out base ref).
-    local merge_base=$(cd "$REPO_ROOT" && git merge-base "$PR_BASE" HEAD 2>/dev/null || echo "HEAD~10")
+    merge_base=$(cd "$REPO_ROOT" && git merge-base "$PR_BASE" HEAD 2>/dev/null || echo "HEAD~10")
     gitleaks_opts+=(--log-opts="$merge_base..HEAD")
   fi
 
@@ -145,9 +149,9 @@ fi
 if command -v hadolint &>/dev/null; then
   # Find all Dockerfiles and lint them; output JSON for later conversion to SARIF.
   # Use hash of full path to avoid collisions when multiple Dockerfiles have same basename.
-  local dockerfile_count=0
+  dockerfile_count=0
   while IFS= read -r dockerfile; do
-    local dockerfile_hash=$(echo "$dockerfile" | md5sum | cut -d' ' -f1)
+    dockerfile_hash=$(echo "$dockerfile" | md5sum | cut -d' ' -f1)
     hadolint --format json "$dockerfile" > "${REPORTS_DIR}/hadolint-${dockerfile_hash}.json" 2>&1 || true
     ((dockerfile_count++))
   done < <(find "$REPO_ROOT" -name "Dockerfile*" -type f)
@@ -169,14 +173,14 @@ if [[ -f "${REPO_ROOT}/package.json" ]] && command -v pnpm &>/dev/null; then
     SCANNER_RESULTS["biome"]="0|biome.json|json"
     log_scanner_end "biome" "biome.json"
   else
-    local exit_code=$?
-    if [[ $exit_code -eq 1 ]]; then
+    biome_exit_code=$?
+    if [[ $biome_exit_code -eq 1 ]]; then
       SCANNER_RESULTS["biome"]="1|biome.json|json"
       log_scanner_end "biome" "biome.json"
     else
-      log_error "Biome linting failed with exit code $exit_code (config or toolchain error)."
-      SCANNER_RESULTS["biome"]="${exit_code}|biome.json|json"
-      return 1
+      log_error "Biome linting failed with exit code $biome_exit_code (config or toolchain error)."
+      SCANNER_RESULTS["biome"]="${biome_exit_code}|biome.json|json"
+      exit 1
     fi
   fi
 else
@@ -204,18 +208,18 @@ log_section "Merging SARIF reports"
 # Invoke the SARIF merge script.
 if ! bash "${REPO_ROOT}/.ci/quality/merge-sarif.sh" "${REPORTS_DIR}"; then
   log_error "SARIF merge failed."
-  return 1
+  exit 1
 fi
 
 log_section "Quality gate evaluation"
 
 # Invoke the gate script; it decides pass/fail based on findings and severity.
 bash "${REPO_ROOT}/.ci/quality/gate.sh" "${REPORTS_DIR}" "$IS_PR" "$GITHUB_REF" || {
-  local gate_code=$?
+  gate_code=$?
   log_error "Quality gate failed with exit code $gate_code."
-  return "$gate_code"
+  exit "$gate_code"
 }
 
 echo ""
 echo "✓ All quality checks passed."
-return 0
+exit 0

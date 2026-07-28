@@ -2,7 +2,9 @@
 
 ## Pre-Deployment Validation ✓
 
-- [x] All shell scripts pass zsh syntax validation
+- [x] All shell scripts pass bash syntax validation (`bash -n`) and were execution-tested with
+  fixture SARIF/JSON inputs (not just parsed) — the workflow invokes them via `bash`, so bash is
+  the compatibility target, not zsh
 - [x] GitHub Actions workflow YAML is valid
 - [x] SARIF merging logic validated (jq syntax)
 - [x] All external actions pinned to commit SHAs

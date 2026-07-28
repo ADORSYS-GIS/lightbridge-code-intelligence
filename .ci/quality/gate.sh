@@ -1,5 +1,7 @@
-#!/bin/zsh
+#!/usr/bin/env bash
 # Quality gate: evaluate merged SARIF findings and enforce policies.
+#
+# Invoked via `bash gate.sh` — targets bash, not zsh (see run.sh header for the same note).
 #
 # Policy:
 #   - Fail on scanner execution errors (non-recoverable exit codes).
@@ -46,7 +48,7 @@ declare -i warning_count=0
 declare -i note_count=0
 
 # Count errors and high/critical security findings
-error_count=$(jq '[.runs[0].results[] | select(.level == "error" or .level == null | if .level == "error" then 1 else 0 end)] | length' "$MERGED_SARIF")
+error_count=$(jq '[.runs[0].results[] | select(.level == "error")] | length' "$MERGED_SARIF")
 high_security_count=$(jq '[.runs[0].results[] | select(.properties.security_severity // 0 | tonumber >= 7.0)] | length' "$MERGED_SARIF")
 warning_count=$(jq '[.runs[0].results[] | select(.level == "warning")] | length' "$MERGED_SARIF")
 note_count=$(jq '[.runs[0].results[] | select(.level == "note" or .level == "none")] | length' "$MERGED_SARIF")
@@ -62,7 +64,7 @@ log_info "  notes: $note_count"
 # On PRs: fail immediately on any actionable findings.
 # On main: report all (informational, no fail).
 
-local actionable_count=$((error_count + high_security_count))
+actionable_count=$((error_count + high_security_count))
 
 if [[ "$IS_PR" == "pull_request" && $actionable_count -gt 0 ]]; then
   log_error "PR contains $actionable_count actionable finding(s) (error-level or critical/high security). Review and fix before merging."

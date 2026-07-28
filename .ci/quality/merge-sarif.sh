@@ -1,4 +1,4 @@
-#!/bin/zsh
+#!/usr/bin/env bash
 # Merge individual SARIF reports from scanners into a single deduplicated run.
 #
 # Input: directory containing scanner SARIF files (*.sarif)
