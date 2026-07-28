@@ -94,7 +94,11 @@ impl RepoRef {
 pub fn stable_id_from_key(key: &str) -> i64 {
     use sha2::{Digest, Sha256};
     let digest = Sha256::digest(key.as_bytes());
-    i64::from_be_bytes(digest[0..8].try_into().expect("sha256 digest is >= 8 bytes"))
+    i64::from_be_bytes(
+        digest[0..8]
+            .try_into()
+            .expect("sha256 digest is >= 8 bytes"),
+    )
 }
 
 /// A changed file in a PR/MR diff. `patch` is the unified-diff text (absent for binary/huge files).
@@ -312,6 +316,9 @@ mod tests {
         let b = stable_id_from_key("myteam/my-repo");
         let c = stable_id_from_key("myteam/other-repo");
         assert_eq!(a, b, "same key must always derive the same id");
-        assert_ne!(a, c, "different keys must (in practice) derive different ids");
+        assert_ne!(
+            a, c,
+            "different keys must (in practice) derive different ids"
+        );
     }
 }

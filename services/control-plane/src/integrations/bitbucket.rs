@@ -5,8 +5,13 @@
 //! pattern rather than GitHub's single-tenant App model. Three ways Bitbucket Cloud's API model
 //! differs from both GitHub's and GitLab's, which shape this file:
 //!
-//! 1. **Auth is a per-repo App Password** (HTTP Basic: `username` + `app_password`), configured in
-//!    `control-plane.json` like GitLab's per-project token — no `BITBUCKET_*` env fallback.
+//! 1. **Auth is a per-repo Bitbucket API token** (HTTP Basic: Atlassian account `email` +
+//!    scoped `api_token`), configured in `control-plane.json` like GitLab's per-project token — no
+//!    `BITBUCKET_*` env fallback. NOT an App Password: Atlassian deprecated Bitbucket Cloud App
+//!    Passwords in phases through 2026 (blocked from creation 2026-09-09, brownout from
+//!    2026-06-09, fully removed 2026-07-28) in favor of API tokens. Git clone over HTTPS uses the
+//!    literal placeholder username `x-bitbucket-api-token-auth` (Bitbucket's documented substitute,
+//!    distinct from GitHub's `x-access-token`) — not the account email, which is REST-API-only.
 //! 2. **No numeric project id.** GitLab has `project.id`; Bitbucket has only the
 //!    `workspace/repo_slug` pair. `RepoRef.installation_id` stays `i64` (shared with GitHub/GitLab,
 //!    not changed for this platform), so a stable `i64` identity is derived from
@@ -42,17 +47,19 @@ use crate::config::BitbucketSection;
 use crate::integrations::platform::*;
 
 /// Bitbucket Cloud API client for one configured repo's credentials — no token minting (a static
-/// App Password, like GitLab's static access token).
+/// API token, like GitLab's static access token).
 #[derive(Clone)]
 pub struct BitbucketClient {
     /// Base API URL, e.g. `https://api.bitbucket.org/2.0` (no trailing slash).
     api_url: String,
     workspace: String,
     repo_slug: String,
-    /// HTTP Basic-auth username.
-    username: String,
-    /// HTTP Basic-auth password (the Bitbucket App Password). Also used for the HTTPS clone URL.
-    app_password: String,
+    /// Atlassian account email — the HTTP Basic-auth username for REST API calls (NOT used for
+    /// the clone URL, which uses the literal `x-bitbucket-api-token-auth` placeholder instead).
+    email: String,
+    /// Scoped Bitbucket Cloud API token — the HTTP Basic-auth password for REST calls, and the
+    /// password half of the HTTPS clone URL.
+    api_token: String,
     /// Per-repo webhook signing secret used to verify `X-Hub-Signature`.
     webhook_secret: String,
     http: Client,
@@ -64,8 +71,8 @@ impl BitbucketClient {
         api_url: String,
         workspace: String,
         repo_slug: String,
-        username: String,
-        app_password: String,
+        email: String,
+        api_token: String,
         webhook_secret: String,
     ) -> anyhow::Result<Self> {
         let http = Client::builder()
@@ -75,8 +82,8 @@ impl BitbucketClient {
             api_url: api_url.trim_end_matches('/').to_string(),
             workspace,
             repo_slug,
-            username,
-            app_password,
+            email,
+            api_token,
             webhook_secret,
             http,
         })
@@ -156,7 +163,7 @@ impl BitbucketClient {
         let resp = self
             .http
             .get(&url)
-            .basic_auth(&self.username, Some(&self.app_password))
+            .basic_auth(&self.email, Some(&self.api_token))
             .send()
             .await?
             .error_for_status()?;
@@ -195,8 +202,8 @@ impl BitbucketRegistry {
                 api_url,
                 project.workspace.clone(),
                 project.repo_slug.clone(),
-                project.username.clone(),
-                project.app_password.clone(),
+                project.email.clone(),
+                project.api_token.clone(),
                 project.webhook_secret.clone(),
             )?;
             by_id.insert(
@@ -251,7 +258,10 @@ impl BitbucketPlatformRouter {
 
     fn client<'a>(&'a self, repo: &RepoRef) -> anyhow::Result<&'a BitbucketClient> {
         self.registry.client_for_repo(repo).ok_or_else(|| {
-            anyhow::anyhow!("Bitbucket project {} is not configured", repo.installation_id)
+            anyhow::anyhow!(
+                "Bitbucket project {} is not configured",
+                repo.installation_id
+            )
         })
     }
 }
@@ -408,7 +418,9 @@ impl CodePlatform for BitbucketClient {
         let sig_header = match headers.get("x-hub-signature").and_then(|v| v.to_str().ok()) {
             Some(s) => s,
             None => {
-                tracing::warn!("Bitbucket verify_webhook failed: X-Hub-Signature header is missing");
+                tracing::warn!(
+                    "Bitbucket verify_webhook failed: X-Hub-Signature header is missing"
+                );
                 return false;
             }
         };
@@ -429,7 +441,10 @@ impl CodePlatform for BitbucketClient {
         let computed_hex = hex::encode(mac.finalize().into_bytes());
 
         use subtle::ConstantTimeEq;
-        let is_valid: bool = computed_hex.as_bytes().ct_eq(expected_hex.as_bytes()).into();
+        let is_valid: bool = computed_hex
+            .as_bytes()
+            .ct_eq(expected_hex.as_bytes())
+            .into();
         if !is_valid {
             tracing::warn!("Bitbucket verify_webhook failed: signature mismatch");
         }
@@ -459,11 +474,15 @@ impl CodePlatform for BitbucketClient {
     ) -> anyhow::Result<Vec<ChangedFile>> {
         // No per-file JSON diff endpoint exists in Bitbucket Cloud's API v2.0; `/diff` returns one
         // raw unified diff for the whole PR, split into per-file chunks below (see module doc).
-        let url = self.url(&format!("{}/pullrequests/{}/diff", self.repo_base(), pr_number));
+        let url = self.url(&format!(
+            "{}/pullrequests/{}/diff",
+            self.repo_base(),
+            pr_number
+        ));
         let resp = self
             .http
             .get(&url)
-            .basic_auth(&self.username, Some(&self.app_password))
+            .basic_auth(&self.email, Some(&self.api_token))
             .send()
             .await?
             .error_for_status()?;
@@ -476,7 +495,7 @@ impl CodePlatform for BitbucketClient {
         let resp = self
             .http
             .get(&url)
-            .basic_auth(&self.username, Some(&self.app_password))
+            .basic_auth(&self.email, Some(&self.api_token))
             .send()
             .await?
             .error_for_status()?;
@@ -523,23 +542,31 @@ impl CodePlatform for BitbucketClient {
                 "content": { "raw": c.body },
                 "inline": { "to": c.line, "path": c.path },
             });
-            let url = self.url(&format!("{}/pullrequests/{}/comments", self.repo_base(), pr_number));
+            let url = self.url(&format!(
+                "{}/pullrequests/{}/comments",
+                self.repo_base(),
+                pr_number
+            ));
             let _ = self
                 .http
                 .post(&url)
-                .basic_auth(&self.username, Some(&self.app_password))
+                .basic_auth(&self.email, Some(&self.api_token))
                 .json(&body)
                 .send()
                 .await?
                 .error_for_status()?;
         }
 
-        let note_url = self.url(&format!("{}/pullrequests/{}/comments", self.repo_base(), pr_number));
+        let note_url = self.url(&format!(
+            "{}/pullrequests/{}/comments",
+            self.repo_base(),
+            pr_number
+        ));
         let note_body = serde_json::json!({ "content": { "raw": review.body } });
         let resp = self
             .http
             .post(&note_url)
-            .basic_auth(&self.username, Some(&self.app_password))
+            .basic_auth(&self.email, Some(&self.api_token))
             .json(&note_body)
             .send()
             .await?
@@ -562,13 +589,16 @@ impl CodePlatform for BitbucketClient {
         body: &str,
         noteable_type: Option<&str>,
     ) -> anyhow::Result<PostedComment> {
-        let endpoint = format!("{}/comments", self.noteable_base(issue_number, noteable_type));
+        let endpoint = format!(
+            "{}/comments",
+            self.noteable_base(issue_number, noteable_type)
+        );
         let url = self.url(&endpoint);
         let payload = serde_json::json!({ "content": { "raw": body } });
         let resp = self
             .http
             .post(&url)
-            .basic_auth(&self.username, Some(&self.app_password))
+            .basic_auth(&self.email, Some(&self.api_token))
             .json(&payload)
             .send()
             .await?
@@ -630,7 +660,7 @@ impl CodePlatform for BitbucketClient {
         let resp = self
             .http
             .get(&url)
-            .basic_auth(&self.username, Some(&self.app_password))
+            .basic_auth(&self.email, Some(&self.api_token))
             .send()
             .await?
             .error_for_status()?;
@@ -674,11 +704,13 @@ impl CodePlatform for BitbucketClient {
     fn clone_url(&self, repo: &RepoRef) -> String {
         // Bitbucket Cloud's git-over-HTTPS host is always `bitbucket.org`, independent of the API
         // host (`api.bitbucket.org` or an on-prem-style override) — unlike GitLab, where the API and
-        // clone hosts share the same base. HTTP Basic embedded in the URL (`user:app_password@host`)
-        // mirrors GitLab's `oauth2:TOKEN@host` embedding.
+        // clone hosts share the same base. Git auth uses Bitbucket's documented literal placeholder
+        // username `x-bitbucket-api-token-auth` (NOT the account email, which is REST-API-only) —
+        // mirrors GitHub's `x-access-token:TOKEN@host` / GitLab's `oauth2:TOKEN@host` embedding, each
+        // platform's own fixed placeholder username paired with the real credential as the password.
         format!(
-            "https://{}:{}@bitbucket.org/{}.git",
-            self.username, self.app_password, repo.full_name
+            "https://x-bitbucket-api-token-auth:{}@bitbucket.org/{}.git",
+            self.api_token, repo.full_name
         )
     }
 }
@@ -688,13 +720,18 @@ mod tests {
     use super::*;
     use crate::config::{BitbucketProjectConfig, BitbucketSection};
 
-    fn project(workspace: &str, repo_slug: &str, app_password: &str, secret: &str) -> BitbucketProjectConfig {
+    fn project(
+        workspace: &str,
+        repo_slug: &str,
+        api_token: &str,
+        secret: &str,
+    ) -> BitbucketProjectConfig {
         BitbucketProjectConfig {
             workspace: workspace.to_string(),
             repo_slug: repo_slug.to_string(),
             api_url: None,
-            username: "bot".to_string(),
-            app_password: app_password.to_string(),
+            email: "bot@example.com".to_string(),
+            api_token: api_token.to_string(),
             webhook_secret: secret.to_string(),
             bot_handle: None,
         }
@@ -703,8 +740,7 @@ mod tests {
     #[test]
     fn disabled_config_builds_no_registry() {
         let section = BitbucketSection::default();
-        let registry =
-            BitbucketRegistry::from_config(&section).expect("disabled config is valid");
+        let registry = BitbucketRegistry::from_config(&section).expect("disabled config is valid");
         assert!(registry.is_none());
     }
 
@@ -744,7 +780,7 @@ mod tests {
             .client_for_repo(&repo)
             .expect("repo resolves through installation_id")
             .clone_url(&repo);
-        assert!(clone_url.contains("bot:pw-b@bitbucket.org"));
+        assert!(clone_url.contains("x-bitbucket-api-token-auth:pw-b@bitbucket.org"));
         assert!(clone_url.ends_with("/myteam/repo-b.git"));
     }
 

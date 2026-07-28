@@ -190,15 +190,17 @@ mod toml_min {
                 "client_id" => cfg.client_id = Some(value),
                 "theme" => cfg.theme = Some(value),
                 "port" => {
-                    cfg.port = Some(value.parse().map_err(|_| ConfigParseError::InvalidPort {
-                        line: lineno + 1,
-                    })?)
+                    cfg.port = Some(
+                        value
+                            .parse()
+                            .map_err(|_| ConfigParseError::InvalidPort { line: lineno + 1 })?,
+                    )
                 }
                 other => {
                     return Err(ConfigParseError::UnknownKey {
                         line: lineno + 1,
                         key: other.to_string(),
-                    })
+                    });
                 }
             }
         }

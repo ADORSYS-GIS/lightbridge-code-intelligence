@@ -16,16 +16,40 @@ use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
+use hmac::{Hmac, KeyInit, Mac};
 use lci_agent_step::{Passthrough, StepError, StepRuntime};
 use lci_agent_types::StepName;
+use sha2::Sha256;
 use tracing::Instrument;
 
 use crate::AppState;
 use crate::integrations::platform::{CodePlatform, Platform, RepoRef};
 
+type HmacSha256 = Hmac<Sha256>;
+
 /// Maximum webhook body size before HMAC / JSON verification. GitLab must parse JSON pre-auth to
 /// read `project.id` for per-project secret selection; this caps attacker-controlled parse cost.
 pub const MAX_BODY_BYTES: usize = 1024 * 1024;
+
+/// Constant-time HMAC-SHA256 verification of a GitHub webhook signature against a raw secret —
+/// the same algorithm `GithubApp::verify_webhook` (integrations/github.rs) implements. Used as a
+/// **fallback** when `GITHUB_WEBHOOK_SECRET` is configured but the GitHub App itself isn't (no
+/// `GITHUB_APP_ID`/`GITHUB_APP_PRIVATE_KEY`, so `state.platforms` has no GitHub entry): signature
+/// verification must never require App credentials — it never did before #504's CodePlatform
+/// wiring (a P2 caught in review: verifying only via the registered App would 503 every webhook
+/// in a secret-only deployment that used to work fine).
+fn verify_signature(secret: &[u8], body: &[u8], signature: &str) -> bool {
+    if secret.is_empty() {
+        return false;
+    }
+    let Ok(mut mac) = HmacSha256::new_from_slice(secret) else {
+        return false;
+    };
+    mac.update(body);
+    let expected = format!("sha256={}", hex::encode(mac.finalize().into_bytes()));
+    use subtle::ConstantTimeEq;
+    expected.as_bytes().ct_eq(signature.as_bytes()).into()
+}
 
 /// Detect the platform from webhook headers.
 /// GitHub sends `X-GitHub-Event`; GitLab sends `X-Gitlab-Event`; Bitbucket Cloud sends
@@ -119,13 +143,30 @@ async fn webhook_router_body(state: AppState, headers: HeaderMap, body: Bytes) -
     // constant-time compare `GithubApp::verify_webhook` runs internally, reading
     // `GITHUB_WEBHOOK_SECRET` — the same env var `state.github_webhook_secret` was built from.
     // GitLab verification happens in `verified_gitlab_payload`.
+    //
+    // Signature verification must not require the GitHub App's credentials: a deployment can set
+    // `GITHUB_WEBHOOK_SECRET` without `GITHUB_APP_ID`/`GITHUB_APP_PRIVATE_KEY` (no App registered,
+    // so no `platforms` entry — App-dependent actions like posting reviews will fail downstream,
+    // but the webhook itself used to verify fine). Fall back to the raw secret in that case rather
+    // than 503ing every webhook (a real regression this refactor introduced, caught in review).
     if platform == Platform::GitHub {
-        let Some(github) = state.platforms.get(&Platform::GitHub) else {
+        let verified = if let Some(github) = state.platforms.get(&Platform::GitHub) {
+            github.verify_webhook(&headers, &body)
+        } else if !state.github_webhook_secret.is_empty() {
+            verify_signature(
+                state.github_webhook_secret.as_bytes(),
+                &body,
+                &header(&headers, "x-hub-signature-256"),
+            )
+        } else {
             tracing::error!(%platform, "no platform implementation configured for github webhooks");
-            return (StatusCode::SERVICE_UNAVAILABLE, "github platform not configured")
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "github platform not configured",
+            )
                 .into_response();
         };
-        if !github.verify_webhook(&headers, &body) {
+        if !verified {
             crate::http::metrics::webhook_signature_failure(&platform.to_string());
             tracing::warn!(%platform, "invalid webhook signature");
             return (StatusCode::UNAUTHORIZED, "invalid signature").into_response();
@@ -460,7 +501,11 @@ fn gitlab_project_identity(project: &serde_json::Value) -> Option<(i64, &str, &s
 fn bitbucket_repo_identity(payload: &serde_json::Value) -> Option<(String, String, String)> {
     let full_name = payload["repository"]["full_name"].as_str()?.to_string();
     let (workspace, repo_slug) = full_name.rsplit_once('/')?;
-    Some((full_name.clone(), workspace.to_string(), repo_slug.to_string()))
+    Some((
+        full_name.clone(),
+        workspace.to_string(),
+        repo_slug.to_string(),
+    ))
 }
 
 /// `Merge Request Hook`: `open` → the automatic first review. `close` → cancel the MR's active
@@ -898,7 +943,10 @@ async fn handle_bitbucket_pullrequest(
         return;
     };
     let Some(pr_number) = payload["pullrequest"]["id"].as_i64() else {
-        tracing::warn!(delivery_id, "Bitbucket PR payload missing pullrequest.id; skipping");
+        tracing::warn!(
+            delivery_id,
+            "Bitbucket PR payload missing pullrequest.id; skipping"
+        );
         return;
     };
     // Bitbucket has no numeric project id (unlike GitLab's `project.id`) — derive a stable one from
@@ -953,9 +1001,7 @@ async fn handle_bitbucket_pullrequest(
             let base_sha = pr["destination"]["commit"]["hash"]
                 .as_str()
                 .map(str::to_string);
-            let head_sha = pr["source"]["commit"]["hash"]
-                .as_str()
-                .map(str::to_string);
+            let head_sha = pr["source"]["commit"]["hash"].as_str().map(str::to_string);
             let task = crate::db::NewTask {
                 repository_id,
                 installation_id,
@@ -1012,7 +1058,10 @@ async fn handle_bitbucket_push(
         bitbucket_default_branch_or_fallback(state, installation_id, &full_name).await;
 
     let Some(changes) = payload["push"]["changes"].as_array() else {
-        tracing::warn!(delivery_id, "Bitbucket push payload missing push.changes; skipping");
+        tracing::warn!(
+            delivery_id,
+            "Bitbucket push payload missing push.changes; skipping"
+        );
         return;
     };
     // Only a push that moves the default branch re-indexes (a branch deletion carries `new: null`).
@@ -1097,7 +1146,10 @@ async fn handle_bitbucket_comment(
         return;
     }
     let Some(pr_number) = payload["pullrequest"]["id"].as_i64() else {
-        tracing::warn!(delivery_id, "Bitbucket comment payload missing pullrequest.id; skipping");
+        tracing::warn!(
+            delivery_id,
+            "Bitbucket comment payload missing pullrequest.id; skipping"
+        );
         return;
     };
     let default_branch =
@@ -1759,29 +1811,6 @@ fn header(headers: &HeaderMap, name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hmac::{Hmac, KeyInit, Mac};
-    use sha2::Sha256;
-
-    type HmacSha256 = Hmac<Sha256>;
-
-    /// Constant-time HMAC-SHA256 verification of the GitHub webhook signature — the raw algorithm
-    /// `GithubApp::verify_webhook` (integrations/github.rs) also implements. Kept here, test-only,
-    /// as a standalone proof of the HMAC-SHA256 + constant-time-compare algorithm's correctness now
-    /// that production code calls the trait method instead of this local helper (#504); moved under
-    /// `#[cfg(test)]` (rather than deleted) so these accept/reject/tamper tests keep exercising the
-    /// exact same algorithm unchanged, without leaving the helper as dead code in a non-test build.
-    fn verify_signature(secret: &[u8], body: &[u8], signature: &str) -> bool {
-        if secret.is_empty() {
-            return false;
-        }
-        let Ok(mut mac) = HmacSha256::new_from_slice(secret) else {
-            return false;
-        };
-        mac.update(body);
-        let expected = format!("sha256={}", hex::encode(mac.finalize().into_bytes()));
-        use subtle::ConstantTimeEq;
-        expected.as_bytes().ct_eq(signature.as_bytes()).into()
-    }
 
     #[test]
     fn mention_must_lead_the_comment() {
@@ -1867,6 +1896,82 @@ mod tests {
     #[test]
     fn rejects_a_tampered_signature() {
         assert!(!verify_signature(b"secret", b"payload", "sha256=deadbeef"));
+    }
+
+    /// A deployment with `GITHUB_WEBHOOK_SECRET` set but no GitHub App (`GITHUB_APP_ID`/
+    /// `GITHUB_APP_PRIVATE_KEY`, so `state.github` is `None` and `state.platforms` has no GitHub
+    /// entry) must still verify a correctly-signed webhook — signature verification never required
+    /// App credentials before #504's `CodePlatform` wiring, and must not start requiring them now
+    /// (a real regression a bot review caught: this used to 503 every such webhook).
+    fn github_secret_only_state(secret: &str) -> AppState {
+        AppState {
+            github_webhook_secret: std::sync::Arc::new(secret.to_string()),
+            seen_deliveries: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashSet::new(),
+            )),
+            jwt: None,
+            db: None,
+            allow_no_db: true,
+            github: None,
+            gitlab: None,
+            bitbucket: None,
+            platforms: std::collections::HashMap::new(),
+            runner_token_signer: None,
+            neo4j: None,
+            metrics: crate::http::metrics::install(),
+            review: std::sync::Arc::new(crate::config::ReviewSection::default()),
+            knowledge_tools: std::sync::Arc::new(crate::config::KnowledgeToolsSection::default()),
+            app_handle: std::sync::Arc::new("lightbridge-assistant".to_string()),
+            permissions_claim: std::sync::Arc::new("permissions".to_string()),
+        }
+    }
+
+    fn github_request(secret: &[u8], body: &[u8], delivery_id: &str) -> (HeaderMap, Bytes) {
+        let mut mac = HmacSha256::new_from_slice(secret).unwrap();
+        mac.update(body);
+        let sig = format!("sha256={}", hex::encode(mac.finalize().into_bytes()));
+        let mut headers = HeaderMap::new();
+        headers.insert("x-github-event", "ping".parse().unwrap());
+        headers.insert("x-github-delivery", delivery_id.parse().unwrap());
+        headers.insert("x-hub-signature-256", sig.parse().unwrap());
+        (headers, Bytes::from(body.to_vec()))
+    }
+
+    #[tokio::test]
+    async fn github_webhook_verifies_via_secret_fallback_when_no_app_is_configured() {
+        let state = github_secret_only_state("wh-secret");
+        let body = br#"{"zen":"hi"}"#;
+        let (headers, body) = github_request(b"wh-secret", body, "no-app-delivery-1");
+
+        let response = webhook_router_body(state, headers, body).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::ACCEPTED,
+            "a validly-signed webhook must verify via the secret fallback, not 503, when only \
+             GITHUB_WEBHOOK_SECRET is set and no GitHub App is registered"
+        );
+    }
+
+    #[tokio::test]
+    async fn github_webhook_secret_fallback_still_rejects_a_tampered_signature() {
+        let state = github_secret_only_state("wh-secret");
+        let body = br#"{"zen":"hi"}"#;
+        let (mut headers, body) = github_request(b"wh-secret", body, "no-app-delivery-2");
+        headers.insert("x-hub-signature-256", "sha256=deadbeef".parse().unwrap());
+
+        let response = webhook_router_body(state, headers, body).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn github_webhook_503s_only_when_truly_unconfigured() {
+        // No App AND no webhook secret — genuinely nothing to verify against.
+        let state = github_secret_only_state("");
+        let body = br#"{"zen":"hi"}"#;
+        let (headers, body) = github_request(b"anything", body, "no-app-delivery-3");
+
+        let response = webhook_router_body(state, headers, body).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[test]
@@ -1957,7 +2062,9 @@ mod tests {
     fn bitbucket_repo_identity_missing_full_name() {
         assert_eq!(bitbucket_repo_identity(&serde_json::json!({})), None);
         assert_eq!(
-            bitbucket_repo_identity(&serde_json::json!({ "repository": { "full_name": "noslash" } })),
+            bitbucket_repo_identity(
+                &serde_json::json!({ "repository": { "full_name": "noslash" } })
+            ),
             None
         );
     }
@@ -1972,8 +2079,8 @@ mod tests {
                     workspace: "myteam".to_string(),
                     repo_slug: "repo-a".to_string(),
                     api_url: None,
-                    username: "bot".to_string(),
-                    app_password: "pw-a".to_string(),
+                    email: "bot@example.com".to_string(),
+                    api_token: "token-a".to_string(),
                     webhook_secret: "secret-a".to_string(),
                     bot_handle: None,
                 },
@@ -1981,8 +2088,8 @@ mod tests {
                     workspace: "myteam".to_string(),
                     repo_slug: "repo-b".to_string(),
                     api_url: None,
-                    username: "bot".to_string(),
-                    app_password: "pw-b".to_string(),
+                    email: "bot@example.com".to_string(),
+                    api_token: "token-b".to_string(),
                     webhook_secret: "secret-b".to_string(),
                     bot_handle: None,
                 },
@@ -2236,7 +2343,9 @@ mod tests {
     fn gitlab_only_state(pool: PgPool) -> AppState {
         AppState {
             github_webhook_secret: std::sync::Arc::new(String::new()),
-            seen_deliveries: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            seen_deliveries: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashSet::new(),
+            )),
             jwt: None,
             db: Some(pool),
             allow_no_db: true,
@@ -2262,7 +2371,9 @@ mod tests {
         headers.insert("x-gitlab-event", "Job Hook".parse().unwrap());
         headers.insert("x-gitlab-token", "secret-a".parse().unwrap());
         headers.insert("x-gitlab-event-uuid", "wrap-test-uuid".parse().unwrap());
-        let body = Bytes::from(serde_json::to_vec(&serde_json::json!({ "project": { "id": 1001 } })).unwrap());
+        let body = Bytes::from(
+            serde_json::to_vec(&serde_json::json!({ "project": { "id": 1001 } })).unwrap(),
+        );
         (headers, body)
     }
 
@@ -2277,13 +2388,12 @@ mod tests {
         let first = webhook_router_body(state.clone(), headers.clone(), body.clone()).await;
         assert_eq!(first.status(), StatusCode::ACCEPTED);
 
-        let count: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM webhook_deliveries WHERE delivery_id = $1",
-        )
-        .bind("wrap-test-uuid")
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+        let count: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM webhook_deliveries WHERE delivery_id = $1")
+                .bind("wrap-test-uuid")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(count, 1, "the fresh delivery is persisted exactly once");
 
         let second = webhook_router_body(state, headers, body).await;
@@ -2293,13 +2403,12 @@ mod tests {
             "a replayed delivery id is still a 202 (duplicate delivery), same as before the wrap"
         );
 
-        let count_after_replay: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM webhook_deliveries WHERE delivery_id = $1",
-        )
-        .bind("wrap-test-uuid")
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+        let count_after_replay: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM webhook_deliveries WHERE delivery_id = $1")
+                .bind("wrap-test-uuid")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(
             count_after_replay, 1,
             "the replay must not insert a second row — the wrap must not change dedup semantics"
@@ -2318,8 +2427,10 @@ mod tests {
         headers.insert("x-gitlab-token", "secret-a".parse().unwrap());
         headers.insert("x-gitlab-event-uuid", "wrap-error-uuid".parse().unwrap());
         let body = Bytes::from(
-            serde_json::to_vec(&serde_json::json!({ "project": { "id": 1001 }, "poison": "\u{0000}" }))
-                .unwrap(),
+            serde_json::to_vec(
+                &serde_json::json!({ "project": { "id": 1001 }, "poison": "\u{0000}" }),
+            )
+            .unwrap(),
         );
 
         let response = webhook_router_body(state, headers, body).await;

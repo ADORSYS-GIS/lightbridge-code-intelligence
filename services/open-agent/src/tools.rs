@@ -49,9 +49,7 @@ pub(crate) struct OpenServices {
 /// Why a tool call's raw JSON arguments failed to parse into the tool's typed `Args`.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ParseError {
-    #[error(
-        "error: invalid arguments — {0}. Re-call with arguments matching the tool's schema."
-    )]
+    #[error("error: invalid arguments — {0}. Re-call with arguments matching the tool's schema.")]
     InvalidArguments(#[from] serde_json::Error),
 }
 

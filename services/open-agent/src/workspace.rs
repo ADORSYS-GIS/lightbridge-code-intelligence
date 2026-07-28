@@ -84,8 +84,7 @@ fn lexical_clean(rel: &str) -> Result<PathBuf, PathError> {
 /// within the canonical workdir. Rejects `..`, absolute paths, and symlink escapes.
 pub fn resolve_read(root: &Path, rel: &str) -> Result<PathBuf, PathError> {
     let cleaned = lexical_clean(rel)?;
-    let canonical_root =
-        std::fs::canonicalize(root).map_err(|_| PathError::WorkdirInaccessible)?;
+    let canonical_root = std::fs::canonicalize(root).map_err(|_| PathError::WorkdirInaccessible)?;
     let canonical = std::fs::canonicalize(canonical_root.join(&cleaned))
         .map_err(|_| PathError::NotFound(rel.to_string()))?;
     if !canonical.starts_with(&canonical_root) {
@@ -102,8 +101,7 @@ pub fn resolve_read(root: &Path, rel: &str) -> Result<PathBuf, PathError> {
 /// the same way. Returns the concrete path to write (rooted at the canonical workdir).
 pub fn resolve_write(root: &Path, rel: &str) -> Result<PathBuf, PathError> {
     let cleaned = lexical_clean(rel)?;
-    let canonical_root =
-        std::fs::canonicalize(root).map_err(|_| PathError::WorkdirInaccessible)?;
+    let canonical_root = std::fs::canonicalize(root).map_err(|_| PathError::WorkdirInaccessible)?;
     let target = canonical_root.join(&cleaned);
 
     // Walk up to the deepest ancestor that exists on disk and canonicalize it. `canonicalize` follows
@@ -167,7 +165,9 @@ mod tests {
         // `dir` inside the workdir is a symlink to a directory OUTSIDE it. Writing `dir/evil` would
         // escape via the symlink — the naive prefix check on the un-canonicalized join would pass.
         symlink(outside.path(), root.path().join("dir")).unwrap();
-        let err = resolve_write(root.path(), "dir/evil").unwrap_err().to_string();
+        let err = resolve_write(root.path(), "dir/evil")
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("escape"), "unexpected: {err}");
     }
 
@@ -182,7 +182,9 @@ mod tests {
         // A file inside the workdir that is itself a symlink pointing outside: writing through it would
         // clobber the outside file.
         symlink(&secret, root.path().join("alias.txt")).unwrap();
-        let err = resolve_write(root.path(), "alias.txt").unwrap_err().to_string();
+        let err = resolve_write(root.path(), "alias.txt")
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("escape"), "unexpected: {err}");
     }
 

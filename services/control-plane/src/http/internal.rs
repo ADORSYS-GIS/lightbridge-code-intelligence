@@ -266,7 +266,7 @@ pub async fn get_context(
                 )
                     .into_response();
             };
-            // BitbucketClient::clone_url() embeds the app password (username:app_password@host).
+            // BitbucketClient::clone_url() embeds the API token (x-bitbucket-api-token-auth:token@host).
             (bitbucket.clone_url(&repo_ref), String::new())
         }
     };

@@ -158,11 +158,16 @@ impl GitlabSection {
 /// intentionally no `BITBUCKET_*` env fallback, since Bitbucket (like GitLab) is naturally
 /// multi-tenant: each repo carries its own credentials rather than one App-wide secret (ADR-0108).
 ///
-/// Auth model (decided at implementation time per ADR-0108's "neutral" consequence): Bitbucket
-/// Cloud's REST API v2.0 supports either an App Password (HTTP Basic: username + app password) or an
-/// OAuth consumer. App Password is chosen here — it's the simplest, matches the "static API
-/// credential" style GitLab already uses in this file, and needs no OAuth app registration/consumer
-/// dance to stand up a first integration.
+/// Auth model: **API tokens**, not App Passwords. Atlassian deprecated Bitbucket Cloud App
+/// Passwords in phases through 2026 (creation blocked 2026-09-09, brownout from 2026-06-09, fully
+/// removed 2026-07-28) in favor of API tokens — HTTP Basic auth with the Atlassian account **email**
+/// as the username and a scoped API token as the password (`read:repository:bitbucket` +
+/// `write:repository:bitbucket`, plus the pull-request scopes, created under Atlassian account
+/// settings → Security → API tokens with scopes). This was originally implemented against App
+/// Passwords and corrected before merge after a bot review caught that the deprecation deadline had
+/// already passed. Git clone over HTTPS uses the literal placeholder username
+/// `x-bitbucket-api-token-auth` (Bitbucket's documented substitute, distinct from GitHub's
+/// `x-access-token`), not the account email.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct BitbucketSection {
@@ -185,10 +190,14 @@ pub struct BitbucketProjectConfig {
     pub repo_slug: String,
     /// Optional per-project API base URL, e.g. `https://api.bitbucket.org/2.0`.
     pub api_url: Option<String>,
-    /// HTTP Basic-auth username paired with `app_password` for Bitbucket Cloud's REST API v2.0.
-    pub username: String,
-    /// Bitbucket Cloud App Password — used both for REST API basic auth and for the HTTPS clone URL.
-    pub app_password: String,
+    /// The Atlassian account email paired with `api_token` for HTTP Basic auth against Bitbucket
+    /// Cloud's REST API v2.0. NOT used for the clone URL — cloning uses the literal
+    /// `x-bitbucket-api-token-auth` placeholder username instead.
+    pub email: String,
+    /// A scoped Bitbucket Cloud API token (`read:repository:bitbucket` +
+    /// `write:repository:bitbucket`, plus pull-request scopes) — the replacement for the retired
+    /// App Password, used for both REST API basic auth and the HTTPS clone URL.
+    pub api_token: String,
     /// Per-repo webhook signing secret. Bitbucket Cloud's HMAC-SHA256 webhook signing feature signs
     /// the raw request body with this secret (`X-Hub-Signature`, `sha256=<hex>` — the same
     /// format GitHub uses); confirm this against the actual configured webhook before relying on it
@@ -283,11 +292,11 @@ impl BitbucketSection {
                     full_name
                 );
             }
-            if project.username.trim().is_empty() {
-                anyhow::bail!("Bitbucket project {} has empty username", full_name);
+            if project.email.trim().is_empty() {
+                anyhow::bail!("Bitbucket project {} has empty email", full_name);
             }
-            if project.app_password.trim().is_empty() {
-                anyhow::bail!("Bitbucket project {} has empty app_password", full_name);
+            if project.api_token.trim().is_empty() {
+                anyhow::bail!("Bitbucket project {} has empty api_token", full_name);
             }
             if project.webhook_secret.trim().is_empty() {
                 anyhow::bail!("Bitbucket project {} has empty webhook_secret", full_name);
@@ -632,15 +641,15 @@ mod tests {
               {
                 "workspace": "myteam",
                 "repo_slug": "my-repo",
-                "username": "bot",
-                "app_password": "pw-a",
+                "email": "bot@example.com",
+                "api_token": "token-a",
                 "webhook_secret": "secret-a"
               },
               {
                 "workspace": "myteam",
                 "repo_slug": "my-repo",
-                "username": "bot",
-                "app_password": "pw-b",
+                "email": "bot@example.com",
+                "api_token": "token-b",
                 "webhook_secret": "secret-b"
               }
             ]
@@ -663,8 +672,8 @@ mod tests {
               {
                 "workspace": "myteam",
                 "repo_slug": "my-repo",
-                "username": "bot",
-                "app_password": "",
+                "email": "bot@example.com",
+                "api_token": "",
                 "webhook_secret": "secret-a"
               }
             ]
@@ -674,8 +683,8 @@ mod tests {
         let err = config
             .bitbucket
             .validate()
-            .expect_err("empty app_password fails");
-        assert!(err.to_string().contains("empty app_password"));
+            .expect_err("empty api_token fails");
+        assert!(err.to_string().contains("empty api_token"));
     }
 
     #[test]
@@ -688,8 +697,8 @@ mod tests {
                 "workspace": "myteam",
                 "repo_slug": "my-repo",
                 "api_url": "htps://api.bitbucket.org/2.0",
-                "username": "bot",
-                "app_password": "pw",
+                "email": "bot@example.com",
+                "api_token": "pw",
                 "webhook_secret": "secret"
               }
             ]
@@ -714,8 +723,8 @@ mod tests {
               {
                 "workspace": "myteam",
                 "repo_slug": "my-repo",
-                "username": "bot",
-                "app_password": "pw",
+                "email": "bot@example.com",
+                "api_token": "pw",
                 "webhook_secret": "secret"
               }
             ]
@@ -738,8 +747,8 @@ mod tests {
             workspace: "myteam".to_string(),
             repo_slug: "my-repo".to_string(),
             api_url: None,
-            username: "bot".to_string(),
-            app_password: "pw".to_string(),
+            email: "bot@example.com".to_string(),
+            api_token: "pw".to_string(),
             webhook_secret: "secret".to_string(),
             bot_handle: None,
         };
