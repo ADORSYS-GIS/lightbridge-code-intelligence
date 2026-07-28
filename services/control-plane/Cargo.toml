@@ -39,6 +39,9 @@ ipnet.workspace = true
 # the 32-byte key from `A2A_PUSH_TOKEN_KEY`. `ring` is already the pinned rustls crypto provider.
 ring.workspace = true
 base64.workspace = true
+# Tolerant JSONC parsing for `.lightbridge-code-review.jsonc` (ADR-0030/ADR-0103): resolving a task's
+# preset needs the repo's `preset`/`entry_points` fields before any clone exists.
+jsonc-parser.workspace = true
 hmac.workspace = true
 sha2.workspace = true
 hex.workspace = true
@@ -62,3 +65,6 @@ a2a-server-lf.workspace = true
 # Test-only: generate an RSA keypair at runtime so no private key is committed (see src/jwt.rs).
 rsa.workspace = true
 rand_08.workspace = true
+# HTTP mocking for platform-API integration tests (e.g. GitLab's repository-file-content fetch during
+# ADR-0103 preset resolution) — no live GitLab/GitHub/Bitbucket needed.
+wiremock.workspace = true

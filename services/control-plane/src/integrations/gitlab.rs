@@ -325,6 +325,15 @@ impl CodePlatform for GitlabPlatformRouter {
         self.client(repo)?.pr_shas(repo, pr_number).await
     }
 
+    async fn get_repo_file(
+        &self,
+        repo: &RepoRef,
+        ref_: &str,
+        path: &str,
+    ) -> anyhow::Result<Option<String>> {
+        self.client(repo)?.get_repo_file(repo, ref_, path).await
+    }
+
     async fn post_review(
         &self,
         repo: &RepoRef,
@@ -536,6 +545,32 @@ impl CodePlatform for GitlabClient {
         let project = Self::project_encoded(repo);
         let refs = self.fetch_mr_diff_refs(&project, pr_number).await?;
         Ok((refs.base_sha, refs.head_sha))
+    }
+
+    async fn get_repo_file(
+        &self,
+        repo: &RepoRef,
+        ref_: &str,
+        path: &str,
+    ) -> anyhow::Result<Option<String>> {
+        let project = Self::project_encoded(repo);
+        // GitLab's file-path segment requires `/` percent-encoded (mirrors `project_encoded` above);
+        // `.lightbridge-code-review.jsonc` itself has no slashes, but a nested path would.
+        let file_path = path.replace('/', "%2F");
+        let url = self.url(&format!(
+            "/projects/{project}/repository/files/{file_path}/raw?ref={ref_}"
+        ));
+        let response = self
+            .http
+            .get(&url)
+            .headers(self.api_headers())
+            .send()
+            .await?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let text = response.error_for_status()?.text().await?;
+        Ok(Some(text))
     }
 
     async fn post_review(

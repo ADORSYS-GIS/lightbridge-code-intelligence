@@ -857,6 +857,7 @@ dependencies = [
  "hex",
  "hmac 0.13.0",
  "ipnet",
+ "jsonc-parser",
  "jsonwebtoken",
  "k8s-openapi",
  "kube",
@@ -887,6 +888,7 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "uuid",
+ "wiremock",
 ]
 
 [[package]]

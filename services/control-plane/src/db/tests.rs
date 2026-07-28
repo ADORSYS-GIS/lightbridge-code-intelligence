@@ -74,7 +74,8 @@ fn pr_task(repository_id: i64, head: &str) -> NewTask {
         base_sha: Some("base".to_string()),
         head_sha: Some(head.to_string()),
         run_epoch: 0,
-        tier: "fast".to_string(),
+        preset: "fast".to_string(),
+        entry_point: "pr_open".to_string(),
         trigger_comment_id: None,
         trace_context: None,
     }
@@ -645,7 +646,8 @@ async fn issue_target_task_round_trips_and_is_distinct_from_a_pr(pool: PgPool) {
         base_sha: None,
         head_sha: None,
         run_epoch: 0,
-        tier: "deep".to_string(),
+        preset: "deep".to_string(),
+        entry_point: "mention".to_string(),
         trigger_comment_id: None,
         trace_context: None,
     };
@@ -715,7 +717,8 @@ async fn explicit_mention_always_creates_a_task_at_the_next_epoch(pool: PgPool) 
         base_sha: Some("base".to_string()),
         head_sha: Some(head.to_string()),
         run_epoch: 0, // ignored by create_explicit_task — the INSERT computes the epoch
-        tier: "deep".to_string(),
+        preset: "deep".to_string(),
+        entry_point: "mention".to_string(),
         trigger_comment_id: None,
         trace_context: None,
     };
@@ -916,7 +919,8 @@ async fn list_repositories_summarises_activity(pool: PgPool) {
                 base_sha: None,
                 head_sha: None,
                 run_epoch: 0,
-                tier: "deep".to_string(),
+                preset: "deep".to_string(),
+                entry_point: "mention".to_string(),
                 trigger_comment_id: None,
                 trace_context: None,
             },
@@ -973,7 +977,8 @@ async fn list_tasks_returns_most_recent_first(pool: PgPool) {
                 base_sha: None,
                 head_sha: None,
                 run_epoch: 0,
-                tier: "deep".to_string(),
+                preset: "deep".to_string(),
+                entry_point: "mention".to_string(),
                 trigger_comment_id: None,
                 trace_context: None,
             },
@@ -1784,8 +1789,8 @@ async fn get_task_context_joins_repo_identity(pool: PgPool) {
     assert_eq!(context.command_text, "review");
     assert_eq!(context.kind, "review", "run kind round-trips (ADR-0033)");
     assert_eq!(
-        context.tier, "fast",
-        "the automatic PR review is the FAST tier (ADR-0062)"
+        context.preset, "fast",
+        "the automatic PR review resolves the fast preset (ADR-0103)"
     );
     assert_eq!(context.head_sha.as_deref(), Some("head1"));
 
@@ -1802,7 +1807,8 @@ async fn get_task_context_joins_repo_identity(pool: PgPool) {
             base_sha: None,
             head_sha: Some("head2".to_string()),
             run_epoch: 0,
-            tier: "deep".to_string(),
+            preset: "deep".to_string(),
+            entry_point: "mention".to_string(),
             trigger_comment_id: Some(918_273),
             trace_context: None,
         },
@@ -1814,8 +1820,8 @@ async fn get_task_context_joins_repo_identity(pool: PgPool) {
         .unwrap()
         .expect("deep task exists");
     assert_eq!(
-        deep_ctx.tier, "deep",
-        "an @mention review is the DEEP tier (ADR-0062)"
+        deep_ctx.preset, "deep",
+        "an @mention review resolves the deep preset (ADR-0103)"
     );
     // ADR-0068: the trigger comment id round-trips through create → get_task_context, so the
     // lifecycle reactions can target the @mention comment.

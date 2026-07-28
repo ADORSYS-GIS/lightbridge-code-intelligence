@@ -650,6 +650,23 @@ async fn handle_gitlab_merge_request(
                     );
                 }
             }
+            let repo_ref = RepoRef {
+                platform: Platform::GitLab,
+                full_name: format!("{owner}/{name}"),
+                platform_repo_id: project_id,
+                installation_id,
+            };
+            let preset = crate::preset::resolve_preset_or_default(
+                state
+                    .gitlab
+                    .as_ref()
+                    .and_then(|registry| registry.client_for_project(project_id))
+                    .map(|client| client as &dyn CodePlatform),
+                &repo_ref,
+                base_sha.as_deref().unwrap_or(default_branch),
+                crate::preset::EntryPoint::PrOpen,
+            )
+            .await;
             let task = crate::db::NewTask {
                 repository_id,
                 installation_id,
@@ -660,7 +677,8 @@ async fn handle_gitlab_merge_request(
                 base_sha,
                 head_sha,
                 run_epoch: 0,
-                tier: "fast".to_string(),
+                preset,
+                entry_point: crate::preset::EntryPoint::PrOpen.as_str().to_string(),
                 trigger_comment_id: None,
                 trace_context: lci_observability::current_traceparent(),
             };
@@ -861,6 +879,24 @@ async fn handle_gitlab_note(
         (None, None)
     };
 
+    let repo_ref = crate::integrations::platform::RepoRef {
+        platform: Platform::GitLab,
+        full_name: format!("{owner}/{name}"),
+        platform_repo_id: project_id,
+        installation_id,
+    };
+    let preset = crate::preset::resolve_preset_or_default(
+        state
+            .gitlab
+            .as_ref()
+            .and_then(|registry| registry.client_for_project(project_id))
+            .map(|client| client as &dyn CodePlatform),
+        &repo_ref,
+        base_sha.as_deref().unwrap_or(default_branch),
+        crate::preset::EntryPoint::Mention,
+    )
+    .await;
+
     let command_text = command_from_comment(body);
     let trigger_comment_id = payload["object_attributes"]["id"].as_i64();
     let task = crate::db::NewTask {
@@ -873,7 +909,8 @@ async fn handle_gitlab_note(
         base_sha,
         head_sha,
         run_epoch: 0,
-        tier: "deep".to_string(),
+        preset,
+        entry_point: crate::preset::EntryPoint::Mention.as_str().to_string(),
         trigger_comment_id,
         trace_context: lci_observability::current_traceparent(),
     };
@@ -1002,6 +1039,23 @@ async fn handle_bitbucket_pullrequest(
                 .as_str()
                 .map(str::to_string);
             let head_sha = pr["source"]["commit"]["hash"].as_str().map(str::to_string);
+            let repo_ref = RepoRef {
+                platform: Platform::Bitbucket,
+                full_name: full_name.clone(),
+                platform_repo_id: installation_id,
+                installation_id,
+            };
+            let preset = crate::preset::resolve_preset_or_default(
+                state
+                    .bitbucket
+                    .as_ref()
+                    .and_then(|registry| registry.client_for_project(installation_id))
+                    .map(|client| client as &dyn CodePlatform),
+                &repo_ref,
+                base_sha.as_deref().unwrap_or(&default_branch),
+                crate::preset::EntryPoint::PrOpen,
+            )
+            .await;
             let task = crate::db::NewTask {
                 repository_id,
                 installation_id,
@@ -1012,7 +1066,8 @@ async fn handle_bitbucket_pullrequest(
                 base_sha,
                 head_sha,
                 run_epoch: 0,
-                tier: "fast".to_string(),
+                preset,
+                entry_point: crate::preset::EntryPoint::PrOpen.as_str().to_string(),
                 trigger_comment_id: None,
                 trace_context: lci_observability::current_traceparent(),
             };
@@ -1201,6 +1256,14 @@ async fn handle_bitbucket_comment(
         }
     };
 
+    let preset = crate::preset::resolve_preset_or_default(
+        Some(client as &dyn CodePlatform),
+        &repo_ref,
+        base_sha.as_deref().unwrap_or(&default_branch),
+        crate::preset::EntryPoint::Mention,
+    )
+    .await;
+
     let command_text = command_from_comment(body);
     let trigger_comment_id = payload["comment"]["id"].as_i64();
     let task = crate::db::NewTask {
@@ -1213,7 +1276,8 @@ async fn handle_bitbucket_comment(
         base_sha,
         head_sha,
         run_epoch: 0,
-        tier: "deep".to_string(),
+        preset,
+        entry_point: crate::preset::EntryPoint::Mention.as_str().to_string(),
         trigger_comment_id,
         trace_context: lci_observability::current_traceparent(),
     };
@@ -1336,6 +1400,25 @@ async fn handle_pull_request(
                 crate::http::metrics::review_skipped_bot_author();
                 return;
             }
+            let base_sha = pr["base"]["sha"].as_str().map(str::to_string);
+            let head_sha = pr["head"]["sha"].as_str().map(str::to_string);
+            // ADR-0103: resolve the repo's configured preset for the pr_open entry point, reading
+            // `.lightbridge-code-review.jsonc` at the BASE ref (fork-safe by construction — never the
+            // PR head) via a single small file fetch, falling back to the platform default (`fast`,
+            // reproducing today's ADR-0062 behavior) when the repo declares nothing.
+            let repo_ref = RepoRef {
+                platform: Platform::GitHub,
+                full_name: format!("{owner}/{name}"),
+                platform_repo_id: github_repo_id,
+                installation_id,
+            };
+            let preset = crate::preset::resolve_preset_or_default(
+                state.platforms.get(&Platform::GitHub).map(std::sync::Arc::as_ref),
+                &repo_ref,
+                base_sha.as_deref().unwrap_or(default_branch),
+                crate::preset::EntryPoint::PrOpen,
+            )
+            .await;
             let task = crate::db::NewTask {
                 repository_id,
                 installation_id,
@@ -1343,12 +1426,11 @@ async fn handle_pull_request(
                 target_type: "pull_request".to_string(),
                 target_id: pr_number,
                 command_text: "review".to_string(),
-                base_sha: pr["base"]["sha"].as_str().map(str::to_string),
-                head_sha: pr["head"]["sha"].as_str().map(str::to_string),
+                base_sha,
+                head_sha,
                 run_epoch: 0, // the automatic first review
-                // ADR-0062: the automatic on-open review is the FAST tier (SAST + a lean diff-only LLM
-                // pass, no retrieval, turn-capped). The deep, repo-aware review is `@mention`-only.
-                tier: "fast".to_string(),
+                preset,
+                entry_point: crate::preset::EntryPoint::PrOpen.as_str().to_string(),
                 // ADR-0068: no trigger comment on the automatic review → the lifecycle reactions land on
                 // the PR body itself.
                 trigger_comment_id: None,
@@ -1513,21 +1595,23 @@ async fn handle_issue_comment(
         return;
     }
 
+    let repo_ref = RepoRef {
+        platform: Platform::GitHub,
+        full_name: format!("{owner}/{name}"),
+        platform_repo_id: github_repo_id,
+        installation_id,
+    };
+    let github_platform = state.platforms.get(&Platform::GitHub);
+
     // A PR re-review needs the base/head SHAs to scope the diff (the comment payload omits them); a
     // plain issue has no diff, so the agent answers against the default branch.
     let (base_sha, head_sha) = if is_pr {
-        let Some(github) = state.platforms.get(&Platform::GitHub) else {
+        let Some(github) = github_platform else {
             tracing::warn!(
                 delivery_id,
                 "github app not configured; cannot fetch PR SHAs"
             );
             return;
-        };
-        let repo_ref = RepoRef {
-            platform: Platform::GitHub,
-            full_name: format!("{owner}/{name}"),
-            platform_repo_id: github_repo_id,
-            installation_id,
         };
         match github.pr_shas(&repo_ref, number).await {
             Ok(shas) => shas,
@@ -1539,6 +1623,16 @@ async fn handle_issue_comment(
     } else {
         (None, None)
     };
+
+    // ADR-0103: resolve the repo's configured preset for the mention entry point, reading the repo
+    // config at the PR's BASE ref when there is one (fork-safe), else the default branch.
+    let preset = crate::preset::resolve_preset_or_default(
+        github_platform.map(std::sync::Arc::as_ref),
+        &repo_ref,
+        base_sha.as_deref().unwrap_or(default_branch),
+        crate::preset::EntryPoint::Mention,
+    )
+    .await;
 
     // Carry the WHOLE comment into the task → prompt (#138): the agent knows its own name from the
     // system prompt, so it interprets "@<handle> please review this" — and co-mentions like
@@ -1566,9 +1660,8 @@ async fn handle_issue_comment(
         base_sha,
         head_sha,
         run_epoch: 0,
-        // ADR-0062: an `@mention` always triggers the DEEP tier — full retrieval, multi-turn — whether
-        // the target is a PR (deep review) or an issue (conversational answer).
-        tier: "deep".to_string(),
+        preset,
+        entry_point: crate::preset::EntryPoint::Mention.as_str().to_string(),
         trigger_comment_id,
         trace_context: lci_observability::current_traceparent(),
     };
@@ -2438,6 +2531,183 @@ mod tests {
             response.status(),
             StatusCode::INTERNAL_SERVER_ERROR,
             "a persistence failure inside the step wrap still returns 500, same as before the wrap"
+        );
+    }
+
+    /// End-to-end: an MR-open webhook fetches the repo's `.lightbridge-code-review.jsonc` from the
+    /// GitLab API (ADR-0030/ADR-0103) and the created task carries the resolved `preset` — proving the
+    /// whole chain (webhook → `resolve_preset` → `CodePlatform::get_repo_file` → JSONC parse → DB
+    /// insert), not just the pure resolver function in isolation.
+    #[sqlx::test]
+    async fn mr_open_resolves_a_custom_preset_from_repo_config(pool: PgPool) {
+        let mock = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/api/v4/projects/acme%2Fwidgets/repository/files/.lightbridge-code-review.jsonc/raw",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_string(r#"{"preset": "ultra"}"#),
+            )
+            .mount(&mock)
+            .await;
+
+        let section = crate::config::GitlabSection {
+            enabled: true,
+            default_api_url: Some("https://gitlab.example.com/api/v4".to_string()),
+            default_bot_handle: Some("lightbridge-bot".to_string()),
+            projects: vec![crate::config::GitlabProjectConfig {
+                project_id: 2001,
+                api_url: Some(format!("{}/api/v4", mock.uri())),
+                access_token: "token-preset-test".to_string(),
+                webhook_secret: "preset-secret".to_string(),
+                bot_handle: None,
+            }],
+        };
+        let registry = crate::integrations::gitlab::GitlabRegistry::from_config(&section)
+            .expect("valid config")
+            .expect("enabled registry");
+
+        let repo_id = crate::db::upsert_repository(
+            &pool,
+            Platform::GitLab,
+            2001,
+            "acme",
+            "widgets",
+            "main",
+            Some(2001),
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE repositories SET status = 'approved' WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let mut state = gitlab_only_state(pool.clone());
+        state.gitlab = Some(registry);
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-gitlab-event", "Merge Request Hook".parse().unwrap());
+        headers.insert("x-gitlab-token", "preset-secret".parse().unwrap());
+        headers.insert("x-gitlab-event-uuid", "preset-test-uuid".parse().unwrap());
+        let payload = serde_json::json!({
+            "object_attributes": {
+                "action": "open",
+                "iid": 7,
+                "diff_refs": { "base_sha": "base123", "head_sha": "head456" },
+                "last_commit": { "author": { "name": "A Human" } },
+            },
+            "project": {
+                "id": 2001,
+                "path_with_namespace": "acme/widgets",
+                "default_branch": "main",
+            },
+            "user": { "username": "a-human" },
+        });
+        let body = Bytes::from(serde_json::to_vec(&payload).unwrap());
+
+        let response = webhook_router_body(state, headers, body).await;
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+        let (preset, entry_point): (String, String) = sqlx::query_as(
+            "SELECT preset, entry_point FROM tasks WHERE repository_id = $1 AND target_id = 7",
+        )
+        .bind(repo_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            preset, "ultra",
+            "the repo's .lightbridge-code-review.jsonc preset was resolved end-to-end"
+        );
+        assert_eq!(entry_point, "pr_open");
+    }
+
+    /// The same MR-open flow, but with no `.lightbridge-code-review.jsonc` on the repo at all (the
+    /// GitLab API 404s) — the task falls back to the platform-default `pr_open` mapping (`fast`),
+    /// reproducing today's ADR-0062 behavior exactly for a repo that configures nothing.
+    #[sqlx::test]
+    async fn mr_open_falls_back_to_the_platform_default_preset_when_no_repo_config_exists(
+        pool: PgPool,
+    ) {
+        let mock = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/api/v4/projects/acme%2Fno-config/repository/files/.lightbridge-code-review.jsonc/raw",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(404))
+            .mount(&mock)
+            .await;
+
+        let section = crate::config::GitlabSection {
+            enabled: true,
+            default_api_url: Some("https://gitlab.example.com/api/v4".to_string()),
+            default_bot_handle: Some("lightbridge-bot".to_string()),
+            projects: vec![crate::config::GitlabProjectConfig {
+                project_id: 2002,
+                api_url: Some(format!("{}/api/v4", mock.uri())),
+                access_token: "token-no-config-test".to_string(),
+                webhook_secret: "no-config-secret".to_string(),
+                bot_handle: None,
+            }],
+        };
+        let registry = crate::integrations::gitlab::GitlabRegistry::from_config(&section)
+            .expect("valid config")
+            .expect("enabled registry");
+
+        let repo_id = crate::db::upsert_repository(
+            &pool,
+            Platform::GitLab,
+            2002,
+            "acme",
+            "no-config",
+            "main",
+            Some(2002),
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE repositories SET status = 'approved' WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let mut state = gitlab_only_state(pool.clone());
+        state.gitlab = Some(registry);
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-gitlab-event", "Merge Request Hook".parse().unwrap());
+        headers.insert("x-gitlab-token", "no-config-secret".parse().unwrap());
+        headers.insert("x-gitlab-event-uuid", "no-config-test-uuid".parse().unwrap());
+        let payload = serde_json::json!({
+            "object_attributes": {
+                "action": "open",
+                "iid": 9,
+                "diff_refs": { "base_sha": "base789", "head_sha": "head012" },
+                "last_commit": { "author": { "name": "A Human" } },
+            },
+            "project": {
+                "id": 2002,
+                "path_with_namespace": "acme/no-config",
+                "default_branch": "main",
+            },
+            "user": { "username": "a-human" },
+        });
+        let body = Bytes::from(serde_json::to_vec(&payload).unwrap());
+
+        let response = webhook_router_body(state, headers, body).await;
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+        let preset: String =
+            sqlx::query_scalar("SELECT preset FROM tasks WHERE repository_id = $1 AND target_id = 9")
+                .bind(repo_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            preset, "fast",
+            "no repo config → the platform-default pr_open mapping applies (ADR-0062 behavior preserved)"
         );
     }
 }
