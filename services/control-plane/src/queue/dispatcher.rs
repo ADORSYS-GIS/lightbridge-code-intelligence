@@ -10,6 +10,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use lci_agent_step::{Passthrough, StepError, StepRuntime};
+use lci_agent_types::StepName;
 use sqlx::PgPool;
 use sqlx::postgres::PgListener;
 
@@ -144,7 +146,7 @@ impl Default for DispatcherConfig {
 
 /// Run the dispatcher until cancelled. `owner` identifies this replica in the lease (e.g. the pod
 /// name) for observability and Phase-2 reaping.
-pub async fn run<L: TaskLauncher>(
+pub async fn run<L: TaskLauncher + Sync>(
     pool: PgPool,
     launcher: L,
     owner: String,
@@ -280,7 +282,7 @@ async fn shutdown_signal() {
 }
 
 /// Claim and dispatch every task that is due right now, then return so the caller can wait.
-async fn drain<L: TaskLauncher>(
+async fn drain<L: TaskLauncher + Sync>(
     pool: &PgPool,
     launcher: &L,
     owner: &str,
@@ -301,39 +303,73 @@ async fn drain<L: TaskLauncher>(
 
 /// Launch a claimed task's Job and record it; on failure, requeue with backoff so the work is not
 /// lost (the claim already moved it out of `queued`).
-async fn dispatch<L: TaskLauncher>(
+///
+/// ADR-0107: this whole function body is the dispatcher's state transition, so it runs behind a
+/// `StepRuntime::step` seam keyed by the task's identity. Every backend role currently only ever
+/// constructs `Passthrough` (the sole concrete runtime until `CheckpointRuntime` promotion, blocked
+/// on #363) — its `step()` is verbatim `f().await`, so wrapping the body here changes nothing about
+/// what runs or when; it only names the transition for the seam ADR-0107 wants exposed everywhere.
+/// `dispatch()` itself keeps its `()` external signature: all pre-existing internal error handling
+/// (the `launcher.launch` match arms, `db::set_task_job`, `react_work_started`, `db::release_task`)
+/// stays unchanged inside the closure, which always resolves `Ok(())` — nothing here ever fails
+/// outward, so the step's own `Result` is only there to satisfy `StepRuntime::step`'s shape.
+async fn dispatch<L: TaskLauncher + Sync>(
     pool: &PgPool,
     launcher: &L,
     task: &db::ClaimedTask,
     cfg: &DispatcherConfig,
     review: &ReviewSection,
 ) {
-    let started = std::time::Instant::now();
-    match launcher.launch(task).await {
-        Ok(job_name) => {
-            crate::http::metrics::dispatch_outcome("launched");
-            crate::http::metrics::dispatch_launch_seconds(started.elapsed().as_secs_f64());
-            match db::set_task_job(pool, task.id, &job_name).await {
-                Ok(()) => tracing::info!(task_id = %task.id, job_name, "dispatched task to a Job"),
+    let step_name = StepName::from(format!("dispatch:{}", task.id));
+    let step_result = Passthrough
+        .step(step_name, async || {
+            let started = std::time::Instant::now();
+            match launcher.launch(task).await {
+                Ok(job_name) => {
+                    crate::http::metrics::dispatch_outcome("launched");
+                    crate::http::metrics::dispatch_launch_seconds(started.elapsed().as_secs_f64());
+                    match db::set_task_job(pool, task.id, &job_name).await {
+                        Ok(()) => {
+                            tracing::info!(task_id = %task.id, job_name, "dispatched task to a Job")
+                        }
+                        Err(error) => {
+                            // The Job exists but we couldn't record its name; surface it for
+                            // follow-up rather than launching a second Job.
+                            tracing::error!(
+                                %error, task_id = %task.id, job_name, "failed to record job name"
+                            )
+                        }
+                    }
+                    // ADR-0068: 👀 means "seen AND work started" — enqueue it now the agent Job is
+                    // launched (the queued→running-and-dispatched transition), not at webhook
+                    // receipt. Best-effort: a failure here must never fail the dispatch. PR tasks and
+                    // @mention-triggered tasks react; the target is the @mention comment when
+                    // mention-triggered, else the PR body.
+                    react_work_started(pool, task, review).await;
+                }
                 Err(error) => {
-                    // The Job exists but we couldn't record its name; surface it for follow-up
-                    // rather than launching a second Job.
-                    tracing::error!(%error, task_id = %task.id, job_name, "failed to record job name")
+                    crate::http::metrics::dispatch_outcome("failed");
+                    tracing::error!(%error, task_id = %task.id, "failed to launch job; requeueing");
+                    if let Err(release_error) =
+                        db::release_task(pool, task.id, cfg.launch_backoff).await
+                    {
+                        tracing::error!(
+                            %release_error, task_id = %task.id, "failed to requeue task"
+                        );
+                    }
                 }
             }
-            // ADR-0068: 👀 means "seen AND work started" — enqueue it now the agent Job is launched (the
-            // queued→running-and-dispatched transition), not at webhook receipt. Best-effort: a failure
-            // here must never fail the dispatch. PR tasks and @mention-triggered tasks react; the target
-            // is the @mention comment when mention-triggered, else the PR body.
-            react_work_started(pool, task, review).await;
-        }
-        Err(error) => {
-            crate::http::metrics::dispatch_outcome("failed");
-            tracing::error!(%error, task_id = %task.id, "failed to launch job; requeueing");
-            if let Err(release_error) = db::release_task(pool, task.id, cfg.launch_backoff).await {
-                tracing::error!(%release_error, task_id = %task.id, "failed to requeue task");
-            }
-        }
+            Ok::<(), StepError>(())
+        })
+        .await;
+    // Passthrough::step is literally `f().await`, and the closure above always resolves `Ok(())`, so
+    // this branch should be unreachable. Log rather than silently swallow it in case that invariant
+    // is ever broken by a future runtime swap.
+    if let Err(error) = step_result {
+        tracing::error!(
+            %error, task_id = %task.id,
+            "unreachable: step runtime reported failure wrapping dispatch"
+        );
     }
 }
 
@@ -448,5 +484,118 @@ mod tests {
             config(Some("0"), Some("100")).a2a_task_ttl_days,
             DEFAULT_A2A_TASK_TTL_DAYS
         );
+    }
+
+    // ── ADR-0107 step wrap: proves `Passthrough.step(...)` around `dispatch()`'s body is a pure
+    // naming exercise, not a behavior change (needs Postgres via DATABASE_URL; CI runs no Rust test
+    // job today) ────────────────────────────────────────────────────────────────────────────────
+
+    use crate::db::{ClaimedTask, NewTask};
+    use crate::integrations::k8s::JobLiveness;
+    use crate::integrations::platform::Platform;
+    use uuid::Uuid;
+
+    /// A launcher whose `launch` outcome is fixed up front — lets `dispatch()` be driven without a
+    /// cluster, for both the success and failure branches of its wrapped body.
+    struct FakeDispatchLauncher {
+        result: Result<String, String>,
+    }
+
+    impl TaskLauncher for FakeDispatchLauncher {
+        async fn launch(&self, _task: &ClaimedTask) -> anyhow::Result<String> {
+            self.result.clone().map_err(|error| anyhow::anyhow!(error))
+        }
+        async fn job_liveness(&self, _job_name: &str) -> anyhow::Result<JobLiveness> {
+            anyhow::bail!("FakeDispatchLauncher::job_liveness is not used by dispatch()")
+        }
+        async fn delete_job(&self, _job_name: &str) -> anyhow::Result<()> {
+            anyhow::bail!("FakeDispatchLauncher::delete_job is not used by dispatch()")
+        }
+    }
+
+    /// Claim a freshly-created `index` task (no PR/mention context, so `react_work_started` returns
+    /// immediately — keeping the fixture focused on the launch/requeue transition this test cares
+    /// about). Returns the claimed task ready to hand to `dispatch()`.
+    async fn claimed_index_task(pool: &PgPool) -> ClaimedTask {
+        let repo_id =
+            db::upsert_repository(pool, Platform::GitHub, 1, "octo", "repo", "main", None)
+                .await
+                .unwrap();
+        db::record_delivery(pool, Platform::GitHub, "d1", "push", &serde_json::json!({}))
+            .await
+            .unwrap();
+        db::create_task(
+            pool,
+            &NewTask {
+                repository_id: repo_id,
+                installation_id: 99,
+                webhook_delivery_id: "d1".to_string(),
+                target_type: "repository".to_string(),
+                target_id: 0,
+                command_text: "index".to_string(),
+                base_sha: None,
+                head_sha: Some("head1".to_string()),
+                run_epoch: 0,
+                tier: "deep".to_string(),
+                trigger_comment_id: None,
+                trace_context: None,
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        db::claim_next_task(pool, "owner-a", Duration::from_secs(60))
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    async fn status_and_job_name(pool: &PgPool, id: Uuid) -> (String, Option<String>) {
+        sqlx::query_as("SELECT status, job_name FROM tasks WHERE id = $1")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// The step-wrapped body still records the Job name and metrics on a successful launch, exactly
+    /// as before the wrap — proving `Passthrough.step(...)` (verbatim `f().await`) changed nothing
+    /// observable about the success path.
+    #[sqlx::test]
+    async fn dispatch_wrapped_in_step_still_records_job_name_on_success(pool: PgPool) {
+        let task = claimed_index_task(&pool).await;
+        let launcher = FakeDispatchLauncher {
+            result: Ok("job-123".to_string()),
+        };
+        let cfg = DispatcherConfig::default();
+        let review = ReviewSection::default();
+
+        dispatch(&pool, &launcher, &task, &cfg, &review).await;
+
+        let (status, job_name) = status_and_job_name(&pool, task.id).await;
+        assert_eq!(
+            status, "running",
+            "a successful launch leaves the task running"
+        );
+        assert_eq!(job_name, Some("job-123".to_string()));
+    }
+
+    /// The step-wrapped body still requeues with backoff on a failed launch, exactly as before the
+    /// wrap — the closure's internal error handling (the `db::release_task` call) is untouched by
+    /// the seam, only named by it.
+    #[sqlx::test]
+    async fn dispatch_wrapped_in_step_still_requeues_on_launch_failure(pool: PgPool) {
+        let task = claimed_index_task(&pool).await;
+        let launcher = FakeDispatchLauncher {
+            result: Err("kube api unavailable".to_string()),
+        };
+        let cfg = DispatcherConfig::default();
+        let review = ReviewSection::default();
+
+        dispatch(&pool, &launcher, &task, &cfg, &review).await;
+
+        let (status, job_name) = status_and_job_name(&pool, task.id).await;
+        assert_eq!(status, "queued", "a failed launch is requeued for retry");
+        assert_eq!(job_name, None, "no Job was actually created");
     }
 }

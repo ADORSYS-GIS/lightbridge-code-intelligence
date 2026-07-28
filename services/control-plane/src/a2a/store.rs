@@ -22,6 +22,8 @@
 use a2a::{A2AError, ListTasksRequest, ListTasksResponse, Task, TaskState, error_code};
 use a2a_server::task_store::{TaskStore, TaskVersion};
 use async_trait::async_trait;
+use lci_agent_step::{Passthrough, StepError, StepRuntime};
+use lci_agent_types::StepName;
 use serde_json::Value;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -229,22 +231,41 @@ impl TaskStore for PgTaskStore {
         let json = serde_json::to_value(&to_store)
             .map_err(|e| A2AError::internal(format!("a2a store: serialize task: {e}")))?;
 
-        let new_version: Option<i64> = sqlx::query_scalar(
-            "UPDATE a2a_tasks \
-             SET task_json = $2, state = $3, \
-                 underlying_task_id = COALESCE($4, underlying_task_id), \
-                 version = version + 1, updated_at = now() \
-             WHERE a2a_task_id = $1 AND version = $5 \
-             RETURNING version",
-        )
-        .bind(id)
-        .bind(&json)
-        .bind(&state)
-        .bind(underlying)
-        .bind(expected)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| A2AError::internal(format!("a2a store: update: {e}")))?;
+        // ADR-0107: the CAS write itself is the state-changing step. Keyed by the A2A task id and
+        // the version it expects to replace, so a retry of the *same* logical transition would
+        // journal under the same name once a real (non-`Passthrough`) runtime is wired in
+        // (blocked on #363). `Passthrough` makes this call a pure pass-through today — `f().await`,
+        // nothing more — so behavior is unchanged; only the seam exists.
+        let pool = &self.pool;
+        let step_name = StepName::from(format!("a2a_task:{id}:{expected}"));
+        let new_version: Option<i64> = Passthrough
+            .step(step_name, async || {
+                sqlx::query_scalar(
+                    "UPDATE a2a_tasks \
+                     SET task_json = $2, state = $3, \
+                         underlying_task_id = COALESCE($4, underlying_task_id), \
+                         version = version + 1, updated_at = now() \
+                     WHERE a2a_task_id = $1 AND version = $5 \
+                     RETURNING version",
+                )
+                .bind(id)
+                .bind(&json)
+                .bind(&state)
+                .bind(underlying)
+                .bind(expected)
+                .fetch_optional(pool)
+                .await
+                .map_err(|e: sqlx::Error| StepError::terminal(format!("a2a store: update: {e}")))
+            })
+            .await
+            .map_err(|error| match error {
+                // The closure above only ever constructs `Terminal`, so this reconstructs the
+                // exact `A2AError::internal(...)` the un-wrapped code produced. The `Transient`
+                // arm is unreachable today but handled so the match stays exhaustive without
+                // silently swallowing a variant if a future edit introduces one.
+                StepError::Terminal { reason } => A2AError::internal(reason),
+                StepError::Transient { source, .. } => A2AError::internal(source.to_string()),
+            })?;
 
         match new_version {
             Some(v) => Ok(v as TaskVersion),
@@ -346,6 +367,35 @@ mod tests {
     use super::*;
     use a2a::{TaskState, TaskStatus};
     use std::collections::HashMap;
+
+    /// ADR-0107: the `Passthrough` wrap added around the CAS write in [`PgTaskStore::update`] must
+    /// be inert — it runs the closure exactly once, in-process, with no serialization or side
+    /// effect of its own. This doesn't touch Postgres: it proves the seam itself (same
+    /// `Passthrough::step` call shape `update` now uses) adds nothing observable, independent of
+    /// the DB-backed CAS tests below which prove `update`'s behavior is unchanged end-to-end.
+    #[tokio::test]
+    async fn passthrough_wrap_around_the_cas_write_is_inert() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let calls = AtomicUsize::new(0);
+        let id = Uuid::now_v7();
+        let expected = 1_i64;
+        let step_name = StepName::from(format!("a2a_task:{id}:{expected}"));
+
+        let result: Result<Option<i64>, StepError> = Passthrough
+            .step(step_name, async || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(Some(2_i64))
+            })
+            .await;
+
+        assert_eq!(result.unwrap(), Some(2));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the wrap must not run the closure more than once"
+        );
+    }
 
     fn task_with(id: Uuid, caller: &str, state: TaskState) -> Task {
         let mut metadata = HashMap::new();
