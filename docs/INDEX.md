@@ -31,6 +31,8 @@ This directory contains the complete documentation set for Lightbridge Code Inte
 
 ### Run it
 - [Local setup guide](local-setup.md) — compose deps, GitHub App + webhook proxy, manual trigger, multipass + k3s
+- [Runbook: setting up and demoing the Bitbucket `CodePlatform`](runbooks/bitbucket-platform-setup.md) — configure one Bitbucket repo end to end (API token, webhook, approval) and prove a webhook produces a review (ADR-0072/0108)
+- [Runbook: activating the Restate egress pilot](runbooks/restate-egress-pilot-activation.md) — turning on (and safely rolling back) the Restate-backed egress path (RFC-0005 Phase A / ADR-0074)
 
 ### Decisions and process
 - [Architecture Decision Records (ADRs)](adr/README.md)

@@ -249,6 +249,46 @@ endpoint. Both the outbound 👀 reaction and the inbound 👍/👎 feedback pol
 (the task's `target_id`) so the reconciler can address the scoped `…/notes/{note_id}/award_emoji`
 endpoint directly.
 
+### Bitbucket configuration (ADR-0108)
+
+Bitbucket Cloud is a third `CodePlatform` implementation, wired in the same way as GitLab: **only**
+through `control-plane.json`, no `BITBUCKET_*` env fallback, one entry per repo. See
+[the Bitbucket platform setup runbook](runbooks/bitbucket-platform-setup.md) for the full walkthrough
+(creating credentials, registering the webhook, verifying end to end); this section is the config
+reference.
+
+```json
+{
+  "bitbucket": {
+    "enabled": true,
+    "default_api_url": "https://api.bitbucket.org/2.0",
+    "default_bot_handle": "lightbridge-bot",
+    "projects": [
+      {
+        "workspace": "myteam",
+        "repo_slug": "my-repo",
+        "email": "<bot-account-email>",
+        "api_token": "<mounted-secret-value>",
+        "webhook_secret": "<mounted-secret-value>"
+      }
+    ]
+  }
+}
+```
+
+**Auth is a Bitbucket Cloud API token, not an App Password.** Atlassian retired App Passwords in
+phases through 2026 (blocked from creation 2026-09-09, brownout from 2026-06-09, fully removed
+2026-07-28) in favor of API tokens — HTTP Basic auth where the *username* is the bot account's
+Atlassian **email** and the *password* is a scoped API token (`read:repository:bitbucket` +
+`write:repository:bitbucket`, plus the pull-request read/write scopes), created under the bot
+account's Atlassian settings → Security → API tokens with scopes. Git clone over HTTPS uses a
+different, fixed placeholder username (`x-bitbucket-api-token-auth`), not the email — the control
+plane handles that distinction internally; operators only ever configure `email` + `api_token`.
+
+Recommended production delivery is the same as GitLab's: an ExternalSecret-managed Kubernetes
+Secret mounted as `/etc/lightbridge/control-plane.json`, so Bitbucket credentials never exist as
+process env vars.
+
 ## Deploy ordering (the `deny_unknown_fields` 3-repo dance)
 
 Because both the control-plane and agent configs set `deny_unknown_fields`, a values file that names a
