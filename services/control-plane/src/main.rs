@@ -36,6 +36,7 @@ mod db;
 mod jwt;
 mod mcp_client;
 mod outbox;
+mod preset;
 mod review;
 mod runner_token;
 mod types;

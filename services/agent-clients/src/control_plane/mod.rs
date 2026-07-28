@@ -44,11 +44,15 @@ pub struct TaskContext {
     /// runner branches on this. Defaults to `review` if an older control plane omits the field.
     #[serde(default = "default_run_kind")]
     pub kind: String,
-    /// Review tier (ADR-0062): `fast` (automatic `pull_request opened` — SAST + one diff-only LLM turn,
-    /// no retrieval) or `deep` (`@mention` — full retrieval, multi-turn). Defaults to `deep` (the full,
-    /// safe behavior) if an older control plane omits the field.
-    #[serde(default = "default_tier")]
-    pub tier: String,
+    /// Resolved review preset (ADR-0103), e.g. `"fast"`/`"deep"`/`"ultra"` or an operator-defined name.
+    /// Defaults to `"deep"` (the full, safe behavior) if an older control plane omits the field.
+    #[serde(default = "default_preset")]
+    pub preset: String,
+    /// Which entry point created this task (`"pr_open"`/`"mention"`/`"a2a"`, ADR-0103) — kept separate
+    /// from `preset` since preset names are operator-defined. Defaults to `"mention"` (the full, safe
+    /// framing) if an older control plane omits the field.
+    #[serde(default = "default_entry_point")]
+    pub entry_point: String,
     pub base_sha: Option<String>,
     pub head_sha: Option<String>,
     /// Whether the repo already has a semantic index — review reuses it instead of re-indexing
@@ -74,10 +78,15 @@ fn default_run_kind() -> String {
     "review".to_string()
 }
 
-/// Default review tier when the control plane omits it (back-compat): the full `deep` review, so an
+/// Default review preset when the control plane omits it (back-compat): the full `deep` review, so an
 /// older control plane never silently downgrades a run to the fast/shallow path.
-fn default_tier() -> String {
+fn default_preset() -> String {
     "deep".to_string()
+}
+
+/// Default entry point when the control plane omits it (back-compat): `mention`, the full/safe framing.
+fn default_entry_point() -> String {
+    "mention".to_string()
 }
 
 impl TaskContext {
@@ -190,7 +199,8 @@ mod tests {
             target_id: 7,
             command: "review".into(),
             kind: "review".into(),
-            tier: "deep".into(),
+            preset: "deep".into(),
+            entry_point: "mention".into(),
             base_sha: None,
             head_sha: Some("deadbeef".into()),
             repo_indexed: false,

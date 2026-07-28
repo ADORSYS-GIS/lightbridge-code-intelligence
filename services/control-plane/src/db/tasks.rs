@@ -74,10 +74,16 @@ pub struct NewTask {
     /// automatic first review uses `0`). The explicit `@mention` path goes through
     /// [`create_explicit_task`], which computes the epoch inside the INSERT and ignores this field.
     pub run_epoch: i32,
-    /// Review tier (ADR-0062): `"fast"` (automatic `pull_request opened` — SAST + one diff-only LLM
-    /// turn, no retrieval) or `"deep"` (`@mention` — full retrieval, multi-turn). The runner reads it
-    /// from the task context. Index tasks don't set it (the column defaults to `deep`, ignored).
-    pub tier: String,
+    /// Resolved review preset (ADR-0103), e.g. `"fast"`/`"deep"`/`"ultra"` or an operator-defined
+    /// name — resolved from repo config per entry point before the task is created
+    /// (`review::preset::resolve_preset`). The runner reads it from the task context. Index tasks
+    /// don't set it (the column defaults to `deep`, ignored).
+    pub preset: String,
+    /// Which entry point created this task (`"pr_open"`/`"mention"`/`"a2a"`) — kept separate from
+    /// `preset` because preset names are operator-defined and can't be relied on to signal intent
+    /// (e.g. "was this an automatic open-PR pass"). Index tasks don't set it meaningfully (defaults to
+    /// `mention`, ignored).
+    pub entry_point: String,
     /// GitHub id of the `@mention` comment that triggered this task (ADR-0068), so the lifecycle
     /// reactions target the triggering comment. `None` for the automatic `pull_request opened` review
     /// (no trigger comment → the reactions land on the PR body) and for index tasks.
@@ -145,9 +151,9 @@ pub async fn create_task(pool: &PgPool, task: &NewTask) -> Result<Option<Uuid>, 
     let id = Uuid::new_v4();
     let inserted: Option<(Uuid, String)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "INSERT INTO tasks (id, repository_id, installation_id, webhook_delivery_id, target_type, \
-         target_id, command_text, base_sha, head_sha, run_epoch, tier, trigger_comment_id, \
-         trace_context, status) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, {INITIAL_TASK_STATUS_SQL}) \
+         target_id, command_text, base_sha, head_sha, run_epoch, preset, entry_point, \
+         trigger_comment_id, trace_context, status) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, {INITIAL_TASK_STATUS_SQL}) \
          ON CONFLICT (repository_id, target_type, target_id, command_text, head_sha, run_epoch) \
          DO NOTHING \
          RETURNING id, status"
@@ -162,7 +168,8 @@ pub async fn create_task(pool: &PgPool, task: &NewTask) -> Result<Option<Uuid>, 
     .bind(&task.base_sha)
     .bind(&task.head_sha)
     .bind(task.run_epoch)
-    .bind(&task.tier)
+    .bind(&task.preset)
+    .bind(&task.entry_point)
     .bind(task.trigger_comment_id)
     .bind(&task.trace_context)
     .fetch_optional(pool)
@@ -197,9 +204,9 @@ pub async fn create_explicit_task(pool: &PgPool, task: &NewTask) -> Result<Uuid,
         let id = Uuid::new_v4();
         let result = sqlx::query_as::<_, (Uuid, String)>(sqlx::AssertSqlSafe(format!(
             "INSERT INTO tasks (id, repository_id, installation_id, webhook_delivery_id, target_type, \
-             target_id, command_text, base_sha, head_sha, tier, trigger_comment_id, trace_context, \
-             run_epoch, status) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, \
+             target_id, command_text, base_sha, head_sha, preset, entry_point, trigger_comment_id, \
+             trace_context, run_epoch, status) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, \
                (SELECT COALESCE(MAX(run_epoch), -1) + 1 FROM tasks \
                 WHERE repository_id = $2 AND target_type = $5 AND target_id = $6 \
                   AND command_text = $7 AND head_sha IS NOT DISTINCT FROM $9), \
@@ -215,7 +222,8 @@ pub async fn create_explicit_task(pool: &PgPool, task: &NewTask) -> Result<Uuid,
         .bind(&task.command_text)
         .bind(&task.base_sha)
         .bind(&task.head_sha)
-        .bind(&task.tier)
+        .bind(&task.preset)
+        .bind(&task.entry_point)
         .bind(task.trigger_comment_id)
         .bind(&task.trace_context)
         .fetch_one(pool)
@@ -458,9 +466,11 @@ pub struct TaskContextRow {
     /// Run kind (ADR-0033): `review` or `ask`. The runner branches on this — a `review` produces
     /// diff-scoped findings, an `ask` produces a conversational answer.
     pub kind: String,
-    /// Review tier (ADR-0062): `fast` (auto PR-opened — SAST + one diff-only LLM turn, no retrieval) or
-    /// `deep` (`@mention` — full retrieval, multi-turn). The runner branches on this for the loop shape.
-    pub tier: String,
+    /// Resolved review preset (ADR-0103) — the runner resolves its `ReviewConfig` by this name.
+    pub preset: String,
+    /// Which entry point created this task (`"pr_open"`/`"mention"`/`"a2a"`, ADR-0103) — used for
+    /// framing decisions that must not key off the (operator-defined) preset name.
+    pub entry_point: String,
     pub base_sha: Option<String>,
     pub head_sha: Option<String>,
     /// The `@mention` comment that triggered this task (ADR-0068), or `None` for the automatic
@@ -476,8 +486,8 @@ pub async fn get_task_context(
 ) -> Result<Option<TaskContextRow>, sqlx::Error> {
     sqlx::query_as::<_, TaskContextRow>(
         "SELECT t.id, t.repository_id, t.installation_id, r.owner, r.name, r.default_branch, r.platform, \
-                t.target_type, t.target_id, t.command_text, t.kind, t.tier, t.base_sha, t.head_sha, \
-                t.trigger_comment_id \
+                t.target_type, t.target_id, t.command_text, t.kind, t.preset, t.entry_point, t.base_sha, \
+                t.head_sha, t.trigger_comment_id \
          FROM tasks t JOIN repositories r ON r.id = t.repository_id \
          WHERE t.id = $1",
     )

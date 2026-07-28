@@ -441,8 +441,8 @@ async fn perform_review(
         None
     } else {
         review_configs
-            .for_preset(&context.tier)
-            .with_context(|| format!("resolving review preset {:?}", context.tier))?
+            .for_preset(&context.preset)
+            .with_context(|| format!("resolving review preset {:?}", context.preset))?
     };
     let Some(review) = resolved else {
         return Ok(("review disabled".to_string(), None));
@@ -508,7 +508,7 @@ async fn perform_review(
         status.set_phase(Phase::Finalizing);
     }
 
-    finalize_review_outcome(outcome, review, &context.tier, client, task_id).await
+    finalize_review_outcome(outcome, review, &context.preset, client, task_id).await
 }
 
 /// Map a finished agent run onto a visible PR artifact and the top-level summary/detail (#137). Net

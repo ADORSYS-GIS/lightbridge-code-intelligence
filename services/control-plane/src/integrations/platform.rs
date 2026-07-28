@@ -223,6 +223,17 @@ pub trait CodePlatform: Send + Sync {
         pr_number: i64,
     ) -> anyhow::Result<(Option<String>, Option<String>)>;
 
+    /// Fetch a single file's raw text content at `ref_`, or `None` when the file doesn't exist at that
+    /// ref (a 404-equivalent — not an error). Used to resolve `.lightbridge-code-review.jsonc`
+    /// (ADR-0030/ADR-0103's `preset`) at webhook/task-creation time, before any clone exists — a single
+    /// small file fetch, not a full checkout.
+    async fn get_repo_file(
+        &self,
+        repo: &RepoRef,
+        ref_: &str,
+        path: &str,
+    ) -> anyhow::Result<Option<String>>;
+
     // --- Posting ---
 
     /// Post a review (inline comments + body). Returns the platform review ID + optional HTML URL.
