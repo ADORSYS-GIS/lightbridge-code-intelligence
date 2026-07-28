@@ -64,10 +64,14 @@ _Last updated: 2026-07-26._
 ## Planned — open epics
 
 - **Repo-configurable OpenCode review presets** (Epic #491) — replaces the fixed fast/deep tier model
-  with per-repo preset selection (`fast`/`deep`/`ultra` defaults, uniform tools/prompt), a full
-  OpenCode fs-tool suite, GitHub MCP access via App-derived tokens, and an OpenCode fatal-session
-  sentinel plugin. Also carries per-identity model selection + ACL (ADR-0038 upgrade, moved here from
-  Epic #241). ([ADR-0103](docs/adr/0103-repo-configurable-opencode-review-presets.md)/
+  with per-repo preset selection, uniform tools/prompt, a full OpenCode fs-tool suite, GitHub MCP access
+  via App-derived tokens, and an OpenCode fatal-session sentinel plugin. Also carries per-identity model
+  selection + ACL (ADR-0038 upgrade, moved here from Epic #241). Preset selection itself has landed:
+  `ReviewConfigs` generalized to named presets (#494/#527), the `.lightbridge-code-review.jsonc` reader
+  (#494/#528), every entry point (webhook/`@mention`/A2A) resolving its preset from repo config (#495/
+  #529/#530), and `ultra` joining `fast`/`deep` as the third platform-default preset name (#496). Still
+  open: the full OpenCode fs-tool suite, GitHub MCP via App-derived tokens, and the fatal-session
+  sentinel plugin. ([ADR-0103](docs/adr/0103-repo-configurable-opencode-review-presets.md)/
   [0104](docs/adr/0104-full-opencode-fs-tool-suite.md)/[0105](docs/adr/0105-github-mcp-via-app-derived-token.md)/
   [0106](docs/adr/0106-opencode-fatal-situation-sentinel-plugin.md))
 - **Control-plane v2 — three planes + the agent execution plane** (Epic #353) — the `StepRuntime`

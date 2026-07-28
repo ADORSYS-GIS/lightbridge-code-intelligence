@@ -353,9 +353,18 @@ impl ReviewConfig {
     /// The platform-default preset names: every one of these always resolves (to its own
     /// `review.presets.<name>` block when declared, else the flat `review.*` block), so a repo that
     /// declares no preset — or an values file with no `presets` map at all — gets exactly today's
-    /// fast/deep behavior (ADR-0103's "behavior-neutral migration" guarantee). `ultra` joins this set
-    /// once the platform ships it (story #496).
-    const PLATFORM_DEFAULT_PRESETS: [&'static str; 2] = ["fast", "deep"];
+    /// fast/deep behavior (ADR-0103's "behavior-neutral migration" guarantee).
+    ///
+    /// `ultra` (story #496) joins `fast`/`deep` here so `preset: "ultra"` always resolves for any
+    /// repo, the same guarantee fast/deep already have — but it carries NO built-in model or budget:
+    /// with no `review.presets.ultra` block declared, it falls back to the flat block exactly like
+    /// fast/deep do (`resolve_presets_falls_back_to_flat_block`). The platform's actual frontier-model
+    /// assignment and wider `max_cycles`/`max_coverage_bounces` are operator config
+    /// (`review.presets.ultra` in the ai-helm-values chart), not code — ADR-0103 already established
+    /// that a preset's resolved values are never pinned in this crate, and story #496's own Assumptions
+    /// section says the "best available model" is an implementation-time deploy decision, not something
+    /// this story pins.
+    const PLATFORM_DEFAULT_PRESETS: [&'static str; 3] = ["fast", "deep", "ultra"];
 
     /// Resolve every named review preset (ADR-0103). Each platform-default name (see
     /// [`Self::PLATFORM_DEFAULT_PRESETS`]) uses its own complete block when present
@@ -627,6 +636,7 @@ mod tests {
         let presets = ReviewConfig::resolve_presets(Some(&file)).expect("resolves");
         let fast = presets.for_preset("fast").expect("known").expect("enabled");
         let deep = presets.for_preset("deep").expect("known").expect("enabled");
+        let ultra = presets.for_preset("ultra").expect("known").expect("enabled");
         assert_eq!(
             fast.model, "only-model",
             "fast falls back to the flat block"
@@ -634,6 +644,10 @@ mod tests {
         assert_eq!(
             deep.model, "only-model",
             "deep falls back to the flat block"
+        );
+        assert_eq!(
+            ultra.model, "only-model",
+            "ultra falls back to the flat block just like fast/deep — it carries no built-in model"
         );
         std::fs::remove_file(&prompt).ok();
     }
@@ -652,10 +666,10 @@ mod tests {
         };
         let presets = ReviewConfig::resolve_presets(Some(&file)).expect("resolves");
         let err = presets
-            .for_preset("ultra")
-            .expect_err("ultra was never declared");
+            .for_preset("nightly")
+            .expect_err("nightly was never declared");
         assert!(
-            format!("{err:#}").contains("ultra"),
+            format!("{err:#}").contains("nightly"),
             "error names the unknown preset: {err:#}"
         );
         std::fs::remove_file(&prompt).ok();
@@ -669,7 +683,42 @@ mod tests {
         std::fs::write(&prompt, "You are a reviewer.").unwrap();
         let p = prompt.to_string_lossy().into_owned();
         let mut flat = review_block("flat-model", &p);
-        flat.presets = presets_map([("ultra", review_block("ultra-model", &p))]);
+        flat.presets = presets_map([("nightly", review_block("nightly-model", &p))]);
+        let file = FileConfig {
+            embeddings: None,
+            sast: None,
+            review: Some(flat),
+        };
+        let presets = ReviewConfig::resolve_presets(Some(&file)).expect("resolves");
+        let nightly = presets
+            .for_preset("nightly")
+            .expect("known")
+            .expect("enabled");
+        assert_eq!(nightly.model, "nightly-model");
+        // Platform defaults are still there, resolved from the flat block.
+        assert_eq!(
+            presets.for_preset("deep").unwrap().unwrap().model,
+            "flat-model"
+        );
+    }
+
+    // Story #496: `ultra` is a platform-default preset (like fast/deep), but the platform's frontier
+    // model and wider budget only apply once an operator declares `review.presets.ultra` — this proves
+    // that declared block resolves independently, with its own model/budget, same shape as fast/deep.
+    #[test]
+    fn resolve_presets_ultra_uses_its_own_declared_block_when_present() {
+        let prompt = std::env::temp_dir().join(format!("lci-ultra-{}.md", std::process::id()));
+        std::fs::write(&prompt, "You are a reviewer.").unwrap();
+        let p = prompt.to_string_lossy().into_owned();
+        let mut flat = review_block("flat-model", &p);
+        let mut ultra_block = review_block("frontier-model", &p);
+        ultra_block.max_cycles = Some(20);
+        ultra_block.max_coverage_bounces = Some(8);
+        flat.presets = presets_map([
+            ("fast", review_block("fast-model", &p)),
+            ("deep", review_block("deep-model", &p)),
+            ("ultra", ultra_block),
+        ]);
         let file = FileConfig {
             embeddings: None,
             sast: None,
@@ -677,12 +726,15 @@ mod tests {
         };
         let presets = ReviewConfig::resolve_presets(Some(&file)).expect("resolves");
         let ultra = presets.for_preset("ultra").expect("known").expect("enabled");
-        assert_eq!(ultra.model, "ultra-model");
-        // Platform defaults are still there, resolved from the flat block.
-        assert_eq!(
-            presets.for_preset("deep").unwrap().unwrap().model,
-            "flat-model"
+        let deep = presets.for_preset("deep").expect("known").expect("enabled");
+        assert_eq!(ultra.model, "frontier-model");
+        assert_eq!(ultra.max_cycles, 20);
+        assert_eq!(ultra.max_coverage_bounces, 8);
+        assert!(
+            ultra.max_cycles > deep.max_cycles,
+            "ultra's declared budget is wider than deep's"
         );
+        std::fs::remove_file(&prompt).ok();
     }
 
     // Per-preset tool allowlist (ADR-0062 + ADR-0103): a valid list resolves through to the preset
