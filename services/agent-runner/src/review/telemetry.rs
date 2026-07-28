@@ -7,25 +7,20 @@ use lci_agent_types::ToolSpec;
 use lci_review_agent::tools::MCP_TOOL_PREFIX;
 use uuid::Uuid;
 
-use super::tool_surface::{run_start_tool_defs, winddown_tool_defs};
 use crate::bootstrap::config::ReviewConfig;
 
-/// Record + submit the run-start telemetry (ADR-0034/0062/0066): a snapshot of what turn 0 will
-/// ACTUALLY offer. A FAST run without an allowlist runs every turn on the wind-down write/finish set
-/// (the `FastTierGuard` narrows to it), so snapshotting the full surface there would claim
-/// retrieval/read_file tools the model is never given — [`run_start_tool_defs`] accounts for that.
-/// Best-effort: a submission failure is logged and non-fatal.
+/// Record + submit the run-start telemetry (ADR-0034/0062/0066/0103): a snapshot of what turn 0 will
+/// ACTUALLY offer. Every preset composes the same tool-resolution path (`resolve_offered_tools`), so
+/// `offered` already IS the real turn-0 surface — no separate fast-tier narrowing to account for any
+/// more. Best-effort: a submission failure is logged and non-fatal.
 pub(crate) async fn submit_run_start_telemetry(
     client: &ControlPlaneClient,
     task_id: Uuid,
     review: &ReviewConfig,
     offered: &[ToolSpec],
-    diff_present: bool,
 ) {
-    let winddown_defs = winddown_tool_defs(offered, diff_present);
-    let start_defs = run_start_tool_defs(review, offered, &winddown_defs);
     let offered_tools_json = serde_json::Value::Array(
-        start_defs
+        offered
             .iter()
             .map(|spec| {
                 let source = if spec.function.name.starts_with(MCP_TOOL_PREFIX) {
@@ -37,13 +32,12 @@ pub(crate) async fn submit_run_start_telemetry(
             })
             .collect(),
     );
-    let offered_tool_names: Vec<&str> = start_defs
+    let offered_tool_names: Vec<&str> = offered
         .iter()
         .map(|spec| spec.function.name.as_str())
         .collect();
     tracing::info!(
         task_id = %task_id,
-        tier = if review.fast { "fast" } else { "deep" },
         model = %review.model,
         tool_count = offered_tool_names.len(),
         tools = ?offered_tool_names,

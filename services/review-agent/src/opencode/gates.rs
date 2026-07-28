@@ -70,25 +70,18 @@ pub struct ReviewGates {
     /// `sast_anchor` gate drains.
     sast_leads: SastLeadSink,
     max_turns: usize,
-    fast: bool,
     cycle: usize,
 }
 
 impl ReviewGates {
-    /// Compose the gates for one review — full parity between fast and deep (fast-tier-parity change):
-    /// the coverage/refute/SAST-anchor gates no longer take a `fast` flag at all, so both tiers bounce,
-    /// refute, and disclose identically; `fast` is kept here only as a pass-through label for logging/
-    /// disclosure banners (see [`Self::is_fast`]) — no gate behavior branches on it any more. The
-    /// [`SastAnchorGate`] is always composed — it stays inert (no leads) unless the model actually calls
-    /// `run_sast`, so no separate "is SAST on" flag is needed here; whether the tool is even offered is
-    /// decided upstream where the MCP surface is built.
+    /// Compose the gates for one review — preset-uniform by construction (ADR-0103): the coverage/
+    /// refute/SAST-anchor gates take no preset identity at all, so every preset bounces, refutes, and
+    /// discloses identically; only the numeric budgets (`max_coverage_bounces`, `max_turns`) passed in
+    /// here vary per preset. The [`SastAnchorGate`] is always composed — it stays inert (no leads)
+    /// unless the model actually calls `run_sast`, so no separate "is SAST on" flag is needed here;
+    /// whether the tool is even offered is decided upstream where the MCP surface is built.
     #[must_use]
-    pub fn new(
-        diff_files: Vec<String>,
-        max_coverage_bounces: usize,
-        max_turns: usize,
-        fast: bool,
-    ) -> Self {
+    pub fn new(diff_files: Vec<String>, max_coverage_bounces: usize, max_turns: usize) -> Self {
         let (coverage, coverage_state) =
             CoverageGate::new(diff_files, max_coverage_bounces, max_turns);
         let sast_leads: SastLeadSink = Arc::new(Mutex::new(Vec::new()));
@@ -100,7 +93,6 @@ impl ReviewGates {
             sast_anchor,
             sast_leads,
             max_turns,
-            fast,
             cycle: 0,
         }
     }
@@ -190,14 +182,6 @@ impl ReviewGates {
         let _ = self.coverage.exhausted_actions(&state);
         self.coverage_state.amended_summary()
     }
-
-    /// Whether these gates are running in FAST-tier. Fast-tier-parity: this is now a pure tier LABEL —
-    /// no gate behavior branches on it any more (fast bounces/refutes/discloses identically to deep) —
-    /// exposed so a host can assert the tier it configured, or for logging/disclosure framing.
-    #[must_use]
-    pub fn is_fast(&self) -> bool {
-        self.fast
-    }
 }
 
 #[cfg(test)]
@@ -210,7 +194,7 @@ mod tests {
     /// must be bounced; a second cycle that reads it is accepted with no disclosure (fully covered).
     #[test]
     fn coverage_bounces_a_premature_finish_then_accepts() {
-        let mut gates = ReviewGates::new(vec!["a.rs".into()], 3, 40, false);
+        let mut gates = ReviewGates::new(vec!["a.rs".into()], 3, 40);
 
         let premature = cycle_turn_outcome(&[
             before(
@@ -250,7 +234,7 @@ mod tests {
     #[test]
     fn refute_bounces_an_outstanding_p1_once() {
         // No diff files → coverage never bounces, isolating the refute gate.
-        let mut gates = ReviewGates::new(vec![], 3, 40, false);
+        let mut gates = ReviewGates::new(vec![], 3, 40);
 
         let record_and_finish = cycle_turn_outcome(&[
             before(
@@ -307,7 +291,7 @@ mod tests {
     #[test]
     fn accepts_after_bounce_budget_but_discloses_unexamined_source() {
         // One bounce allowed.
-        let mut gates = ReviewGates::new(vec!["a.rs".into()], 1, 40, false);
+        let mut gates = ReviewGates::new(vec!["a.rs".into()], 1, 40);
 
         let first_finish = cycle_turn_outcome(&[
             before(
@@ -347,7 +331,7 @@ mod tests {
     /// amend, so exhaustion produces no disclosure (the caller posts its own truncation note).
     #[test]
     fn exhaustion_without_a_finish_produces_no_disclosure() {
-        let mut gates = ReviewGates::new(vec!["a.rs".into()], 3, 40, false);
+        let mut gates = ReviewGates::new(vec!["a.rs".into()], 3, 40);
         let idle = cycle_turn_outcome(&[before(
             "lightbridge_report_progress",
             "c1",
@@ -365,7 +349,7 @@ mod tests {
     #[test]
     fn sast_anchor_bounces_a_misanchored_verdict_recovered_from_the_run_sast_digest() {
         // No diff files → coverage never bounces, isolating the SAST anchor gate.
-        let mut gates = ReviewGates::new(vec![], 3, 40, false);
+        let mut gates = ReviewGates::new(vec![], 3, 40);
 
         // A real `lci_agent_sast::digest` for one finding — the exact text `run_sast` returns as its MCP
         // result, which the recorder captures and we parse back into a lead.
@@ -427,7 +411,7 @@ mod tests {
     /// the gate targets misanchored triage, not every comment near a lead.
     #[test]
     fn sast_anchor_allows_a_verdict_on_the_real_flagged_line() {
-        let mut gates = ReviewGates::new(vec![], 3, 40, false);
+        let mut gates = ReviewGates::new(vec![], 3, 40);
         let digest = lci_agent_sast::digest(&[lci_agent_sast::SastFinding {
             file: ".env".into(),
             line: 216,
@@ -466,76 +450,4 @@ mod tests {
         );
     }
 
-    /// Fast-tier-parity proof: `is_fast()` is a pure label now — fast bounces a premature finish and
-    /// discloses unexamined coverage exactly like deep does in
-    /// [`coverage_bounces_a_premature_finish_then_accepts`], the only difference being the tier flag
-    /// itself. Replaces the old `fast_tier_accepts_immediately` test, whose assertion (fast skips the
-    /// gates entirely) is now false by design.
-    #[test]
-    fn fast_tier_bounces_and_discloses_identically_to_deep() {
-        let mut gates = ReviewGates::new(vec!["a.rs".into()], 3, 40, true);
-        assert!(gates.is_fast());
-
-        let premature = cycle_turn_outcome(&[before(
-            "lightbridge_finish",
-            "c1",
-            serde_json::json!({"summary": "quick"}),
-        )]);
-        match gates.observe_cycle(&premature) {
-            GateDecision::RejectFinish(nudge) => assert!(nudge.contains("a.rs")),
-            other => panic!("expected fast tier to bounce a premature finish too, got {other:?}"),
-        }
-
-        let covered = cycle_turn_outcome(&[
-            before(
-                "lightbridge_read_file",
-                "c2",
-                serde_json::json!({"path": "a.rs"}),
-            ),
-            after("lightbridge_read_file", "c2", "source"),
-            before(
-                "lightbridge_finish",
-                "c3",
-                serde_json::json!({"summary": "done"}),
-            ),
-            after("lightbridge_finish", "c3", "finalize"),
-        ]);
-        assert_eq!(
-            gates.observe_cycle(&covered),
-            GateDecision::Accept { disclosure: None }
-        );
-    }
-
-    /// Fast-tier-parity proof, refute half: a P1 finding bounces the finish on fast exactly as it does
-    /// on deep in [`refute_bounces_an_outstanding_p1_once`].
-    #[test]
-    fn fast_tier_refutes_identically_to_deep() {
-        let mut gates = ReviewGates::new(vec![], 3, 40, true);
-        assert!(gates.is_fast());
-
-        let record_and_finish = cycle_turn_outcome(&[
-            before(
-                "lightbridge_add_review_comment",
-                "c1",
-                serde_json::json!({"file": "a.rs", "line": 2, "priority": "P1", "title": "bug"}),
-            ),
-            after(
-                "lightbridge_add_review_comment",
-                "c1",
-                "recorded finding at a.rs:2",
-            ),
-            before(
-                "lightbridge_finish",
-                "c2",
-                serde_json::json!({"summary": "one bug"}),
-            ),
-            after("lightbridge_finish", "c2", "finalize"),
-        ]);
-        match gates.observe_cycle(&record_and_finish) {
-            GateDecision::RejectFinish(nudge) => {
-                assert!(nudge.contains("re-verify") || nudge.contains("DISPROVE"));
-            }
-            other => panic!("expected fast tier to refute-bounce too, got {other:?}"),
-        }
-    }
 }

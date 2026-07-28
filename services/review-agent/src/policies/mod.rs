@@ -1,12 +1,14 @@
 //! Review-flavoured policies kept above the generic runtime loop.
 //!
-//! Each submodule owns one independent [`TurnPolicy`](lci_agent_loop::TurnPolicy): [`fast_tier`] narrows
-//! the FAST tier's offered tools, [`coverage`] bounces a premature `finish` until the changed files were
-//! actually engaged (or discloses what wasn't), [`scratchpad`] breaks a same-line `add_review_comment`
-//! loop, [`refute`] makes the model re-verify its own P0/P1 findings before finishing, [`sast_anchor`]
-//! rejects a SAST triage verdict anchored to a line opengrep never flagged, and [`finding_nudge`] steers
-//! the model toward `finish` once it has recorded something. This file only holds the helpers shared
-//! across them and the flat re-exports the host (`crate::flows`) consumes.
+//! Each submodule owns one independent [`TurnPolicy`](lci_agent_loop::TurnPolicy): [`coverage`] bounces a
+//! premature `finish` until the changed files were actually engaged (or discloses what wasn't),
+//! [`scratchpad`] breaks a same-line `add_review_comment` loop, [`refute`] makes the model re-verify its
+//! own P0/P1 findings before finishing, [`sast_anchor`] rejects a SAST triage verdict anchored to a line
+//! opengrep never flagged, and [`finding_nudge`] steers the model toward `finish` once it has recorded
+//! something. Every policy here is preset-uniform (ADR-0103): none branches on which named preset is
+//! running — only the numeric budgets the host passes in via [`crate::flows::ReviewRunParams`] (turn/
+//! read/batch ceilings) differ. This file only holds the helpers shared across them and the flat
+//! re-exports the host (`crate::flows`) consumes.
 
 use lci_agent_tools::DispatchRefusal;
 use lci_agent_types::ToolOutcome;
@@ -14,7 +16,6 @@ use lci_agent_types::ToolOutcome;
 use crate::tools::fast_refusal;
 
 mod coverage;
-mod fast_tier;
 mod finding_nudge;
 mod refute;
 mod sast_anchor;
@@ -24,7 +25,6 @@ mod scratchpad;
 mod test_support;
 
 pub use coverage::{CoverageGate, CoverageState};
-pub use fast_tier::FastTierGuard;
 pub use finding_nudge::FindingFinishNudge;
 pub use refute::RefuteGate;
 pub use sast_anchor::{SastAnchorGate, SastLead, SastLeadSink};

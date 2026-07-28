@@ -137,18 +137,15 @@ pub struct ReviewFile {
     /// `"{env:LLM_STREAM:-true}"`) still deserializes instead of failing the config.
     #[serde(default, deserialize_with = "lci_config::de::opt_bool")]
     pub stream: Option<bool>,
-    /// Two-tier review (ADR-0062): a fully-independent config for the FAST tier (automatic
-    /// `pull_request opened`). When present it is a COMPLETE review block (its own model, gateway, prompt,
-    /// reasoning budget, timeout, …) — NOT an overlay on the flat fields. When absent, the FAST tier
-    /// falls back to the flat `review.*` block (back-compat: an older values file with no tier blocks).
-    /// A nested block's own `fast`/`deep` are ignored.
+    /// Named review presets (ADR-0103): an arbitrary, operator-extensible set of fully-independent
+    /// review blocks, keyed by preset name (`fast`/`deep`/`ultra` ship as the platform defaults; an
+    /// operator may add more). Each entry is a COMPLETE review block (its own model, gateway, prompt,
+    /// reasoning budget, timeout, …) — NOT an overlay on the flat fields. A preset name with no entry
+    /// here falls back to the flat `review.*` block (back-compat: an older values file with no preset
+    /// blocks keeps working, every preset resolving to the same flat config). A nested block's own
+    /// `presets` is ignored (presets don't nest).
     #[serde(default)]
-    pub fast: Option<Box<ReviewFile>>,
-    /// Two-tier review (ADR-0062): a fully-independent config for the DEEP tier (`@mention`). Same shape
-    /// and fallback as `fast`. This is where the strong model + 2h timeout live; the FAST block carries
-    /// the cheap model + short timeout.
-    #[serde(default)]
-    pub deep: Option<Box<ReviewFile>>,
+    pub presets: std::collections::HashMap<String, ReviewFile>,
     /// Per-tier tool allowlist (ADR-0062 + ADR-0066): the exact set of tools this tier offers, e.g.
     /// `["add_review_comment", "finish", "abort"]` for a diff-only FAST pass with no retrieval. Each
     /// entry is a [`ReviewToolSelector`] — either an exact built-in name (validated at deserialize

@@ -43,7 +43,6 @@ pub(crate) fn build_chat_client(
         max_retries = review.resilience.max_retries,
         circuit_breaker_threshold = review.resilience.circuit_breaker_threshold,
         stream = review.stream,
-        tier = if review.fast { "fast" } else { "deep" },
         extra = %serde_json::Value::Object(review.extra.clone()),
         "review agent starting"
     );
