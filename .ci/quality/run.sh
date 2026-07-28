@@ -38,20 +38,21 @@ log_warn() { echo "WARN: $1" >&2; }
 # Track scanner results: name → (exit_code, report_file, kind)
 declare -A SCANNER_RESULTS
 
-# Verify scanner availability (lightweight check).
+# Verify scanner availability (lightweight check). Does not exit on its own — records the
+# result so the caller can check every scanner before deciding whether to fail, instead of
+# stopping at the first missing tool and hiding the rest of the picture.
+MISSING_SCANNERS=()
 verify_scanner_availability() {
   local scanner_name=$1
   local cmd=$2
   if ! command -v "$cmd" &>/dev/null; then
     if [[ "$CI" == "true" ]]; then
       log_error "Scanner '$scanner_name' not found: '$cmd' not in PATH. Runner not provisioned correctly."
-      return 1
+      MISSING_SCANNERS+=("$scanner_name")
     else
       log_warn "Scanner '$scanner_name' not found: '$cmd' not in PATH (skipping for local run)"
-      return 2
     fi
   fi
-  return 0
 }
 
 # Run a scanner and capture its output. Handles non-zero exits gracefully (findings are not errors).
@@ -92,10 +93,15 @@ run_scanner() {
 
 log_section "Verifying scanner availability"
 
-verify_scanner_availability "semgrep" "semgrep" || [[ $? -eq 2 ]]
-verify_scanner_availability "trivy" "trivy" || [[ $? -eq 2 ]]
-verify_scanner_availability "gitleaks" "gitleaks" || [[ $? -eq 2 ]]
-verify_scanner_availability "hadolint" "hadolint" || [[ $? -eq 2 ]]
+verify_scanner_availability "semgrep" "semgrep"
+verify_scanner_availability "trivy" "trivy"
+verify_scanner_availability "gitleaks" "gitleaks"
+verify_scanner_availability "hadolint" "hadolint"
+
+if [[ "$CI" == "true" && ${#MISSING_SCANNERS[@]} -gt 0 ]]; then
+  log_error "Runner not provisioned correctly. Missing: ${MISSING_SCANNERS[*]}"
+  exit 1
+fi
 
 log_section "Running scanners"
 
