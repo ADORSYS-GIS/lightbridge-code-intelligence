@@ -1,0 +1,41 @@
+rules:
+  - id: typescript-no-eval
+    pattern-either:
+      - pattern: eval(...)
+      - pattern: Function(...)
+    message: "Unsafe eval() or Function() constructor detected. Use alternatives like JSON.parse or template literals."
+    languages: [typescript, javascript]
+    severity: ERROR
+    metadata:
+      cwe: "CWE-95: Improper Neutralization of Directives in Dynamically Evaluated Code"
+      owasp: "A03:2021 – Injection"
+      category: "security"
+      references:
+        - "https://semgrep.dev/r/javascript.security.eval"
+
+  - id: typescript-sql-injection-template
+    pattern-either:
+      - pattern-regex: |
+          (query|sql|execute)\s*\(\s*[`'"].*\$\{.*\}.*[`'"]\s*\)
+      - pattern: |
+          sqlx.query($X)
+          where $X is not a string literal
+    message: "Potential SQL injection via template literal or unsanitized input. Use parameterized queries."
+    languages: [typescript, javascript]
+    severity: WARNING
+    metadata:
+      cwe: "CWE-89: Improper Neutralization of Special Elements used in an SQL Command"
+      owasp: "A03:2021 – Injection"
+      category: "security"
+
+  - id: typescript-no-hardcoded-secrets
+    pattern-either:
+      - pattern-regex: |
+          (password|secret|token|api_key|apiKey)\s*[:=]\s*[`'"]([^`'"]+)[`'"]
+    message: "Potential hardcoded secret or credential detected. Use environment variables or secure vaults."
+    languages: [typescript, javascript]
+    severity: ERROR
+    metadata:
+      cwe: "CWE-798: Use of Hard-coded Credentials"
+      owasp: "A02:2021 – Cryptographic Failures"
+      category: "security"

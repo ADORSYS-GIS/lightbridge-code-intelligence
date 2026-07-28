@@ -1,0 +1,80 @@
+name: Quality
+
+# Trigger on PRs, pushes to main, scheduled scans, and manual dispatch.
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  push:
+    branches: [main]
+  schedule:
+    # Full scan weekly (Monday 02:00 UTC)
+    - cron: "0 2 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  checks: write
+  pull-requests: write
+
+concurrency:
+  group: quality-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    runs-on: [self-hosted, vymalo-vps]
+    timeout-minutes: 30
+    steps:
+      # Fetch repository code with full history (depth: 0) for accurate PR diffs in reviewdog.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Run all quality scanners (SAST, secrets, dependency, infra, linting).
+      - name: Run quality scanners
+        env:
+          CI: "true"
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+          GITHUB_BASE_REF: ${{ github.base_ref }}
+        run: |
+          bash .ci/quality/run.sh
+
+      # Upload individual reports and merged SARIF as artifacts for debugging/auditing.
+      - name: Upload reports
+        if: always()
+        uses: actions/upload-artifact@97a0fdd30d330287a78c2239ea01e15720c0e5a3
+        with:
+          name: quality-reports
+          path: .ci/quality/reports/
+          retention-days: 30
+
+      # Report merged findings to GitHub PR via reviewdog (PR context only).
+      - name: Report findings to PR (reviewdog)
+        if: |
+          always() &&
+          github.event_name == 'pull_request' &&
+          hashFiles('.ci/quality/reports/quality.sarif') != ''
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          reviewdog \
+            -f sarif \
+            -reporter github-pr-check \
+            -filter-mode added \
+            -fail-on-error \
+            -name "Quality Gate" \
+            < .ci/quality/reports/quality.sarif
+
+      # Optional: Upload merged SARIF to GitHub Code Scanning (if enabled per configuration).
+      # GitHub Code Scanning provides a centralized UI for tracking findings across the repository.
+      # This is disabled by default and requires explicit enablement via repository variable.
+      - name: Upload to GitHub Code Scanning
+        if: |
+          always() &&
+          github.ref == 'refs/heads/main' &&
+          vars.ENABLE_CODE_SCANNING == 'true' &&
+          hashFiles('.ci/quality/reports/quality.sarif') != ''
+        uses: github/codeql-action/upload-sarif@9fa7e86e37b0d1da3b80c8a1b9a2f0ede7e8d9e0
+        with:
+          sarif_file: .ci/quality/reports/quality.sarif
+          category: "quality-pipeline"
