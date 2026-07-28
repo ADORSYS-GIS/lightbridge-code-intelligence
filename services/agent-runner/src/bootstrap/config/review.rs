@@ -592,8 +592,13 @@ mod tests {
     }
 
     /// Build a `review.presets` map from `(name, block)` pairs.
-    fn presets_map(entries: impl IntoIterator<Item = (&'static str, ReviewFile)>) -> HashMap<String, ReviewFile> {
-        entries.into_iter().map(|(k, v)| (k.to_string(), v)).collect()
+    fn presets_map(
+        entries: impl IntoIterator<Item = (&'static str, ReviewFile)>,
+    ) -> HashMap<String, ReviewFile> {
+        entries
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect()
     }
 
     // ADR-0103: with `review.presets.fast`/`review.presets.deep` present, each preset resolves to its
@@ -636,7 +641,10 @@ mod tests {
         let presets = ReviewConfig::resolve_presets(Some(&file)).expect("resolves");
         let fast = presets.for_preset("fast").expect("known").expect("enabled");
         let deep = presets.for_preset("deep").expect("known").expect("enabled");
-        let ultra = presets.for_preset("ultra").expect("known").expect("enabled");
+        let ultra = presets
+            .for_preset("ultra")
+            .expect("known")
+            .expect("enabled");
         assert_eq!(
             fast.model, "only-model",
             "fast falls back to the flat block"
@@ -725,7 +733,10 @@ mod tests {
             review: Some(flat),
         };
         let presets = ReviewConfig::resolve_presets(Some(&file)).expect("resolves");
-        let ultra = presets.for_preset("ultra").expect("known").expect("enabled");
+        let ultra = presets
+            .for_preset("ultra")
+            .expect("known")
+            .expect("enabled");
         let deep = presets.for_preset("deep").expect("known").expect("enabled");
         assert_eq!(ultra.model, "frontier-model");
         assert_eq!(ultra.max_cycles, 20);
@@ -805,12 +816,20 @@ mod tests {
         };
         let presets = ReviewConfig::resolve_presets(Some(&file)).expect("resolves");
         assert_eq!(
-            presets.for_preset("fast").unwrap().unwrap().opencode_overlay,
+            presets
+                .for_preset("fast")
+                .unwrap()
+                .unwrap()
+                .opencode_overlay,
             Some(serde_json::json!({ "model": "flat-override" })),
             "flat review.opencode reaches the fast preset"
         );
         assert_eq!(
-            presets.for_preset("deep").unwrap().unwrap().opencode_overlay,
+            presets
+                .for_preset("deep")
+                .unwrap()
+                .unwrap()
+                .opencode_overlay,
             Some(serde_json::json!({ "model": "flat-override" })),
             "flat review.opencode reaches the deep preset"
         );
@@ -828,12 +847,20 @@ mod tests {
         };
         let presets = ReviewConfig::resolve_presets(Some(&file)).expect("resolves");
         assert_eq!(
-            presets.for_preset("deep").unwrap().unwrap().opencode_overlay,
+            presets
+                .for_preset("deep")
+                .unwrap()
+                .unwrap()
+                .opencode_overlay,
             Some(serde_json::json!({ "model": "deep-override" })),
             "a per-preset review.presets.deep.opencode wins for deep"
         );
         assert_eq!(
-            presets.for_preset("fast").unwrap().unwrap().opencode_overlay,
+            presets
+                .for_preset("fast")
+                .unwrap()
+                .unwrap()
+                .opencode_overlay,
             Some(serde_json::json!({ "model": "flat-override" })),
             "fast still inherits the flat overlay"
         );
