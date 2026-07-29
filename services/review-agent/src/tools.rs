@@ -423,18 +423,12 @@ mod tests {
     async fn every_concrete_module_dispatches_through_the_single_registry() {
         let cp = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(path(format!(
-                "/api/v2/internal/tasks/{}/search",
-                Uuid::nil()
-            )))
+            .and(path(format!("/internal/tasks/{}/search", Uuid::nil())))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
             .mount(&cp)
             .await;
         Mock::given(method("POST"))
-            .and(path(format!(
-                "/api/v2/internal/tasks/{}/graph/query",
-                Uuid::nil()
-            )))
+            .and(path(format!("/internal/tasks/{}/graph/query", Uuid::nil())))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
             .mount(&cp)
             .await;
@@ -445,17 +439,14 @@ mod tests {
             "review/summary",
         ] {
             Mock::given(method("POST"))
-                .and(path(format!(
-                    "/api/v2/internal/tasks/{}/{endpoint}",
-                    Uuid::nil()
-                )))
+                .and(path(format!("/internal/tasks/{}/{endpoint}", Uuid::nil())))
                 .respond_with(ResponseTemplate::new(204))
                 .mount(&cp)
                 .await;
         }
         Mock::given(method("POST"))
             .and(path(format!(
-                "/api/v2/internal/tasks/{}/knowledge/call",
+                "/internal/tasks/{}/knowledge/call",
                 Uuid::nil()
             )))
             .respond_with(

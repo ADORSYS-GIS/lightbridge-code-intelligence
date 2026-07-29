@@ -179,13 +179,9 @@ pub struct ApiClient {
 
 impl ApiClient {
     pub fn new(http: reqwest::Client, base: impl Into<String>, token: impl Into<String>) -> Self {
-        // Bake the versioned path prefix into the stored base so every call site in this file
-        // remains unchanged. Strip any trailing slash first, then append the prefix once.
-        let raw = base.into();
-        let base = format!("{}/api/v2", raw.trim_end_matches('/'));
         Self {
             http,
-            base,
+            base: base.into().trim_end_matches('/').to_string(),
             token: std::sync::Arc::new(tokio::sync::RwLock::new(token.into())),
         }
     }

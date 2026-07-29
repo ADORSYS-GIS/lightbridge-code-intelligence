@@ -126,10 +126,7 @@ mod tests {
     async fn open_loop_edits_commits_and_proposes_a_pr() {
         let cp = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(path(format!(
-                "/api/v2/internal/tasks/{}/propose-pr",
-                Uuid::nil()
-            )))
+            .and(path(format!("/internal/tasks/{}/propose-pr", Uuid::nil())))
             .respond_with(ResponseTemplate::new(202))
             .mount(&cp)
             .await;

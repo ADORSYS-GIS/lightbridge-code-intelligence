@@ -640,7 +640,7 @@
   ],
   "control_plane_writes": [
     {
-      "endpoint": "/api/v2/internal/tasks/00000000-0000-0000-0000-000000000000/review/inline",
+      "endpoint": "/internal/tasks/00000000-0000-0000-0000-000000000000/review/inline",
       "body": {
         "body": "body\n\n**Evidence:** line 2",
         "category": "quality",
@@ -653,7 +653,7 @@
       }
     },
     {
-      "endpoint": "/api/v2/internal/tasks/00000000-0000-0000-0000-000000000000/review/summary",
+      "endpoint": "/internal/tasks/00000000-0000-0000-0000-000000000000/review/summary",
       "body": {
         "body": "one finding"
       }

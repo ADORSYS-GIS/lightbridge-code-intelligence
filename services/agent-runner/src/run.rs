@@ -687,7 +687,7 @@ mod tests {
         let cp = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path(format!(
-                "/api/v2/internal/tasks/{}/review/finalize",
+                "/internal/tasks/{}/review/finalize",
                 Uuid::nil()
             )))
             .respond_with(ResponseTemplate::new(200))
@@ -695,7 +695,7 @@ mod tests {
             .await;
         Mock::given(method("POST"))
             .and(path(format!(
-                "/api/v2/internal/tasks/{}/review/summary",
+                "/internal/tasks/{}/review/summary",
                 Uuid::nil()
             )))
             .respond_with(ResponseTemplate::new(200))

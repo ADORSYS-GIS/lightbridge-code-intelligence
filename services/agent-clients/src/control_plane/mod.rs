@@ -180,10 +180,8 @@ pub struct ControlPlaneClient {
 
 impl ControlPlaneClient {
     pub fn new(base_url: impl Into<String>, token: impl Into<String>) -> Self {
-        let raw = base_url.into();
-        let base_url = format!("{}/api/v2", raw.trim_end_matches('/'));
         Self {
-            base_url,
+            base_url: base_url.into().trim_end_matches('/').to_string(),
             token: token.into(),
             http: reqwest::Client::new(),
         }

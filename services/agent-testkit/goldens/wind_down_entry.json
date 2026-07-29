@@ -352,7 +352,7 @@
   ],
   "control_plane_writes": [
     {
-      "endpoint": "/api/v2/internal/tasks/00000000-0000-0000-0000-000000000000/review/summary",
+      "endpoint": "/internal/tasks/00000000-0000-0000-0000-000000000000/review/summary",
       "body": {
         "body": "done"
       }
