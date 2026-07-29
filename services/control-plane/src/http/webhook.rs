@@ -13,7 +13,7 @@
 //! the same unified handler.
 
 use axum::body::Bytes;
-use axum::extract::State;
+use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use hmac::{Hmac, KeyInit, Mac};
@@ -51,283 +51,335 @@ fn verify_signature(secret: &[u8], body: &[u8], signature: &str) -> bool {
     expected.as_bytes().ct_eq(signature.as_bytes()).into()
 }
 
-/// Detect the platform from webhook headers.
-/// GitHub sends `X-GitHub-Event`; GitLab sends `X-Gitlab-Event`; Bitbucket Cloud sends
-/// `X-Event-Key` (e.g. `pullrequest:created`, `pullrequest:comment_created`).
-fn detect_platform(headers: &HeaderMap) -> Option<Platform> {
-    if headers.contains_key("x-github-event") {
-        Some(Platform::GitHub)
-    } else if headers.contains_key("x-gitlab-event") {
-        Some(Platform::GitLab)
-    } else if headers.contains_key("x-event-key") {
-        Some(Platform::Bitbucket)
-    } else {
-        None
-    }
-}
-
-/// Unified webhook receiver. Detects the platform from headers and dispatches.
+/// `POST /webhook/github` — GitHub webhook receiver.
 ///
-/// Ticket #246: this is the ROOT span of the webhook→task→Job→turns→egress trace — the sampling
-/// decision made here (an unparented span; no incoming `traceparent` to continue) is what every
-/// downstream span inherits. A thin wrapper around [`webhook_router_body`] so the span covers every
-/// early return in the body (invalid signature, dup delivery, persistence error, ...) via
-/// `.instrument()`, not just the happy path.
-pub async fn webhook_router(
+/// This is the ROOT span of the webhook→task→Job→turns→egress trace (ticket #246).
+pub async fn github_webhook(
     State(state): State<AppState>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
     let span = tracing::info_span!(
         "webhook.receive",
-        platform = tracing::field::Empty,
+        platform = "github",
         event = tracing::field::Empty,
         delivery_id = tracing::field::Empty,
     );
-    webhook_router_body(state, headers, body)
+    github_webhook_body(state, headers, body)
         .instrument(span)
         .await
 }
 
-async fn webhook_router_body(state: AppState, headers: HeaderMap, body: Bytes) -> Response {
-    let platform = match detect_platform(&headers) {
-        Some(p) => p,
-        None => {
-            tracing::warn!(
-                "webhook: unknown platform (no X-GitHub-Event or X-Gitlab-Event header)"
-            );
-            return (StatusCode::BAD_REQUEST, "unknown platform").into_response();
+async fn github_webhook_body(state: AppState, headers: HeaderMap, body: Bytes) -> Response {
+    let verified = if let Some(github) = state.platforms.get(&Platform::GitHub) {
+        github.verify_webhook(&headers, &body)
+    } else if !state.github_webhook_secret.is_empty() {
+        verify_signature(
+            state.github_webhook_secret.as_bytes(),
+            &body,
+            &header(&headers, "x-hub-signature-256"),
+        )
+    } else {
+        tracing::error!("no github platform or webhook secret configured");
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "github platform not configured",
+        )
+            .into_response();
+    };
+    if !verified {
+        crate::http::metrics::webhook_signature_failure("github");
+        tracing::warn!(platform = "github", "invalid webhook signature");
+        return (StatusCode::UNAUTHORIZED, "invalid signature").into_response();
+    }
+    let delivery_id = header(&headers, "x-github-delivery");
+    if delivery_id.is_empty() {
+        return (StatusCode::BAD_REQUEST, "missing delivery id").into_response();
+    }
+    let event = header(&headers, "x-github-event");
+    tracing::Span::current()
+        .record("delivery_id", &delivery_id)
+        .record("event", &event);
+    let payload: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(p) => p,
+        Err(error) => {
+            tracing::error!(%error, delivery_id, "github webhook: invalid json payload");
+            return (StatusCode::BAD_REQUEST, "invalid json payload").into_response();
         }
     };
+    match persist_delivery(&state, Platform::GitHub, &delivery_id, &event, &payload).await {
+        DeliveryResult::Persisted => {}
+        DeliveryResult::Duplicate => {
+            crate::http::metrics::webhook_duplicate("github");
+            tracing::info!(delivery_id, "github: duplicate delivery");
+            return (StatusCode::ACCEPTED, "duplicate delivery").into_response();
+        }
+        DeliveryResult::Error => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, "persistence error").into_response();
+        }
+    }
+    crate::http::metrics::webhook_delivery("github", &event);
+    tracing::info!(delivery_id, %event, "github: accepted webhook");
+    if state.db.is_some() {
+        route_github_event(&state, &event, &payload, &delivery_id).await;
+    }
+    (StatusCode::ACCEPTED, "accepted").into_response()
+}
 
-    tracing::info!(%platform, "webhook received");
-    tracing::Span::current().record("platform", tracing::field::display(&platform));
+/// `POST /webhook/gitlab/{installation_id}` — GitLab webhook receiver.
+///
+/// The path carries the installation (project) ID — no body pre-parse before verification.
+/// `installation_id` must match the `installation_id` (or `project_id` when absent) configured
+/// for the project in `control-plane.json`.
+pub async fn gitlab_webhook(
+    State(state): State<AppState>,
+    Path(installation_id): Path<i64>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let span = tracing::info_span!(
+        "webhook.receive",
+        platform = "gitlab",
+        installation_id,
+        event = tracing::field::Empty,
+        delivery_id = tracing::field::Empty,
+    );
+    gitlab_webhook_body(state, installation_id, headers, body)
+        .instrument(span)
+        .await
+}
 
-    // GitLab needs the payload's `project.id` to select the configured per-project webhook secret.
-    // The helper returns the verified payload, making ownership explicit.
-    let gitlab_payload = if platform == Platform::GitLab {
-        match verified_gitlab_payload(&state, &headers, &body) {
-            Ok(payload) => Some(payload),
+async fn gitlab_webhook_body(
+    state: AppState,
+    installation_id: i64,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let payload =
+        match verified_gitlab_payload_for_installation(&state, installation_id, &headers, &body) {
+            Ok(p) => p,
             Err(GitlabPayloadError::InvalidJson) => {
                 return (StatusCode::BAD_REQUEST, "invalid json payload").into_response();
             }
+            Err(GitlabPayloadError::UnknownInstallationId) => {
+                tracing::warn!(installation_id, "gitlab webhook: unknown installation_id");
+                return (StatusCode::NOT_FOUND, "unknown installation").into_response();
+            }
             Err(GitlabPayloadError::InvalidSignature) => {
-                crate::http::metrics::webhook_signature_failure(&platform.to_string());
-                tracing::warn!(%platform, "invalid webhook signature");
+                crate::http::metrics::webhook_signature_failure("gitlab");
+                tracing::warn!(installation_id, "invalid gitlab webhook signature");
                 return (StatusCode::UNAUTHORIZED, "invalid signature").into_response();
             }
+        };
+    let delivery_id = header(&headers, "x-gitlab-event-uuid");
+    if delivery_id.is_empty() {
+        return (StatusCode::BAD_REQUEST, "missing delivery id").into_response();
+    }
+    let event = header(&headers, "x-gitlab-event");
+    tracing::Span::current()
+        .record("delivery_id", &delivery_id)
+        .record("event", &event);
+    match persist_delivery(&state, Platform::GitLab, &delivery_id, &event, &payload).await {
+        DeliveryResult::Persisted => {}
+        DeliveryResult::Duplicate => {
+            crate::http::metrics::webhook_duplicate("gitlab");
+            tracing::info!(delivery_id, "gitlab: duplicate delivery");
+            return (StatusCode::ACCEPTED, "duplicate delivery").into_response();
         }
-    } else {
-        None
-    };
+        DeliveryResult::Error => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, "persistence error").into_response();
+        }
+    }
+    crate::http::metrics::webhook_delivery("gitlab", &event);
+    tracing::info!(delivery_id, %event, installation_id, "gitlab: accepted webhook");
+    if state.db.is_some() {
+        route_gitlab_event(&state, &event, &payload, &delivery_id).await;
+    }
+    (StatusCode::ACCEPTED, "accepted").into_response()
+}
 
-    // Bitbucket, like GitLab, needs the payload's repository identity to select the configured
-    // per-repo webhook secret — there is no single App-wide secret to check up front.
-    let bitbucket_payload = if platform == Platform::Bitbucket {
-        match verified_bitbucket_payload(&state, &headers, &body) {
-            Ok(payload) => Some(payload),
+/// `POST /webhook/bitbucket/{installation_id}` — Bitbucket webhook receiver.
+///
+/// `installation_id` is `platform::stable_id_from_key("workspace/repo_slug")`.
+/// See `docs/runbooks/bitbucket-platform-setup.md` for the URL format.
+pub async fn bitbucket_webhook(
+    State(state): State<AppState>,
+    Path(installation_id): Path<i64>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let span = tracing::info_span!(
+        "webhook.receive",
+        platform = "bitbucket",
+        installation_id,
+        event = tracing::field::Empty,
+        delivery_id = tracing::field::Empty,
+    );
+    bitbucket_webhook_body(state, installation_id, headers, body)
+        .instrument(span)
+        .await
+}
+
+async fn bitbucket_webhook_body(
+    state: AppState,
+    installation_id: i64,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let payload =
+        match verified_bitbucket_payload_for_installation(&state, installation_id, &headers, &body)
+        {
+            Ok(p) => p,
             Err(BitbucketPayloadError::InvalidJson) => {
                 return (StatusCode::BAD_REQUEST, "invalid json payload").into_response();
             }
             Err(BitbucketPayloadError::InvalidSignature) => {
-                crate::http::metrics::webhook_signature_failure(&platform.to_string());
-                tracing::warn!(%platform, "invalid webhook signature");
+                crate::http::metrics::webhook_signature_failure("bitbucket");
+                tracing::warn!(installation_id, "invalid bitbucket webhook signature");
                 return (StatusCode::UNAUTHORIZED, "invalid signature").into_response();
             }
-        }
-    } else {
-        None
-    };
-
-    // Verify GitHub signature via the CodePlatform trait (ADR-0072/0108): the same HMAC-SHA256 +
-    // constant-time compare `GithubApp::verify_webhook` runs internally, reading
-    // `GITHUB_WEBHOOK_SECRET` — the same env var `state.github_webhook_secret` was built from.
-    // GitLab verification happens in `verified_gitlab_payload`.
-    //
-    // Signature verification must not require the GitHub App's credentials: a deployment can set
-    // `GITHUB_WEBHOOK_SECRET` without `GITHUB_APP_ID`/`GITHUB_APP_PRIVATE_KEY` (no App registered,
-    // so no `platforms` entry — App-dependent actions like posting reviews will fail downstream,
-    // but the webhook itself used to verify fine). Fall back to the raw secret in that case rather
-    // than 503ing every webhook (a real regression this refactor introduced, caught in review).
-    if platform == Platform::GitHub {
-        let verified = if let Some(github) = state.platforms.get(&Platform::GitHub) {
-            github.verify_webhook(&headers, &body)
-        } else if !state.github_webhook_secret.is_empty() {
-            verify_signature(
-                state.github_webhook_secret.as_bytes(),
-                &body,
-                &header(&headers, "x-hub-signature-256"),
-            )
-        } else {
-            tracing::error!(%platform, "no platform implementation configured for github webhooks");
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "github platform not configured",
-            )
-                .into_response();
         };
-        if !verified {
-            crate::http::metrics::webhook_signature_failure(&platform.to_string());
-            tracing::warn!(%platform, "invalid webhook signature");
-            return (StatusCode::UNAUTHORIZED, "invalid signature").into_response();
-        }
-    }
-
-    // Delivery ID for dedup — platform-specific header.
-    let delivery_id = match platform {
-        Platform::GitHub => header(&headers, "x-github-delivery"),
-        Platform::GitLab => header(&headers, "x-gitlab-event-uuid"),
-        Platform::Bitbucket => header(&headers, "x-request-uuid"),
-    };
+    let delivery_id = header(&headers, "x-request-uuid");
     if delivery_id.is_empty() {
         return (StatusCode::BAD_REQUEST, "missing delivery id").into_response();
     }
-    tracing::Span::current().record("delivery_id", &delivery_id);
+    let event = header(&headers, "x-event-key");
+    tracing::Span::current()
+        .record("delivery_id", &delivery_id)
+        .record("event", &event);
+    match persist_delivery(&state, Platform::Bitbucket, &delivery_id, &event, &payload).await {
+        DeliveryResult::Persisted => {}
+        DeliveryResult::Duplicate => {
+            crate::http::metrics::webhook_duplicate("bitbucket");
+            tracing::info!(delivery_id, "bitbucket: duplicate delivery");
+            return (StatusCode::ACCEPTED, "duplicate delivery").into_response();
+        }
+        DeliveryResult::Error => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, "persistence error").into_response();
+        }
+    }
+    crate::http::metrics::webhook_delivery("bitbucket", &event);
+    tracing::info!(delivery_id, %event, installation_id, "bitbucket: accepted webhook");
+    if state.db.is_some() {
+        route_bitbucket_event(&state, &event, &payload, &delivery_id).await;
+    }
+    (StatusCode::ACCEPTED, "accepted").into_response()
+}
 
-    // Event type — platform-specific header.
-    let event = match platform {
-        Platform::GitHub => header(&headers, "x-github-event"),
-        Platform::GitLab => header(&headers, "x-gitlab-event"),
-        Platform::Bitbucket => header(&headers, "x-event-key"),
-    };
-    tracing::Span::current().record("event", &event);
+enum DeliveryResult {
+    Persisted,
+    Duplicate,
+    Error,
+}
 
-    // Parse the payload up front: reject non-JSON bodies (never persist `null`). GitLab/Bitbucket
-    // already parsed (and verified against) the payload above; GitHub parses it fresh here.
-    let payload: serde_json::Value = match gitlab_payload.or(bitbucket_payload) {
-        Some(payload) => payload,
-        None => match serde_json::from_slice(&body) {
-            Ok(payload) => payload,
-            Err(error) => {
-                tracing::error!(%error, %platform, %delivery_id, "webhook payload is not valid JSON");
-                return (StatusCode::BAD_REQUEST, "invalid json payload").into_response();
-            }
-        },
-    };
-
-    // Dedup (and persist, when a database is configured). `is_new` is false for a replayed
-    // delivery id — platforms retry, so this is the exactly-once guard.
-    let is_new = match &state.db {
+async fn persist_delivery(
+    state: &AppState,
+    platform: Platform,
+    delivery_id: &str,
+    event: &str,
+    payload: &serde_json::Value,
+) -> DeliveryResult {
+    match &state.db {
         Some(pool) => {
-            // ADR-0107/#502 webhook-ingress slice: the delivery dedup+persist write is the
-            // state-changing transition, keyed by the delivery's own identity. `Passthrough` is the
-            // only runtime this role can construct today — `CheckpointRuntime` promotion stays
-            // blocked on #363 regardless of the state-machine backbone landing — so this wrap is a
-            // no-op seam (`Passthrough::step` is a bare `f().await`) ahead of that promotion.
             let step_name = StepName::from(format!("webhook:{delivery_id}"));
-            let step_result: Result<bool, StepError> = Passthrough
+            let step_result = Passthrough
                 .step(step_name, async || {
-                    crate::db::record_delivery(pool, platform, &delivery_id, &event, &payload)
+                    crate::db::record_delivery(pool, platform, delivery_id, event, payload)
                         .await
-                        .map_err(|error| StepError::terminal(error.to_string()))
+                        .map_err(|e| StepError::terminal(e.to_string()))
                 })
                 .await;
             match step_result {
-                Ok(is_new) => is_new,
+                Ok(true) => DeliveryResult::Persisted,
+                Ok(false) => DeliveryResult::Duplicate,
                 Err(step_error) => {
-                    // The closure above only ever constructs `Terminal` (from the sqlx error's own
-                    // Display text), so extracting `reason` reconstructs the exact error string the
-                    // un-wrapped code logged. `Transient` is unreachable today but handled so this
-                    // stays exhaustive without silently swallowing a future variant.
                     let error = match step_error {
                         StepError::Terminal { reason } => reason,
                         StepError::Transient { source, .. } => source.to_string(),
                     };
-                    tracing::error!(%error, %delivery_id, "failed to persist delivery");
-                    return (StatusCode::INTERNAL_SERVER_ERROR, "persistence error")
-                        .into_response();
+                    tracing::error!(%error, delivery_id, "failed to persist delivery");
+                    DeliveryResult::Error
                 }
             }
         }
-        None => state
-            .seen_deliveries
-            .lock()
-            .expect("dedup lock poisoned")
-            .insert(delivery_id.clone()),
-    };
-    if !is_new {
-        crate::http::metrics::webhook_duplicate(&platform.to_string());
-        tracing::info!(%platform, %delivery_id, "duplicate delivery");
-        return (StatusCode::ACCEPTED, "duplicate delivery").into_response();
-    }
-
-    crate::http::metrics::webhook_delivery(&platform.to_string(), &event);
-    tracing::info!(%platform, %delivery_id, %event, "accepted webhook");
-
-    // Route by platform.
-    if state.db.is_some() {
-        match platform {
-            Platform::GitHub => route_github_event(&state, &event, &payload, &delivery_id).await,
-            Platform::GitLab => route_gitlab_event(&state, &event, &payload, &delivery_id).await,
-            Platform::Bitbucket => {
-                route_bitbucket_event(&state, &event, &payload, &delivery_id).await
+        None => {
+            let is_new = state
+                .seen_deliveries
+                .lock()
+                .expect("dedup lock poisoned")
+                .insert(delivery_id.to_string());
+            if is_new {
+                DeliveryResult::Persisted
+            } else {
+                DeliveryResult::Duplicate
             }
         }
     }
-
-    (StatusCode::ACCEPTED, "accepted").into_response()
-}
-
-/// Legacy GitHub webhook route — forwards to the unified [`webhook_router`]. Kept during the
-/// transition so existing webhook configurations don't break; remove in a later release.
-pub async fn github_webhook_legacy(
-    state: State<AppState>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Response {
-    webhook_router(state, headers, body).await
 }
 
 enum GitlabPayloadError {
     InvalidJson,
+    UnknownInstallationId,
     InvalidSignature,
 }
 
-fn verified_gitlab_payload(
+fn verified_gitlab_payload_for_installation(
     state: &AppState,
+    installation_id: i64,
     headers: &HeaderMap,
     body: &[u8],
 ) -> Result<serde_json::Value, GitlabPayloadError> {
-    let platform = Platform::GitLab;
     let payload = match serde_json::from_slice(body) {
-        Ok(payload) => payload,
+        Ok(p) => p,
         Err(error) => {
-            tracing::error!(%error, %platform, "webhook payload is not valid JSON");
+            tracing::error!(%error, installation_id, "gitlab webhook: invalid json payload");
             return Err(GitlabPayloadError::InvalidJson);
         }
     };
-
-    if !verify_gitlab_project_webhook_with_registry(state.gitlab.as_ref(), headers, body, &payload)
+    match verify_gitlab_webhook_with_registry(state.gitlab.as_ref(), headers, body, installation_id)
     {
-        return Err(GitlabPayloadError::InvalidSignature);
+        GitlabVerifyResult::Ok => {}
+        GitlabVerifyResult::UnknownInstallationId => {
+            return Err(GitlabPayloadError::UnknownInstallationId);
+        }
+        GitlabVerifyResult::InvalidSignature => {
+            return Err(GitlabPayloadError::InvalidSignature);
+        }
     }
-
     Ok(payload)
 }
 
-fn verify_gitlab_project_webhook_with_registry(
+enum GitlabVerifyResult {
+    Ok,
+    UnknownInstallationId,
+    InvalidSignature,
+}
+
+fn verify_gitlab_webhook_with_registry(
     registry: Option<&crate::integrations::gitlab::GitlabRegistry>,
     headers: &HeaderMap,
     body: &[u8],
-    payload: &serde_json::Value,
-) -> bool {
-    let Some(project_id) = payload["project"]["id"].as_i64() else {
-        tracing::warn!("GitLab webhook missing project.id");
-        return false;
-    };
+    installation_id: i64,
+) -> GitlabVerifyResult {
     let Some(registry) = registry else {
         tracing::warn!(
-            project_id,
+            installation_id,
             "GitLab webhook received but GitLab is not configured"
         );
-        return false;
+        return GitlabVerifyResult::UnknownInstallationId;
     };
-    let Some(project) = registry.get(project_id) else {
-        tracing::warn!(project_id, "GitLab webhook for unconfigured project");
-        return false;
+    let Some(project) = registry.get_by_installation_id(installation_id) else {
+        tracing::warn!(
+            installation_id,
+            "GitLab webhook for unconfigured installation_id"
+        );
+        return GitlabVerifyResult::UnknownInstallationId;
     };
-
-    project.client.verify_webhook(headers, body)
+    if project.client.verify_webhook(headers, body) {
+        GitlabVerifyResult::Ok
+    } else {
+        GitlabVerifyResult::InvalidSignature
+    }
 }
 
 enum BitbucketPayloadError {
@@ -335,32 +387,27 @@ enum BitbucketPayloadError {
     InvalidSignature,
 }
 
-/// Mirrors [`verified_gitlab_payload`]: Bitbucket has no single App-wide webhook secret either, so
-/// the payload must be parsed first to find the repository identity, then verified against the
-/// matching configured repo's secret.
-fn verified_bitbucket_payload(
+fn verified_bitbucket_payload_for_installation(
     state: &AppState,
+    installation_id: i64,
     headers: &HeaderMap,
     body: &[u8],
 ) -> Result<serde_json::Value, BitbucketPayloadError> {
-    let platform = Platform::Bitbucket;
     let payload = match serde_json::from_slice(body) {
-        Ok(payload) => payload,
+        Ok(p) => p,
         Err(error) => {
-            tracing::error!(%error, %platform, "webhook payload is not valid JSON");
+            tracing::error!(%error, installation_id, "bitbucket webhook: invalid json payload");
             return Err(BitbucketPayloadError::InvalidJson);
         }
     };
-
     if !verify_bitbucket_project_webhook_with_registry(
         state.bitbucket.as_ref(),
         headers,
         body,
-        &payload,
+        installation_id,
     ) {
         return Err(BitbucketPayloadError::InvalidSignature);
     }
-
     Ok(payload)
 }
 
@@ -368,26 +415,23 @@ fn verify_bitbucket_project_webhook_with_registry(
     registry: Option<&crate::integrations::bitbucket::BitbucketRegistry>,
     headers: &HeaderMap,
     body: &[u8],
-    payload: &serde_json::Value,
+    installation_id: i64,
 ) -> bool {
-    let Some((full_name, _, _)) = bitbucket_repo_identity(payload) else {
-        tracing::warn!("Bitbucket webhook missing repository.full_name");
-        return false;
-    };
-    let project_id = crate::integrations::platform::stable_id_from_key(&full_name);
     let Some(registry) = registry else {
         tracing::warn!(
-            repo = %full_name,
+            installation_id,
             "Bitbucket webhook received but Bitbucket is not configured"
         );
         return false;
     };
-    let Some(project) = registry.get(project_id) else {
-        tracing::warn!(repo = %full_name, "Bitbucket webhook for unconfigured repository");
+    let Some(repo) = registry.get(installation_id) else {
+        tracing::warn!(
+            installation_id,
+            "Bitbucket webhook for unconfigured installation_id"
+        );
         return false;
     };
-
-    project.client.verify_webhook(headers, body)
+    repo.client.verify_webhook(headers, body)
 }
 
 /// GitHub webhook → internal action mapping (the only events that do anything beyond being
@@ -2058,7 +2102,7 @@ mod tests {
         let body = br#"{"zen":"hi"}"#;
         let (headers, body) = github_request(b"wh-secret", body, "no-app-delivery-1");
 
-        let response = webhook_router_body(state, headers, body).await;
+        let response = gitlab_webhook_body(state, 1001, headers, body).await;
         assert_eq!(
             response.status(),
             StatusCode::ACCEPTED,
@@ -2074,7 +2118,7 @@ mod tests {
         let (mut headers, body) = github_request(b"wh-secret", body, "no-app-delivery-2");
         headers.insert("x-hub-signature-256", "sha256=deadbeef".parse().unwrap());
 
-        let response = webhook_router_body(state, headers, body).await;
+        let response = gitlab_webhook_body(state, 1001, headers, body).await;
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
@@ -2085,7 +2129,7 @@ mod tests {
         let body = br#"{"zen":"hi"}"#;
         let (headers, body) = github_request(b"anything", body, "no-app-delivery-3");
 
-        let response = webhook_router_body(state, headers, body).await;
+        let response = gitlab_webhook_body(state, 1001, headers, body).await;
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
@@ -2133,32 +2177,9 @@ mod tests {
         assert!(!should_skip_bot_review(false, &human_pr));
     }
 
-    #[test]
-    fn detect_platform_recognises_github_headers() {
-        let mut headers = HeaderMap::new();
-        headers.insert("x-github-event", "pull_request".parse().unwrap());
-        assert_eq!(detect_platform(&headers), Some(Platform::GitHub));
-    }
-
-    #[test]
-    fn detect_platform_recognises_gitlab_headers() {
-        let mut headers = HeaderMap::new();
-        headers.insert("x-gitlab-event", "Merge Request Hook".parse().unwrap());
-        assert_eq!(detect_platform(&headers), Some(Platform::GitLab));
-    }
-
-    #[test]
-    fn detect_platform_recognises_bitbucket_headers() {
-        let mut headers = HeaderMap::new();
-        headers.insert("x-event-key", "pullrequest:created".parse().unwrap());
-        assert_eq!(detect_platform(&headers), Some(Platform::Bitbucket));
-    }
-
-    #[test]
-    fn detect_platform_returns_none_for_unknown() {
-        let headers = HeaderMap::new();
-        assert_eq!(detect_platform(&headers), None);
-    }
+    // Platform detection from headers is no longer used — platform is known at the path level
+    // (/webhook/github, /webhook/gitlab/{id}, /webhook/bitbucket/{id}).
+    // The old detect_platform tests are removed accordingly.
 
     #[test]
     fn bitbucket_repo_identity_parses_full_name() {
@@ -2219,67 +2240,51 @@ mod tests {
     fn bitbucket_project_webhook_accepts_matching_repo_secret() {
         let registry = bitbucket_registry();
         let body = br#"{"repository":{"full_name":"myteam/repo-a"}}"#;
-        let payload: serde_json::Value = serde_json::from_slice(body).unwrap();
-
+        let installation_id = crate::integrations::platform::stable_id_from_key("myteam/repo-a");
         use hmac::{Hmac, KeyInit, Mac};
         use sha2::Sha256;
         type HmacSha256 = Hmac<Sha256>;
         let mut mac = HmacSha256::new_from_slice(b"secret-a").unwrap();
         mac.update(body);
         let sig = format!("sha256={}", hex::encode(mac.finalize().into_bytes()));
-
         let mut headers = HeaderMap::new();
         headers.insert("x-hub-signature", sig.parse().unwrap());
-
         assert!(verify_bitbucket_project_webhook_with_registry(
             Some(&registry),
             &headers,
             body,
-            &payload
+            installation_id,
         ));
     }
-
     #[test]
     fn bitbucket_project_webhook_rejects_wrong_repo_secret() {
         let registry = bitbucket_registry();
         let body = br#"{"repository":{"full_name":"myteam/repo-a"}}"#;
-        let payload: serde_json::Value = serde_json::from_slice(body).unwrap();
-
+        let installation_id = crate::integrations::platform::stable_id_from_key("myteam/repo-a");
         use hmac::{Hmac, KeyInit, Mac};
         use sha2::Sha256;
         type HmacSha256 = Hmac<Sha256>;
-        // Signed with repo-b's secret, but the payload identifies repo-a.
         let mut mac = HmacSha256::new_from_slice(b"secret-b").unwrap();
         mac.update(body);
         let sig = format!("sha256={}", hex::encode(mac.finalize().into_bytes()));
-
         let mut headers = HeaderMap::new();
         headers.insert("x-hub-signature", sig.parse().unwrap());
-
         assert!(!verify_bitbucket_project_webhook_with_registry(
             Some(&registry),
             &headers,
             body,
-            &payload
+            installation_id,
         ));
     }
-
     #[test]
-    fn bitbucket_project_webhook_rejects_missing_or_unknown_repo() {
+    fn bitbucket_project_webhook_rejects_unknown_installation_id() {
         let registry = bitbucket_registry();
         let headers = HeaderMap::new();
-
         assert!(!verify_bitbucket_project_webhook_with_registry(
             Some(&registry),
             &headers,
             b"{}",
-            &serde_json::json!({})
-        ));
-        assert!(!verify_bitbucket_project_webhook_with_registry(
-            Some(&registry),
-            &headers,
-            b"{}",
-            &serde_json::json!({ "repository": { "full_name": "unknown/repo" } })
+            9999,
         ));
     }
 
@@ -2291,6 +2296,7 @@ mod tests {
             projects: vec![
                 crate::config::GitlabProjectConfig {
                     project_id: 1001,
+                    installation_id: None, // effective = 1001
                     api_url: None,
                     access_token: "token-a".to_string(),
                     webhook_secret: "secret-a".to_string(),
@@ -2298,6 +2304,7 @@ mod tests {
                 },
                 crate::config::GitlabProjectConfig {
                     project_id: 1002,
+                    installation_id: Some(9000), // custom installation_id
                     api_url: None,
                     access_token: "token-b".to_string(),
                     webhook_secret: "secret-b".to_string(),
@@ -2311,52 +2318,58 @@ mod tests {
     }
 
     #[test]
-    fn gitlab_project_webhook_accepts_matching_project_secret() {
+    fn gitlab_project_webhook_accepts_matching_secret() {
         let registry = gitlab_registry();
         let mut headers = HeaderMap::new();
         headers.insert("x-gitlab-token", "secret-a".parse().unwrap());
-        let payload = serde_json::json!({ "project": { "id": 1001 } });
-
-        assert!(verify_gitlab_project_webhook_with_registry(
-            Some(&registry),
-            &headers,
-            b"{}",
-            &payload
+        assert!(matches!(
+            verify_gitlab_webhook_with_registry(Some(&registry), &headers, b"{}", 1001),
+            GitlabVerifyResult::Ok
         ));
     }
 
     #[test]
-    fn gitlab_project_webhook_rejects_wrong_project_secret() {
+    fn gitlab_project_webhook_rejects_wrong_secret() {
+        let registry = gitlab_registry();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-gitlab-token", "wrong".parse().unwrap());
+        assert!(matches!(
+            verify_gitlab_webhook_with_registry(Some(&registry), &headers, b"{}", 1001),
+            GitlabVerifyResult::InvalidSignature
+        ));
+    }
+
+    #[test]
+    fn gitlab_project_webhook_rejects_unknown_installation_id() {
+        let registry = gitlab_registry();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-gitlab-token", "secret-a".parse().unwrap());
+        assert!(matches!(
+            verify_gitlab_webhook_with_registry(Some(&registry), &headers, b"{}", 9999),
+            GitlabVerifyResult::UnknownInstallationId
+        ));
+    }
+
+    #[test]
+    fn gitlab_project_webhook_rejects_raw_project_id_when_custom_installation_id_set() {
+        // project 1002 uses installation_id=9000; the raw project_id must not be accepted.
         let registry = gitlab_registry();
         let mut headers = HeaderMap::new();
         headers.insert("x-gitlab-token", "secret-b".parse().unwrap());
-        let payload = serde_json::json!({ "project": { "id": 1001 } });
-
-        assert!(!verify_gitlab_project_webhook_with_registry(
-            Some(&registry),
-            &headers,
-            b"{}",
-            &payload
+        assert!(matches!(
+            verify_gitlab_webhook_with_registry(Some(&registry), &headers, b"{}", 1002),
+            GitlabVerifyResult::UnknownInstallationId
         ));
     }
 
     #[test]
-    fn gitlab_project_webhook_rejects_missing_or_unknown_project() {
+    fn gitlab_project_webhook_accepts_custom_installation_id() {
         let registry = gitlab_registry();
         let mut headers = HeaderMap::new();
-        headers.insert("x-gitlab-token", "secret-a".parse().unwrap());
-
-        assert!(!verify_gitlab_project_webhook_with_registry(
-            Some(&registry),
-            &headers,
-            b"{}",
-            &serde_json::json!({ "project": {} })
-        ));
-        assert!(!verify_gitlab_project_webhook_with_registry(
-            Some(&registry),
-            &headers,
-            b"{}",
-            &serde_json::json!({ "project": { "id": 9999 } })
+        headers.insert("x-gitlab-token", "secret-b".parse().unwrap());
+        assert!(matches!(
+            verify_gitlab_webhook_with_registry(Some(&registry), &headers, b"{}", 9000),
+            GitlabVerifyResult::Ok
         ));
     }
 
@@ -2501,7 +2514,7 @@ mod tests {
         let state = gitlab_only_state(pool.clone());
         let (headers, body) = gitlab_job_hook_request();
 
-        let first = webhook_router_body(state.clone(), headers.clone(), body.clone()).await;
+        let first = gitlab_webhook_body(state.clone(), 1001, headers.clone(), body.clone()).await;
         assert_eq!(first.status(), StatusCode::ACCEPTED);
 
         let count: i64 =
@@ -2512,7 +2525,7 @@ mod tests {
                 .unwrap();
         assert_eq!(count, 1, "the fresh delivery is persisted exactly once");
 
-        let second = webhook_router_body(state, headers, body).await;
+        let second = gitlab_webhook_body(state, 1001, headers, body).await;
         assert_eq!(
             second.status(),
             StatusCode::ACCEPTED,
@@ -2549,7 +2562,7 @@ mod tests {
             .unwrap(),
         );
 
-        let response = webhook_router_body(state, headers, body).await;
+        let response = gitlab_webhook_body(state, 1001, headers, body).await;
         assert_eq!(
             response.status(),
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -2580,6 +2593,7 @@ mod tests {
             default_bot_handle: Some("lightbridge-bot".to_string()),
             projects: vec![crate::config::GitlabProjectConfig {
                 project_id: 2001,
+                installation_id: None,
                 api_url: Some(format!("{}/api/v4", mock.uri())),
                 access_token: "token-preset-test".to_string(),
                 webhook_secret: "preset-secret".to_string(),
@@ -2630,7 +2644,7 @@ mod tests {
         });
         let body = Bytes::from(serde_json::to_vec(&payload).unwrap());
 
-        let response = webhook_router_body(state, headers, body).await;
+        let response = gitlab_webhook_body(state, 1001, headers, body).await;
         assert_eq!(response.status(), StatusCode::ACCEPTED);
 
         let (preset, entry_point): (String, String) = sqlx::query_as(
@@ -2669,6 +2683,7 @@ mod tests {
             default_bot_handle: Some("lightbridge-bot".to_string()),
             projects: vec![crate::config::GitlabProjectConfig {
                 project_id: 2002,
+                installation_id: None,
                 api_url: Some(format!("{}/api/v4", mock.uri())),
                 access_token: "token-no-config-test".to_string(),
                 webhook_secret: "no-config-secret".to_string(),
@@ -2722,7 +2737,7 @@ mod tests {
         });
         let body = Bytes::from(serde_json::to_vec(&payload).unwrap());
 
-        let response = webhook_router_body(state, headers, body).await;
+        let response = gitlab_webhook_body(state, 1001, headers, body).await;
         assert_eq!(response.status(), StatusCode::ACCEPTED);
 
         let preset: String = sqlx::query_scalar(

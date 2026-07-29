@@ -618,6 +618,7 @@ mod tests {
             default_bot_handle: Some("lightbridge-bot".to_string()),
             projects: vec![crate::config::GitlabProjectConfig {
                 project_id: 3001,
+                installation_id: None,
                 api_url: Some(format!("{mock_uri}/api/v4")),
                 access_token: "token-admin-preset-test".to_string(),
                 webhook_secret: "admin-preset-secret".to_string(),

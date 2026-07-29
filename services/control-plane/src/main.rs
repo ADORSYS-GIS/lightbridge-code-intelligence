@@ -323,16 +323,19 @@ fn app(state: AppState) -> Router {
         .route("/healthz", get(liveness))
         .route("/readyz", get(readiness))
         .route("/metrics", get(metrics_endpoint))
-        // Unified webhook route — detects the platform (GitHub/GitLab) from headers.
+        // Path-scoped webhook ingress — one route per forge, no header-sniffing.
         .route(
-            "/webhook",
-            post(webhook::webhook_router).layer(DefaultBodyLimit::max(webhook::MAX_BODY_BYTES)),
+            "/webhook/github",
+            post(webhook::github_webhook).layer(DefaultBodyLimit::max(webhook::MAX_BODY_BYTES)),
         )
-        // Legacy GitHub webhook route — forwards to the unified handler. Kept during the
-        // transition so existing webhook configurations don't break.
         .route(
-            "/github/webhook",
-            post(webhook::github_webhook_legacy).layer(DefaultBodyLimit::max(webhook::MAX_BODY_BYTES)),
+            "/webhook/gitlab/{installation_id}",
+            post(webhook::gitlab_webhook).layer(DefaultBodyLimit::max(webhook::MAX_BODY_BYTES)),
+        )
+        // Bitbucket: installation_id = stable_id_from_key("workspace/repo_slug").
+        .route(
+            "/webhook/bitbucket/{installation_id}",
+            post(webhook::bitbucket_webhook).layer(DefaultBodyLimit::max(webhook::MAX_BODY_BYTES)),
         )
         .route("/me", get(jwt::me))
         .route("/tasks", get(tasks::list))

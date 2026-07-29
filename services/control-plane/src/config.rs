@@ -57,6 +57,9 @@ pub struct GitlabSection {
 pub struct GitlabProjectConfig {
     /// Numeric GitLab project id; also used as `tasks.installation_id` for GitLab.
     pub project_id: i64,
+    /// The value placed in the webhook URL path (`/webhook/gitlab/{installation_id}`).
+    /// Defaults to `project_id` when absent so existing configs work unchanged.
+    pub installation_id: Option<i64>,
     /// Optional per-project API URL, e.g. `https://gitlab.example.com/api/v4`.
     pub api_url: Option<String>,
     /// Project/group/PAT token sent as `PRIVATE-TOKEN`.
@@ -65,6 +68,13 @@ pub struct GitlabProjectConfig {
     pub webhook_secret: String,
     /// Optional per-project bot handle for @mention deep-review requests.
     pub bot_handle: Option<String>,
+}
+
+impl GitlabProjectConfig {
+    /// The value used as the `{installation_id}` path segment in the webhook URL.
+    pub fn effective_installation_id(&self) -> i64 {
+        self.installation_id.unwrap_or(self.project_id)
+    }
 }
 
 impl GitlabSection {
@@ -107,9 +117,18 @@ impl GitlabSection {
         }
 
         let mut seen = std::collections::HashSet::new();
+        let mut seen_iids = std::collections::HashSet::new();
         for project in &self.projects {
             if !seen.insert(project.project_id) {
                 anyhow::bail!("duplicate GitLab project_id {}", project.project_id);
+            }
+            let iid = project.effective_installation_id();
+            if !seen_iids.insert(iid) {
+                anyhow::bail!(
+                    "duplicate GitLab installation_id {} (project {})",
+                    iid,
+                    project.project_id
+                );
             }
             let api_url = self.resolved_api_url(project);
             let parsed_api_url = reqwest::Url::parse(api_url).map_err(|error| {
