@@ -180,9 +180,6 @@ pub struct ControlPlaneClient {
 
 impl ControlPlaneClient {
     pub fn new(base_url: impl Into<String>, token: impl Into<String>) -> Self {
-        // Bake the versioned path prefix into the stored base so every call site across the
-        // sub-modules (tasks, review, indexing, …) remains unchanged. Strip any trailing slash
-        // first, then append the prefix once at construction time.
         let raw = base_url.into();
         let base_url = format!("{}/api/v2", raw.trim_end_matches('/'));
         Self {
