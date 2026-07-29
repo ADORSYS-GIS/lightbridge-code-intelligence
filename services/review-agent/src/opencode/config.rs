@@ -4,10 +4,10 @@
 //!
 //! 1. **base** — the checked-in, human-readable [`integrations/opencode/config/review.jsonc`], baked in
 //!    via `include_str!`. It holds the invariants + defaults: the disabled built-ins (top-level
-//!    `tools`), the read-only `permission`, the mediated `lightbridge` MCP, the recorder/gate/logger
-//!    plugins, and the `eaig/reviewer` model wiring via `{env:*}`. Secrets ride `{env:*}` placeholders
-//!    (opencode resolves them at load); the reviewer prompt rides a `{file:*}` placeholder pointing at
-//!    a per-task file the host writes beside the config.
+//!    `tools`), the read-only `permission`, the mediated `lightbridge` MCP, the recorder/gate/logger/
+//!    sentinel plugins (ADR-0106), and the `eaig/reviewer` model wiring via `{env:*}`. Secrets ride
+//!    `{env:*}` placeholders (opencode resolves them at load); the reviewer prompt rides a `{file:*}`
+//!    placeholder pointing at a per-task file the host writes beside the config.
 //! 2. **runtime injection** — patched onto the parsed base per task: the attribution/billing headers
 //!    (#89, dynamic keys), the tier's `reasoning` flag (deep=true/fast=false, ADR-0069), the tier's
 //!    `review.extra` passthrough params (`reasoning_effort`, `top_p`, …) merged into the reviewer
@@ -360,7 +360,7 @@ impl Floor {
         }
 
         // A required plugin missing from the final `plugin` list (arrays are replaced wholesale under
-        // full override, so an overlay that sets `plugin` can drop the recorder/gate/logger).
+        // full override, so an overlay that sets `plugin` can drop the recorder/gate/logger/sentinel).
         let final_plugins = final_config
             .get("plugin")
             .and_then(Value::as_array)
@@ -371,7 +371,7 @@ impl Floor {
                 let name = plugin.as_str().unwrap_or("<plugin>");
                 breaches.push(FloorBreach {
                     message: format!(
-                        "required plugin `{name}` dropped or replaced (recorder/gate/logger)"
+                        "required plugin `{name}` dropped or replaced (recorder/gate/logger/sentinel)"
                     ),
                 });
             }
@@ -468,8 +468,9 @@ mod tests {
         // The mediated stdio review MCP.
         assert_eq!(config["mcp"]["lightbridge"]["type"], "local");
         assert_eq!(config["mcp"]["lightbridge"]["command"][0], "lci-review-mcp");
-        // The three first-party plugins by absolute path.
-        assert_eq!(config["plugin"].as_array().map(Vec::len), Some(3));
+        // The four first-party plugins by absolute path (recorder/gate-interlock/logger + sentinel,
+        // ADR-0106).
+        assert_eq!(config["plugin"].as_array().map(Vec::len), Some(4));
     }
 
     #[test]
@@ -810,7 +811,7 @@ mod tests {
 
     #[test]
     fn overlay_replacing_plugins_or_dropping_the_mcp_fires_the_floor_warning() {
-        // Replacing the `plugin` ARRAY drops all three first-party plugins (full override on arrays).
+        // Replacing the `plugin` ARRAY drops all four first-party plugins (full override on arrays).
         let overlay = json!({ "plugin": ["/some/custom/plugin.ts"] });
         let rendered = render_review_config(None, &Map::new(), &[], Some(&overlay));
         assert_eq!(
@@ -819,8 +820,8 @@ mod tests {
                 .iter()
                 .filter(|b| b.message.contains("required plugin"))
                 .count(),
-            3,
-            "all three base plugins should be reported dropped: {:?}",
+            4,
+            "all four base plugins should be reported dropped: {:?}",
             rendered.floor_breaches
         );
 
