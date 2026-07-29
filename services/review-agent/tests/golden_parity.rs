@@ -31,7 +31,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 async fn mount_golden_control_plane(server: &MockServer) {
     Mock::given(method("GET"))
         .and(path(format!(
-            "/internal/tasks/{}/knowledge/tools",
+            "/api/v2/internal/tasks/{}/knowledge/tools",
             Uuid::nil()
         )))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
@@ -39,7 +39,7 @@ async fn mount_golden_control_plane(server: &MockServer) {
         .await;
     Mock::given(method("POST"))
         .and(path(format!(
-            "/internal/tasks/{}/review/telemetry",
+            "/api/v2/internal/tasks/{}/review/telemetry",
             Uuid::nil()
         )))
         .respond_with(ResponseTemplate::new(204))
@@ -48,7 +48,7 @@ async fn mount_golden_control_plane(server: &MockServer) {
     for endpoint in ["inline", "reply", "summary", "retract"] {
         Mock::given(method("POST"))
             .and(path(format!(
-                "/internal/tasks/{}/review/{endpoint}",
+                "/api/v2/internal/tasks/{}/review/{endpoint}",
                 Uuid::nil()
             )))
             .respond_with(ResponseTemplate::new(204))

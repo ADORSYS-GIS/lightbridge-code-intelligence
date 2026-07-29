@@ -195,7 +195,7 @@ mod tests {
         let cp = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path(format!(
-                "/internal/tasks/{}/knowledge/tools",
+                "/api/v2/internal/tasks/{}/knowledge/tools",
                 Uuid::nil()
             )))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))

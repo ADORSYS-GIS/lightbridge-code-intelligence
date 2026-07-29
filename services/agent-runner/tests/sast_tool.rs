@@ -98,7 +98,7 @@ fn review_config(base_url: String) -> ReviewConfig {
 async fn mount_control_plane(cp: &MockServer) {
     Mock::given(method("GET"))
         .and(path(format!(
-            "/internal/tasks/{}/knowledge/tools",
+            "/api/v2/internal/tasks/{}/knowledge/tools",
             Uuid::nil()
         )))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
@@ -106,7 +106,7 @@ async fn mount_control_plane(cp: &MockServer) {
         .await;
     Mock::given(method("POST"))
         .and(path(format!(
-            "/internal/tasks/{}/review/telemetry",
+            "/api/v2/internal/tasks/{}/review/telemetry",
             Uuid::nil()
         )))
         .respond_with(ResponseTemplate::new(204))
@@ -114,7 +114,7 @@ async fn mount_control_plane(cp: &MockServer) {
         .await;
     Mock::given(method("POST"))
         .and(path(format!(
-            "/internal/tasks/{}/review/inline",
+            "/api/v2/internal/tasks/{}/review/inline",
             Uuid::nil()
         )))
         .respond_with(ResponseTemplate::new(204))
@@ -122,7 +122,7 @@ async fn mount_control_plane(cp: &MockServer) {
         .await;
     Mock::given(method("POST"))
         .and(path(format!(
-            "/internal/tasks/{}/review/summary",
+            "/api/v2/internal/tasks/{}/review/summary",
             Uuid::nil()
         )))
         .respond_with(ResponseTemplate::new(204))
