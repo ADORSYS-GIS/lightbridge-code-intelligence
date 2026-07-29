@@ -449,5 +449,4 @@ mod tests {
             GateDecision::Accept { disclosure: None }
         );
     }
-
 }
