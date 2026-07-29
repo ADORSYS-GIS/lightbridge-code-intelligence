@@ -15,7 +15,7 @@ function controlPlaneUrl(): string {
     process.env.CONTROL_PLANE_URL ??
     process.env.AUTH_BACKEND_URL ??
     "http://localhost:8080"
-  ).replace(/\/+$/, "") + "/api/v2";
+  ).replace(/\/+$/, "");
 }
 
 /** Discriminated result so pages can render honest states instead of throwing. */

@@ -14,7 +14,7 @@ function controlPlaneUrl(): string {
     process.env.CONTROL_PLANE_URL ??
     process.env.AUTH_BACKEND_URL ??
     "http://localhost:8080"
-  ).replace(/\/+$/, "") + "/api/v2";
+  ).replace(/\/+$/, "");
 }
 
 /** The dotted claim path the caller's permissions live under (ADR-0023). Mirrors the control plane's
