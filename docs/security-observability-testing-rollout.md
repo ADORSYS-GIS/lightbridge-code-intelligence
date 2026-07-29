@@ -62,6 +62,7 @@ The `Caller` axum extractor carries the verified `Claims` plus the parsed permis
 | `repo:read`    | `GET /repositories`, `GET /admin/repositories`                                     |
 | `repo:approve` | `POST /admin/repositories/{id}/approve`                                            |
 | `repo:deny`    | `POST /admin/repositories/{id}/deny`                                               |
+| `model:configure` | `POST /admin/repositories/{id}/model`, `POST /admin/organizations/{installation_id}/model` (ADR-0110) |
 
 `GET /me` (`jwt::me`) returns the caller's verified claims plus the sorted effective permissions, so
 the web can render capability-aware affordances — but the control plane is the real enforcement

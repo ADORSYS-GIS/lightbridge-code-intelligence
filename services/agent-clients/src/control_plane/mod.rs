@@ -53,6 +53,12 @@ pub struct TaskContext {
     /// framing) if an older control plane omits the field.
     #[serde(default = "default_entry_point")]
     pub entry_point: String,
+    /// Resolved repo/org model override (ADR-0110, story #501). `Some` overrides the preset's own
+    /// configured model as the FINAL step, after `for_preset` resolves the preset's complete base
+    /// config — never tools/gates/budgets. `None` (including from an older control plane that omits
+    /// the field) means no override: the preset's configured model applies unchanged.
+    #[serde(default)]
+    pub model_override: Option<String>,
     pub base_sha: Option<String>,
     pub head_sha: Option<String>,
     /// Whether the repo already has a semantic index — review reuses it instead of re-indexing
@@ -201,6 +207,7 @@ mod tests {
             kind: "review".into(),
             preset: "deep".into(),
             entry_point: "mention".into(),
+            model_override: None,
             base_sha: None,
             head_sha: Some("deadbeef".into()),
             repo_indexed: false,

@@ -410,6 +410,23 @@ async fn perform_indexing(
     Ok((chunks, graph))
 }
 
+/// Apply the resolved repo/org model override (ADR-0110, story #501) to a preset-resolved
+/// `ReviewConfig`, if any. Overrides `model` only, never tools/gates/budgets — so a repo/org override
+/// changes which model runs without touching ADR-0103's "presets never diverge structurally"
+/// guarantee. A `None`, empty, or all-whitespace override is treated as no override (the preset's own
+/// configured model applies unchanged).
+fn apply_model_override(mut review: ReviewConfig, model_override: Option<&str>) -> ReviewConfig {
+    if let Some(model) = model_override.map(str::trim).filter(|m| !m.is_empty()) {
+        tracing::info!(
+            model_override = model,
+            previous_model = %review.model,
+            "applying repo/org model override (ADR-0110)"
+        );
+        review.model = model.to_string();
+    }
+    review
+}
+
 /// Run the review step for one task: the native agent (which may call `run_sast`, ADR-0073), then
 /// finalize. Returns `(review_summary, review_detail)` — the summary always folds into the top-level
 /// task summary; the
@@ -447,6 +464,10 @@ async fn perform_review(
     let Some(review) = resolved else {
         return Ok(("review disabled".to_string(), None));
     };
+    // Repo/org model override (ADR-0110, story #501), applied as the FINAL step after `for_preset`
+    // resolves the preset's complete base config.
+    let review = apply_model_override(review.clone(), context.model_override.as_deref());
+    let review = &review;
 
     // Repo-owned review config (`.lightbridge-code-review.jsonc`, ADR-0030): conventions/architecture/
     // instructions (prompt context), focus/ignore (diff filtering), and severity.min (finding filter,
@@ -736,5 +757,38 @@ mod tests {
         let detail = detail.expect("truncation note");
         assert!(detail.contains("step budget"));
         assert!(detail.contains("40 turns"));
+    }
+
+    // ADR-0110 / story #501: `context.model_override` must reach the built `ReviewConfig.model` as
+    // the final step, and must never touch any other field (tools/gates/budgets stay preset-defined).
+    #[test]
+    fn model_override_replaces_the_preset_model_and_nothing_else() {
+        let base = review_config();
+        let overridden = apply_model_override(base.clone(), Some("claude-opus-5"));
+        assert_eq!(overridden.model, "claude-opus-5");
+        assert_eq!(overridden.max_turns, base.max_turns);
+        assert!(overridden.tools.is_none() && base.tools.is_none());
+    }
+
+    #[test]
+    fn no_override_leaves_the_preset_model_unchanged() {
+        let base = review_config();
+        let unchanged = apply_model_override(base.clone(), None);
+        assert_eq!(unchanged.model, base.model);
+    }
+
+    // An override that's empty or all-whitespace (shouldn't happen from the write-time-validated admin
+    // API, but the runner doesn't trust the control plane blindly) is treated as no override.
+    #[test]
+    fn blank_override_is_treated_as_no_override() {
+        let base = review_config();
+        assert_eq!(
+            apply_model_override(base.clone(), Some("")).model,
+            base.model
+        );
+        assert_eq!(
+            apply_model_override(base.clone(), Some("   ")).model,
+            base.model
+        );
     }
 }

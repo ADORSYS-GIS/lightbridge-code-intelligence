@@ -667,6 +667,8 @@ async fn handle_gitlab_merge_request(
                 crate::preset::EntryPoint::PrOpen,
             )
             .await;
+            let model_override =
+                crate::model::resolve_model_override(pool, repository_id, installation_id).await;
             let task = crate::db::NewTask {
                 repository_id,
                 installation_id,
@@ -681,6 +683,7 @@ async fn handle_gitlab_merge_request(
                 entry_point: crate::preset::EntryPoint::PrOpen.as_str().to_string(),
                 trigger_comment_id: None,
                 trace_context: lci_observability::current_traceparent(),
+                model_override,
             };
             create_review_task(pool, task, delivery_id).await;
         }
@@ -899,6 +902,8 @@ async fn handle_gitlab_note(
 
     let command_text = command_from_comment(body);
     let trigger_comment_id = payload["object_attributes"]["id"].as_i64();
+    let model_override =
+        crate::model::resolve_model_override(pool, repository_id, installation_id).await;
     let task = crate::db::NewTask {
         repository_id,
         installation_id,
@@ -913,6 +918,7 @@ async fn handle_gitlab_note(
         entry_point: crate::preset::EntryPoint::Mention.as_str().to_string(),
         trigger_comment_id,
         trace_context: lci_observability::current_traceparent(),
+        model_override,
     };
     tracing::info!(
         delivery_id,
@@ -1056,6 +1062,8 @@ async fn handle_bitbucket_pullrequest(
                 crate::preset::EntryPoint::PrOpen,
             )
             .await;
+            let model_override =
+                crate::model::resolve_model_override(pool, repository_id, installation_id).await;
             let task = crate::db::NewTask {
                 repository_id,
                 installation_id,
@@ -1070,6 +1078,7 @@ async fn handle_bitbucket_pullrequest(
                 entry_point: crate::preset::EntryPoint::PrOpen.as_str().to_string(),
                 trigger_comment_id: None,
                 trace_context: lci_observability::current_traceparent(),
+                model_override,
             };
             create_review_task(pool, task, delivery_id).await;
         }
@@ -1266,6 +1275,8 @@ async fn handle_bitbucket_comment(
 
     let command_text = command_from_comment(body);
     let trigger_comment_id = payload["comment"]["id"].as_i64();
+    let model_override =
+        crate::model::resolve_model_override(pool, repository_id, installation_id).await;
     let task = crate::db::NewTask {
         repository_id,
         installation_id,
@@ -1280,6 +1291,7 @@ async fn handle_bitbucket_comment(
         entry_point: crate::preset::EntryPoint::Mention.as_str().to_string(),
         trigger_comment_id,
         trace_context: lci_observability::current_traceparent(),
+        model_override,
     };
     tracing::info!(
         delivery_id,
@@ -1413,12 +1425,17 @@ async fn handle_pull_request(
                 installation_id,
             };
             let preset = crate::preset::resolve_preset_or_default(
-                state.platforms.get(&Platform::GitHub).map(std::sync::Arc::as_ref),
+                state
+                    .platforms
+                    .get(&Platform::GitHub)
+                    .map(std::sync::Arc::as_ref),
                 &repo_ref,
                 base_sha.as_deref().unwrap_or(default_branch),
                 crate::preset::EntryPoint::PrOpen,
             )
             .await;
+            let model_override =
+                crate::model::resolve_model_override(pool, repository_id, installation_id).await;
             let task = crate::db::NewTask {
                 repository_id,
                 installation_id,
@@ -1435,6 +1452,7 @@ async fn handle_pull_request(
                 // the PR body itself.
                 trigger_comment_id: None,
                 trace_context: lci_observability::current_traceparent(),
+                model_override,
             };
             create_review_task(pool, task, delivery_id).await;
         }
@@ -1644,6 +1662,8 @@ async fn handle_issue_comment(
     // on THIS comment, not the PR body, so the acknowledgment sits on the human's request. Absent on a
     // malformed payload → `None`, and the reactions fall back to the PR/issue body.
     let trigger_comment_id = payload["comment"]["id"].as_i64();
+    let model_override =
+        crate::model::resolve_model_override(pool, repository_id, installation_id).await;
     // An @mention is an explicit human command: it must ALWAYS create a task. True webhook
     // redeliveries are already deduped upstream by the `webhook_deliveries` delivery-id PRIMARY KEY,
     // so content-idempotency adds nothing here — and previously dropped legitimate re-requests when
@@ -1664,6 +1684,7 @@ async fn handle_issue_comment(
         entry_point: crate::preset::EntryPoint::Mention.as_str().to_string(),
         trigger_comment_id,
         trace_context: lci_observability::current_traceparent(),
+        model_override,
     };
     tracing::info!(
         delivery_id,
@@ -2016,6 +2037,7 @@ mod tests {
             knowledge_tools: std::sync::Arc::new(crate::config::KnowledgeToolsSection::default()),
             app_handle: std::sync::Arc::new("lightbridge-assistant".to_string()),
             permissions_claim: std::sync::Arc::new("permissions".to_string()),
+            model_allowlist: std::sync::Arc::new(Vec::new()),
         }
     }
 
@@ -2453,6 +2475,7 @@ mod tests {
             knowledge_tools: std::sync::Arc::new(crate::config::KnowledgeToolsSection::default()),
             app_handle: std::sync::Arc::new("lightbridge-assistant".to_string()),
             permissions_claim: std::sync::Arc::new("permissions".to_string()),
+            model_allowlist: std::sync::Arc::new(Vec::new()),
         }
     }
 
@@ -2679,7 +2702,10 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("x-gitlab-event", "Merge Request Hook".parse().unwrap());
         headers.insert("x-gitlab-token", "no-config-secret".parse().unwrap());
-        headers.insert("x-gitlab-event-uuid", "no-config-test-uuid".parse().unwrap());
+        headers.insert(
+            "x-gitlab-event-uuid",
+            "no-config-test-uuid".parse().unwrap(),
+        );
         let payload = serde_json::json!({
             "object_attributes": {
                 "action": "open",
@@ -2699,12 +2725,13 @@ mod tests {
         let response = webhook_router_body(state, headers, body).await;
         assert_eq!(response.status(), StatusCode::ACCEPTED);
 
-        let preset: String =
-            sqlx::query_scalar("SELECT preset FROM tasks WHERE repository_id = $1 AND target_id = 9")
-                .bind(repo_id)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let preset: String = sqlx::query_scalar(
+            "SELECT preset FROM tasks WHERE repository_id = $1 AND target_id = 9",
+        )
+        .bind(repo_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(
             preset, "fast",
             "no repo config → the platform-default pr_open mapping applies (ADR-0062 behavior preserved)"
