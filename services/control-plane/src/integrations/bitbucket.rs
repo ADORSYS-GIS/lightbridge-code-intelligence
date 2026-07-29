@@ -328,11 +328,11 @@ impl CodePlatform for BitbucketPlatformRouter {
         &self,
         repo: &RepoRef,
         path: &str,
-        content: &str,
+        mutate: Box<dyn FnOnce(Option<String>) -> String + Send>,
         message: &str,
     ) -> anyhow::Result<()> {
         self.client(repo)?
-            .update_repo_file(repo, path, content, message)
+            .update_repo_file(repo, path, mutate, message)
             .await
     }
 
@@ -550,23 +550,36 @@ impl CodePlatform for BitbucketClient {
 
     async fn update_repo_file(
         &self,
-        _repo: &RepoRef,
+        repo: &RepoRef,
         path: &str,
-        content: &str,
+        mutate: Box<dyn FnOnce(Option<String>) -> String + Send>,
         message: &str,
     ) -> anyhow::Result<()> {
         // Bitbucket's Source API commits directly to the main/default branch when `branch` is
         // omitted (ADR-0109's requirement, for free — unlike GitLab this needs no separate
-        // default_branch() lookup). `application/x-www-form-urlencoded` (not multipart) — the leading
-        // `/` on the path field disambiguates it from the `message` meta-data field per Bitbucket's own
-        // documented convention, and this repo's `reqwest` build only has the `form` feature enabled,
-        // not `multipart` (both content types are equally valid per Bitbucket's docs).
+        // default_branch() lookup for the WRITE). `application/x-www-form-urlencoded` (not
+        // multipart) — the leading `/` on the path field disambiguates it from the `message`
+        // meta-data field per Bitbucket's own documented convention, and this repo's `reqwest` build
+        // only has the `form` feature enabled, not `multipart` (both content types are equally valid
+        // per Bitbucket's docs).
+        //
+        // Bitbucket's Source API has NO compare-and-swap primitive (no sha/last_commit_id-equivalent
+        // on this endpoint) — reading the current content immediately before writing narrows the
+        // TOCTOU window (vs. reading it earlier, e.g. in the admin.rs caller) but cannot eliminate a
+        // genuinely concurrent write the way GitHub's sha-guarded PUT or GitLab's last_commit_id can.
+        let branch = self.default_branch(repo).await?;
+        let current_content = self.get_repo_file(repo, &branch, path).await?;
+        let new_content = mutate(current_content);
+
         let url = self.url(&format!("{}/src", self.repo_base()));
         let field_path = format!("/{path}");
         self.http
             .post(&url)
             .basic_auth(&self.email, Some(&self.api_token))
-            .form(&[(field_path.as_str(), content), ("message", message)])
+            .form(&[
+                (field_path.as_str(), new_content.as_str()),
+                ("message", message),
+            ])
             .send()
             .await?
             .error_for_status()?;

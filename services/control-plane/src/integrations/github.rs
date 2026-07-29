@@ -432,16 +432,19 @@ impl GithubApp {
     }
 
     /// Create or update a file's content on the repository's default branch via the Contents API
-    /// (ADR-0109) — a direct commit, not a PR. Looks up the file's current `sha` first (required by
-    /// GitHub for an update, omitted for a create); a concurrent edit since that lookup surfaces as a
-    /// 409 from the PUT (`error_for_status` below), never a silent overwrite.
+    /// (ADR-0109) — a direct commit, not a PR. Reads the file's current content **and** `sha` as ONE
+    /// GET, calls `mutate` on that exact snapshot, then PUTs the result guarded by that same `sha`
+    /// (required by GitHub for an update, omitted for a create) — a concurrent edit since that read
+    /// surfaces as a 409 from the PUT (`error_for_status` below), never a silent overwrite. Doing the
+    /// read and the mutation as one call is load-bearing: a caller that reads separately and passes
+    /// final content would race a concurrent editor without ever seeing the 409 (see the trait doc).
     pub async fn update_repository_file_content(
         &self,
         token: &str,
         owner: &str,
         repo: &str,
         path: &str,
-        content: &str,
+        mutate: Box<dyn FnOnce(Option<String>) -> String + Send>,
         message: &str,
     ) -> anyhow::Result<()> {
         use anyhow::Context;
@@ -456,9 +459,9 @@ impl GithubApp {
             .header("X-GitHub-Api-Version", "2022-11-28")
             .send()
             .await
-            .context("looking up the existing file sha")?;
-        let sha = if existing.status() == reqwest::StatusCode::NOT_FOUND {
-            None
+            .context("looking up the existing file content")?;
+        let (current_content, sha) = if existing.status() == reqwest::StatusCode::NOT_FOUND {
+            (None, None)
         } else {
             let value: serde_json::Value = existing
                 .error_for_status()
@@ -466,11 +469,20 @@ impl GithubApp {
                 .json()
                 .await
                 .context("parsing file lookup response")?;
-            value["sha"].as_str().map(str::to_string)
+            let content = value["content"].as_str().map(|encoded| {
+                let stripped: String = encoded.chars().filter(|c| !c.is_whitespace()).collect();
+                let decoded = base64::engine::general_purpose::STANDARD
+                    .decode(stripped)
+                    .unwrap_or_default();
+                String::from_utf8_lossy(&decoded).into_owned()
+            });
+            let sha = value["sha"].as_str().map(str::to_string);
+            (content, sha)
         };
+        let new_content = mutate(current_content);
         let mut body = serde_json::json!({
             "message": message,
-            "content": base64::engine::general_purpose::STANDARD.encode(content),
+            "content": base64::engine::general_purpose::STANDARD.encode(&new_content),
         });
         if let Some(sha) = sha {
             body["sha"] = serde_json::Value::String(sha);
@@ -783,12 +795,12 @@ impl CodePlatform for GithubApp {
         &self,
         repo: &RepoRef,
         path: &str,
-        content: &str,
+        mutate: Box<dyn FnOnce(Option<String>) -> String + Send>,
         message: &str,
     ) -> anyhow::Result<()> {
         let (owner, name) = repo.owner_repo();
         let token = self.token_for(repo).await?;
-        self.update_repository_file_content(&token, owner, name, path, content, message)
+        self.update_repository_file_content(&token, owner, name, path, mutate, message)
             .await
     }
 

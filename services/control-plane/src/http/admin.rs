@@ -64,7 +64,7 @@ pub async fn deny(caller: Caller, State(state): State<AppState>, Path(id): Path<
     set_status(caller, state, id, "disabled").await
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct SetPresetBody {
     /// The flat `preset` field to set in `.lightbridge-code-review.jsonc` (ADR-0030). Omit to leave
     /// it untouched (e.g. when only setting `entry_points`).
@@ -286,28 +286,23 @@ pub async fn set_preset(
         Ok(platform) => platform,
         Err(response) => return *response,
     };
-    let current = match platform
-        .get_repo_file(&repo_ref, &repo.default_branch, CONFIG_FILENAME)
-        .await
-    {
-        Ok(current) => current,
-        Err(error) => {
-            tracing::error!(%error, repo_id = id, "admin set preset: reading current config failed");
-            return (
-                StatusCode::BAD_GATEWAY,
-                "reading the repo's current config failed",
-            )
-                .into_response();
-        }
-    };
-    let new_content = merge_preset_fields(current.as_deref(), &body);
     let admin = caller.claims.identity().to_string();
     let message = format!(
         "chore: update review preset via Lightbridge admin console (by {admin})\n\n\
          {CONFIG_FILENAME} updated by an admin action, not an author commit."
     );
+    // The read (current content + the platform's concurrency token) and the merge happen INSIDE
+    // `update_repo_file`, as one call — never a separate `get_repo_file` here. A caller-side read
+    // followed by a later platform-side write reads two different snapshots, so a concurrent author
+    // edit landing in between is silently discarded instead of surfacing as a conflict (the exact
+    // TOCTOU gap ADR-0109's `mutate`-closure design exists to close — see the trait doc).
+    let body_for_merge = body.clone();
+    let mutate: Box<dyn FnOnce(Option<String>) -> String + Send> =
+        Box::new(move |current: Option<String>| {
+            merge_preset_fields(current.as_deref(), &body_for_merge)
+        });
     match platform
-        .update_repo_file(&repo_ref, CONFIG_FILENAME, &new_content, &message)
+        .update_repo_file(&repo_ref, CONFIG_FILENAME, mutate, &message)
         .await
     {
         Ok(()) => {
@@ -324,10 +319,10 @@ pub async fn set_preset(
             .into_response()
         }
         Err(error) => {
-            tracing::error!(%error, repo_id = id, "admin set preset: committing the file failed");
+            tracing::error!(%error, repo_id = id, "admin set preset: updating the repo config failed");
             (
                 StatusCode::BAD_GATEWAY,
-                "committing the file to the repo failed",
+                "updating the repo's review config failed",
             )
                 .into_response()
         }
@@ -674,16 +669,26 @@ mod tests {
         let repo_id = insert_gitlab_repo(&pool).await;
         let mock = wiremock::MockServer::start().await;
         // `update_repo_file`'s GitLab implementation resolves the default branch first (GitLab, unlike
-        // GitHub, needs the target branch explicit in the write body).
+        // GitHub, needs the target branch explicit in the write body), then reads content + a
+        // `last_commit_id` via the METADATA endpoint (not `/raw` — the closure-based `update_repo_file`
+        // reads and mutates as one call, see the trait doc for why this is load-bearing, not stylistic).
         mount_default_branch(&mock).await;
+        let encoded_current = {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD
+                .encode(r#"{"preset": "fast", "conventions": ["use tabs"]}"#)
+        };
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path(
-                "/api/v4/projects/acme%2Fwidgets/repository/files/.lightbridge-code-review.jsonc/raw",
+                "/api/v4/projects/acme%2Fwidgets/repository/files/.lightbridge-code-review.jsonc",
             ))
-            .respond_with(
-                wiremock::ResponseTemplate::new(200)
-                    .set_body_string(r#"{"preset": "fast", "conventions": ["use tabs"]}"#),
-            )
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "content": encoded_current,
+                "last_commit_id": "abc123",
+            })))
+            // Exactly one read: content and the concurrency token (`last_commit_id`) MUST come from
+            // the same snapshot, never two separate round-trips (the TOCTOU gap this fix closes).
+            .expect(1)
             .mount(&mock)
             .await;
         wiremock::Mock::given(wiremock::matchers::method("PUT"))
@@ -693,6 +698,9 @@ mod tests {
             // Body-content assertions live in `merge_preset_fields_preserves_other_fields` below (a
             // plain unit test, no wiremock) — this mock only proves the HTTP round-trip completes.
             .and(wiremock::matchers::body_string_contains("\"branch\":\"main\""))
+            .and(wiremock::matchers::body_string_contains(
+                "\"last_commit_id\":\"abc123\"",
+            ))
             .respond_with(wiremock::ResponseTemplate::new(200))
             .expect(1)
             .mount(&mock)
@@ -711,6 +719,60 @@ mod tests {
         .await;
         assert_eq!(response.status(), StatusCode::OK);
         mock.verify().await;
+    }
+
+    // Regression for the P1 the lightbridge-assistant review caught: a concurrent author edit between
+    // set_preset's read and its write must surface as a conflict, never a silent overwrite. Simulates
+    // GitLab rejecting a stale `last_commit_id` (its documented optimistic-concurrency behavior) —
+    // proving the admin response is an error, not the false `200 OK` a caller-side split read+write
+    // would have produced by unconditionally overwriting whatever the concurrent editor committed.
+    #[sqlx::test]
+    async fn set_preset_surfaces_a_concurrent_edit_as_an_error_not_a_silent_overwrite(
+        pool: sqlx::PgPool,
+    ) {
+        let repo_id = insert_gitlab_repo(&pool).await;
+        let mock = wiremock::MockServer::start().await;
+        mount_default_branch(&mock).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/api/v4/projects/acme%2Fwidgets/repository/files/.lightbridge-code-review.jsonc",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "content": "e30=", // "{}"
+                    "last_commit_id": "stale-commit",
+                })),
+            )
+            .mount(&mock)
+            .await;
+        // GitLab rejects a stale `last_commit_id` with 400 — the platform's own conflict signal.
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path(
+                "/api/v4/projects/acme%2Fwidgets/repository/files/.lightbridge-code-review.jsonc",
+            ))
+            .and(wiremock::matchers::body_string_contains(
+                "\"last_commit_id\":\"stale-commit\"",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(400))
+            .mount(&mock)
+            .await;
+
+        let state = gitlab_only_state(pool, &mock.uri());
+        let response = set_preset(
+            caller_with(&["repo:configure"]),
+            State(state),
+            Path(repo_id),
+            Json(SetPresetBody {
+                preset: Some("ultra".to_string()),
+                entry_points: None,
+            }),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_GATEWAY,
+            "a conflicting concurrent edit must surface as an error, never a silent 200 overwrite"
+        );
     }
 
     // Pure test of the merge logic itself (no platform round-trip) — proves ADR-0109's "other
@@ -771,7 +833,7 @@ mod tests {
         mount_default_branch(&mock).await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path(
-                "/api/v4/projects/acme%2Fwidgets/repository/files/.lightbridge-code-review.jsonc/raw",
+                "/api/v4/projects/acme%2Fwidgets/repository/files/.lightbridge-code-review.jsonc",
             ))
             .respond_with(wiremock::ResponseTemplate::new(404))
             .mount(&mock)
@@ -812,7 +874,7 @@ mod tests {
         mount_default_branch(&mock).await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path(
-                "/api/v4/projects/acme%2Fwidgets/repository/files/.lightbridge-code-review.jsonc/raw",
+                "/api/v4/projects/acme%2Fwidgets/repository/files/.lightbridge-code-review.jsonc",
             ))
             .respond_with(wiremock::ResponseTemplate::new(404))
             .mount(&mock)

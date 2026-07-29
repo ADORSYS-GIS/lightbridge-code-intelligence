@@ -235,18 +235,25 @@ pub trait CodePlatform: Send + Sync {
     ) -> anyhow::Result<Option<String>>;
 
     /// Create or update a single file on the repository's **default branch** (ADR-0109) — a direct
-    /// commit, not a PR. Deliberately narrow and dyn-safe: takes the FINAL content, not a mutation
-    /// closure — a read-modify-write (fetch the current content via [`Self::get_repo_file`], compute
-    /// the new content, then call this) is the caller's job, not this trait's. The only caller in this
-    /// codebase passes `path = ".lightbridge-code-review.jsonc"` (story #500's preset-selector
-    /// endpoint) — this is a single-purpose escape hatch for that one file, not a general write tool;
-    /// widening what path a caller may pass is a decision that needs its own review, per ADR-0109's
-    /// own Consequences section.
+    /// commit, not a PR. Takes a `mutate` closure, not the final content: the implementation fetches
+    /// the file's current content **and** its concurrency token (GitHub's `sha`) as ONE read, calls
+    /// `mutate` on that exact snapshot, then writes the result back guarded by that same token. This
+    /// is load-bearing, not stylistic — a caller-side read-modify-write (fetch via
+    /// [`Self::get_repo_file`], compute new content, call this with the final string) opens a TOCTOU
+    /// gap: a concurrent edit landing between the caller's read and this method's own internal
+    /// conflict check is silently discarded rather than surfaced, because the two reads observe
+    /// different snapshots even though the write's conflict check only compares against the second.
+    /// `Box<dyn FnOnce>` (not `impl FnOnce`) is required for dyn-safety (this trait is used as
+    /// `dyn CodePlatform`). The only caller in this codebase passes `path =
+    /// ".lightbridge-code-review.jsonc"` (story #500's preset-selector endpoint) — this is a
+    /// single-purpose escape hatch for that one file, not a general write tool; widening what path a
+    /// caller may pass is a decision that needs its own review, per ADR-0109's own Consequences
+    /// section.
     async fn update_repo_file(
         &self,
         repo: &RepoRef,
         path: &str,
-        content: &str,
+        mutate: Box<dyn FnOnce(Option<String>) -> String + Send>,
         message: &str,
     ) -> anyhow::Result<()>;
 
