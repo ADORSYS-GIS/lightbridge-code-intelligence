@@ -260,3 +260,146 @@ impl TurnPolicy for TurnBudget {
         ]
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::chat::ChatMessage;
+    use crate::turn::LoopStats;
+    use lci_agent_types::AssistantTurn;
+
+    fn state<'a>(
+        turn: usize,
+        max_turns: usize,
+        messages: &'a [ChatMessage],
+        stats: &'a LoopStats,
+    ) -> TurnState<'a> {
+        TurnState {
+            turn,
+            max_turns,
+            messages,
+            base_tools: &[],
+            stats,
+            converging: false,
+        }
+    }
+
+    #[test]
+    fn context_window_trim_returns_no_actions_when_under_budget() {
+        let mut policy = ContextWindowTrim::new(Some(1_000));
+        let messages = [ChatMessage::user("hi")];
+        let stats = LoopStats::default();
+        assert!(
+            policy
+                .before_turn(&state(0, 10, &messages, &stats))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn context_window_trim_clears_convergence_when_trim_brings_estimate_back_under_target() {
+        let mut policy = ContextWindowTrim::new(Some(4_000));
+        let messages = [
+            ChatMessage::tool("old", "x".repeat(20_000)),
+            ChatMessage::assistant(AssistantTurn::default()),
+            ChatMessage::user("done"),
+        ];
+        let stats = LoopStats::default();
+        let actions = policy.before_turn(&state(0, 10, &messages, &stats));
+        assert_eq!(
+            actions,
+            vec![PolicyAction::TrimHistory {
+                target_tokens: 3_000,
+                convergence: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn wind_down_disabled_returns_no_actions_even_past_the_boundary() {
+        let mut policy = WindDown::new(1, 1).disabled(true);
+        let stats = LoopStats {
+            batches: 5,
+            ..Default::default()
+        };
+        assert!(policy.before_turn(&state(0, 1, &[], &stats)).is_empty());
+    }
+
+    #[test]
+    fn wind_down_announces_batch_budget_spent_before_the_turn_boundary() {
+        let mut policy = WindDown::new(40, 1);
+        let stats = LoopStats {
+            batches: 1,
+            ..Default::default()
+        };
+        let actions = policy.before_turn(&state(0, 40, &[], &stats));
+        let reason = actions.iter().find_map(|action| match action {
+            PolicyAction::Record { detail, .. } => {
+                detail.get("reason").and_then(|value| value.as_str())
+            }
+            _ => None,
+        });
+        assert_eq!(
+            reason,
+            Some("Investigation batch budget spent (1/1 batches)")
+        );
+    }
+
+    #[test]
+    fn read_budgets_disabled_returns_no_actions_even_over_budget() {
+        let mut policy = ReadBudgets::new(1, 1).disabled(true);
+        let stats = LoopStats {
+            files_read: 5,
+            searches: 5,
+            ..Default::default()
+        };
+        assert!(policy.before_turn(&state(0, 10, &[], &stats)).is_empty());
+    }
+
+    #[test]
+    fn read_budgets_narrows_and_announces_once_the_file_budget_is_spent() {
+        let mut policy = ReadBudgets::new(1, 100);
+        let stats = LoopStats {
+            files_read: 1,
+            ..Default::default()
+        };
+        let actions = policy.before_turn(&state(0, 10, &[], &stats));
+        assert_eq!(actions.len(), 3);
+        assert!(matches!(actions[0], PolicyAction::Narrow(_)));
+        assert!(matches!(
+            &actions[1],
+            PolicyAction::Record {
+                name: Some("read_file_budget"),
+                ..
+            }
+        ));
+        assert!(matches!(actions[2], PolicyAction::Inject(_)));
+    }
+
+    #[test]
+    fn read_budgets_narrows_and_announces_once_the_search_budget_is_spent() {
+        let mut policy = ReadBudgets::new(100, 1);
+        let stats = LoopStats {
+            searches: 1,
+            ..Default::default()
+        };
+        let actions = policy.before_turn(&state(0, 10, &[], &stats));
+        assert_eq!(actions.len(), 3);
+        assert!(matches!(actions[0], PolicyAction::Narrow(_)));
+        assert!(matches!(
+            &actions[1],
+            PolicyAction::Record {
+                name: Some("retrieval_budget"),
+                ..
+            }
+        ));
+        assert!(matches!(actions[2], PolicyAction::Inject(_)));
+    }
+
+    #[test]
+    fn turn_budget_disabled_returns_no_actions_even_past_halfway() {
+        let mut policy = TurnBudget::new(10).disabled(true);
+        let stats = LoopStats::default();
+        assert!(policy.before_turn(&state(5, 10, &[], &stats)).is_empty());
+    }
+}

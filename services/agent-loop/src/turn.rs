@@ -103,3 +103,17 @@ pub trait TurnPolicy: Send {
         Vec::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nudge_from_str_and_string_both_wrap_the_message() {
+        assert_eq!(Nudge::from("hello"), Nudge("hello".to_string()));
+        assert_eq!(
+            Nudge::from(String::from("world")),
+            Nudge("world".to_string())
+        );
+    }
+}
