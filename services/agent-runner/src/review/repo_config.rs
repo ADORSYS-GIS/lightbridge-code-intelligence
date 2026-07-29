@@ -121,7 +121,11 @@ impl RepoReviewConfig {
     #[must_use]
     pub fn render_context_block(&self) -> Option<String> {
         let mut sections = Vec::new();
-        if let Some(architecture) = self.architecture.as_deref().filter(|s| !s.trim().is_empty()) {
+        if let Some(architecture) = self
+            .architecture
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+        {
             sections.push(format!("### Architecture\n{}", architecture.trim()));
         }
         if !self.conventions.is_empty() {
@@ -133,7 +137,11 @@ impl RepoReviewConfig {
                 .join("\n");
             sections.push(format!("### Conventions\n{list}"));
         }
-        if let Some(instructions) = self.instructions.as_deref().filter(|s| !s.trim().is_empty()) {
+        if let Some(instructions) = self
+            .instructions
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+        {
             sections.push(format!("### Instructions\n{}", instructions.trim()));
         }
         if sections.is_empty() {
@@ -311,7 +319,10 @@ mod tests {
         );
         assert!(filter.keep("vendor/keep-me.rs"));
         assert!(!filter.keep("vendor/other.rs"));
-        assert!(filter.keep("src/a.rs"), "unmatched paths are kept by default");
+        assert!(
+            filter.keep("src/a.rs"),
+            "unmatched paths are kept by default"
+        );
     }
 
     #[test]
@@ -341,8 +352,14 @@ mod tests {
         }"#;
         let cfg = parse(text).expect("valid config");
         assert_eq!(cfg.preset.as_deref(), Some("ultra"));
-        assert_eq!(cfg.entry_points.get("pr_open").map(String::as_str), Some("fast"));
-        assert_eq!(cfg.entry_points.get("mention").map(String::as_str), Some("deep"));
+        assert_eq!(
+            cfg.entry_points.get("pr_open").map(String::as_str),
+            Some("fast")
+        );
+        assert_eq!(
+            cfg.entry_points.get("mention").map(String::as_str),
+            Some("deep")
+        );
         assert_eq!(
             cfg.conventions,
             vec!["Errors are values, never thrown across module boundaries".to_string()]
@@ -360,7 +377,12 @@ mod tests {
             cfg.instructions.as_deref(),
             Some("Favor explicit error types over panics.")
         );
-        assert_eq!(cfg.severity, Some(SeverityFilter { min: MinSeverity::P1 }));
+        assert_eq!(
+            cfg.severity,
+            Some(SeverityFilter {
+                min: MinSeverity::P1
+            })
+        );
     }
 
     #[test]
@@ -402,9 +424,6 @@ mod tests {
     #[test]
     fn tolerates_jsonc_comment_styles() {
         let text = "{\n  /* block comment */\n  \"preset\": \"deep\", // trailing line comment\n}";
-        assert_eq!(
-            parse(text).and_then(|c| c.preset),
-            Some("deep".to_string())
-        );
+        assert_eq!(parse(text).and_then(|c| c.preset), Some("deep".to_string()));
     }
 }
