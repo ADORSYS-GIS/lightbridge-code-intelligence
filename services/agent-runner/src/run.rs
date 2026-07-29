@@ -488,6 +488,11 @@ async fn perform_review(
         embed_key: &embeddings_config.api_key,
         embed_model: &embeddings_config.model,
         min_priority,
+        // GitHub MCP (ADR-0105, story #498): reuse the SAME installation token already minted for the
+        // clone URL — no new credential. Empty for a non-GitHub platform (GitLab/Bitbucket embed
+        // credentials directly in `clone_url` instead; `context.token` is unused there, mirroring
+        // `authenticated_clone_url`'s own platform detection).
+        github_token: (!context.token.is_empty()).then_some(context.token.as_str()),
     };
     let outcome = review::opencode::run_opencode_agent(
         review,

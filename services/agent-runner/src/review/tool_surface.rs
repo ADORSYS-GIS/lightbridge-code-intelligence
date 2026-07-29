@@ -23,6 +23,24 @@ pub(crate) fn sast_explicitly_listed(review: &ReviewConfig) -> bool {
     })
 }
 
+/// Whether an operator EXPLICITLY listed a `mcp__github__…` selector in this preset's `review.tools`
+/// allowlist (ADR-0105, story #498) — the same "opt-in via allowlist" gate `sast_explicitly_listed`
+/// uses, and for the same reason: unlike `sast`, GitHub MCP genuinely spawns a second, freshly
+/// credentialed subprocess, so the decision to pay that cost per task must be explicit, never implied
+/// by an unset allowlist. Checked against the selector's raw config string (`mcp__github__…`), not a
+/// discovered tool name — this predicate decides whether to spawn `github-mcp-server` at all, before
+/// any tool discovery could happen.
+pub(crate) fn github_mcp_explicitly_listed(review: &ReviewConfig) -> bool {
+    review.tools.as_ref().is_some_and(|allow| {
+        allow.iter().any(|selector| match selector {
+            ReviewToolSelector::Mcp(pattern) => {
+                pattern.as_str().starts_with("mcp__github__")
+            }
+            ReviewToolSelector::Builtin(_) => false,
+        })
+    })
+}
+
 /// Resolve the tools offered to the model for one run: built-in tools filtered by the diff gate + the
 /// per-tier allowlist, plus any discovered external-knowledge MCP tools that match it (ADR-0066).
 /// Returns `(offered, dispatch_discovered)` — `offered` is the full surface (for the turn-0 `TurnFilter`
@@ -151,6 +169,27 @@ mod tests {
             tools,
             opencode_overlay: None,
         }
+    }
+
+    fn selectors(names: &[&str]) -> Vec<ReviewToolSelector> {
+        serde_json::from_value(serde_json::json!(names)).unwrap()
+    }
+
+    // ADR-0105 / story #498: `github_mcp_explicitly_listed` is the same "opt-in via allowlist" gate
+    // `sast_explicitly_listed` already proves out — GitHub MCP must never ride an unset or
+    // unrelated-mcp allowlist.
+    #[test]
+    fn github_mcp_explicitly_listed_requires_a_github_selector() {
+        assert!(!github_mcp_explicitly_listed(&review_config(None)));
+        assert!(!github_mcp_explicitly_listed(&review_config(Some(
+            selectors(&["finish", "abort"])
+        ))));
+        assert!(!github_mcp_explicitly_listed(&review_config(Some(
+            selectors(&["mcp__brave-search__brave_web_search"])
+        ))));
+        assert!(github_mcp_explicitly_listed(&review_config(Some(selectors(
+            &["finish", "mcp__github__get_issue"]
+        )))));
     }
 
     async fn mock_no_knowledge_tools() -> MockServer {

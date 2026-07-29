@@ -77,6 +77,31 @@ RUN set -eux; \
          /opt/opengrep-rules/stats /opt/opengrep-rules/scripts; \
   test -d /opt/opengrep-rules/python && test -d /opt/opengrep-rules/rust
 
+# ── Stage 1c: github-mcp-server (ADR-0105, story #498) ─────────────────────────────────────────────
+# The official GitHub MCP server binary (github.com/github/github-mcp-server), statically-linked Go —
+# runs unmodified on this Alpine/musl base like opengrep above (verified: `file` reports
+# "statically linked" for the v1.7.0 Linux release assets). Only ever spawned with `stdio --read-only`
+# (see `services/agent-runner/src/review/opencode.rs`) — review must never get a write-capable
+# instance. SHAs pinned + verified against the v1.7.0 release's own published checksums file
+# (github-mcp-server_1.7.0_checksums.txt).
+FROM alpine:3.24 AS github-mcp
+ARG GITHUB_MCP_VERSION=v1.7.0
+ARG GITHUB_MCP_SHA256_AMD64=b653a2a01f33e9a726b581fa0d8a8d9a05a86af419e5ab33b8e26858366d1d66
+ARG GITHUB_MCP_SHA256_ARM64=50bd6b4e604d1039577710431c7025a9b1c05b8acce458001bb53f792e78d43f
+ARG TARGETARCH
+RUN set -eux; \
+  apk add --no-cache curl; \
+  case "$TARGETARCH" in \
+    amd64) asset="github-mcp-server_Linux_x86_64.tar.gz"; sha="$GITHUB_MCP_SHA256_AMD64" ;; \
+    arm64) asset="github-mcp-server_Linux_arm64.tar.gz";  sha="$GITHUB_MCP_SHA256_ARM64" ;; \
+    *) echo "unsupported TARGETARCH: $TARGETARCH" >&2; exit 1 ;; \
+  esac; \
+  curl -fsSL -o /tmp/github-mcp-server.tar.gz \
+    "https://github.com/github/github-mcp-server/releases/download/${GITHUB_MCP_VERSION}/${asset}"; \
+  echo "${sha}  /tmp/github-mcp-server.tar.gz" | sha256sum -c -; \
+  tar xzf /tmp/github-mcp-server.tar.gz -C /usr/local/bin github-mcp-server; \
+  chmod +x /usr/local/bin/github-mcp-server
+
 # ── Stage 2: the review-on-opencode runtime ────────────────────────────────────────────────────────
 FROM alpine:3.24 AS runtime
 # libgcc/libstdc++: OpenCode links them. ripgrep: opencode shells out to it. git + ca-certificates:
@@ -96,6 +121,11 @@ RUN opencode --version
 COPY --from=opengrep /usr/local/bin/opengrep /usr/local/bin/opengrep
 COPY --from=opengrep /opt/opengrep-rules /opt/opengrep-rules
 RUN opengrep --version
+
+# github-mcp-server (musl-static, ADR-0105/story #498) — opt-in per preset, read-only only. `--version`
+# re-runs the smoke test against the final runtime image.
+COPY --from=github-mcp /usr/local/bin/github-mcp-server /usr/local/bin/github-mcp-server
+RUN github-mcp-server --version
 
 # The static-musl Rust binaries from the build context (dist/, ADR-0080): the Job ENTRYPOINT host and
 # the stdio review MCP opencode is pointed at (config `mcp.lightbridge.command = ["lci-review-mcp"]`).

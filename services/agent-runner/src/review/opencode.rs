@@ -104,6 +104,14 @@ pub struct McpEnv<'a> {
     /// everything). Threaded as an env var (`LCI_MCP_MIN_PRIORITY`) since the MCP server is a separate
     /// process, not a function call.
     pub min_priority: Option<&'a str>,
+    /// The task's GitHub App installation token (ADR-0072), reused verbatim from the same token
+    /// `TaskContext` already carries for the authenticated clone URL — story #498 mints nothing new.
+    /// `None` for a non-GitHub platform (GitLab/Bitbucket embed credentials directly in `clone_url`
+    /// instead, per `authenticated_clone_url`'s own platform detection) or when the task context
+    /// carries no token. GitHub MCP is only ever spawned when this is `Some` AND the preset's
+    /// `review.tools` explicitly lists a `mcp__github__…` selector (ADR-0105) — see
+    /// `tool_surface::github_mcp_explicitly_listed`.
+    pub github_token: Option<&'a str>,
 }
 
 /// Run one review on OpenCode. Renders the per-task config, spawns `opencode acp`, drives the review
@@ -187,7 +195,29 @@ pub async fn run_opencode_agent(
         );
     }
     let floor_disclosure = rendered.disclosure_note();
-    let config = rendered.config;
+    let mut config = rendered.config;
+
+    // ── GitHub MCP (ADR-0105, story #498) ───────────────────────────────────────────────────────
+    // Opt-in per preset (`review.tools` must explicitly list a `mcp__github__…` selector) AND only for
+    // a GitHub-platformed task (`github_token: Some`, the same installation token already minted for
+    // the clone URL — no new credential). Registered as a SECOND `local` (stdio) MCP server alongside
+    // `lightbridge`, not proxied through it — unlike the ADR-0066 knowledge-tools registry (shared,
+    // pre-deployed, no per-task credential), this genuinely needs a fresh per-task secret in its own
+    // subprocess env, which the shared `lci-review-mcp` proxy shape can't carry.
+    let github_mcp_offered =
+        super::tool_surface::github_mcp_explicitly_listed(review) && mcp_env.github_token.is_some();
+    if github_mcp_offered {
+        config["mcp"]["github"] = serde_json::json!({
+            "type": "local",
+            // `--read-only` is the upstream github-mcp-server flag restricting it to non-mutating
+            // operations — review must never get a write-capable GitHub MCP. Pin the exact binary
+            // version in the runner image build (verify the `stdio --read-only` invocation shape
+            // against that pinned release before rollout).
+            "command": ["github-mcp-server", "stdio", "--read-only"],
+            "enabled": true,
+        });
+    }
+
     let workdir = std::env::temp_dir().join(format!("lci-opencode-review-{task_id}"));
     tokio::fs::create_dir_all(&workdir)
         .await
@@ -279,6 +309,15 @@ pub async fn run_opencode_agent(
     if let Ok(ca_path) = std::env::var("EMBEDDINGS_CA_CERT") {
         env.push(("NODE_EXTRA_CA_CERTS".into(), ca_path));
     }
+    // GitHub MCP credential (ADR-0105, story #498): set on the WHOLE opencode process env, the same way
+    // `lci-review-mcp` gets its `LCI_MCP_*` vars — a `type: "local"` MCP server is a child of opencode
+    // and inherits its parent's env, and this codebase's own `review.jsonc` comment confirms that's the
+    // verified mechanism opencode-over-ACP actually honors for stdio MCP servers (no per-server
+    // `environment` config key is used anywhere else in this repo's OpenCode config). `lci-review-mcp`
+    // itself never reads this var, so its presence in the shared env is harmless there.
+    if let (true, Some(token)) = (github_mcp_offered, mcp_env.github_token) {
+        env.push(("GITHUB_PERSONAL_ACCESS_TOKEN".into(), token.to_string()));
+    }
 
     // ── SAST opt-in wiring for the review MCP (ADR-0073 / ADR-0097) ───────────────────────────────
     // `run_sast` runs INSIDE `lci-review-mcp` (a separate process). Offer it there iff it clears the
@@ -311,6 +350,11 @@ pub async fn run_opencode_agent(
     // Deny every permission request: review is read-only, so edit/bash/webfetch are already denied in
     // the config and should never be asked — a cancel is the safe answer if one somehow arrives.
     // cwd = the neutral workdir, NOT the untrusted checkout (config-isolation, see above).
+    // Startup-cost measurement (ADR-0105's explicit NFR, story #498): timed + logged with whether
+    // GitHub MCP was offered this run, so an operator can compare the two populations in Loki before
+    // deciding to enable it broadly — this codebase has no `metrics` crate dependency in agent-runner
+    // (only control-plane does), so a `tracing` span is the measurement, not a histogram.
+    let spawn_started = std::time::Instant::now();
     let client_acp = AcpClient::spawn(&bin, &workdir, PermissionPolicy::Cancel, &env)
         .await
         .context("spawning opencode acp")?;
@@ -318,6 +362,12 @@ pub async fn run_opencode_agent(
         .initialize()
         .await
         .context("opencode initialize")?;
+    tracing::info!(
+        task_id = %task_id,
+        github_mcp_offered,
+        elapsed_ms = spawn_started.elapsed().as_millis() as u64,
+        "opencode spawn+initialize complete"
+    );
     // `mcpServers` here must be a JSON ARRAY (opencode rejects an object); the stdio review MCP is
     // wired via the config `mcp` block, not here, so this is empty — caught by the real-opencode e2e.
     let session_id = client_acp
