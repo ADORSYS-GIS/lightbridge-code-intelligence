@@ -307,17 +307,10 @@ mod tests {
     #[tokio::test]
     async fn diff_run_converges_on_finish_once_the_changed_file_is_engaged() {
         let script = vec![
-            call_turn(
-                "read",
-                READ_FILE,
-                r#"{"path":"a.rs"}"#,
-            ),
+            call_turn("read", READ_FILE, r#"{"path":"a.rs"}"#),
             finish_turn(),
         ];
-        assert_eq!(
-            drive_to_finish(true, script).await,
-            LoopOutcome::Finished
-        );
+        assert_eq!(drive_to_finish(true, script).await, LoopOutcome::Finished);
     }
 
     // Regression for #407: WindDown strips every ReadOnly tool once it converges, so if RefuteGate

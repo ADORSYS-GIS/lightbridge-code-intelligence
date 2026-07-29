@@ -198,7 +198,9 @@ impl A2aHandler {
             base_sha: input.base_sha.clone(),
             head_sha: input.head_sha.clone(),
             run_epoch: 0,
-            preset: crate::preset::EntryPoint::A2a.platform_default_preset().to_string(),
+            preset: crate::preset::EntryPoint::A2a
+                .platform_default_preset()
+                .to_string(),
             entry_point: crate::preset::EntryPoint::A2a.as_str().to_string(),
             trigger_comment_id: None,
             // The A2A ingress face has no `webhook.receive` span (ticket #246 scoped tracing to the
