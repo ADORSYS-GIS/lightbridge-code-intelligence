@@ -193,6 +193,25 @@ async fn gitlab_webhook_body(
     crate::http::metrics::webhook_delivery("gitlab", &event);
     tracing::info!(delivery_id, %event, installation_id, "gitlab: accepted webhook");
     if state.db.is_some() {
+        // Verify the payload's claimed project identity matches the path-resolved project.
+        // This prevents a holder of project A's secret from driving project B's repo.
+        let payload_project_id = payload["project"]["id"].as_i64();
+        let path_project_id = state
+            .gitlab
+            .as_ref()
+            .and_then(|r| r.get_by_installation_id(installation_id))
+            .map(|p| p.project_id);
+        if let (Some(path_id), Some(payload_id)) = (path_project_id, payload_project_id)
+            && path_id != payload_id
+        {
+            tracing::warn!(
+                installation_id,
+                path_project_id = path_id,
+                payload_project_id = payload_id,
+                "gitlab webhook: payload project.id does not match path installation_id"
+            );
+            return (StatusCode::BAD_REQUEST, "project identity mismatch").into_response();
+        }
         route_gitlab_event(&state, &event, &payload, &delivery_id).await;
     }
     (StatusCode::ACCEPTED, "accepted").into_response()
@@ -261,6 +280,19 @@ async fn bitbucket_webhook_body(
     crate::http::metrics::webhook_delivery("bitbucket", &event);
     tracing::info!(delivery_id, %event, installation_id, "bitbucket: accepted webhook");
     if state.db.is_some() {
+        // Verify the payload's claimed repo identity matches the path installation_id.
+        if let Some((full_name, _, _)) = bitbucket_repo_identity(&payload) {
+            let payload_id = crate::integrations::platform::stable_id_from_key(&full_name);
+            if payload_id != installation_id {
+                tracing::warn!(
+                    installation_id,
+                    payload_id,
+                    %full_name,
+                    "bitbucket webhook: payload repo does not match path installation_id"
+                );
+                return (StatusCode::BAD_REQUEST, "repo identity mismatch").into_response();
+            }
+        }
         route_bitbucket_event(&state, &event, &payload, &delivery_id).await;
     }
     (StatusCode::ACCEPTED, "accepted").into_response()
@@ -329,13 +361,8 @@ fn verified_gitlab_payload_for_installation(
     headers: &HeaderMap,
     body: &[u8],
 ) -> Result<serde_json::Value, GitlabPayloadError> {
-    let payload = match serde_json::from_slice(body) {
-        Ok(p) => p,
-        Err(error) => {
-            tracing::error!(%error, installation_id, "gitlab webhook: invalid json payload");
-            return Err(GitlabPayloadError::InvalidJson);
-        }
-    };
+    // Verify against raw bytes first — the path carries installation_id so we no longer
+    // need to parse the body to find the project secret.
     match verify_gitlab_webhook_with_registry(state.gitlab.as_ref(), headers, body, installation_id)
     {
         GitlabVerifyResult::Ok => {}
@@ -346,9 +373,14 @@ fn verified_gitlab_payload_for_installation(
             return Err(GitlabPayloadError::InvalidSignature);
         }
     }
-    Ok(payload)
+    match serde_json::from_slice(body) {
+        Ok(p) => Ok(p),
+        Err(error) => {
+            tracing::error!(%error, installation_id, "gitlab webhook: invalid json payload");
+            Err(GitlabPayloadError::InvalidJson)
+        }
+    }
 }
-
 enum GitlabVerifyResult {
     Ok,
     UnknownInstallationId,
@@ -393,13 +425,7 @@ fn verified_bitbucket_payload_for_installation(
     headers: &HeaderMap,
     body: &[u8],
 ) -> Result<serde_json::Value, BitbucketPayloadError> {
-    let payload = match serde_json::from_slice(body) {
-        Ok(p) => p,
-        Err(error) => {
-            tracing::error!(%error, installation_id, "bitbucket webhook: invalid json payload");
-            return Err(BitbucketPayloadError::InvalidJson);
-        }
-    };
+    // Verify against raw bytes first — path carries installation_id.
     if !verify_bitbucket_project_webhook_with_registry(
         state.bitbucket.as_ref(),
         headers,
@@ -408,9 +434,14 @@ fn verified_bitbucket_payload_for_installation(
     ) {
         return Err(BitbucketPayloadError::InvalidSignature);
     }
-    Ok(payload)
+    match serde_json::from_slice(body) {
+        Ok(p) => Ok(p),
+        Err(error) => {
+            tracing::error!(%error, installation_id, "bitbucket webhook: invalid json payload");
+            Err(BitbucketPayloadError::InvalidJson)
+        }
+    }
 }
-
 fn verify_bitbucket_project_webhook_with_registry(
     registry: Option<&crate::integrations::bitbucket::BitbucketRegistry>,
     headers: &HeaderMap,
@@ -2102,7 +2133,7 @@ mod tests {
         let body = br#"{"zen":"hi"}"#;
         let (headers, body) = github_request(b"wh-secret", body, "no-app-delivery-1");
 
-        let response = gitlab_webhook_body(state, 1001, headers, body).await;
+        let response = github_webhook_body(state, headers, body).await;
         assert_eq!(
             response.status(),
             StatusCode::ACCEPTED,
@@ -2118,7 +2149,7 @@ mod tests {
         let (mut headers, body) = github_request(b"wh-secret", body, "no-app-delivery-2");
         headers.insert("x-hub-signature-256", "sha256=deadbeef".parse().unwrap());
 
-        let response = gitlab_webhook_body(state, 1001, headers, body).await;
+        let response = github_webhook_body(state, headers, body).await;
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
@@ -2129,7 +2160,7 @@ mod tests {
         let body = br#"{"zen":"hi"}"#;
         let (headers, body) = github_request(b"anything", body, "no-app-delivery-3");
 
-        let response = gitlab_webhook_body(state, 1001, headers, body).await;
+        let response = github_webhook_body(state, headers, body).await;
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
