@@ -69,11 +69,19 @@ _Last updated: 2026-07-26._
   selection + ACL (ADR-0038 upgrade, moved here from Epic #241). Preset selection itself has landed:
   `ReviewConfigs` generalized to named presets (#494/#527), the `.lightbridge-code-review.jsonc` reader
   (#494/#528), every entry point (webhook/`@mention`/A2A) resolving its preset from repo config (#495/
-  #529/#530), and `ultra` joining `fast`/`deep` as the third platform-default preset name (#496). Still
-  open: the full OpenCode fs-tool suite, GitHub MCP via App-derived tokens, and the fatal-session
-  sentinel plugin. ([ADR-0103](docs/adr/0103-repo-configurable-opencode-review-presets.md)/
+  #529/#530), and `ultra` joining `fast`/`deep` as the third platform-default preset name (#496). Two
+  new ADRs unblock the remaining stories: [ADR-0109](docs/adr/0109-control-plane-forge-write-for-repo-review-config.md)
+  (a narrow, single-file forge-write capability so #500's preset selector can actually change a repo's
+  config, not just display it) and [ADR-0110](docs/adr/0110-identity-scoped-model-selection-and-acl.md)
+  (ADR-0038's promised follow-up — repo/org-scoped model overrides + ACL; the per-user tier stays a
+  further follow-on). Still open: the full OpenCode fs-tool suite (#497), GitHub MCP via App-derived
+  tokens (#498), the fatal-session sentinel plugin (#499), the preset-selection UI + write endpoint
+  (#500), and repo/org model selection + ACL (#501).
+  ([ADR-0103](docs/adr/0103-repo-configurable-opencode-review-presets.md)/
   [0104](docs/adr/0104-full-opencode-fs-tool-suite.md)/[0105](docs/adr/0105-github-mcp-via-app-derived-token.md)/
-  [0106](docs/adr/0106-opencode-fatal-situation-sentinel-plugin.md))
+  [0106](docs/adr/0106-opencode-fatal-situation-sentinel-plugin.md)/
+  [0109](docs/adr/0109-control-plane-forge-write-for-repo-review-config.md)/
+  [0110](docs/adr/0110-identity-scoped-model-selection-and-acl.md))
 - **Control-plane v2 — three planes + the agent execution plane** (Epic #353) — the `StepRuntime`
   seam is now generalized (`Passthrough`-backed, zero behavior change) to webhook ingress, the
   dispatcher, the reconciler, and A2A's task lifecycle (#502); `CodePlatform` is fully wired into

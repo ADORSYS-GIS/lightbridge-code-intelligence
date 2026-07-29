@@ -1,6 +1,7 @@
 # ADR-0038: Per-repository review model, selected in the admin UI from an operator allowlist
 
-- **Status:** Proposed — scope expanded to per-identity (org/user/repo) model + ACL; to be superseded by a follow-up ADR (see Amendment + epic #241).
+- **Status:** Accepted — repo-scope tier only. The identity/ACL scope expansion below is superseded by
+  [ADR-0110](0110-identity-scoped-model-selection-and-acl.md) (repo/org scope; per-user tier still open).
 - **Date:** 2026-06-22
 - **Deciders:** @stephane-segning
 
@@ -105,3 +106,9 @@ This ADR does not cover identity-scoped selection or the authz model, so it will
 follow-up ADR** that designs: (a) the config store keyed on (org, user, repo); (b) the resolution/precedence
 order; (c) the ACL governing who sets what at which scope; (d) how the resolved model reaches the runner's
 per-task config (the control plane already owns that hand-off). Tracked in epic #241.
+
+**Follow-up ADR written 2026-07-29:** [ADR-0110](0110-identity-scoped-model-selection-and-acl.md)
+answers (a)-(d) above for **repo and org** scope. It deliberately does not resolve the per-**user** tier
+this amendment's own headline example asked for (two people reviewing the same repo getting different
+models) — see ADR-0110's Decision Outcome for why that's cut to a further follow-up rather than silently
+built. Tracked in epic #491, story #501.
