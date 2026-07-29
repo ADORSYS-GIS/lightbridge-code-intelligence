@@ -26,6 +26,7 @@ pub struct FileConfig {
     pub knowledge_tools: KnowledgeToolsSection,
     pub gitlab: GitlabSection,
     pub bitbucket: BitbucketSection,
+    pub model: ModelSection,
     /// Back-compat tombstone (ADR-0093): the Restate egress pilot (ADR-0074) is gone — the reconciler
     /// `outbox` drain is the sole egress again. This field exists ONLY to absorb a leftover `egress:`
     /// block from a ConfigMap not yet updated, so `deny_unknown_fields` can't brick control-plane boot
@@ -367,6 +368,18 @@ pub struct EmbeddingsSection {
     #[serde(default, deserialize_with = "lci_config::de::opt_i64")]
     pub dimension: Option<i64>,
     pub allow_reindex_on_dim_change: bool,
+}
+
+/// Operator-curated model allowlist (ADR-0110, story #501): the set of model ids a
+/// `repo_model_overrides`/`org_model_overrides` write may name. Empty (the default — no
+/// `model:` block configured) means no override can be written yet; this is deliberately
+/// fail-closed rather than fail-open, since an unenforced allowlist reintroduces exactly the
+/// "typo breaks every review" risk ADR-0038 was written to prevent.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ModelSection {
+    #[serde(default)]
+    pub allowlist: Vec<String>,
 }
 
 /// Review-feedback knobs the control plane applies to the PR: lifecycle reactions and outcome labels.

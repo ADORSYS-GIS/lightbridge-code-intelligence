@@ -65,6 +65,7 @@ async fn seed(pool: &PgPool) -> i64 {
 
 fn pr_task(repository_id: i64, head: &str) -> NewTask {
     NewTask {
+        model_override: None,
         repository_id,
         installation_id: 99,
         webhook_delivery_id: "d1".to_string(),
@@ -637,6 +638,7 @@ async fn has_responded_or_pending_content_covers_in_flight_review(pool: PgPool) 
 async fn issue_target_task_round_trips_and_is_distinct_from_a_pr(pool: PgPool) {
     let repo_id = seed(&pool).await;
     let issue = NewTask {
+        model_override: None,
         repository_id: repo_id,
         installation_id: 99,
         webhook_delivery_id: "d1".to_string(),
@@ -708,6 +710,7 @@ async fn create_task_is_idempotent_on_target_and_head(pool: PgPool) {
 async fn explicit_mention_always_creates_a_task_at_the_next_epoch(pool: PgPool) {
     let repo_id = seed(&pool).await;
     let mention = |head: &str| NewTask {
+        model_override: None,
         repository_id: repo_id,
         installation_id: 99,
         webhook_delivery_id: "d1".to_string(),
@@ -910,6 +913,7 @@ async fn list_repositories_summarises_activity(pool: PgPool) {
         create_task(
             &pool,
             &NewTask {
+                model_override: None,
                 repository_id: active,
                 installation_id: 7,
                 webhook_delivery_id: (*delivery).to_string(),
@@ -968,6 +972,7 @@ async fn list_tasks_returns_most_recent_first(pool: PgPool) {
         let id = create_task(
             &pool,
             &NewTask {
+                model_override: None,
                 repository_id: repo,
                 installation_id: 7,
                 webhook_delivery_id: (*delivery).to_string(),
@@ -1798,6 +1803,7 @@ async fn get_task_context_joins_repo_identity(pool: PgPool) {
     let deep_id = create_explicit_task(
         &pool,
         &NewTask {
+            model_override: None,
             repository_id: repo_id,
             installation_id: 99,
             webhook_delivery_id: "d1".to_string(),

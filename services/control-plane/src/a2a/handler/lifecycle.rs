@@ -187,7 +187,11 @@ impl A2aHandler {
         // identical idempotency tuple / run_epoch semantics. ADR-0103: the A2A role holds no forge
         // credentials (see this module's trust-boundary doc comment), so it can't fetch repo config to
         // resolve a preset the way the webhook entry points do — it always uses the A2A entry point's
-        // platform default (`deep`, reproducing today's behavior exactly).
+        // platform default (`deep`, reproducing today's behavior exactly). Unlike preset resolution,
+        // the model-override lookup (ADR-0110) needs no forge credentials at all — it's a plain DB
+        // read — so the A2A role resolves it exactly like every webhook entry point.
+        let model_override =
+            crate::model::resolve_model_override(&self.pool, repo.id, installation_id).await;
         let new_task = db::NewTask {
             repository_id: repo.id,
             installation_id,
@@ -206,6 +210,7 @@ impl A2aHandler {
             // The A2A ingress face has no `webhook.receive` span (ticket #246 scoped tracing to the
             // webhook path); a future A2A trace root is a separate, unscoped addition.
             trace_context: None,
+            model_override,
         };
 
         // Record a synthetic delivery so the task's `webhook_delivery_id` FK is satisfied and the
