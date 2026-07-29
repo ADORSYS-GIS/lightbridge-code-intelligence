@@ -94,7 +94,10 @@ fn merge_preset_fields(current: Option<&str>, body: &SetPresetBody) -> String {
         .as_object_mut()
         .expect("filtered to is_object above, or freshly constructed as one");
     if let Some(preset) = &body.preset {
-        obj.insert("preset".to_string(), serde_json::Value::String(preset.clone()));
+        obj.insert(
+            "preset".to_string(),
+            serde_json::Value::String(preset.clone()),
+        );
     }
     if let Some(entry_points) = &body.entry_points {
         obj.insert(
@@ -171,7 +174,9 @@ fn pick_platform(
     match platform {
         Platform::GitHub => match state.platforms.get(&Platform::GitHub) {
             Some(client) => Ok(client.as_ref()),
-            None => Err((StatusCode::SERVICE_UNAVAILABLE, "GitHub App not configured").into_response()),
+            None => {
+                Err((StatusCode::SERVICE_UNAVAILABLE, "GitHub App not configured").into_response())
+            }
         },
         Platform::GitLab => match state
             .gitlab
@@ -179,9 +184,11 @@ fn pick_platform(
             .and_then(|registry| registry.client_for_project(installation_id))
         {
             Some(client) => Ok(client),
-            None => {
-                Err((StatusCode::SERVICE_UNAVAILABLE, "GitLab project not configured").into_response())
-            }
+            None => Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "GitLab project not configured",
+            )
+                .into_response()),
         },
         Platform::Bitbucket => match state
             .bitbucket
@@ -189,9 +196,11 @@ fn pick_platform(
             .and_then(|registry| registry.client_for_project(installation_id))
         {
             Some(client) => Ok(client),
-            None => Err(
-                (StatusCode::SERVICE_UNAVAILABLE, "Bitbucket repo not configured").into_response(),
-            ),
+            None => Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Bitbucket repo not configured",
+            )
+                .into_response()),
         },
     }
 }
@@ -201,7 +210,11 @@ fn pick_platform(
 /// offering to change it). Requires `repo:read` — this is a read of already-repo-visible content, not
 /// a new capability, unlike [`set_preset`]. `null`/`{}` when the repo declares nothing (platform
 /// defaults apply, per `services/control-plane/src/preset.rs`).
-pub async fn get_preset(caller: Caller, State(state): State<AppState>, Path(id): Path<i64>) -> Response {
+pub async fn get_preset(
+    caller: Caller,
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Response {
     if let Err(e) = caller.require("repo:read") {
         return e.into_response();
     }
@@ -266,7 +279,10 @@ pub async fn set_preset(
         Ok(current) => current,
         Err(error) => {
             tracing::error!(%error, repo_id = id, "admin set preset: reading current config failed");
-            return (StatusCode::BAD_GATEWAY, "reading the repo's current config failed")
+            return (
+                StatusCode::BAD_GATEWAY,
+                "reading the repo's current config failed",
+            )
                 .into_response();
         }
     };
@@ -295,7 +311,11 @@ pub async fn set_preset(
         }
         Err(error) => {
             tracing::error!(%error, repo_id = id, "admin set preset: committing the file failed");
-            (StatusCode::BAD_GATEWAY, "committing the file to the repo failed").into_response()
+            (
+                StatusCode::BAD_GATEWAY,
+                "committing the file to the repo failed",
+            )
+                .into_response()
         }
     }
 }
@@ -707,7 +727,10 @@ mod tests {
         };
         let merged = merge_preset_fields(Some(r#"{"preset": "deep"}"#), &body);
         let parsed: serde_json::Value = serde_json::from_str(&merged).unwrap();
-        assert_eq!(parsed["preset"], "deep", "untouched when body.preset is None");
+        assert_eq!(
+            parsed["preset"], "deep",
+            "untouched when body.preset is None"
+        );
         assert_eq!(parsed["entry_points"]["pr_open"], "fast");
     }
 
