@@ -9,7 +9,7 @@ open a PR to fix this file.
 > **Keeping this current is part of "done."** When a PR meaningfully ships, unblocks, or retires an item
 > here, update its status in the **same PR** (see [AGENTS.md](AGENTS.md)).
 
-_Last updated: 2026-07-26._
+_Last updated: 2026-07-29._
 
 ## Recently shipped
 
@@ -49,6 +49,24 @@ _Last updated: 2026-07-26._
   OpenCode reviewer, closing the parity gap with the old native path. ([ADR-0073](docs/adr/0073-sast-as-agent-tool.md), #456)
 - **Restate egress removed** — forge egress runs on the single-writer reconciler drain again after the
   Restate pilot proved unnecessary at current scale. ([ADR-0093](docs/adr/0093-restate-egress-pilot-no-go.md))
+- **Repo-configurable OpenCode review presets** (Epic #491, closed) — replaces the fixed fast/deep tier
+  model with per-repo preset selection, uniform tools/prompt, a full OpenCode fs-tool suite, GitHub MCP
+  access via App-derived tokens, and an OpenCode fatal-session sentinel plugin; also carries per-identity
+  (repo/org) model selection + ACL (the ADR-0038 upgrade, moved here from closed Epic #241). All 8 child
+  stories shipped: `ReviewConfigs` generalized to named presets + the `.lightbridge-code-review.jsonc`
+  reader (#494/#527/#528), every entry point (webhook/`@mention`/A2A) resolving its preset from repo
+  config (#495/#529/#530), `ultra` joining `fast`/`deep` as the third platform-default preset name
+  (#496), the full OpenCode fs-tool suite behind an explicit `fs_write` gate independent of the
+  known-unenforced tool-allowlist mechanism (#497/#537), GitHub MCP wired in opt-in per preset via the
+  App-derived installation token (#498/#538), the fatal-situation sentinel plugin
+  (#499/#539), the lci TUI + apps/web preset-selection UI backed by a new narrow
+  `CodePlatform::update_repo_file` forge-write capability (#500/#540), and repo/org model
+  selection + ACL with a fail-closed operator allowlist (#501/#541).
+  ([ADR-0103](docs/adr/0103-repo-configurable-opencode-review-presets.md)/
+  [0104](docs/adr/0104-full-opencode-fs-tool-suite.md)/[0105](docs/adr/0105-github-mcp-via-app-derived-token.md)/
+  [0106](docs/adr/0106-opencode-fatal-situation-sentinel-plugin.md)/
+  [0109](docs/adr/0109-control-plane-forge-write-for-repo-review-config.md)/
+  [0110](docs/adr/0110-identity-scoped-model-selection-and-acl.md))
 
 ## In progress / near-term follow-ups
 
@@ -63,25 +81,6 @@ _Last updated: 2026-07-26._
 
 ## Planned — open epics
 
-- **Repo-configurable OpenCode review presets** (Epic #491) — replaces the fixed fast/deep tier model
-  with per-repo preset selection, uniform tools/prompt, a full OpenCode fs-tool suite, GitHub MCP access
-  via App-derived tokens, and an OpenCode fatal-session sentinel plugin. Also carries per-identity model
-  selection + ACL (ADR-0038 upgrade, moved here from Epic #241). Preset selection itself has landed:
-  `ReviewConfigs` generalized to named presets (#494/#527), the `.lightbridge-code-review.jsonc` reader
-  (#494/#528), every entry point (webhook/`@mention`/A2A) resolving its preset from repo config (#495/
-  #529/#530), and `ultra` joining `fast`/`deep` as the third platform-default preset name (#496). Two
-  new ADRs unblock the remaining stories: [ADR-0109](docs/adr/0109-control-plane-forge-write-for-repo-review-config.md)
-  (a narrow, single-file forge-write capability so #500's preset selector can actually change a repo's
-  config, not just display it) and [ADR-0110](docs/adr/0110-identity-scoped-model-selection-and-acl.md)
-  (ADR-0038's promised follow-up — repo/org-scoped model overrides + ACL; the per-user tier stays a
-  further follow-on). Still open: the full OpenCode fs-tool suite (#497), GitHub MCP via App-derived
-  tokens (#498), the fatal-session sentinel plugin (#499), the preset-selection UI + write endpoint
-  (#500), and repo/org model selection + ACL (#501).
-  ([ADR-0103](docs/adr/0103-repo-configurable-opencode-review-presets.md)/
-  [0104](docs/adr/0104-full-opencode-fs-tool-suite.md)/[0105](docs/adr/0105-github-mcp-via-app-derived-token.md)/
-  [0106](docs/adr/0106-opencode-fatal-situation-sentinel-plugin.md)/
-  [0109](docs/adr/0109-control-plane-forge-write-for-repo-review-config.md)/
-  [0110](docs/adr/0110-identity-scoped-model-selection-and-acl.md))
 - **Control-plane v2 — three planes + the agent execution plane** (Epic #353) — the `StepRuntime`
   seam is now generalized (`Passthrough`-backed, zero behavior change) to webhook ingress, the
   dispatcher, the reconciler, and A2A's task lifecycle (#502); `CodePlatform` is fully wired into
