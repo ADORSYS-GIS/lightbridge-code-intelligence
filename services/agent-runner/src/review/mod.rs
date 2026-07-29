@@ -230,6 +230,8 @@ pub async fn run_native_agent(
         // Retired/legacy path (`run_native_agent`, removed in a follow-up) — not worth wiring the new
         // ADR-0030 severity filter through code on its way out.
         None,
+        // Same reasoning: the retired native path never offers the ADR-0104 fs-tool trio either.
+        false,
     )
     .context("assembling review tool registry")?;
 

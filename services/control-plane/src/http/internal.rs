@@ -139,6 +139,12 @@ pub struct TaskContextResponse {
     /// Which entry point created this task (`"pr_open"`/`"mention"`/`"a2a"`, ADR-0103) — used for
     /// framing decisions that must not key off the (operator-defined) preset name.
     pub entry_point: String,
+    /// Resolved repo/org model override (ADR-0110, story #501). `None` when neither is set — the
+    /// runner applies the preset's own configured model unchanged. `Some` overrides
+    /// `ReviewConfig.model` only, never tools/gates/budgets, after the preset resolves its base
+    /// config.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_override: Option<String>,
     pub base_sha: Option<String>,
     pub head_sha: Option<String>,
     /// Whether the repo has a reusable semantic index — i.e. a latest indexed snapshot exists
@@ -178,6 +184,7 @@ impl std::fmt::Debug for TaskContextResponse {
             .field("kind", &self.kind)
             .field("preset", &self.preset)
             .field("entry_point", &self.entry_point)
+            .field("model_override", &self.model_override)
             .field("base_sha", &self.base_sha)
             .field("head_sha", &self.head_sha)
             .field("repo_indexed", &self.repo_indexed)
@@ -350,6 +357,7 @@ pub async fn get_context(
         kind: context.kind,
         preset: context.preset,
         entry_point: context.entry_point,
+        model_override: context.model_override,
         base_sha: context.base_sha,
         head_sha: context.head_sha,
         repo_indexed,

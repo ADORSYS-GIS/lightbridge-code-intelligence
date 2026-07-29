@@ -52,6 +52,7 @@ straight from the token).
 | `task:logs` | `GET /tasks/{id}/logs` (web SA route) |
 | `review:read` | `GET /tasks/{id}/review` |
 | `rbac:manage` | reserved (future policy/admin surface) |
+| `model:configure` | `POST /admin/repositories/{id}/model`, `POST /admin/organizations/{installation_id}/model` (ADR-0110) |
 
 These are documented as code constants (a catalogue), not a table. `GET /me` returns the caller's
 effective permissions so the web can show/hide affordances; the control plane stays the enforcement

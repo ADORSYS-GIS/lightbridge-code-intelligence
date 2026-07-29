@@ -206,6 +206,9 @@ async fn build_tools() -> Result<Tools> {
         filter_discovered(discovered),
         sast,
         min_priority,
+        // ADR-0104 fs-tool trio (story #497): review never gets write access — no env var offers this
+        // an opt-in today, unlike `sast`/`min_priority` above. See `tools.rs`'s `fs_write` doc comment.
+        false,
     )
     .map_err(|error| anyhow::anyhow!("building the review tool registry: {error}"))
 }

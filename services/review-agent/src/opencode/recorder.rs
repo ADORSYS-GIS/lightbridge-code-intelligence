@@ -14,8 +14,9 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::tools::{
-    ABORT, ADD_COMMENT, ADD_REVIEW_COMMENT, FINISH, GRAPH_FIND_SYMBOL, GRAPH_GET_CALLERS,
-    READ_FILE, REPORT_PROGRESS, RETRACT_FINDING, RUN_SAST, VECTOR_SEMANTIC_SEARCH,
+    ABORT, ADD_COMMENT, ADD_REVIEW_COMMENT, EDIT_FILE, FINISH, GRAPH_FIND_SYMBOL,
+    GRAPH_GET_CALLERS, LIST_DIRECTORY, READ_FILE, REPORT_PROGRESS, RETRACT_FINDING, RUN_SAST,
+    VECTOR_SEMANTIC_SEARCH, WRITE_FILE,
 };
 
 /// Every review tool the gates key on, by its native canonical name. OpenCode exposes each mediated
@@ -36,6 +37,13 @@ pub const KNOWN_REVIEW_TOOLS: &[&str] = &[
     GRAPH_FIND_SYMBOL,
     GRAPH_GET_CALLERS,
     VECTOR_SEMANTIC_SEARCH,
+    // ADR-0104's fs-tool trio (story #497) — never actually offered to review today (`tools.rs`'s
+    // `fs_write` gate is always false in production), but recognized here so a future consumer
+    // (`open` mode) gets uniform recorder normalization for free, per the ADR's "logged with the same
+    // shape regardless of which mode invoked it" requirement.
+    WRITE_FILE,
+    EDIT_FILE,
+    LIST_DIRECTORY,
 ];
 
 /// Map an OpenCode tool id back to the canonical native review tool name, or `None` for a tool the

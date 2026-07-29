@@ -527,6 +527,7 @@ mod tests {
         db::create_task(
             pool,
             &NewTask {
+                model_override: None,
                 repository_id: repo_id,
                 installation_id: 99,
                 webhook_delivery_id: "d1".to_string(),

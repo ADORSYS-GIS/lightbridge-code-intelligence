@@ -35,6 +35,7 @@ mod config;
 mod db;
 mod jwt;
 mod mcp_client;
+mod model;
 mod outbox;
 mod preset;
 mod review;
@@ -126,6 +127,10 @@ pub struct AppState {
     /// Dotted claim path the caller's **permissions** list is read from (ADR-0023), from
     /// `PERMISSIONS_CLAIM`. Default `permissions`. Endpoints authorize on permissions, not roles.
     pub permissions_claim: Arc<String>,
+    /// Operator-curated model allowlist (ADR-0110, story #501), from the file config's `model`
+    /// section. Empty when unconfigured — every repo/org model-override write is then rejected
+    /// (fail-closed), not silently unvalidated.
+    pub model_allowlist: Arc<Vec<String>>,
 }
 
 impl AppState {
@@ -156,6 +161,10 @@ impl AppState {
         let bitbucket_config = file_config
             .as_ref()
             .map(|f| f.bitbucket.clone())
+            .unwrap_or_default();
+        let model_allowlist = file_config
+            .as_ref()
+            .map(|f| f.model.allowlist.clone())
             .unwrap_or_default();
         let db = db::connect_from_env().await?;
         // Embedding-dimension safety (ADR-0018): if configured and the live column differs, either
@@ -269,6 +278,7 @@ impl AppState {
                     .filter(|c| !c.trim().is_empty())
                     .unwrap_or_else(|| "permissions".to_string()),
             ),
+            model_allowlist: Arc::new(model_allowlist),
         })
     }
 }
@@ -340,6 +350,13 @@ fn app(state: AppState) -> Router {
         .route(
             "/admin/repositories/{id}/preset",
             get(admin::get_preset).post(admin::set_preset),
+        )
+        // Per-identity model selection + ACL (ADR-0110, story #501).
+        .route("/admin/models", get(admin::list_model_allowlist))
+        .route("/admin/repositories/{id}/model", post(admin::set_repo_model))
+        .route(
+            "/admin/organizations/{installation_id}/model",
+            post(admin::set_org_model),
         )
         // Internal runner API (shared-bearer, not OIDC) — the agent Job's lifecycle callbacks.
         .route("/internal/tasks/{id}", get(internal::get_context))
