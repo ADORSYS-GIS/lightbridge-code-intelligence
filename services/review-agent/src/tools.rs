@@ -397,11 +397,7 @@ mod tests {
             .view(&TurnFilter::all())
             .dispatch(
                 &cx,
-                &call(
-                    "w",
-                    WRITE_FILE,
-                    r#"{"path":"new.txt","content":"hello"}"#,
-                ),
+                &call("w", WRITE_FILE, r#"{"path":"new.txt","content":"hello"}"#),
             )
             .await;
         let DispatchResult::Completed(ToolOutcome::Continue(message)) = outcome else {

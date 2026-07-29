@@ -132,7 +132,9 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
         symlink(outside.path(), root.path().join("dir")).unwrap();
-        let err = resolve_write(root.path(), "dir/evil").unwrap_err().to_string();
+        let err = resolve_write(root.path(), "dir/evil")
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("escape"), "unexpected: {err}");
     }
 

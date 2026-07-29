@@ -114,7 +114,10 @@ mod tests {
         std::fs::write(dir.path().join("f.txt"), "old").unwrap();
         let target = resolve_write(dir.path(), "f.txt").unwrap();
         write(&target, "f.txt", "new").await;
-        assert_eq!(std::fs::read_to_string(dir.path().join("f.txt")).unwrap(), "new");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("f.txt")).unwrap(),
+            "new"
+        );
     }
 
     #[tokio::test]

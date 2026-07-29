@@ -103,7 +103,10 @@ mod tests {
         let target = super::super::fs_safety::resolve_read(dir.path(), "f.txt").unwrap();
         let msg = edit(&target, "f.txt", "new").await;
         assert!(msg.contains("wrote"), "{msg}");
-        assert_eq!(std::fs::read_to_string(dir.path().join("f.txt")).unwrap(), "new");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("f.txt")).unwrap(),
+            "new"
+        );
     }
 
     #[tokio::test]
@@ -130,7 +133,9 @@ mod tests {
         let secret = outside.path().join("secret.txt");
         std::fs::write(&secret, "keep-me").unwrap();
         symlink(&secret, dir.path().join("alias.txt")).unwrap();
-        let err = resolve_read(dir.path(), "alias.txt").unwrap_err().to_string();
+        let err = resolve_read(dir.path(), "alias.txt")
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("escape"), "{err}");
     }
 }

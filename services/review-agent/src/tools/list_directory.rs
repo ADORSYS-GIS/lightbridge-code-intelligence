@@ -136,7 +136,9 @@ mod tests {
     async fn lists_immediate_entries_sorted_with_dir_suffix() {
         let dir = tempfile::tempdir().unwrap();
         tokio::fs::write(dir.path().join("b.rs"), "").await.unwrap();
-        tokio::fs::create_dir(dir.path().join("a_dir")).await.unwrap();
+        tokio::fs::create_dir(dir.path().join("a_dir"))
+            .await
+            .unwrap();
         tokio::fs::write(dir.path().join("c.rs"), "").await.unwrap();
         let result = list(dir.path(), ".").await;
         assert_eq!(result, ". (3 entries):\na_dir/\nb.rs\nc.rs");
@@ -146,7 +148,9 @@ mod tests {
     async fn lists_a_subdirectory() {
         let dir = tempfile::tempdir().unwrap();
         tokio::fs::create_dir(dir.path().join("src")).await.unwrap();
-        tokio::fs::write(dir.path().join("src/main.rs"), "").await.unwrap();
+        tokio::fs::write(dir.path().join("src/main.rs"), "")
+            .await
+            .unwrap();
         let result = list(dir.path(), "src").await;
         assert_eq!(result, "src (1 entries):\nmain.rs");
     }
