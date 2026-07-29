@@ -111,6 +111,7 @@ async fn drive(scenario: GoldenScenario) -> (LegacyTrace, Vec<String>) {
         RuntimeCaps::default(),
         None,
         None,
+        false,
     )
     .unwrap();
     let workspace = flows::eager_workspace(checkout.path().to_path_buf());
