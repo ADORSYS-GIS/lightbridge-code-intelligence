@@ -334,6 +334,18 @@ impl CodePlatform for GitlabPlatformRouter {
         self.client(repo)?.get_repo_file(repo, ref_, path).await
     }
 
+    async fn update_repo_file(
+        &self,
+        repo: &RepoRef,
+        path: &str,
+        mutate: Box<dyn FnOnce(Option<String>) -> String + Send>,
+        message: &str,
+    ) -> anyhow::Result<()> {
+        self.client(repo)?
+            .update_repo_file(repo, path, mutate, message)
+            .await
+    }
+
     async fn post_review(
         &self,
         repo: &RepoRef,
@@ -571,6 +583,85 @@ impl CodePlatform for GitlabClient {
         }
         let text = response.error_for_status()?.text().await?;
         Ok(Some(text))
+    }
+
+    async fn update_repo_file(
+        &self,
+        repo: &RepoRef,
+        path: &str,
+        mutate: Box<dyn FnOnce(Option<String>) -> String + Send>,
+        message: &str,
+    ) -> anyhow::Result<()> {
+        // GitLab requires the target branch explicitly in the body (unlike GitHub, which defaults to
+        // the repo's default branch server-side) — ADR-0109 always commits to the default branch.
+        let branch = self.default_branch(repo).await?;
+        let project = Self::project_encoded(repo);
+        let file_path = path.replace('/', "%2F");
+        let url = self.url(&format!("/projects/{project}/repository/files/{file_path}"));
+
+        // Read content + `last_commit_id` as ONE call (the metadata endpoint, not `/raw` — it carries
+        // both), call `mutate` on that exact snapshot, then write guarded by that same
+        // `last_commit_id` — mirrors GitHub's sha-guarded PUT (see the trait doc for why the read and
+        // the mutation must happen together, not as two separate round-trips).
+        let existing = self
+            .http
+            .get(&url)
+            .headers(self.api_headers())
+            .query(&[("ref", branch.as_str())])
+            .send()
+            .await?;
+        let (current_content, last_commit_id) =
+            if existing.status() == reqwest::StatusCode::NOT_FOUND {
+                (None, None)
+            } else {
+                let value: serde_json::Value = existing.error_for_status()?.json().await?;
+                let content = value["content"].as_str().and_then(|encoded| {
+                    use base64::Engine;
+                    let stripped: String = encoded.chars().filter(|c| !c.is_whitespace()).collect();
+                    base64::engine::general_purpose::STANDARD
+                        .decode(stripped)
+                        .ok()
+                        .map(|decoded| String::from_utf8_lossy(&decoded).into_owned())
+                });
+                let last_commit_id = value["last_commit_id"].as_str().map(str::to_string);
+                (content, last_commit_id)
+            };
+        let new_content = mutate(current_content);
+
+        let mut body = serde_json::json!({
+            "branch": branch,
+            "content": new_content,
+            "commit_message": message,
+        });
+        // `last_commit_id` is GitLab's optimistic-concurrency guard for an UPDATE — a stale value
+        // surfaces as a 400 from the PUT below. Only meaningful when the file already exists; a
+        // create (the POST fallback) has no prior commit to guard against.
+        if let Some(last_commit_id) = &last_commit_id {
+            body["last_commit_id"] = serde_json::Value::String(last_commit_id.clone());
+        }
+        // GitLab uses different HTTP methods for create (POST) vs update (PUT) on the same path —
+        // unlike GitHub's single PUT. Try PUT (the overwhelmingly common case: the config file already
+        // exists once a repo is under review) and fall back to POST only on a 404 (the file has never
+        // been created).
+        let put_response = self
+            .http
+            .put(&url)
+            .headers(self.api_headers())
+            .json(&body)
+            .send()
+            .await?;
+        if put_response.status() == reqwest::StatusCode::NOT_FOUND {
+            self.http
+                .post(&url)
+                .headers(self.api_headers())
+                .json(&body)
+                .send()
+                .await?
+                .error_for_status()?;
+        } else {
+            put_response.error_for_status()?;
+        }
+        Ok(())
     }
 
     async fn post_review(

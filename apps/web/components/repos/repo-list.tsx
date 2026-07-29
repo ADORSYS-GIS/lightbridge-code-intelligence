@@ -1,6 +1,7 @@
 "use client";
 
-import { ExternalLink, GitBranch } from "lucide-react";
+import { ExternalLink, GitBranch, Settings } from "lucide-react";
+import Link from "next/link";
 import { parseAsInteger, useQueryState } from "nuqs";
 import { useMemo } from "react";
 import { Card } from "@/components/ui/card";
@@ -105,15 +106,24 @@ function RepoCard({
       <div className="flex items-center justify-between gap-3 border-t border-base-content/15 px-4 py-2 text-xs">
         {/* Index health (graph + vector freshness, ADR-0016) lands with the indexer — honest for now. */}
         <span className="text-base-content/60">Not indexed yet</span>
-        <a
-          href={repoUrl(repo, gitlabLinks)}
-          target="_blank"
-          rel="noopener noreferrer"
-          className="inline-flex items-center gap-1 text-primary transition-colors hover:underline"
-        >
-          {viewLabel}
-          <ExternalLink className="size-3 shrink-0" />
-        </a>
+        <div className="flex items-center gap-3">
+          <Link
+            href={`/dashboard/repositories/${repo.id}`}
+            className="inline-flex items-center gap-1 text-base-content/60 transition-colors hover:text-base-content"
+            title="Review preset settings"
+          >
+            <Settings className="size-3 shrink-0" />
+          </Link>
+          <a
+            href={repoUrl(repo, gitlabLinks)}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="inline-flex items-center gap-1 text-primary transition-colors hover:underline"
+          >
+            {viewLabel}
+            <ExternalLink className="size-3 shrink-0" />
+          </a>
+        </div>
       </div>
     </Card>
   );

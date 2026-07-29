@@ -42,6 +42,11 @@ pub(super) fn draw_status(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
             };
             format!("{mouse} · {live}")
         }
+        View::RepoSettings => match app.repo_settings.as_ref() {
+            Some(s) if s.saving => "saving…".to_string(),
+            Some(s) if s.loaded => "loaded".to_string(),
+            _ => "loading…".to_string(),
+        },
     };
     let spinner = if app.loading {
         format!("{} ", SPINNER[app.spinner_frame % SPINNER.len()])
@@ -52,9 +57,10 @@ pub(super) fn draw_status(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
 
     // RIGHT text: the key hint (trailing space keeps it off the edge).
     let hint = match app.view {
-        View::Repositories => "j/k move · f filter · r refresh · q quit ",
+        View::Repositories => "j/k move · s settings · f filter · r refresh · q quit ",
         View::Runs => "↵ open · j/k move · f active/all · r refresh · q quit ",
         View::Detail => "m mouse · r refresh · Esc back ",
+        View::RepoSettings => "type · ↵ save · Esc back ",
     };
 
     // Give the side segments what their content needs, but never more than ~45% each so a very long

@@ -76,6 +76,11 @@ pub(super) fn handle_key(
         handle_detail_key(app, key, api, tx);
         return;
     }
+    // The repo settings page captures typing, so it must intercept before the list keys too.
+    if app.view == View::RepoSettings {
+        handle_repo_settings_key(app, key, api, tx);
+        return;
+    }
 
     match key.code {
         KeyCode::Char('q') | KeyCode::Esc => app.should_quit = true,
@@ -119,6 +124,50 @@ pub(super) fn handle_key(
         KeyCode::Char('a') => request_approve(app),
         KeyCode::Char('d') => request_deny(app),
         KeyCode::Char('c') => request_cancel(app),
+        KeyCode::Char('s') if app.view == View::Repositories => {
+            let target = app.selected_repo().map(|r| r.id);
+            app.open_repo_settings();
+            if let Some(id) = target {
+                message::spawn_preset_fetch(id, app, api, tx);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The repo settings page's key map (story #500): free-text edit of the preset name, Enter to save
+/// (requires `repo:configure`), Esc/`q` to back out without saving.
+fn handle_repo_settings_key(
+    app: &mut App,
+    key: KeyEvent,
+    api: &ApiClient,
+    tx: &mpsc::UnboundedSender<Msg>,
+) {
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') => app.close_repo_settings(),
+        KeyCode::Char('?') => app.toggle_help(),
+        KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => app.cycle_theme(),
+        KeyCode::Backspace => app.repo_settings_backspace(),
+        KeyCode::Char(c) => app.repo_settings_push_char(c),
+        KeyCode::Enter => {
+            if !app.can_configure_preset() {
+                app.toast_error("you lack repo:configure");
+                return;
+            }
+            let Some(s) = app.repo_settings.as_ref() else {
+                return;
+            };
+            if s.saving {
+                return; // already in flight
+            }
+            let preset = s.input.trim().to_string();
+            if preset.is_empty() {
+                app.toast_error("enter a preset name first");
+                return;
+            }
+            let repo_id = s.repo_id;
+            message::spawn_preset_save(repo_id, preset, app, api, tx);
+        }
         _ => {}
     }
 }

@@ -7,6 +7,9 @@
 //!   open/close. Turns an operator intent into a new `App` state.
 //! - [`detail`] — the Run Detail page's own sub-model (`DetailState`): task + review data, self-
 //!   contained because it's a page with its own life cycle (run observability is Loki-only — epic #459).
+//! - [`repo_settings`] — the Repo Settings page's own sub-model (`RepoSettingsState`, story #500): a
+//!   repo's currently-configured review preset + a free-text input to change it. Same "own life cycle"
+//!   shape as `detail`.
 //! - [`types`] — the small value types both layers share (`View`, `RepoFilter`, `Toast`, `Confirm`,
 //!   `PendingAction`).
 //!
@@ -15,6 +18,7 @@
 //! and I/O-free and fully unit-testable.
 
 mod detail;
+mod repo_settings;
 mod state;
 mod types;
 mod update;

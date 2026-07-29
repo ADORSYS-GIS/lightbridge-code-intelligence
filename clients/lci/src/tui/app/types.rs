@@ -6,11 +6,13 @@ use crate::theme::ButtonKind;
 use std::time::Instant;
 
 /// The operator views. `Detail` is a "page" opened from a selected Runs row (Enter / l / →).
+/// `RepoSettings` is a "page" opened from a selected Repositories row (`s`, story #500).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum View {
     Repositories,
     Runs,
     Detail,
+    RepoSettings,
 }
 
 /// The status filter cycled with `f` on the Repositories view.

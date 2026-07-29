@@ -347,6 +347,10 @@ fn app(state: AppState) -> Router {
         .route("/admin/repositories", get(admin::list_repositories))
         .route("/admin/repositories/{id}/approve", post(admin::approve))
         .route("/admin/repositories/{id}/deny", post(admin::deny))
+        .route(
+            "/admin/repositories/{id}/preset",
+            get(admin::get_preset).post(admin::set_preset),
+        )
         // Per-identity model selection + ACL (ADR-0110, story #501).
         .route("/admin/models", get(admin::list_model_allowlist))
         .route("/admin/repositories/{id}/model", post(admin::set_repo_model))

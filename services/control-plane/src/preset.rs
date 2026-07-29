@@ -68,11 +68,14 @@ const MAX_CONFIG_BYTES: usize = 64 * 1024;
 /// (`agent-runner::review::repo_config::RepoReviewConfig`). Deliberately permissive (no
 /// `deny_unknown_fields`): this is an intentional partial read of a schema this crate doesn't own
 /// end-to-end, so an unrelated field the full schema defines must not fail this read.
+/// `pub(crate)` (not module-private): story #500's admin read endpoint
+/// (`services/control-plane/src/http/admin.rs::get_preset`) reuses this exact partial-read shape to
+/// show a repo's currently-configured preset, rather than re-declaring the same permissive struct.
 #[derive(Debug, Default, Clone, Deserialize)]
 #[serde(default)]
-struct RepoPresetConfig {
-    preset: Option<String>,
-    entry_points: HashMap<String, String>,
+pub(crate) struct RepoPresetConfig {
+    pub(crate) preset: Option<String>,
+    pub(crate) entry_points: HashMap<String, String>,
 }
 
 /// Resolve the preset name a task under `entry` should run with. Fetches the repo's
@@ -118,7 +121,7 @@ fn resolve_from_config(config: Option<&RepoPresetConfig>, entry: EntryPoint) -> 
         .unwrap_or_else(|| entry.platform_default_preset().to_string())
 }
 
-async fn fetch_repo_preset_config(
+pub(crate) async fn fetch_repo_preset_config(
     platform: &dyn CodePlatform,
     repo: &RepoRef,
     ref_: &str,

@@ -4,6 +4,7 @@
 //! transitions in `super::update`, and the renderer (`tui::ui`) only ever reads it.
 
 use super::detail::DetailState;
+use super::repo_settings::RepoSettingsState;
 use super::types::{Confirm, RepoFilter, Toast, View};
 use crate::api::{Me, RepositoryRow, TaskRow};
 use crate::theme::{Theme, ThemeKind};
@@ -24,6 +25,10 @@ pub struct App {
 
     /// The open Run Detail page, if any (view == Detail). `None` on the list views.
     pub detail: Option<DetailState>,
+
+    /// The open Repo Settings page, if any (view == RepoSettings, story #500). `None` on the list
+    /// views.
+    pub repo_settings: Option<RepoSettingsState>,
 
     /// Whether crossterm mouse capture is active. Toggled with `m` so the operator can fall back to
     /// the terminal's native text selection (mouse capture steals it). The event loop enables/disables
@@ -79,6 +84,7 @@ impl App {
             runs_active_only: true,
             run_selected: 0,
             detail: None,
+            repo_settings: None,
             mouse_enabled: true,
             toast: None,
             confirm: None,
@@ -130,6 +136,11 @@ impl App {
     /// `review:read` gates the detail view's review + transcript fetches.
     pub fn can_review_read(&self) -> bool {
         self.me.as_ref().is_some_and(|m| m.can("review:read"))
+    }
+    /// `repo:configure` gates the repo-settings page's SAVE action (story #500, ADR-0109) — the page
+    /// itself still opens read-only without it, mirroring the detail page's `permission_denied` shape.
+    pub fn can_configure_preset(&self) -> bool {
+        self.me.as_ref().is_some_and(|m| m.can("repo:configure"))
     }
 
     /// The tasks currently visible under the active filter.
