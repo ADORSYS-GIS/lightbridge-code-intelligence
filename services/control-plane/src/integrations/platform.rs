@@ -234,6 +234,22 @@ pub trait CodePlatform: Send + Sync {
         path: &str,
     ) -> anyhow::Result<Option<String>>;
 
+    /// Create or update a single file on the repository's **default branch** (ADR-0109) — a direct
+    /// commit, not a PR. Deliberately narrow and dyn-safe: takes the FINAL content, not a mutation
+    /// closure — a read-modify-write (fetch the current content via [`Self::get_repo_file`], compute
+    /// the new content, then call this) is the caller's job, not this trait's. The only caller in this
+    /// codebase passes `path = ".lightbridge-code-review.jsonc"` (story #500's preset-selector
+    /// endpoint) — this is a single-purpose escape hatch for that one file, not a general write tool;
+    /// widening what path a caller may pass is a decision that needs its own review, per ADR-0109's
+    /// own Consequences section.
+    async fn update_repo_file(
+        &self,
+        repo: &RepoRef,
+        path: &str,
+        content: &str,
+        message: &str,
+    ) -> anyhow::Result<()>;
+
     // --- Posting ---
 
     /// Post a review (inline comments + body). Returns the platform review ID + optional HTML URL.

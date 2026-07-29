@@ -334,6 +334,18 @@ impl CodePlatform for GitlabPlatformRouter {
         self.client(repo)?.get_repo_file(repo, ref_, path).await
     }
 
+    async fn update_repo_file(
+        &self,
+        repo: &RepoRef,
+        path: &str,
+        content: &str,
+        message: &str,
+    ) -> anyhow::Result<()> {
+        self.client(repo)?
+            .update_repo_file(repo, path, content, message)
+            .await
+    }
+
     async fn post_review(
         &self,
         repo: &RepoRef,
@@ -571,6 +583,49 @@ impl CodePlatform for GitlabClient {
         }
         let text = response.error_for_status()?.text().await?;
         Ok(Some(text))
+    }
+
+    async fn update_repo_file(
+        &self,
+        repo: &RepoRef,
+        path: &str,
+        content: &str,
+        message: &str,
+    ) -> anyhow::Result<()> {
+        // GitLab requires the target branch explicitly in the body (unlike GitHub, which defaults to
+        // the repo's default branch server-side) — ADR-0109 always commits to the default branch.
+        let branch = self.default_branch(repo).await?;
+        let project = Self::project_encoded(repo);
+        let file_path = path.replace('/', "%2F");
+        let url = self.url(&format!("/projects/{project}/repository/files/{file_path}"));
+        let body = serde_json::json!({
+            "branch": branch,
+            "content": content,
+            "commit_message": message,
+        });
+        // GitLab uses different HTTP methods for create (POST) vs update (PUT) on the same path —
+        // unlike GitHub's single PUT. Try PUT (the overwhelmingly common case: the config file already
+        // exists once a repo is under review) and fall back to POST only on a 404 (the file has never
+        // been created).
+        let put_response = self
+            .http
+            .put(&url)
+            .headers(self.api_headers())
+            .json(&body)
+            .send()
+            .await?;
+        if put_response.status() == reqwest::StatusCode::NOT_FOUND {
+            self.http
+                .post(&url)
+                .headers(self.api_headers())
+                .json(&body)
+                .send()
+                .await?
+                .error_for_status()?;
+        } else {
+            put_response.error_for_status()?;
+        }
+        Ok(())
     }
 
     async fn post_review(

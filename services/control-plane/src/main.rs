@@ -337,6 +337,10 @@ fn app(state: AppState) -> Router {
         .route("/admin/repositories", get(admin::list_repositories))
         .route("/admin/repositories/{id}/approve", post(admin::approve))
         .route("/admin/repositories/{id}/deny", post(admin::deny))
+        .route(
+            "/admin/repositories/{id}/preset",
+            get(admin::get_preset).post(admin::set_preset),
+        )
         // Internal runner API (shared-bearer, not OIDC) — the agent Job's lifecycle callbacks.
         .route("/internal/tasks/{id}", get(internal::get_context))
         .route(

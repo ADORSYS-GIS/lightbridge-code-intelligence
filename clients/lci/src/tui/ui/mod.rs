@@ -16,6 +16,7 @@ mod detail;
 mod header;
 mod helpers;
 mod overlays;
+mod repo_settings;
 mod repositories;
 mod runs;
 mod status;
@@ -70,6 +71,7 @@ pub fn draw(f: &mut Frame, app: &App) {
         View::Repositories => repositories::draw_repositories(f, chunks[2], app, &theme),
         View::Runs => runs::draw_runs(f, chunks[2], app, &theme),
         View::Detail => detail::draw_detail(f, chunks[2], app, &theme),
+        View::RepoSettings => repo_settings::draw_repo_settings(f, chunks[2], app, &theme),
     }
     status::draw_status(f, chunks[3], app, &theme);
 

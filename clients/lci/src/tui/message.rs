@@ -6,7 +6,7 @@
 
 use super::REFRESH_INTERVAL;
 use super::app::{App, PendingAction, View};
-use crate::api::{ApiClient, RepositoryRow, ReviewRow, TaskRow};
+use crate::api::{ApiClient, PresetInfo, RepositoryRow, ReviewRow, TaskRow};
 use crate::auth::{self, EXPIRY_SKEW_SECS};
 use crate::config::Config;
 use anyhow::Result;
@@ -31,6 +31,17 @@ pub(super) enum Msg {
     /// the enum's size (`clippy::large_enum_variant`): `TaskRow`/`ReviewRow` are large, and the other
     /// variants are small.
     Detail(Box<DetailFetch>),
+    /// A repo-settings page fetch resolved (story #500) — carries the repo id so a stale result for a
+    /// page the operator has since closed/replaced is ignored, mirroring `Msg::Detail`.
+    PresetLoaded {
+        repo_id: i64,
+        result: Result<PresetInfo>,
+    },
+    /// A repo-settings SAVE (`POST .../preset`) resolved.
+    PresetSaved {
+        repo_id: i64,
+        result: Result<PresetInfo>,
+    },
 }
 
 /// The payload of [`Msg::Detail`]: the task metadata + review resolved for the detail page, carrying
@@ -125,6 +136,29 @@ pub(super) fn apply_msg(app: &mut App, msg: Msg) -> FollowUp {
                 app.toast_error(e);
             }
             app.mark_dirty();
+            FollowUp::None
+        }
+        Msg::PresetLoaded { repo_id, result } => {
+            app.set_loading(false);
+            match result {
+                Ok(info) => app.set_preset_loaded(repo_id, info),
+                Err(e) => app.toast_error(format!("preset: {e}")),
+            }
+            FollowUp::None
+        }
+        Msg::PresetSaved { repo_id, result } => {
+            app.set_repo_settings_saving(false);
+            // Ignore a stale result for a page the operator has since closed/replaced.
+            if app.repo_settings.as_ref().map(|s| s.repo_id) != Some(repo_id) {
+                return FollowUp::None;
+            }
+            match result {
+                Ok(info) => {
+                    app.set_preset_loaded(repo_id, info);
+                    app.toast_success("preset saved");
+                }
+                Err(e) => app.toast_error(format!("save failed: {e}")),
+            }
             FollowUp::None
         }
         Msg::TokenRefreshed(Ok(token)) => {
@@ -231,7 +265,42 @@ pub(super) fn spawn_refresh_current_view(
                 });
             }
         }
+        // The repo-settings page doesn't refresh on the periodic poll (unlike Detail's live task) —
+        // its data is a config value an admin edits interactively, not something that changes out from
+        // under a stationary viewer. Its own fetch is spawned explicitly on open (`spawn_preset_fetch`).
+        View::RepoSettings => {}
     }
+}
+
+/// Spawn the repo-settings preset fetch (`GET .../preset`), on page open.
+pub(super) fn spawn_preset_fetch(
+    repo_id: i64,
+    app: &mut App,
+    api: &ApiClient,
+    tx: &mpsc::UnboundedSender<Msg>,
+) {
+    app.set_loading(true);
+    let (api, tx) = (api.clone(), tx.clone());
+    tokio::spawn(async move {
+        let result = api.get_preset(repo_id).await;
+        let _ = tx.send(Msg::PresetLoaded { repo_id, result });
+    });
+}
+
+/// Spawn the repo-settings SAVE (`POST .../preset`), on Enter.
+pub(super) fn spawn_preset_save(
+    repo_id: i64,
+    preset: String,
+    app: &mut App,
+    api: &ApiClient,
+    tx: &mpsc::UnboundedSender<Msg>,
+) {
+    app.set_repo_settings_saving(true);
+    let (api, tx) = (api.clone(), tx.clone());
+    tokio::spawn(async move {
+        let result = api.set_preset(repo_id, &preset).await;
+        let _ = tx.send(Msg::PresetSaved { repo_id, result });
+    });
 }
 
 /// Spawn the detail fetch: task metadata + review (404→None), both for `id`. Flips the loading flag

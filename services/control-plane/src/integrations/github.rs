@@ -431,6 +431,65 @@ impl GithubApp {
         Ok(Some(String::from_utf8_lossy(&decoded).into_owned()))
     }
 
+    /// Create or update a file's content on the repository's default branch via the Contents API
+    /// (ADR-0109) — a direct commit, not a PR. Looks up the file's current `sha` first (required by
+    /// GitHub for an update, omitted for a create); a concurrent edit since that lookup surfaces as a
+    /// 409 from the PUT (`error_for_status` below), never a silent overwrite.
+    pub async fn update_repository_file_content(
+        &self,
+        token: &str,
+        owner: &str,
+        repo: &str,
+        path: &str,
+        content: &str,
+        message: &str,
+    ) -> anyhow::Result<()> {
+        use anyhow::Context;
+        use base64::Engine;
+        let contents_url = format!("https://api.github.com/repos/{owner}/{repo}/contents/{path}");
+        let existing = self
+            .http
+            .get(&contents_url)
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Accept", "application/vnd.github+json")
+            .header("User-Agent", "lightbridge-code-intelligence")
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .send()
+            .await
+            .context("looking up the existing file sha")?;
+        let sha = if existing.status() == reqwest::StatusCode::NOT_FOUND {
+            None
+        } else {
+            let value: serde_json::Value = existing
+                .error_for_status()
+                .context("github rejected the file lookup")?
+                .json()
+                .await
+                .context("parsing file lookup response")?;
+            value["sha"].as_str().map(str::to_string)
+        };
+        let mut body = serde_json::json!({
+            "message": message,
+            "content": base64::engine::general_purpose::STANDARD.encode(content),
+        });
+        if let Some(sha) = sha {
+            body["sha"] = serde_json::Value::String(sha);
+        }
+        self.http
+            .put(&contents_url)
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Accept", "application/vnd.github+json")
+            .header("User-Agent", "lightbridge-code-intelligence")
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .json(&body)
+            .send()
+            .await
+            .context("committing the file update")?
+            .error_for_status()
+            .context("github rejected the file commit (e.g. a stale sha ⇒ 409 conflict)")?;
+        Ok(())
+    }
+
     /// Fetch a PR's base + head SHAs. Used by the `@mention` re-review path, where the
     /// `issue_comment` payload has no SHAs (unlike the `pull_request` event).
     pub async fn pull_request_shas(
@@ -717,6 +776,19 @@ impl CodePlatform for GithubApp {
         let (owner, name) = repo.owner_repo();
         let token = self.token_for(repo).await?;
         self.repository_file_content(&token, owner, name, ref_, path)
+            .await
+    }
+
+    async fn update_repo_file(
+        &self,
+        repo: &RepoRef,
+        path: &str,
+        content: &str,
+        message: &str,
+    ) -> anyhow::Result<()> {
+        let (owner, name) = repo.owner_repo();
+        let token = self.token_for(repo).await?;
+        self.update_repository_file_content(&token, owner, name, path, content, message)
             .await
     }
 

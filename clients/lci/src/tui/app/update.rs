@@ -5,9 +5,10 @@
 //! defined once in the crate — rather than duplicating/wrapping the struct.
 
 use super::detail::DetailState;
+use super::repo_settings::RepoSettingsState;
 use super::state::App;
 use super::types::{Confirm, PendingAction, Toast, ToastKind, View};
-use crate::api::{RepositoryRow, TaskRow};
+use crate::api::{PresetInfo, RepositoryRow, TaskRow};
 use crate::theme::ButtonKind;
 use std::time::{Duration, Instant};
 
@@ -37,6 +38,61 @@ impl App {
         self.detail = None;
         self.view = View::Runs;
         self.mark_dirty();
+    }
+
+    // --- repo settings page (story #500) ---
+    /// Open the Repo Settings page for the currently-selected repo (`s`). No-op unless on the
+    /// Repositories view with a selected row.
+    pub fn open_repo_settings(&mut self) {
+        if self.view != View::Repositories {
+            return;
+        }
+        let Some(repo) = self.selected_repo() else {
+            return;
+        };
+        let label = format!("{}/{}", repo.owner, repo.name);
+        self.repo_settings = Some(RepoSettingsState::new(repo.id, label));
+        self.view = View::RepoSettings;
+        self.mark_dirty();
+    }
+
+    /// Close the repo settings page and return to the Repositories list (Esc).
+    pub fn close_repo_settings(&mut self) {
+        self.repo_settings = None;
+        self.view = View::Repositories;
+        self.mark_dirty();
+    }
+
+    /// Fold a resolved preset fetch into the open page. Ignores a stale result for a repo the operator
+    /// has since navigated away from (mirrors `Msg::Detail`'s same stale-result guard).
+    pub fn set_preset_loaded(&mut self, repo_id: i64, info: PresetInfo) {
+        if let Some(s) = self.repo_settings.as_mut()
+            && s.repo_id == repo_id
+        {
+            s.set_loaded(info);
+            self.mark_dirty();
+        }
+    }
+
+    pub fn repo_settings_push_char(&mut self, c: char) {
+        if let Some(s) = self.repo_settings.as_mut() {
+            s.push_char(c);
+            self.mark_dirty();
+        }
+    }
+
+    pub fn repo_settings_backspace(&mut self) {
+        if let Some(s) = self.repo_settings.as_mut() {
+            s.backspace();
+            self.mark_dirty();
+        }
+    }
+
+    pub fn set_repo_settings_saving(&mut self, saving: bool) {
+        if let Some(s) = self.repo_settings.as_mut() {
+            s.saving = saving;
+            self.mark_dirty();
+        }
     }
 
     // --- data replacement (from async fetches) ---
@@ -71,22 +127,23 @@ impl App {
         match self.view {
             View::Repositories => self.repos.len(),
             View::Runs => self.visible_tasks().len(),
-            // The detail page has no list selection — j/k scroll the transcript instead.
-            View::Detail => 0,
+            // Neither page has a list selection — Detail scrolls nothing (Loki-only observability);
+            // RepoSettings' j/k would collide with a future multi-line form, so left unbound for now.
+            View::Detail | View::RepoSettings => 0,
         }
     }
     fn current_selection(&self) -> usize {
         match self.view {
             View::Repositories => self.repo_selected,
             View::Runs => self.run_selected,
-            View::Detail => 0,
+            View::Detail | View::RepoSettings => 0,
         }
     }
     fn set_selection(&mut self, idx: usize) {
         match self.view {
             View::Repositories => self.repo_selected = idx,
             View::Runs => self.run_selected = idx,
-            View::Detail => {}
+            View::Detail | View::RepoSettings => {}
         }
     }
 
@@ -106,23 +163,27 @@ impl App {
         }
     }
     pub fn toggle_view(&mut self) {
-        // Tab from the detail page returns to the Runs list first (then toggles as usual).
+        // Tab from either page returns to its own list first (then toggles as usual).
         if self.view == View::Detail {
             self.close_detail();
             return;
         }
+        if self.view == View::RepoSettings {
+            self.close_repo_settings();
+            return;
+        }
         self.set_view(match self.view {
             View::Repositories => View::Runs,
-            View::Runs | View::Detail => View::Repositories,
+            View::Runs | View::Detail | View::RepoSettings => View::Repositories,
         });
     }
     /// Cycle the active filter. On Repositories that's the status filter; on Runs it toggles the
-    /// active-only view. No-op on the detail page.
+    /// active-only view. No-op on either page.
     pub fn cycle_filter(&mut self) {
         match self.view {
             View::Repositories => self.repo_filter = self.repo_filter.next(),
             View::Runs => self.runs_active_only = !self.runs_active_only,
-            View::Detail => return,
+            View::Detail | View::RepoSettings => return,
         }
         self.clamp_selection();
         self.mark_dirty();

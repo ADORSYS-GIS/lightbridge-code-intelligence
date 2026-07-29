@@ -83,6 +83,16 @@ pub struct RepositoryRow {
     pub last_task_at: Option<OffsetDateTime>,
 }
 
+/// A repo's currently-configured review preset (story #500). Mirrors the JSON both
+/// `GET`/`POST /admin/repositories/{id}/preset` return.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct PresetInfo {
+    #[serde(default)]
+    pub preset: Option<String>,
+    #[serde(default)]
+    pub entry_points: std::collections::HashMap<String, String>,
+}
+
 /// A task row from `GET /tasks`. Mirrors `db::TaskRow` (only the fields the TUI shows).
 #[derive(Debug, Clone, Deserialize)]
 pub struct TaskRow {
@@ -218,6 +228,31 @@ impl ApiClient {
     pub async fn deny(&self, id: i64) -> Result<RepositoryRow> {
         self.post_json(&format!("/admin/repositories/{id}/deny"))
             .await
+    }
+
+    /// `GET /admin/repositories/{id}/preset` — the repo's currently-configured review preset (story
+    /// #500; needs `repo:read`). `preset`/`entry_points` are both `None`/empty when the repo declares
+    /// nothing (platform defaults apply).
+    pub async fn get_preset(&self, id: i64) -> Result<PresetInfo> {
+        self.get_json(&format!("/admin/repositories/{id}/preset"))
+            .await
+    }
+
+    /// `POST /admin/repositories/{id}/preset` — commit a new preset to the repo's
+    /// `.lightbridge-code-review.jsonc` (story #500; needs `repo:configure`). Only `preset` is set by
+    /// the TUI today; `entry_points` stays untouched (the endpoint accepts it too, for apps/web or a
+    /// future TUI screen to use).
+    pub async fn set_preset(&self, id: i64, preset: &str) -> Result<PresetInfo> {
+        let url = format!("{}/admin/repositories/{id}/preset", self.base);
+        let resp = self
+            .http
+            .post(&url)
+            .bearer_auth(self.bearer().await)
+            .json(&serde_json::json!({ "preset": preset }))
+            .send()
+            .await
+            .with_context(|| format!("POST {url}"))?;
+        self.decode(resp, "preset").await
     }
 
     /// `GET /tasks` — most recent first, capped at 100 by the server (needs `task:read`).

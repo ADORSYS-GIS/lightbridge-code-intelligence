@@ -324,6 +324,18 @@ impl CodePlatform for BitbucketPlatformRouter {
         self.client(repo)?.get_repo_file(repo, ref_, path).await
     }
 
+    async fn update_repo_file(
+        &self,
+        repo: &RepoRef,
+        path: &str,
+        content: &str,
+        message: &str,
+    ) -> anyhow::Result<()> {
+        self.client(repo)?
+            .update_repo_file(repo, path, content, message)
+            .await
+    }
+
     async fn post_review(
         &self,
         repo: &RepoRef,
@@ -534,6 +546,31 @@ impl CodePlatform for BitbucketClient {
         }
         let text = response.error_for_status()?.text().await?;
         Ok(Some(text))
+    }
+
+    async fn update_repo_file(
+        &self,
+        _repo: &RepoRef,
+        path: &str,
+        content: &str,
+        message: &str,
+    ) -> anyhow::Result<()> {
+        // Bitbucket's Source API commits directly to the main/default branch when `branch` is
+        // omitted (ADR-0109's requirement, for free — unlike GitLab this needs no separate
+        // default_branch() lookup). `application/x-www-form-urlencoded` (not multipart) — the leading
+        // `/` on the path field disambiguates it from the `message` meta-data field per Bitbucket's own
+        // documented convention, and this repo's `reqwest` build only has the `form` feature enabled,
+        // not `multipart` (both content types are equally valid per Bitbucket's docs).
+        let url = self.url(&format!("{}/src", self.repo_base()));
+        let field_path = format!("/{path}");
+        self.http
+            .post(&url)
+            .basic_auth(&self.email, Some(&self.api_token))
+            .form(&[(field_path.as_str(), content), ("message", message)])
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
     }
 
     async fn pr_shas(

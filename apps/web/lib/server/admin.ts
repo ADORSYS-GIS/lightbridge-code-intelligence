@@ -87,3 +87,51 @@ export async function setRepoStatus(id: number, action: "approve" | "deny"): Pro
     return false;
   }
 }
+
+/** A repo's currently-configured review preset (story #500, ADR-0109). Mirrors
+ * `GET`/`POST /admin/repositories/{id}/preset`'s JSON shape. */
+export interface RepoPreset {
+  preset: string | null;
+  entry_points: Record<string, string>;
+}
+
+/** `GET /admin/repositories/{id}/preset` — the repo's currently-configured preset, read straight from
+ * `.lightbridge-code-review.jsonc`. `null`/`{}` when the repo declares nothing (platform defaults
+ * apply). Needs `repo:read`. */
+export async function getRepoPreset(id: number): Promise<ApiResult<RepoPreset>> {
+  try {
+    const t = await token();
+    if (!t) return { ok: false, reason: "unauthenticated" };
+    const res = await fetch(`${controlPlaneUrl()}/admin/repositories/${id}/preset`, {
+      headers: { authorization: `Bearer ${t}`, accept: "application/json" },
+      cache: "no-store",
+    });
+    if (!res.ok) return { ok: false, reason: classify(res.status), status: res.status };
+    return { ok: true, data: (await res.json()) as RepoPreset };
+  } catch {
+    return { ok: false, reason: "unavailable" };
+  }
+}
+
+/** `POST /admin/repositories/{id}/preset` — commit a new preset to the repo's
+ * `.lightbridge-code-review.jsonc` on its default branch (a direct commit, ADR-0109). Needs
+ * `repo:configure`. Returns whether it succeeded; the caller re-fetches to reflect the change. */
+export async function setRepoPreset(id: number, preset: string): Promise<boolean> {
+  const t = await token();
+  if (!t) return false;
+  try {
+    const res = await fetch(`${controlPlaneUrl()}/admin/repositories/${id}/preset`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${t}`,
+        accept: "application/json",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ preset }),
+      cache: "no-store",
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}

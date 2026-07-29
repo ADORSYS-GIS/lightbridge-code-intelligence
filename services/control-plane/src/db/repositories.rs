@@ -125,6 +125,26 @@ pub async fn register_pending_repository(
     Ok(affected.rows_affected() > 0)
 }
 
+/// A single repository by its control-plane id, or `None` if no such repo. Read-only — unlike
+/// [`set_repository_status_by_id`], which is approve/deny's own mutate-then-reselect helper. Used by
+/// story #500's preset-write endpoint to resolve the repo's platform/owner/name/default_branch before
+/// picking a `CodePlatform` client.
+pub async fn get_repository_by_id(
+    pool: &PgPool,
+    id: i64,
+) -> Result<Option<RepositoryRow>, sqlx::Error> {
+    sqlx::query_as::<_, RepositoryRow>(
+        "SELECT r.id, r.platform_repo_id, r.platform, r.owner, r.name, r.default_branch, r.status, \
+           (r.status = 'approved') AS active, r.approved_at, r.approved_by, \
+           COUNT(t.id) AS task_count, MAX(t.created_at) AS last_task_at \
+         FROM repositories r LEFT JOIN tasks t ON t.repository_id = r.id \
+         WHERE r.id = $1 GROUP BY r.id",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await
+}
+
 /// A repository's approval status (`pending`/`approved`/`disabled`), or `None` if no such repo.
 pub async fn repository_status(
     pool: &PgPool,
