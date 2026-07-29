@@ -18,7 +18,8 @@
   "plugin": [
     "/opt/lightbridge/opencode/plugins/recorder/src/index.ts",
     "/opt/lightbridge/opencode/plugins/gate-interlock/src/index.ts",
-    "/opt/lightbridge/opencode/plugins/logger/src/index.ts"
+    "/opt/lightbridge/opencode/plugins/logger/src/index.ts",
+    "/opt/lightbridge/opencode/plugins/sentinel/src/index.ts"
   ],
   // Global invariant for every agent in open mode: no direct web egress (defense-in-depth over the
   // ADR-0088 network allowlist). edit/bash are decided per-agent below, so this is NOT a duplicate

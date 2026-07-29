@@ -80,7 +80,8 @@
   "plugin": [
     "/opt/lightbridge/opencode/plugins/recorder/src/index.ts",
     "/opt/lightbridge/opencode/plugins/gate-interlock/src/index.ts",
-    "/opt/lightbridge/opencode/plugins/logger/src/index.ts"
+    "/opt/lightbridge/opencode/plugins/logger/src/index.ts",
+    "/opt/lightbridge/opencode/plugins/sentinel/src/index.ts"
   ],
   // Read-only posture: a review never mutates the tree or egresses.
   "permission": {

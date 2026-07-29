@@ -221,6 +221,7 @@ pub async fn run_opencode_agent(
     .await
     .context("writing opencode config")?;
     let recorder_path = workdir.join("recording.jsonl");
+    let sentinel_marker_path = workdir.join("sentinel.marker.json");
 
     // ── Env for the opencode child (config placeholders + recorder + the review MCP server) ──────
     let mut env: Vec<(String, String)> = vec![
@@ -235,6 +236,11 @@ pub async fn run_opencode_agent(
         (
             "LCI_RECORDER_PATH".into(),
             recorder_path.display().to_string(),
+        ),
+        // The sentinel plugin's marker file (ADR-0106, story #499) — read after shutdown, below.
+        (
+            "LCI_SENTINEL_MARKER_PATH".into(),
+            sentinel_marker_path.display().to_string(),
         ),
         // Provider (`{env:LCI_EAIG_*}` in the config).
         ("LCI_EAIG_BASE_URL".into(), review.base_url.clone()),
@@ -344,6 +350,36 @@ pub async fn run_opencode_agent(
         tracing::warn!(%error, "shutting down opencode acp failed (non-fatal)");
     }
 
+    // ── Sentinel marker (ADR-0106, story #499) ──────────────────────────────────────────────────
+    // Read AFTER shutdown so the sentinel's `process.on("exit", …)` handler has already run (it fires
+    // on the child process's own exit, which `session.shutdown()` triggers). `provider_error`/
+    // `uncaught_exception` are a genuine anomaly regardless of how the loop resolved — logged as a
+    // warning even on a clean Finished/Exhausted/Aborted outcome. `exit_without_terminal` is NOT
+    // inherently alarming (a normal budget-exhausted review also never calls finish/abort — see the
+    // plugin's own doc comment) — it's only folded into the reported error below, on the `Err` branch,
+    // where it adds real diagnostic value (WHY did the loop never reach a resolution at all).
+    let sentinel = read_sentinel_marker(&sentinel_marker_path).await;
+    if let Some(event) = &sentinel
+        && event.fatal_kind != SentinelFatalKind::ExitWithoutTerminal
+    {
+        tracing::warn!(
+            task_id = %task_id,
+            fatal_kind = ?event.fatal_kind,
+            message = %event.message,
+            last_tool_call = ?event.last_tool_call,
+            "opencode sentinel observed a fatal-shaped event (ADR-0106)"
+        );
+    }
+    let resolution = resolution.map_err(|error| match &sentinel {
+        Some(event) => error.context(format!(
+            "opencode sentinel: {:?} — {} (last tool call: {})",
+            event.fatal_kind,
+            event.message,
+            event.last_tool_call.as_deref().unwrap_or("none")
+        )),
+        None => error,
+    });
+
     // ── Map the resolution onto a ReviewOutcome (+ post any coverage disclosure) ─────────────────
     // The coverage disclosure (ADR-0069) is augmented with the ADR-0099 floor note when the operator
     // overlay relaxed an invariant, so findings produced under a custom config aren't read as default.
@@ -373,6 +409,43 @@ pub async fn run_opencode_agent(
     )
 }
 
+/// The sentinel plugin's own three kinds (ADR-0106, `integrations/opencode/plugins/sentinel`) —
+/// `serde(rename_all = "snake_case")` matches the plugin's TS union (`"provider_error"` etc.) verbatim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum SentinelFatalKind {
+    ProviderError,
+    UncaughtException,
+    ExitWithoutTerminal,
+}
+
+/// One fatal-shaped event the sentinel plugin observed, deserialized from its marker file
+/// (`LCI_SENTINEL_MARKER_PATH`). Field names match the plugin's `FatalEvent` JSON shape (camelCase) —
+/// see `integrations/opencode/plugins/sentinel/src/index.ts`.
+#[derive(Debug, Clone, serde::Deserialize)]
+struct SentinelEvent {
+    #[serde(rename = "fatalKind")]
+    fatal_kind: SentinelFatalKind,
+    message: String,
+    #[serde(rename = "lastToolCall")]
+    last_tool_call: Option<String>,
+}
+
+/// Best-effort read of the sentinel marker file, written by the sentinel plugin (ADR-0106) if it ever
+/// observed a fatal-shaped event this run. `None` on any failure (file absent — the overwhelmingly
+/// common case, nothing fatal happened — or malformed content) — never lets a marker-read problem mask
+/// or replace the actual review outcome.
+async fn read_sentinel_marker(marker_path: &Path) -> Option<SentinelEvent> {
+    let content = tokio::fs::read_to_string(marker_path).await.ok()?;
+    match serde_json::from_str(&content) {
+        Ok(event) => Some(event),
+        Err(error) => {
+            tracing::warn!(%error, path = %marker_path.display(), "sentinel marker file is malformed; ignoring");
+            None
+        }
+    }
+}
+
 /// Combine the coverage disclosure (ADR-0069) with the ADR-0099 operator-overlay floor note. Either may
 /// be absent; when both are present the floor note follows the coverage note as its own paragraph.
 fn merge_disclosure(coverage: Option<String>, floor: Option<String>) -> Option<String> {
@@ -393,6 +466,62 @@ fn merge_disclosure(coverage: Option<String>, floor: Option<String>) -> Option<S
 //         tracing::warn!(%error, task_id = %task_id, "coverage disclosure re-post failed (non-fatal)");
 //     }
 // }
+
+#[cfg(test)]
+mod sentinel_marker_tests {
+    use super::*;
+
+    // Exact shape the sentinel plugin's `writeFileSync` produces
+    // (`integrations/opencode/plugins/sentinel/src/index.ts`'s `FatalEvent`) — a cross-language
+    // contract test: if either side's field names/casing drift, this test (not a silent runtime
+    // parse failure) is what should catch it.
+    #[tokio::test]
+    async fn parses_the_exact_shape_the_sentinel_plugin_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker_path = dir.path().join("sentinel.marker.json");
+        tokio::fs::write(
+            &marker_path,
+            r#"{"kind":"fatal_event","fatalKind":"provider_error","message":"provider unreachable","lastToolCall":"lightbridge_read_file","sessionID":"s1"}"#,
+        )
+        .await
+        .unwrap();
+        let event = read_sentinel_marker(&marker_path).await.expect("parses");
+        assert_eq!(event.fatal_kind, SentinelFatalKind::ProviderError);
+        assert_eq!(event.message, "provider unreachable");
+        assert_eq!(event.last_tool_call.as_deref(), Some("lightbridge_read_file"));
+    }
+
+    #[tokio::test]
+    async fn parses_exit_without_terminal_with_a_null_last_tool_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker_path = dir.path().join("sentinel.marker.json");
+        tokio::fs::write(
+            &marker_path,
+            r#"{"kind":"fatal_event","fatalKind":"exit_without_terminal","message":"process exited","lastToolCall":null,"sessionID":null}"#,
+        )
+        .await
+        .unwrap();
+        let event = read_sentinel_marker(&marker_path).await.expect("parses");
+        assert_eq!(event.fatal_kind, SentinelFatalKind::ExitWithoutTerminal);
+        assert_eq!(event.last_tool_call, None);
+    }
+
+    // The overwhelmingly common case: nothing fatal happened, so the plugin never wrote the file.
+    #[tokio::test]
+    async fn absent_marker_file_is_none_not_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker_path = dir.path().join("sentinel.marker.json");
+        assert!(read_sentinel_marker(&marker_path).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn malformed_marker_content_degrades_to_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker_path = dir.path().join("sentinel.marker.json");
+        tokio::fs::write(&marker_path, "not json").await.unwrap();
+        assert!(read_sentinel_marker(&marker_path).await.is_none());
+    }
+}
 
 /// End-to-end proof that the host drives a REAL `opencode acp` (RFC-0009 slice 3 / slice 4).
 ///

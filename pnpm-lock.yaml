@@ -127,6 +127,21 @@ importers:
         specifier: ^5.6.0
         version: 5.9.3
 
+  integrations/opencode/plugins/sentinel:
+    devDependencies:
+      '@lightbridge/tsconfig':
+        specifier: workspace:*
+        version: link:../../../../packages/tsconfig
+      '@opencode-ai/plugin':
+        specifier: 1.18.2
+        version: 1.18.2
+      '@types/node':
+        specifier: ^22.0.0
+        version: 22.19.21
+      typescript:
+        specifier: ^5.6.0
+        version: 5.9.3
+
   integrations/opencode/probe:
     devDependencies:
       '@lightbridge/tsconfig':
