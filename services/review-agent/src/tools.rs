@@ -12,23 +12,30 @@ pub use lci_agent_types::ToolOutcome;
 use lci_agent_types::{ToolCallReq, ToolSpec};
 use uuid::Uuid;
 
+pub mod edit_file;
 pub mod finish;
+mod fs_safety;
 pub mod graph;
+pub mod list_directory;
 pub mod mcp;
 pub mod read_file;
 pub mod record;
 pub mod reply;
 pub mod sast;
 pub mod vector;
+pub mod write_file;
 
+pub use edit_file::EDIT_FILE;
 pub use finish::{ABORT, FINISH, REPORT_PROGRESS};
 pub use graph::{GRAPH_FIND_SYMBOL, GRAPH_GET_CALLERS};
+pub use list_directory::LIST_DIRECTORY;
 pub use mcp::MCP_TOOL_PREFIX;
 pub use read_file::READ_FILE;
 pub use record::{ADD_REVIEW_COMMENT, RETRACT_FINDING};
 pub use reply::ADD_COMMENT;
 pub use sast::{RUN_SAST, SastToolConfig};
 pub use vector::VECTOR_SEMANTIC_SEARCH;
+pub use write_file::WRITE_FILE;
 
 pub(crate) const DEFAULT_LIMIT: i64 = 10;
 pub(crate) const MAX_LIMIT: i64 = 100;
@@ -105,6 +112,18 @@ pub fn known_tool_names() -> Vec<&'static str> {
 /// `sast` is `None` when SAST is off or there's no diff to scope a scan to (ADR-0073) — `run_sast` then
 /// simply isn't registered, so a dispatch attempt is refused as an unknown tool rather than silently
 /// scanning nothing.
+///
+/// `fs_write` (ADR-0104, story #497) gates `write_file`/`edit_file`/`list_directory` the same way —
+/// **deliberately not** via `tool_defs()`/`known_tool_names()`/the `ReviewTool` allowlist enum. Those
+/// drive the (currently native-loop-only) per-preset allowlist; on the live OpenCode-hosted review path
+/// every builtin `tool_registry` unconditionally registers is exposed to every preset regardless of its
+/// configured allowlist (a separate, already-flagged gap — the allowlist mechanism isn't wired into the
+/// live path at all yet). Since review must NEVER get write access, gating these three tools behind an
+/// explicit `bool` this function's every caller passes `false` for is safe *today*, independent of that
+/// other gap — no review preset can reach them no matter what its `tools:` config says, because nothing
+/// sets `fs_write: true` anywhere in production. `open` mode migrating onto this shared fs-tool family
+/// (ADR-0104's "More Information") is a future consumer that would pass `true`.
+#[allow(clippy::too_many_arguments)]
 pub fn tool_registry(
     client: Arc<ControlPlaneClient>,
     embedder: Arc<EmbeddingsClient>,
@@ -112,6 +131,7 @@ pub fn tool_registry(
     caps: RuntimeCaps,
     sast: Option<SastToolConfig>,
     min_priority: Option<String>,
+    fs_write: bool,
 ) -> Result<ToolRegistry, RegistryError> {
     let services = ReviewServices {
         client,
@@ -130,6 +150,11 @@ pub fn tool_registry(
     }
     if let Some(tool_config) = sast {
         self::sast::register(&mut registry, &services, tool_config, caps)?;
+    }
+    if fs_write {
+        write_file::register(&mut registry, caps)?;
+        edit_file::register(&mut registry, caps)?;
+        list_directory::register(&mut registry, caps)?;
     }
     Ok(registry)
 }
@@ -178,16 +203,18 @@ impl Tools {
             discovered,
             None,
             None,
+            false,
         )
     }
 
-    /// Like [`Self::new`], but also registers the `run_sast` tool (ADR-0073) when `sast` is `Some`, and
-    /// applies the repo's `severity.min` (ADR-0030) when `min_priority` is `Some`. Used by the OpenCode
-    /// review path's stdio MCP server (`lci-review-mcp`): `run_sast` runs in that separate process
-    /// exactly as it does in the native loop, reusing `lci-agent-sast` verbatim. `sast: None` leaves the
-    /// tool unregistered — the opt-in surface rule (allowlisted + SAST enabled + a diff) is enforced by
-    /// the caller only passing `Some` when all three hold, so an un-offered `run_sast` never reaches
-    /// `tools/list` or dispatch.
+    /// Like [`Self::new`], but also registers the `run_sast` tool (ADR-0073) when `sast` is `Some`,
+    /// applies the repo's `severity.min` (ADR-0030) when `min_priority` is `Some`, and registers the
+    /// `write_file`/`edit_file`/`list_directory` fs-tool trio (ADR-0104, story #497) when `fs_write` is
+    /// `true`. Used by the OpenCode review path's stdio MCP server (`lci-review-mcp`): `run_sast` runs
+    /// in that separate process exactly as it does in the native loop, reusing `lci-agent-sast`
+    /// verbatim. `sast: None` / `fs_write: false` leave those tools unregistered — the opt-in surface
+    /// rule is enforced by the caller, so an un-offered tool never reaches `tools/list` or dispatch. No
+    /// production caller passes `fs_write: true` today (see `tool_registry`'s doc comment).
     #[allow(clippy::too_many_arguments)]
     pub fn with_sast(
         client: &ControlPlaneClient,
@@ -197,6 +224,7 @@ impl Tools {
         discovered: impl IntoIterator<Item = ToolSpec>,
         sast: Option<SastToolConfig>,
         min_priority: Option<String>,
+        fs_write: bool,
     ) -> Result<Self, RegistryError> {
         Ok(Self {
             registry: tool_registry(
@@ -206,6 +234,7 @@ impl Tools {
                 RuntimeCaps::default(),
                 sast,
                 min_priority,
+                fs_write,
             )?,
             workspace: EagerWorkspace(checkout_root.to_path_buf()),
             task_id,
@@ -280,6 +309,27 @@ mod tests {
         }
     }
 
+    // ADR-0104 / story #497 safety proof: `Tools::new` (used by every production review call site) sets
+    // `fs_write: false`, so `write_file`/`edit_file`/`list_directory` are unregistered — a call to any
+    // of them is refused as an unknown tool, not dispatched. Review must never gain write access.
+    #[tokio::test]
+    async fn fs_write_tools_are_unreachable_via_the_default_review_registry() {
+        let client = ControlPlaneClient::new("http://unused", "tok");
+        let embedder = EmbeddingsClient::new("http://unused", "key", "model");
+        let tools = Tools::new(&client, &embedder, Uuid::nil(), Path::new("/tmp"), []).unwrap();
+        for (name, args) in [
+            (WRITE_FILE, r#"{"path":"x","content":"y"}"#),
+            (EDIT_FILE, r#"{"path":"x","content":"y"}"#),
+            (LIST_DIRECTORY, r#"{}"#),
+        ] {
+            let outcome = tools.dispatch(&call("t", name, args)).await;
+            assert!(
+                matches!(&outcome, ToolOutcome::Continue(m) if m.contains("unknown tool")),
+                "{name} must be unreachable by default, got {outcome:?}"
+            );
+        }
+    }
+
     #[test]
     fn builtins_keep_the_legacy_order_and_full_schemas() {
         let specs = tool_defs();
@@ -318,6 +368,55 @@ mod tests {
         assert!(
             matches!(result, ToolOutcome::Continue(message) if message.contains("non-empty call id"))
         );
+    }
+
+    // The opt-in path (a future consumer, e.g. `open` mode): with `fs_write: true`, the trio dispatches
+    // through the same single registry every other tool does — proves the tools themselves work, not
+    // just that they're correctly withheld by default.
+    #[tokio::test]
+    async fn fs_write_tools_dispatch_when_explicitly_enabled() {
+        let cp = ControlPlaneClient::new("http://unused", "tok");
+        let emb = EmbeddingsClient::new("http://unused", "key", "model");
+        let checkout = tempfile::tempdir().unwrap();
+        let registry = tool_registry(
+            Arc::new(cp),
+            Arc::new(emb),
+            [],
+            RuntimeCaps::default(),
+            None,
+            None,
+            true,
+        )
+        .unwrap();
+        let workspace = EagerWorkspace(checkout.path().to_path_buf());
+        let cx = ToolCx {
+            task_id: Uuid::nil(),
+            workspace: &workspace,
+        };
+        let outcome = registry
+            .view(&TurnFilter::all())
+            .dispatch(
+                &cx,
+                &call("w", WRITE_FILE, r#"{"path":"new.txt","content":"hello"}"#),
+            )
+            .await;
+        let DispatchResult::Completed(ToolOutcome::Continue(message)) = outcome else {
+            panic!("expected a completed write, got {outcome:?}");
+        };
+        assert!(message.contains("wrote"), "{message}");
+        assert_eq!(
+            std::fs::read_to_string(checkout.path().join("new.txt")).unwrap(),
+            "hello"
+        );
+
+        let outcome = registry
+            .view(&TurnFilter::all())
+            .dispatch(&cx, &call("l", LIST_DIRECTORY, r#"{}"#))
+            .await;
+        assert!(matches!(
+            outcome,
+            DispatchResult::Completed(ToolOutcome::Continue(m)) if m.contains("new.txt")
+        ));
     }
 
     #[tokio::test]

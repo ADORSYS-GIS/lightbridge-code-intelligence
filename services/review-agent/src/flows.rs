@@ -240,6 +240,7 @@ mod tests {
             RuntimeCaps::default(),
             None,
             None,
+            false,
         )
         .unwrap();
         let workspace = eager_workspace(checkout.path().to_path_buf());
@@ -352,6 +353,7 @@ mod tests {
             RuntimeCaps::default(),
             None,
             None,
+            false,
         )
         .unwrap();
         let workspace = eager_workspace(checkout.path().to_path_buf());
