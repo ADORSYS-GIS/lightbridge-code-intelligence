@@ -338,7 +338,8 @@ mod tests {
         let config = prompt_config();
         let prior = "## Your previous review of this pull request\nPrior verdict: looks fine.";
 
-        let with_prior = build_messages(&config, "review again", None, None, Some(prior), None, None);
+        let with_prior =
+            build_messages(&config, "review again", None, None, Some(prior), None, None);
         let user = with_prior[1].content.as_deref().expect("user content");
         assert!(
             user.contains("Your previous review of this pull request"),
