@@ -20,3 +20,7 @@ serde_json.workspace = true
 # Per-turn `agent.turn` span (ticket #246) — bridged into an OTel span by whichever binary registers
 # `tracing-opentelemetry`'s layer process-wide; this crate itself stays otel-unaware.
 tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }
+uuid.workspace = true
