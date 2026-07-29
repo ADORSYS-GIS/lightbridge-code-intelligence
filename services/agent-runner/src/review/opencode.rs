@@ -488,7 +488,10 @@ mod sentinel_marker_tests {
         let event = read_sentinel_marker(&marker_path).await.expect("parses");
         assert_eq!(event.fatal_kind, SentinelFatalKind::ProviderError);
         assert_eq!(event.message, "provider unreachable");
-        assert_eq!(event.last_tool_call.as_deref(), Some("lightbridge_read_file"));
+        assert_eq!(
+            event.last_tool_call.as_deref(),
+            Some("lightbridge_read_file")
+        );
     }
 
     #[tokio::test]
