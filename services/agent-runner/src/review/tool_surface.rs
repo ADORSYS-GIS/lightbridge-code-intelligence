@@ -33,9 +33,7 @@ pub(crate) fn sast_explicitly_listed(review: &ReviewConfig) -> bool {
 pub(crate) fn github_mcp_explicitly_listed(review: &ReviewConfig) -> bool {
     review.tools.as_ref().is_some_and(|allow| {
         allow.iter().any(|selector| match selector {
-            ReviewToolSelector::Mcp(pattern) => {
-                pattern.as_str().starts_with("mcp__github__")
-            }
+            ReviewToolSelector::Mcp(pattern) => pattern.as_str().starts_with("mcp__github__"),
             ReviewToolSelector::Builtin(_) => false,
         })
     })
@@ -133,7 +131,6 @@ pub(crate) async fn resolve_offered_tools(
     (offered, dispatch_discovered)
 }
 
-
 #[cfg(test)]
 mod tests {
     use uuid::Uuid;
@@ -187,9 +184,9 @@ mod tests {
         assert!(!github_mcp_explicitly_listed(&review_config(Some(
             selectors(&["mcp__brave-search__brave_web_search"])
         ))));
-        assert!(github_mcp_explicitly_listed(&review_config(Some(selectors(
-            &["finish", "mcp__github__get_issue"]
-        )))));
+        assert!(github_mcp_explicitly_listed(&review_config(Some(
+            selectors(&["finish", "mcp__github__get_issue"])
+        ))));
     }
 
     async fn mock_no_knowledge_tools() -> MockServer {
