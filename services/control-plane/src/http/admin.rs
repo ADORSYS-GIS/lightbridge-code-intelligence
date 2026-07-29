@@ -130,28 +130,38 @@ async fn load_repo_ref(
         crate::db::RepositoryRow,
         crate::integrations::platform::RepoRef,
     ),
-    Response,
+    Box<Response>,
 > {
     let repo = match crate::db::get_repository_by_id(pool, id).await {
         Ok(Some(repo)) => repo,
-        Ok(None) => return Err((StatusCode::NOT_FOUND, "repository not found").into_response()),
+        Ok(None) => {
+            return Err(Box::new(
+                (StatusCode::NOT_FOUND, "repository not found").into_response(),
+            ));
+        }
         Err(error) => {
             tracing::error!(%error, repo_id = id, "admin preset endpoint: repository lookup failed");
-            return Err((StatusCode::INTERNAL_SERVER_ERROR, "query error").into_response());
+            return Err(Box::new(
+                (StatusCode::INTERNAL_SERVER_ERROR, "query error").into_response(),
+            ));
         }
     };
     let installation_id = match crate::db::repository_installation_id(pool, id).await {
         Ok(Some(installation_id)) => installation_id,
         Ok(None) => {
-            return Err((
-                StatusCode::CONFLICT,
-                "repository has no recorded installation id yet (no webhook has been received for it)",
-            )
-                .into_response());
+            return Err(Box::new(
+                (
+                    StatusCode::CONFLICT,
+                    "repository has no recorded installation id yet (no webhook has been received for it)",
+                )
+                    .into_response(),
+            ));
         }
         Err(error) => {
             tracing::error!(%error, repo_id = id, "admin preset endpoint: installation id lookup failed");
-            return Err((StatusCode::INTERNAL_SERVER_ERROR, "query error").into_response());
+            return Err(Box::new(
+                (StatusCode::INTERNAL_SERVER_ERROR, "query error").into_response(),
+            ));
         }
     };
     let repo_ref = crate::integrations::platform::RepoRef {
@@ -169,14 +179,14 @@ fn pick_platform(
     state: &AppState,
     platform: crate::integrations::platform::Platform,
     installation_id: i64,
-) -> Result<&dyn crate::integrations::platform::CodePlatform, Response> {
+) -> Result<&dyn crate::integrations::platform::CodePlatform, Box<Response>> {
     use crate::integrations::platform::Platform;
     match platform {
         Platform::GitHub => match state.platforms.get(&Platform::GitHub) {
             Some(client) => Ok(client.as_ref()),
-            None => {
-                Err((StatusCode::SERVICE_UNAVAILABLE, "GitHub App not configured").into_response())
-            }
+            None => Err(Box::new(
+                (StatusCode::SERVICE_UNAVAILABLE, "GitHub App not configured").into_response(),
+            )),
         },
         Platform::GitLab => match state
             .gitlab
@@ -184,11 +194,13 @@ fn pick_platform(
             .and_then(|registry| registry.client_for_project(installation_id))
         {
             Some(client) => Ok(client),
-            None => Err((
-                StatusCode::SERVICE_UNAVAILABLE,
-                "GitLab project not configured",
-            )
-                .into_response()),
+            None => Err(Box::new(
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "GitLab project not configured",
+                )
+                    .into_response(),
+            )),
         },
         Platform::Bitbucket => match state
             .bitbucket
@@ -196,11 +208,13 @@ fn pick_platform(
             .and_then(|registry| registry.client_for_project(installation_id))
         {
             Some(client) => Ok(client),
-            None => Err((
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Bitbucket repo not configured",
-            )
-                .into_response()),
+            None => Err(Box::new(
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Bitbucket repo not configured",
+                )
+                    .into_response(),
+            )),
         },
     }
 }
@@ -223,11 +237,11 @@ pub async fn get_preset(
     };
     let (repo, repo_ref) = match load_repo_ref(pool, id).await {
         Ok(pair) => pair,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let platform = match pick_platform(&state, repo.platform, repo_ref.installation_id) {
         Ok(platform) => platform,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let config = crate::preset::fetch_repo_preset_config(platform, &repo_ref, &repo.default_branch)
         .await
@@ -266,11 +280,11 @@ pub async fn set_preset(
     };
     let (repo, repo_ref) = match load_repo_ref(pool, id).await {
         Ok(pair) => pair,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let platform = match pick_platform(&state, repo.platform, repo_ref.installation_id) {
         Ok(platform) => platform,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let current = match platform
         .get_repo_file(&repo_ref, &repo.default_branch, CONFIG_FILENAME)
