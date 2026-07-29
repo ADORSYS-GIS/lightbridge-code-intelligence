@@ -292,8 +292,10 @@ mod tests {
     #[test]
     fn filter_diff_focus_wins_over_a_matching_ignore_glob() {
         let diff = section("vendor/important.rs", "@@ -1,1 +1,1 @@\n-old\n+new\n");
-        let filter =
-            DiffFilter::build_for_test(&["vendor/important.rs".to_string()], &["vendor/**".to_string()]);
+        let filter = DiffFilter::build_for_test(
+            &["vendor/important.rs".to_string()],
+            &["vendor/**".to_string()],
+        );
         let (filtered_diff, files) =
             filter_diff(&diff, vec!["vendor/important.rs".to_string()], &filter);
         assert_eq!(files, vec!["vendor/important.rs".to_string()]);
@@ -308,7 +310,8 @@ mod tests {
              rename from old_name.rs\nrename to vendor/new_name.rs\n"
             .to_string();
         let filter = DiffFilter::build_for_test(&[], &["vendor/**".to_string()]);
-        let (filtered_diff, files) = filter_diff(&diff, vec!["vendor/new_name.rs".to_string()], &filter);
+        let (filtered_diff, files) =
+            filter_diff(&diff, vec!["vendor/new_name.rs".to_string()], &filter);
         assert!(files.is_empty());
         assert!(filtered_diff.is_empty());
     }

@@ -6,7 +6,9 @@ use std::collections::HashSet;
 
 use lci_agent_clients::ControlPlaneClient;
 use lci_agent_types::ToolSpec;
-use lci_review_agent::tools::{ADD_REVIEW_COMMENT, FINISH, RUN_SAST, tool_defs};
+#[cfg(test)]
+use lci_review_agent::tools::FINISH;
+use lci_review_agent::tools::{ADD_REVIEW_COMMENT, RUN_SAST, tool_defs};
 use uuid::Uuid;
 
 use crate::bootstrap::config::{McpToolPattern, ReviewConfig, ReviewTool, ReviewToolSelector};
@@ -114,7 +116,6 @@ pub(crate) async fn resolve_offered_tools(
     }
     (offered, dispatch_discovered)
 }
-
 
 #[cfg(test)]
 mod tests {

@@ -1413,7 +1413,10 @@ async fn handle_pull_request(
                 installation_id,
             };
             let preset = crate::preset::resolve_preset_or_default(
-                state.platforms.get(&Platform::GitHub).map(std::sync::Arc::as_ref),
+                state
+                    .platforms
+                    .get(&Platform::GitHub)
+                    .map(std::sync::Arc::as_ref),
                 &repo_ref,
                 base_sha.as_deref().unwrap_or(default_branch),
                 crate::preset::EntryPoint::PrOpen,
@@ -2679,7 +2682,10 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("x-gitlab-event", "Merge Request Hook".parse().unwrap());
         headers.insert("x-gitlab-token", "no-config-secret".parse().unwrap());
-        headers.insert("x-gitlab-event-uuid", "no-config-test-uuid".parse().unwrap());
+        headers.insert(
+            "x-gitlab-event-uuid",
+            "no-config-test-uuid".parse().unwrap(),
+        );
         let payload = serde_json::json!({
             "object_attributes": {
                 "action": "open",
@@ -2699,12 +2705,13 @@ mod tests {
         let response = webhook_router_body(state, headers, body).await;
         assert_eq!(response.status(), StatusCode::ACCEPTED);
 
-        let preset: String =
-            sqlx::query_scalar("SELECT preset FROM tasks WHERE repository_id = $1 AND target_id = 9")
-                .bind(repo_id)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let preset: String = sqlx::query_scalar(
+            "SELECT preset FROM tasks WHERE repository_id = $1 AND target_id = 9",
+        )
+        .bind(repo_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(
             preset, "fast",
             "no repo config → the platform-default pr_open mapping applies (ADR-0062 behavior preserved)"
