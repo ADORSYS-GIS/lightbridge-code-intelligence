@@ -571,13 +571,12 @@ pub fn validate(findings: Vec<Finding>, diff: &HashMap<String, DiffLines>) -> Va
         // the diff keys — otherwise `./src/x`, `/src/x` or `src\x` would miss the lookup and
         // a valid finding would be wrongly dropped as out of scope.
         finding.file = normalize_path(&finding.file);
-        let key = (finding.file.clone(), finding.line, finding.title.clone());
-        if !seen.insert(key) {
-            continue; // duplicate
-        }
         let in_changed_file = diff.contains_key(&finding.file);
         if scope_known && !in_changed_file {
-            review.out_of_scope.push(finding); // outside the PR diff — surfaced, not dropped
+            let key = (finding.file.clone(), finding.line, finding.title.clone());
+            if seen.insert(key) {
+                review.out_of_scope.push(finding); // outside the PR diff — surfaced, not dropped
+            }
             continue;
         }
         let file_diff = diff.get(&finding.file);
@@ -598,19 +597,29 @@ pub fn validate(findings: Vec<Finding>, diff: &HashMap<String, DiffLines>) -> Va
             None // line not visible in the diff at all — defer
         };
 
+        // Dedup using the resolved anchor (or original line if deferred) so multiple context-line
+        // findings clamping to the same added line collapse into one, preventing duplicate comments.
+        let dedup_line = anchor.unwrap_or(finding.line);
+        let key = (finding.file.clone(), dedup_line, finding.title.clone());
+        if !seen.insert(key) {
+            continue; // duplicate
+        }
+
         if let Some(line) = anchor.filter(|&l| l > 0) {
             // Use the (possibly clamped) anchor line for the GitLab position while keeping the
             // original finding body, which still references the correct code context.
-            let clamped_finding = if line != finding.line {
-                Finding {
+            let (body, start_line) = if line != finding.line {
+                // If we clamped, strip the suggestion and range so we don't mis-apply a fix to the wrong line.
+                let clamped = Finding {
                     line,
+                    start_line: None,
+                    suggestion: None,
                     ..finding.clone()
-                }
+                };
+                (inline_body(&clamped), None)
             } else {
-                finding.clone()
+                (inline_body(&finding), validated_range_start(&finding, all))
             };
-            let start_line = validated_range_start(&clamped_finding, all);
-            let body = inline_body(&finding); // body always from original finding
             review.inline.push(InlineComment {
                 path: finding.file,
                 line,
@@ -1460,6 +1469,29 @@ mod tests {
     //
     // PATCH produces: added={2,3} (the `+` lines), all={1,2,3,4} (added + context).
     // Line 1 is ` let a = 1;` (context), line 4 is ` println!` (context).
+
+    #[test]
+    fn validate_clamps_context_line_to_nearest_added_line_stripping_suggestion() {
+        let mut commentable: HashMap<String, DiffLines> = HashMap::new();
+        commentable.insert("src/main.rs".to_string(), diff_lines(PATCH));
+
+        // Line 1 is a context line. We provide a suggestion and a range.
+        let mut f = finding("src/main.rs", 1, "Context line finding");
+        f.start_line = Some(1);
+        f.suggestion = Some("replacement text".to_string());
+
+        let review = validate(vec![f], &commentable);
+        assert_eq!(review.inline.len(), 1);
+        assert_eq!(review.inline[0].line, 2, "Clamped to nearest added line 2");
+        assert_eq!(
+            review.inline[0].start_line, None,
+            "Range stripped when clamped"
+        );
+        assert!(
+            !review.inline[0].body.contains("```suggestion"),
+            "Suggestion fence stripped to prevent mis-application"
+        );
+    }
 
     #[test]
     fn validate_clamps_context_line_to_nearest_added_line() {
