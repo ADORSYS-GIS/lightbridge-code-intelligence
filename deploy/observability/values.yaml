@@ -61,6 +61,7 @@ dashboards:
   review-quality: true
   review-runs: true
   review-cost: true
+  review-delivery: true
   feedback: true
   ingress-dispatcher: true
   operations: true
