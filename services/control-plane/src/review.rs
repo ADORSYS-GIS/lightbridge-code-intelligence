@@ -488,15 +488,6 @@ pub fn diff_lines(patch: &str) -> DiffLines {
     result
 }
 
-/// The RIGHT-side (new file) line numbers that are commentable for one file's unified-diff `patch` —
-/// the added (`+`) and context (` `) lines within the hunks. GitHub only accepts inline comments on
-/// these lines.
-///
-/// This is a thin convenience wrapper around [`diff_lines`] that returns `DiffLines::all`.
-pub fn commentable_lines(patch: &str) -> BTreeSet<u32> {
-    diff_lines(patch).all
-}
-
 /// Find the nearest **added** (`+`) line to `target` within `max_delta` lines on either side.
 /// Returns `None` when the added set is empty or no added line falls within the window.
 ///
@@ -520,10 +511,18 @@ pub fn nearest_added_line(target: u32, added: &BTreeSet<u32>, max_delta: u32) ->
             }
         }
         (Some(b), None) => {
-            if target.saturating_sub(b) <= max_delta { Some(b) } else { None }
+            if target.saturating_sub(b) <= max_delta {
+                Some(b)
+            } else {
+                None
+            }
         }
         (None, Some(a)) => {
-            if a.saturating_sub(target) <= max_delta { Some(a) } else { None }
+            if a.saturating_sub(target) <= max_delta {
+                Some(a)
+            } else {
+                None
+            }
         }
         (None, None) => None,
     }
@@ -562,10 +561,7 @@ const CLAMP_MAX_DELTA: u32 = 5;
 /// Safety valve: when `diff` is empty we couldn't determine the change set (e.g. no patchable
 /// files), so we don't know what's in scope — fall back to deferring everything rather than
 /// dropping the whole review.
-pub fn validate(
-    findings: Vec<Finding>,
-    diff: &HashMap<String, DiffLines>,
-) -> ValidatedReview {
+pub fn validate(findings: Vec<Finding>, diff: &HashMap<String, DiffLines>) -> ValidatedReview {
     let scope_known = !diff.is_empty();
     let mut seen: HashSet<(String, u32, String)> = HashSet::new();
     let mut review = ValidatedReview::default();
@@ -606,7 +602,10 @@ pub fn validate(
             // Use the (possibly clamped) anchor line for the GitLab position while keeping the
             // original finding body, which still references the correct code context.
             let clamped_finding = if line != finding.line {
-                Finding { line, ..finding.clone() }
+                Finding {
+                    line,
+                    ..finding.clone()
+                }
             } else {
                 finding.clone()
             };
@@ -631,7 +630,7 @@ pub fn validate(
 /// - `start_line <= line` (GitHub always treats `line` as the range's *last* line), and
 /// - every line from `start_line` to `line` (inclusive) is in the file's `commentable` set.
 ///
-/// That last check is both the contiguity check AND the single-hunk check: [`commentable_lines`] only
+/// That last check is both the contiguity check AND the single-hunk check: [`diff_lines`] only
 /// ever inserts a line that is actually an added/context line inside some hunk, and hunks never share
 /// line numbers (they're strictly increasing down the file), so a contiguous run of membership can only
 /// come from one hunk. GitHub itself rejects a range that crosses a hunk boundary or starts on a
@@ -901,13 +900,6 @@ mod tests {
 
     // Explicit `\n` (no backslash-continuation) so the leading diff markers (' ', '+', '-') survive.
     const PATCH: &str = "@@ -1,3 +1,4 @@ fn main() {\n let a = 1;\n-    let b = 2;\n+    let b = 3;\n+    let c = 4;\n println!(\"{a}\");";
-
-    #[test]
-    fn commentable_lines_are_added_and_context() {
-        let lines = commentable_lines(PATCH);
-        // new side: 1 (context ' let a'), 2 (+let b), 3 (+let c), 4 (context println)
-        assert_eq!(lines.iter().copied().collect::<Vec<_>>(), vec![1, 2, 3, 4]);
-    }
 
     fn finding(file: &str, line: u32, title: &str) -> Finding {
         Finding {
@@ -1475,8 +1467,15 @@ mod tests {
         commentable.insert("src/main.rs".to_string(), diff_lines(PATCH));
 
         // Line 1 is a context line; nearest added line is 2 (delta 1 ≤ CLAMP_MAX_DELTA).
-        let review = validate(vec![finding("src/main.rs", 1, "context line finding")], &commentable);
-        assert_eq!(review.inline.len(), 1, "context-line finding is posted inline via clamping");
+        let review = validate(
+            vec![finding("src/main.rs", 1, "context line finding")],
+            &commentable,
+        );
+        assert_eq!(
+            review.inline.len(),
+            1,
+            "context-line finding is posted inline via clamping"
+        );
         assert_eq!(review.inline[0].line, 2, "clamped to nearest added line");
         // The body still carries the original finding title.
         assert!(review.inline[0].body.contains("context line finding"));
@@ -1490,8 +1489,15 @@ mod tests {
         let mut commentable: HashMap<String, DiffLines> = HashMap::new();
         commentable.insert("src/main.rs".to_string(), diff_lines(context_only_patch));
 
-        let review = validate(vec![finding("src/main.rs", 1, "no added line nearby")], &commentable);
-        assert_eq!(review.inline.len(), 0, "no added line to clamp to → deferred");
+        let review = validate(
+            vec![finding("src/main.rs", 1, "no added line nearby")],
+            &commentable,
+        );
+        assert_eq!(
+            review.inline.len(),
+            0,
+            "no added line to clamp to → deferred"
+        );
         assert_eq!(review.deferred.len(), 1);
     }
 

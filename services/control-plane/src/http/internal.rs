@@ -1572,10 +1572,7 @@ pub async fn finalize_review(
             match platform.list_changed_files(&repo_ref, pr).await {
                 Ok(files) => files
                     .into_iter()
-                    .filter_map(|f| {
-                        f.patch
-                            .map(|p| (f.path, crate::review::diff_lines(&p)))
-                    })
+                    .filter_map(|f| f.patch.map(|p| (f.path, crate::review::diff_lines(&p))))
                     .collect(),
                 Err(error) => {
                     tracing::error!(%error, task_id = %id, "fetching PR files failed");
