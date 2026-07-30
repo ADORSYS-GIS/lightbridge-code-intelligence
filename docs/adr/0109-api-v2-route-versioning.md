@@ -23,16 +23,18 @@ Health probes (`/healthz`, `/readyz`) and `/metrics` stay at root because they a
 Kubernetes and Prometheus respectively, not by API clients. Moving them would require coordinating
 changes in every Helm chart and monitoring config with no user-facing benefit.
 
-The version prefix is applied at the lowest possible level in each client — inside the constructor
-— so env vars (`CONTROL_PLANE_URL`, `api_url`) carry the bare origin and no operator config
-needs to change:
+The version prefix is carried in the env var, not appended by client constructors. Each client
+trims trailing slashes and uses the value as-is:
 
-- `apps/web`: `controlPlaneUrl()` defaults to `http://localhost:8080/api/v2`
-- `lci` CLI: `ApiClient::new()` appends `/api/v2` to `self.base`
-- `agent-clients`: `ControlPlaneClient::new()` appends `/api/v2` to `self.base_url`
+- `apps/web`: `controlPlaneUrl()` uses `CONTROL_PLANE_URL` / `AUTH_BACKEND_URL` as-is
+- `lci` CLI: `ApiClient::new()` trims trailing slashes; `api_url` must include `/api/v2`
+- `agent-clients`: `ControlPlaneClient::new()` trims trailing slashes; `CONTROL_PLANE_INTERNAL_URL` must include `/api/v2`
 
-The cutover is hard — old flat paths return 404 immediately after deployment. Every consumer is
-updated in the same change to avoid a broken intermediate state.
+The chart values are updated in the companion Helm PR (ADORSYS-GIS/ai-helm) to append `/api/v2`
+to `CONTROL_PLANE_INTERNAL_URL` and `AUTH_BACKEND_URL`.
+
+The cutover is hard — old flat paths return 404 immediately after deployment. The chart update
+must be deployed in the same window as this image to avoid downtime.
 
 ## Consequences
 
@@ -40,5 +42,6 @@ updated in the same change to avoid a broken intermediate state.
   introduce under `/api/v3` without affecting existing clients.
 - The single `api_v2_router()` function is the canonical list of all versioned routes; adding a
   route requires touching one place.
-- Operators must ensure `CONTROL_PLANE_URL` points at the bare service origin (no `/api/v2`
-  suffix), which is the existing convention.
+- Operators must ensure `CONTROL_PLANE_INTERNAL_URL` and `AUTH_BACKEND_URL` include `/api/v2`.
+  The chart default values are updated accordingly (ADORSYS-GIS/ai-helm#817). Local dev env vars
+  must also be updated if set explicitly.
