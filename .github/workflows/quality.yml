@@ -124,6 +124,11 @@ jobs:
           path: .ci/quality/reports/
           retention-days: 30
 
+      - name: Install reviewdog
+        uses: reviewdog/action-setup@v1
+        with:
+          reviewdog_version: latest
+
       # Report merged findings to GitHub PR via reviewdog (PR context only).
       - name: Report findings to PR (reviewdog)
         if: |
