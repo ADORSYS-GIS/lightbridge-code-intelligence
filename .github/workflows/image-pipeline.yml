@@ -173,12 +173,16 @@ jobs:
       # Let podman resolve bare base-image names (node:22-slim, python:…, debian:…) to Docker Hub
       # non-interactively; gcr.io/distroless is already fully qualified. Written to the per-user
       # config (no sudo); the host's registries.conf.d short-name aliases are still merged in.
-      - name: Configure podman registries
+      - name: Configure podman registries and runtime
         run: |
           mkdir -p "$HOME/.config/containers"
           cat > "$HOME/.config/containers/registries.conf" <<'EOF'
           unqualified-search-registries = ["docker.io"]
           short-name-mode = "permissive"
+          EOF
+          cat > "$HOME/.config/containers/containers.conf" <<'EOF'
+          [engine]
+          runtime = "runc"
           EOF
       - name: Stage build context
         id: ctx
