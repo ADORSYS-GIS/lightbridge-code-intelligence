@@ -41,7 +41,7 @@ concurrency:
 
 jobs:
   lint:
-    runs-on: [self-hosted, vymalo-vps]
+    runs-on: ubuntu-latest
     # The `vymalo-vps` label now resolves to ARC pod runners whose image
     # (ghcr.io/vymalo/arc-runners:jdk21-node22) already bakes build-essential + rustup stable
     # (clippy/rustfmt/rust-src) + cargo-llvm-cov + sccache. There is no Docker daemon on these pods,

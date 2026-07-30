@@ -39,7 +39,7 @@ permissions:
 jobs:
   # ── Compile the Rust workspace natively → one static-musl binary per service ──────────────────────
   rust-build:
-    runs-on: [self-hosted, vymalo-vps]
+    runs-on: ubuntu-latest
     # The `vymalo-vps` label now resolves to ARC pod runners whose image
     # (ghcr.io/vymalo/arc-runners:jdk21-node22) bakes build-essential + rustup stable + sccache. No
     # Docker daemon on these pods, so steps run directly on the runner — no `container:` wrapper.
@@ -86,7 +86,7 @@ jobs:
 
   # ── Compile the Next.js app natively → the standalone bundle ──────────────────────────────────────
   web-build:
-    runs-on: [self-hosted, vymalo-vps]
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -120,7 +120,7 @@ jobs:
   # ── Assemble images from the prebuilt artifacts, daemonless, with rootless podman ─────────────────
   images:
     needs: [rust-build, web-build]
-    runs-on: [self-hosted, vymalo-vps]
+    runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write # push (inputs.push only)

@@ -21,7 +21,7 @@ permissions:
 
 jobs:
   generate-and-verify:
-    runs-on: [self-hosted, vymalo-vps]
+    runs-on: ubuntu-latest
     # The `vymalo-vps` label now resolves to ARC pod runners (Ubuntu 24.04 noble base) whose image
     # already ships system `python3` (3.12) + `python3-venv` + git. No Docker daemon on these pods, so
     # steps run directly on the runner — no `container:` wrapper. The dependencies are installed into a
@@ -45,7 +45,7 @@ jobs:
           fi
 
   helm-lint:
-    runs-on: [self-hosted, vymalo-vps]
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: azure/setup-helm@v4
