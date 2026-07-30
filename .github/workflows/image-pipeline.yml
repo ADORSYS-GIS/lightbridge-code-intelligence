@@ -156,6 +156,10 @@ jobs:
             artifact: rust-bins
     steps:
       - uses: actions/checkout@v4 # the Dockerfiles
+      - name: Lowercase repository owner
+        id: owner
+        run: |
+          echo "owner=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
       - uses: actions/cache/restore@v4
         with:
           path: ${{ matrix.artifact == 'rust-bins' && 'dist' || 'web' }}
@@ -199,7 +203,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}
+          images: ghcr.io/${{ steps.owner.outputs.owner }}/${{ matrix.image }}
           tags: |
             type=semver,pattern={{version}},value=${{ inputs.version }},enable=${{ inputs.version != '' }}
             type=ref,event=branch,enable=${{ inputs.version == '' }}
@@ -220,13 +224,13 @@ jobs:
       - name: Report image size
         continue-on-error: true
         run: |
-          size=$(podman images --format '{{.Size}}' "ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}" | head -1)
+          size=$(podman images --format '{{.Size}}' "ghcr.io/${{ steps.owner.outputs.owner }}/${{ matrix.image }}" | head -1)
           printf '### 📦 %s\n\n**%s**\n' "${{ matrix.image }}" "$size" >> "$GITHUB_STEP_SUMMARY"
       # push=true only: push every tag, then cosign-sign the (single) digest they share.
       - name: Push + sign
         if: ${{ inputs.push }}
         env:
-          IMAGE: ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}
+          IMAGE: ghcr.io/${{ steps.owner.outputs.owner }}/${{ matrix.image }}
           TAGS: ${{ steps.meta.outputs.tags }}
         run: |
           # podman pushes the image; cosign pushes the signature — each needs its own GHCR login.

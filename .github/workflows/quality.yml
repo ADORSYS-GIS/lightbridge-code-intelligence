@@ -66,6 +66,39 @@ jobs:
       - name: Add gitleaks to PATH
         run: echo "${{ runner.tool_cache }}/gitleaks-bin" >> "$GITHUB_PATH"
 
+      - name: Cache hadolint binary
+        id: hadolint-cache
+        uses: actions/cache@9255dc7a253b0ccc959486e2bca901246202afeb # v5.0.1
+        with:
+          path: ${{ runner.tool_cache }}/hadolint-bin
+          key: hadolint-bin-2.12.0-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Install hadolint
+        if: steps.hadolint-cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p "${{ runner.tool_cache }}/hadolint-bin"
+          curl -sL -o "${{ runner.tool_cache }}/hadolint-bin/hadolint" https://github.com/hadolint/hadolint/releases/download/v2.12.0/hadolint-Linux-x86_64
+          chmod +x "${{ runner.tool_cache }}/hadolint-bin/hadolint"
+
+      - name: Add hadolint to PATH
+        run: echo "${{ runner.tool_cache }}/hadolint-bin" >> "$GITHUB_PATH"
+
+      - name: Cache semgrep venv
+        id: semgrep-cache
+        uses: actions/cache@9255dc7a253b0ccc959486e2bca901246202afeb # v5.0.1
+        with:
+          path: ${{ runner.tool_cache }}/semgrep-venv
+          key: semgrep-venv-1.70.0-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Install semgrep
+        if: steps.semgrep-cache.outputs.cache-hit != 'true'
+        run: |
+          python3 -m venv "${{ runner.tool_cache }}/semgrep-venv"
+          "${{ runner.tool_cache }}/semgrep-venv/bin/pip" install semgrep==1.70.0
+
+      - name: Add semgrep to PATH
+        run: echo "${{ runner.tool_cache }}/semgrep-venv/bin" >> "$GITHUB_PATH"
+
       # Run all quality scanners (SAST, secrets, dependency, infra, linting).
       - name: Run quality scanners
         env:
