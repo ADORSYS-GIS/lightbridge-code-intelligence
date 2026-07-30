@@ -9,11 +9,14 @@ import type { ApiResult } from "@/lib/server/api";
  * (returns 403 for non-admins). Used by the admin approval screen.
  */
 
+/** Control-plane base URL. `AUTH_BACKEND_URL` is set by the Helm chart and must include the
+ * `/api/v2` prefix (e.g. `http://control-plane:8080/api/v2` — ADR-0109). The localhost fallback
+ * includes the prefix so local dev without an explicit env override works out of the box. */
 function controlPlaneUrl(): string {
   return (
     process.env.CONTROL_PLANE_URL ??
     process.env.AUTH_BACKEND_URL ??
-    "http://localhost:8080"
+    "http://localhost:8080/api/v2"
   ).replace(/\/+$/, "");
 }
 
