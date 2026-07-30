@@ -2675,7 +2675,7 @@ mod tests {
         });
         let body = Bytes::from(serde_json::to_vec(&payload).unwrap());
 
-        let response = gitlab_webhook_body(state, 1001, headers, body).await;
+        let response = gitlab_webhook_body(state, 2001, headers, body).await;
         assert_eq!(response.status(), StatusCode::ACCEPTED);
 
         let (preset, entry_point): (String, String) = sqlx::query_as(
@@ -2768,7 +2768,7 @@ mod tests {
         });
         let body = Bytes::from(serde_json::to_vec(&payload).unwrap());
 
-        let response = gitlab_webhook_body(state, 1001, headers, body).await;
+        let response = gitlab_webhook_body(state, 2002, headers, body).await;
         assert_eq!(response.status(), StatusCode::ACCEPTED);
 
         let preset: String = sqlx::query_scalar(

@@ -181,7 +181,7 @@ impl ApiClient {
     pub fn new(http: reqwest::Client, base: impl Into<String>, token: impl Into<String>) -> Self {
         Self {
             http,
-            base: base.into(),
+            base: base.into().trim_end_matches('/').to_string(),
             token: std::sync::Arc::new(tokio::sync::RwLock::new(token.into())),
         }
     }

@@ -181,7 +181,7 @@ pub struct ControlPlaneClient {
 impl ControlPlaneClient {
     pub fn new(base_url: impl Into<String>, token: impl Into<String>) -> Self {
         Self {
-            base_url: base_url.into(),
+            base_url: base_url.into().trim_end_matches('/').to_string(),
             token: token.into(),
             http: reqwest::Client::new(),
         }

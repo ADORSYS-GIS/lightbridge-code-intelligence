@@ -9,7 +9,7 @@ use directories::ProjectDirs;
 use std::path::PathBuf;
 
 /// Default control-plane base URL (prod). Override with `CONTROL_PLANE_URL`.
-pub const DEFAULT_API_URL: &str = "https://code-intelligence-api.ai.camer.digital";
+pub const DEFAULT_API_URL: &str = "https://code-intelligence-api.ai.camer.digital/api/v2";
 /// Default OIDC issuer (Keycloak realm). Override with `OIDC_ISSUER`.
 pub const DEFAULT_ISSUER: &str = "https://auth.verif.fyi/realms/camer-digital";
 /// Default public client id. Override with `OIDC_CLIENT_ID`.
