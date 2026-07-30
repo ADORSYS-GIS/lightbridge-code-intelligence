@@ -9,12 +9,14 @@ import type { Review, Task } from "@/lib/domain/tasks";
  * token as a Bearer credential — the same token the control plane validates (ADR-0014).
  */
 
-/** Control-plane base URL. `AUTH_BACKEND_URL` is the in-cluster Service name set by the chart. */
+/** Control-plane base URL. `AUTH_BACKEND_URL` is set by the Helm chart and must include the
+ * `/api/v2` prefix (e.g. `http://control-plane:8080/api/v2` — ADR-0109). The localhost fallback
+ * includes the prefix so local dev without an explicit env override works out of the box. */
 function controlPlaneUrl(): string {
   return (
     process.env.CONTROL_PLANE_URL ??
     process.env.AUTH_BACKEND_URL ??
-    "http://localhost:8080"
+    "http://localhost:8080/api/v2"
   ).replace(/\/+$/, "");
 }
 
