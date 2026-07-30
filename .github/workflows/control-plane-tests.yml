@@ -32,7 +32,7 @@ concurrency:
 
 jobs:
   test:
-    runs-on: [self-hosted, vymalo-vps]
+    runs-on: ubuntu-latest
     # The `vymalo-vps` label now resolves to ARC pod runners whose image
     # (ghcr.io/vymalo/arc-runners:jdk21-node22) bakes build-essential + rustup stable + sccache +
     # rootless podman. There is no Docker daemon on these pods, so GitHub Actions `services:` (which

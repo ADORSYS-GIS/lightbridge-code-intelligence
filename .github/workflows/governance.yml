@@ -33,7 +33,7 @@ jobs:
     # blocked). The check is a lightweight github-script PR-body validation — no toolchain or
     # container needed, so the bare runner suffices.
     with:
-      runs-on: vymalo-vps
+      runs-on: ubuntu-latest
     permissions:
       pull-requests: write
       contents: read
