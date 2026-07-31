@@ -447,11 +447,24 @@ pub struct ValidatedReview {
     pub out_of_scope: Vec<Finding>,
 }
 
-/// The RIGHT-side (new file) line numbers that are commentable for one file's unified-diff `patch` —
-/// the added (`+`) and context (` `) lines within the hunks. GitHub only accepts inline comments on
-/// these lines.
-pub fn commentable_lines(patch: &str) -> BTreeSet<u32> {
-    let mut lines = BTreeSet::new();
+/// Per-file line sets derived from a unified-diff patch, split by line type so that inline
+/// comment anchors can be validated per-platform:
+///
+/// - `added`: only `+` lines (new content). GitLab's discussions API **requires** the `new_line`
+///   position to land on one of these; sending a context-line position returns a hard `400`.
+/// - `all`: `+` and ` ` (context) lines. GitHub accepts both; `all` is used for scope checks and
+///   the GitHub anchor path.
+#[derive(Debug, Default)]
+pub struct DiffLines {
+    /// Only newly-added (`+`) lines on the new-file side.
+    pub added: BTreeSet<u32>,
+    /// Both added (`+`) and unchanged-context (` `) lines visible in the diff hunk.
+    pub all: BTreeSet<u32>,
+}
+
+/// Parse a unified-diff `patch` into a [`DiffLines`] that separates added lines from context.
+pub fn diff_lines(patch: &str) -> DiffLines {
+    let mut result = DiffLines::default();
     let mut new_line: u32 = 0;
     for raw in patch.lines() {
         if let Some(start) = parse_hunk_new_start(raw) {
@@ -460,18 +473,59 @@ pub fn commentable_lines(patch: &str) -> BTreeSet<u32> {
         }
         match raw.as_bytes().first() {
             Some(b'+') => {
-                lines.insert(new_line);
+                result.added.insert(new_line);
+                result.all.insert(new_line);
                 new_line += 1;
             }
             Some(b' ') => {
-                lines.insert(new_line);
+                result.all.insert(new_line);
                 new_line += 1;
             }
             Some(b'-') => { /* deleted line — no new-side number */ }
             _ => { /* "\ No newline at end of file", etc. */ }
         }
     }
-    lines
+    result
+}
+
+/// Find the nearest **added** (`+`) line to `target` within `max_delta` lines on either side.
+/// Returns `None` when the added set is empty or no added line falls within the window.
+///
+/// This is used to clamp an AI-suggested line that lands on an unchanged context line to the
+/// closest truly-added line in the same hunk, preventing GitLab `400` rejections caused by
+/// context-line positions (see ADR-0033 — line-number resolution).
+pub fn nearest_added_line(target: u32, added: &BTreeSet<u32>, max_delta: u32) -> Option<u32> {
+    // Range ..=target to pick the closest element at-or-before target.
+    let before = added.range(..=target).next_back().copied();
+    // Range target.. to pick the closest element at-or-after target.
+    let after = added.range(target..).next().copied();
+    match (before, after) {
+        (Some(b), Some(a)) => {
+            let db = target.saturating_sub(b);
+            let da = a.saturating_sub(target);
+            // Prefer the closer one; ties go to the earlier line (lower delta, i.e. `b`).
+            if db <= da {
+                if db <= max_delta { Some(b) } else { None }
+            } else {
+                if da <= max_delta { Some(a) } else { None }
+            }
+        }
+        (Some(b), None) => {
+            if target.saturating_sub(b) <= max_delta {
+                Some(b)
+            } else {
+                None
+            }
+        }
+        (None, Some(a)) => {
+            if a.saturating_sub(target) <= max_delta {
+                Some(a)
+            } else {
+                None
+            }
+        }
+        (None, None) => None,
+    }
 }
 
 /// Parse the new-side start line from a hunk header `@@ -a,b +c,d @@` → `c`.
@@ -485,49 +539,90 @@ fn parse_hunk_new_start(line: &str) -> Option<u32> {
     num.parse().ok()
 }
 
-/// Validate findings against the PR's changed files. `commentable` maps each **changed** file path →
-/// its commentable line set (from [`commentable_lines`]). Dedups by `(file, line, title)`.
+/// Maximum line-number delta for [`nearest_added_line`] clamping inside [`validate`].
+/// A context line more than this many lines from any added line is deferred rather than clamped.
+const CLAMP_MAX_DELTA: u32 = 5;
+
+/// Validate findings against the PR's changed files. `diff` maps each **changed** file path →
+/// its [`DiffLines`] (from [`diff_lines`]). Dedups by `(file, line, title)`.
 ///
 /// Scoping (a PR review reviews the PR, not the whole repo):
-/// - file is in the diff **and** the line is commentable → **inline** comment (with a ```suggestion
-///   block when the finding carries one);
-/// - file is in the diff but the line isn't anchorable → **deferred** to the body (still part of the
-///   change, just not pinnable);
-/// - file is **not** in the diff → **out of scope**, dropped (counted, not posted).
+/// - file is in the diff **and** the line is an **added** (`+`) line → **inline** comment;
+/// - file is in the diff and the line is a **context** (` `) line → the anchor is clamped to
+///   the nearest added line within [`CLAMP_MAX_DELTA`] lines; if none is close enough, deferred;
+/// - file is in the diff but the line isn't visible at all → **deferred** to the body;
+/// - file is **not** in the diff → **out of scope**, surfaced in a collapsed body section.
 ///
-/// Safety valve: when `commentable` is empty we couldn't determine the change set (e.g. no patchable
-/// files), so we don't know what's in scope — fall back to deferring everything rather than dropping
-/// the whole review.
-pub fn validate(
-    findings: Vec<Finding>,
-    commentable: &HashMap<String, BTreeSet<u32>>,
-) -> ValidatedReview {
-    let scope_known = !commentable.is_empty();
+/// The clamping step prevents `400 Bad Request` errors from GitLab's discussions API, which
+/// rejects position objects whose `new_line` lands on a context line rather than an added line
+/// (GitHub accepts both). By snapping the anchor to the nearest `+` line the inline comment
+/// still appears in the correct diff hunk without requiring per-platform branching at post time.
+///
+/// Safety valve: when `diff` is empty we couldn't determine the change set (e.g. no patchable
+/// files), so we don't know what's in scope — fall back to deferring everything rather than
+/// dropping the whole review.
+pub fn validate(findings: Vec<Finding>, diff: &HashMap<String, DiffLines>) -> ValidatedReview {
+    let scope_known = !diff.is_empty();
     let mut seen: HashSet<(String, u32, String)> = HashSet::new();
     let mut review = ValidatedReview::default();
 
     for mut finding in findings {
         // Normalize the model's path to the repo-root-relative, forward-slash form GitHub uses for
-        // the `commentable` keys — otherwise `./src/x`, `/src/x` or `src\x` would miss the lookup and
+        // the diff keys — otherwise `./src/x`, `/src/x` or `src\x` would miss the lookup and
         // a valid finding would be wrongly dropped as out of scope.
         finding.file = normalize_path(&finding.file);
-        let key = (finding.file.clone(), finding.line, finding.title.clone());
+        let in_changed_file = diff.contains_key(&finding.file);
+        if scope_known && !in_changed_file {
+            let key = (finding.file.clone(), finding.line, finding.title.clone());
+            if seen.insert(key) {
+                review.out_of_scope.push(finding); // outside the PR diff — surfaced, not dropped
+            }
+            continue;
+        }
+        let file_diff = diff.get(&finding.file);
+        let added = file_diff.map(|d| &d.added);
+        let all = file_diff.map(|d| &d.all);
+
+        // Resolve the line to anchor the inline comment on:
+        // 1. If the AI's line is already an added line → use it directly.
+        // 2. If it's a context line → clamp to nearest added line (prevents GitLab 400s).
+        // 3. Otherwise → defer to the review body.
+        let anchor = if added.is_some_and(|s| s.contains(&finding.line)) {
+            // Directly on an added line — always valid for both GitHub and GitLab.
+            Some(finding.line)
+        } else if all.is_some_and(|s| s.contains(&finding.line)) {
+            // Context line: valid for GitHub, rejected by GitLab. Clamp to nearest added line.
+            added.and_then(|s| nearest_added_line(finding.line, s, CLAMP_MAX_DELTA))
+        } else {
+            None // line not visible in the diff at all — defer
+        };
+
+        // Dedup using the resolved anchor (or original line if deferred) so multiple context-line
+        // findings clamping to the same added line collapse into one, preventing duplicate comments.
+        let dedup_line = anchor.unwrap_or(finding.line);
+        let key = (finding.file.clone(), dedup_line, finding.title.clone());
         if !seen.insert(key) {
             continue; // duplicate
         }
-        let in_changed_file = commentable.contains_key(&finding.file);
-        if scope_known && !in_changed_file {
-            review.out_of_scope.push(finding); // outside the PR diff — surfaced, not dropped
-            continue;
-        }
-        let file_lines = commentable.get(&finding.file);
-        let anchorable = file_lines.is_some_and(|lines| lines.contains(&finding.line));
-        if anchorable && finding.line > 0 {
-            let start_line = validated_range_start(&finding, file_lines);
-            let body = inline_body(&finding);
+
+        if let Some(line) = anchor.filter(|&l| l > 0) {
+            // Use the (possibly clamped) anchor line for the GitLab position while keeping the
+            // original finding body, which still references the correct code context.
+            let (body, start_line) = if line != finding.line {
+                // If we clamped, strip the suggestion and range so we don't mis-apply a fix to the wrong line.
+                let clamped = Finding {
+                    line,
+                    start_line: None,
+                    suggestion: None,
+                    ..finding.clone()
+                };
+                (inline_body(&clamped), None)
+            } else {
+                (inline_body(&finding), validated_range_start(&finding, all))
+            };
             review.inline.push(InlineComment {
                 path: finding.file,
-                line: finding.line,
+                line,
                 start_line,
                 body,
             });
@@ -544,7 +639,7 @@ pub fn validate(
 /// - `start_line <= line` (GitHub always treats `line` as the range's *last* line), and
 /// - every line from `start_line` to `line` (inclusive) is in the file's `commentable` set.
 ///
-/// That last check is both the contiguity check AND the single-hunk check: [`commentable_lines`] only
+/// That last check is both the contiguity check AND the single-hunk check: [`diff_lines`] only
 /// ever inserts a line that is actually an added/context line inside some hunk, and hunks never share
 /// line numbers (they're strictly increasing down the file), so a contiguous run of membership can only
 /// come from one hunk. GitHub itself rejects a range that crosses a hunk boundary or starts on a
@@ -814,13 +909,6 @@ mod tests {
 
     // Explicit `\n` (no backslash-continuation) so the leading diff markers (' ', '+', '-') survive.
     const PATCH: &str = "@@ -1,3 +1,4 @@ fn main() {\n let a = 1;\n-    let b = 2;\n+    let b = 3;\n+    let c = 4;\n println!(\"{a}\");";
-
-    #[test]
-    fn commentable_lines_are_added_and_context() {
-        let lines = commentable_lines(PATCH);
-        // new side: 1 (context ' let a'), 2 (+let b), 3 (+let c), 4 (context println)
-        assert_eq!(lines.iter().copied().collect::<Vec<_>>(), vec![1, 2, 3, 4]);
-    }
 
     fn finding(file: &str, line: u32, title: &str) -> Finding {
         Finding {
@@ -1166,11 +1254,11 @@ mod tests {
 
     #[test]
     fn validate_anchors_in_diff_defers_unanchored_drops_out_of_scope_and_dedups() {
-        let mut commentable = HashMap::new();
-        commentable.insert("src/main.rs".to_string(), commentable_lines(PATCH));
+        let mut commentable: HashMap<String, DiffLines> = HashMap::new();
+        commentable.insert("src/main.rs".to_string(), diff_lines(PATCH));
 
         let findings = vec![
-            finding("src/main.rs", 2, "on a changed line"), // anchorable → inline
+            finding("src/main.rs", 2, "on a changed line"), // added line → inline
             finding("src/main.rs", 2, "on a changed line"), // duplicate → dropped
             finding("src/main.rs", 99, "changed file, line not in diff"), // deferred
             finding("other.rs", 1, "file not in PR"),       // out of scope → dropped
@@ -1196,8 +1284,8 @@ mod tests {
 
     #[test]
     fn validate_renders_suggestion_block_for_anchored_finding() {
-        let mut commentable = HashMap::new();
-        commentable.insert("src/main.rs".to_string(), commentable_lines(PATCH));
+        let mut commentable: HashMap<String, DiffLines> = HashMap::new();
+        commentable.insert("src/main.rs".to_string(), diff_lines(PATCH));
         let mut f = finding("src/main.rs", 2, "Fix it");
         f.suggestion = Some("    let b = 4;".into());
 
@@ -1218,10 +1306,10 @@ mod tests {
 
     #[test]
     fn validate_anchors_ranged_finding_when_fully_commentable_within_one_hunk() {
-        let mut commentable = HashMap::new();
-        commentable.insert("src/main.rs".to_string(), commentable_lines(PATCH));
+        let mut commentable: HashMap<String, DiffLines> = HashMap::new();
+        commentable.insert("src/main.rs".to_string(), diff_lines(PATCH));
         let mut f = finding("src/main.rs", 3, "Whole loop is wrong");
-        f.start_line = Some(2); // 2..=3 fully commentable (PATCH: {1,2,3,4})
+        f.start_line = Some(2); // 2..=3 both added lines in PATCH
 
         let review = validate(vec![f], &commentable);
         assert_eq!(review.inline.len(), 1);
@@ -1235,10 +1323,10 @@ mod tests {
 
     #[test]
     fn validate_range_crossing_hunk_boundary_falls_back_to_single_line() {
-        let mut commentable = HashMap::new();
-        commentable.insert("src/main.rs".to_string(), commentable_lines(TWO_HUNK_PATCH));
+        let mut commentable: HashMap<String, DiffLines> = HashMap::new();
+        commentable.insert("src/main.rs".to_string(), diff_lines(TWO_HUNK_PATCH));
         let mut f = finding("src/main.rs", 21, "Spans two hunks");
-        f.start_line = Some(2); // commentable in hunk 1, but 4..19 aren't → crosses the boundary
+        f.start_line = Some(2); // hunk 1 end; 4..19 aren't commentable → crosses the boundary
 
         let review = validate(vec![f], &commentable);
         assert_eq!(
@@ -1255,8 +1343,8 @@ mod tests {
 
     #[test]
     fn validate_range_with_uncommentable_start_falls_back_to_single_line() {
-        let mut commentable = HashMap::new();
-        commentable.insert("src/main.rs".to_string(), commentable_lines(TWO_HUNK_PATCH));
+        let mut commentable: HashMap<String, DiffLines> = HashMap::new();
+        commentable.insert("src/main.rs".to_string(), diff_lines(TWO_HUNK_PATCH));
         let mut f = finding("src/main.rs", 21, "start_line isn't in any hunk");
         f.start_line = Some(10); // in the gap between hunks — not commentable at all
 
@@ -1268,8 +1356,8 @@ mod tests {
 
     #[test]
     fn validate_range_start_after_line_falls_back_to_single_line() {
-        let mut commentable = HashMap::new();
-        commentable.insert("src/main.rs".to_string(), commentable_lines(PATCH));
+        let mut commentable: HashMap<String, DiffLines> = HashMap::new();
+        commentable.insert("src/main.rs".to_string(), diff_lines(PATCH));
         let mut f = finding("src/main.rs", 2, "start_line > line");
         f.start_line = Some(3); // start_line > line — invalid ordering
 
@@ -1284,8 +1372,8 @@ mod tests {
 
     #[test]
     fn validate_ranged_finding_with_suggestion_renders_correctly() {
-        let mut commentable = HashMap::new();
-        commentable.insert("src/main.rs".to_string(), commentable_lines(PATCH));
+        let mut commentable: HashMap<String, DiffLines> = HashMap::new();
+        commentable.insert("src/main.rs".to_string(), diff_lines(PATCH));
         let mut f = finding("src/main.rs", 3, "Replace both lines");
         f.start_line = Some(2);
         f.suggestion = Some("    let b = 4;\n    let c = 5;".into());
@@ -1308,8 +1396,8 @@ mod tests {
 
     #[test]
     fn validate_normalizes_path_so_dotslash_still_anchors() {
-        let mut commentable = HashMap::new();
-        commentable.insert("src/main.rs".to_string(), commentable_lines(PATCH));
+        let mut commentable: HashMap<String, DiffLines> = HashMap::new();
+        commentable.insert("src/main.rs".to_string(), diff_lines(PATCH));
 
         // The model returned a `./`-prefixed path; it must still match the diff, not be dropped.
         let review = validate(vec![finding("./src/main.rs", 2, "x")], &commentable);
@@ -1323,8 +1411,8 @@ mod tests {
 
     #[test]
     fn validate_renders_empty_suggestion_as_a_deletion() {
-        let mut commentable = HashMap::new();
-        commentable.insert("src/main.rs".to_string(), commentable_lines(PATCH));
+        let mut commentable: HashMap<String, DiffLines> = HashMap::new();
+        commentable.insert("src/main.rs".to_string(), diff_lines(PATCH));
         let mut f = finding("src/main.rs", 2, "Delete this");
         f.suggestion = Some(String::new()); // intentional line deletion
 
@@ -1337,10 +1425,124 @@ mod tests {
 
     #[test]
     fn validate_unknown_scope_defers_instead_of_dropping() {
-        // Empty `commentable` = we couldn't determine the change set → defer, don't drop.
+        // Empty `diff` = we couldn't determine the change set → defer, don't drop.
         let review = validate(vec![finding("a.rs", 1, "x")], &HashMap::new());
         assert_eq!(review.out_of_scope.len(), 0);
         assert_eq!(review.deferred.len(), 1);
+    }
+
+    // ── nearest_added_line tests ──────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn nearest_added_line_returns_none_on_empty_set() {
+        assert_eq!(nearest_added_line(10, &BTreeSet::new(), 5), None);
+    }
+
+    #[test]
+    fn nearest_added_line_exact_match_returns_itself() {
+        let mut s = BTreeSet::new();
+        s.insert(5u32);
+        assert_eq!(nearest_added_line(5, &s, 5), Some(5));
+    }
+
+    #[test]
+    fn nearest_added_line_prefers_closer_of_two_candidates() {
+        let mut s = BTreeSet::new();
+        s.insert(3u32);
+        s.insert(8u32);
+        // target 5: before=3 (delta 2), after=8 (delta 3) → prefer before
+        assert_eq!(nearest_added_line(5, &s, 5), Some(3));
+        // target 7: before=3 (delta 4), after=8 (delta 1) → prefer after
+        assert_eq!(nearest_added_line(7, &s, 5), Some(8));
+    }
+
+    #[test]
+    fn nearest_added_line_returns_none_when_outside_max_delta() {
+        let mut s = BTreeSet::new();
+        s.insert(1u32);
+        s.insert(10u32);
+        // target 5: before=1 (delta 4 <= 3? no), after=10 (delta 5 <= 3? no)
+        assert_eq!(nearest_added_line(5, &s, 3), None);
+    }
+
+    // ── context-line clamping tests (the GitLab 400 fix) ─────────────────────────────────────────
+    //
+    // PATCH produces: added={2,3} (the `+` lines), all={1,2,3,4} (added + context).
+    // Line 1 is ` let a = 1;` (context), line 4 is ` println!` (context).
+
+    #[test]
+    fn validate_clamps_context_line_to_nearest_added_line_stripping_suggestion() {
+        let mut commentable: HashMap<String, DiffLines> = HashMap::new();
+        commentable.insert("src/main.rs".to_string(), diff_lines(PATCH));
+
+        // Line 1 is a context line. We provide a suggestion and a range.
+        let mut f = finding("src/main.rs", 1, "Context line finding");
+        f.start_line = Some(1);
+        f.suggestion = Some("replacement text".to_string());
+
+        let review = validate(vec![f], &commentable);
+        assert_eq!(review.inline.len(), 1);
+        assert_eq!(review.inline[0].line, 2, "Clamped to nearest added line 2");
+        assert_eq!(
+            review.inline[0].start_line, None,
+            "Range stripped when clamped"
+        );
+        assert!(
+            !review.inline[0].body.contains("```suggestion"),
+            "Suggestion fence stripped to prevent mis-application"
+        );
+    }
+
+    #[test]
+    fn validate_clamps_context_line_to_nearest_added_line() {
+        let mut commentable: HashMap<String, DiffLines> = HashMap::new();
+        commentable.insert("src/main.rs".to_string(), diff_lines(PATCH));
+
+        // Line 1 is a context line; nearest added line is 2 (delta 1 ≤ CLAMP_MAX_DELTA).
+        let review = validate(
+            vec![finding("src/main.rs", 1, "context line finding")],
+            &commentable,
+        );
+        assert_eq!(
+            review.inline.len(),
+            1,
+            "context-line finding is posted inline via clamping"
+        );
+        assert_eq!(review.inline[0].line, 2, "clamped to nearest added line");
+        // The body still carries the original finding title.
+        assert!(review.inline[0].body.contains("context line finding"));
+        assert_eq!(review.deferred.len(), 0, "clamped finding is NOT deferred");
+    }
+
+    #[test]
+    fn validate_defers_context_line_when_no_added_line_within_window() {
+        // A patch with only a context line and no `+` lines (e.g., a binary/rename diff).
+        let context_only_patch = "@@ -1,1 +1,1 @@\n unchanged line";
+        let mut commentable: HashMap<String, DiffLines> = HashMap::new();
+        commentable.insert("src/main.rs".to_string(), diff_lines(context_only_patch));
+
+        let review = validate(
+            vec![finding("src/main.rs", 1, "no added line nearby")],
+            &commentable,
+        );
+        assert_eq!(
+            review.inline.len(),
+            0,
+            "no added line to clamp to → deferred"
+        );
+        assert_eq!(review.deferred.len(), 1);
+    }
+
+    #[test]
+    fn diff_lines_separates_added_from_context() {
+        let dl = diff_lines(PATCH);
+        // PATCH: ` let a` (ctx,1), `-let b=2` (del), `+let b=3` (add,2), `+let c=4` (add,3), ` println` (ctx,4)
+        assert!(dl.added.contains(&2), "line 2 is +");
+        assert!(dl.added.contains(&3), "line 3 is +");
+        assert!(!dl.added.contains(&1), "line 1 is context, not added");
+        assert!(!dl.added.contains(&4), "line 4 is context, not added");
+        assert!(dl.all.contains(&1), "line 1 is in all (context)");
+        assert!(dl.all.contains(&4), "line 4 is in all (context)");
     }
 
     #[test]

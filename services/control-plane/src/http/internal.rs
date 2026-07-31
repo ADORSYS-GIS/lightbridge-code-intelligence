@@ -1568,14 +1568,11 @@ pub async fn finalize_review(
             platform_repo_id: context.repository_id,
             installation_id: context.installation_id,
         };
-        let commentable: std::collections::HashMap<String, std::collections::BTreeSet<u32>> =
+        let commentable: std::collections::HashMap<String, crate::review::DiffLines> =
             match platform.list_changed_files(&repo_ref, pr).await {
                 Ok(files) => files
                     .into_iter()
-                    .filter_map(|f| {
-                        f.patch
-                            .map(|p| (f.path, crate::review::commentable_lines(&p)))
-                    })
+                    .filter_map(|f| f.patch.map(|p| (f.path, crate::review::diff_lines(&p))))
                     .collect(),
                 Err(error) => {
                     tracing::error!(%error, task_id = %id, "fetching PR files failed");

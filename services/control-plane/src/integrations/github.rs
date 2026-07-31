@@ -140,7 +140,7 @@ impl GithubApp {
 
     /// Fetch a PR's changed files with their unified-diff patches (first page, up to 100 files —
     /// enough for typical PRs; pagination is a follow-up). Used to validate which finding lines are
-    /// commentable (see `review::commentable_lines`).
+    /// commentable (see `review::diff_lines`).
     pub async fn list_pr_files(
         &self,
         token: &str,
