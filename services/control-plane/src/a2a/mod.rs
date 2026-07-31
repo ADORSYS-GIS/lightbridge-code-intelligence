@@ -16,8 +16,7 @@
 //!   answering an unapproved/unauthorized/over-quota submission with `TASK_STATE_REJECTED`;
 //! - holds **no forge credentials** — egress stays on the reconciler drain (ADR-0059).
 //!
-//! The role's k8s Deployment/Ingress is an ai-helm follow-up; this module adds the role + logic.
-
+//! - holds **no forge credentials** — egress stays on the reconciler drain (ADR-0059).
 mod card;
 pub(crate) mod events;
 mod handler;
@@ -53,9 +52,6 @@ pub(crate) const HDR_PERMS: &str = "x-lb-a2a-perms";
 /// Max A2A request body. The peers are hostile-by-assumption (R9); a review submission is a small
 /// JSON document, so a tight cap bounds the JSON-parse attack surface.
 const MAX_BODY_BYTES: usize = 256 * 1024;
-
-/// Default bind address for the A2A HTTP surface. Overridable via `A2A_BIND`.
-const DEFAULT_BIND: &str = "0.0.0.0:8080";
 
 /// Shared state for the auth layer: the token validator + the configured permissions claim path.
 #[derive(Clone)]
@@ -112,18 +108,7 @@ fn base_url_from_env() -> String {
 fn base_url_from(value: Option<String>) -> String {
     value
         .filter(|v| !v.trim().is_empty())
-        .unwrap_or_else(|| "http://localhost:8080".to_string())
-}
-
-fn bind_addr() -> String {
-    bind_addr_from(std::env::var("A2A_BIND").ok())
-}
-
-fn bind_addr_from(value: Option<String>) -> String {
-    match value {
-        Some(v) if !v.trim().is_empty() => v,
-        _ => DEFAULT_BIND.to_string(),
-    }
+        .unwrap_or_else(|| "https://code-intelligence-api.ai.camer.digital/a2a".to_string())
 }
 
 /// Build the full A2A router: the public card, plus the OIDC-protected JSON-RPC + REST bindings.
@@ -213,25 +198,10 @@ async fn a2a_auth(State(auth): State<A2aAuthState>, mut req: Request, next: Next
     next.run(req).await
 }
 
-/// The `a2a` role entrypoint. Requires a database (the task queue) and OIDC (there is no anonymous
-/// access). Serves the A2A surface on `A2A_BIND` and a metrics-only listener on `METRICS_ADDR`, like
-/// the other headless roles.
-pub async fn run(state: AppState) -> anyhow::Result<()> {
-    if state.db.is_none() {
-        anyhow::bail!("the a2a role requires DATABASE_URL (it is the task queue)");
-    }
-    let jwt = state.jwt.clone().ok_or_else(|| {
-        anyhow::anyhow!("the a2a role requires OIDC_ISSUER (no anonymous access)")
-    })?;
-
-    crate::spawn_metrics_server(state.metrics.clone());
-
-    let addr = bind_addr();
-    let router = build_router(state, jwt);
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
-    tracing::info!(addr = %addr, "a2a role listening (A2A v1.0.1: review skill, polling)");
-    axum::serve(listener, router).await?;
-    Ok(())
+/// Returns the A2A router to be mounted under `/a2a` by the unified app().
+pub fn axum_router(state: AppState) -> Router {
+    let jwt = state.jwt.clone().expect("a2a role requires OIDC_ISSUER (checked at startup)");
+    build_router(state, jwt)
 }
 
 #[cfg(test)]
@@ -430,13 +400,7 @@ mod tests {
     }
 
     #[test]
-    fn bind_and_base_url_fallbacks() {
-        assert_eq!(bind_addr_from(None), DEFAULT_BIND);
-        assert_eq!(bind_addr_from(Some("   ".to_string())), DEFAULT_BIND);
-        assert_eq!(
-            bind_addr_from(Some("127.0.0.1:18080".to_string())),
-            "127.0.0.1:18080"
-        );
+    fn base_url_fallbacks() {
         assert!(base_url_from(None).starts_with("http"));
     }
 }

@@ -465,6 +465,7 @@ fn app(state: AppState) -> Router {
         .route("/readyz", get(readiness))
         .route("/metrics", get(metrics_endpoint))
         .nest("/api/v2", api_v2_router())
+        .nest_service("/a2a", a2a::axum_router(state.clone()))
         .layer(axum::middleware::from_fn(track_http_metrics))
         .with_state(state)
 }
@@ -634,14 +635,12 @@ async fn main() -> anyhow::Result<()> {
         // `poller` is the legacy alias for `reconciler` (ADR-0058); accept both so the binary and the
         // Deployment's role string can be flipped in either order across the rename rollout.
         "poller" | "reconciler" => run_reconciler(state).await,
-        // The A2A ingress face (RFC-0006 / #299): serves the `review` skill over polling.
-        "a2a" => a2a::run(state).await,
         // The A2A push-notification webhook-delivery actor (RFC-0006 Phase 3 / ADR-0079).
         "notifier" => run_notifier(state).await,
         // The durable-replay store lifecycle owner (ADR-0087): TTL-sweeps the `durable_step` journal.
         "replay" => run_replay(state).await,
         other => anyhow::bail!(
-            "unknown role {other:?} (expected: serve | dispatcher | reconciler | a2a | notifier | replay | mint-runner-token [| poller])"
+            "unknown role {other:?} (expected: serve | dispatcher | reconciler | notifier | replay | mint-runner-token [| poller])"
         ),
     };
     // Flush any still-batched spans before exit — covers every role's graceful (SIGTERM-triggered)
