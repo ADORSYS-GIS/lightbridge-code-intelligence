@@ -101,9 +101,10 @@ async-trait = "0.1.89"
 axum = "0.8.9"
 # `rust_crypto` (ring) is jsonwebtoken's crypto backend — NOT a default feature. It used to be
 # switched on transitively by restate-sdk; with the Restate egress path removed (ADR-0093) the sole
-# jsonwebtoken user (control-plane) must enable it explicitly, else v10 panics with "exactly one of
-# 'rust_crypto' and 'aws_lc_rs'". ring matches the process-level provider `main` installs.
-jsonwebtoken = { version = "10", features = ["rust_crypto"] }
+# jsonwebtoken user (control-plane) must enable it explicitly, else it panics with "exactly one of
+# 'rust_crypto' and 'aws_lc_rs'". Still true on v11: the crypto backend remains an explicit choice
+# and neither backend is in `default`. ring matches the process-level provider `main` installs.
+jsonwebtoken = { version = "11", features = ["rust_crypto"] }
 hmac = "0.13"
 sha2 = "0.11"
 hex = "0.4.3"
