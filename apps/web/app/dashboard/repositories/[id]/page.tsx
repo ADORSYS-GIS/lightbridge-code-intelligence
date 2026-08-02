@@ -1,6 +1,7 @@
 import { ArrowLeft } from "lucide-react";
 import Link from "next/link";
 import { notFound } from "next/navigation";
+import { PresetPicker } from "@/components/repos/preset-picker";
 import { Button } from "@/components/ui/button";
 import { Card, CardBody, CardHeader, CardTitle } from "@/components/ui/card";
 import { ApiErrorLine, StatusLine } from "@/components/ui/states";
@@ -85,16 +86,9 @@ export default async function RepoSettings({ params }: { params: Promise<{ id: s
           ) : (
             <form action={setPresetAction} className="flex flex-wrap items-center gap-2">
               <input type="hidden" name="id" value={id} />
-              <label className="input input-sm">
-                <input
-                  type="text"
-                  name="preset"
-                  placeholder="e.g. fast, deep, ultra, or a custom name"
-                  defaultValue={presetResult.ok ? (presetResult.data.preset ?? "") : ""}
-                  className="w-64"
-                  required
-                />
-              </label>
+              <PresetPicker
+                initialPreset={presetResult.ok ? (presetResult.data.preset ?? "") : ""}
+              />
               <Button type="submit" variant="primary" size="sm">
                 Save
               </Button>
