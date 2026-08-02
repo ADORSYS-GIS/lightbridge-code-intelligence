@@ -1,5 +1,6 @@
 import { SESSION_COOKIE, type SessionClaims } from "@lightbridge/auth";
 import { cookies } from "next/headers";
+import type { SettingsSource } from "@/components/ui/source-badge";
 import type { Repository } from "@/lib/domain/repos";
 import type { ApiResult } from "@/lib/server/api";
 
@@ -113,6 +114,85 @@ export async function getRepoPreset(id: number): Promise<ApiResult<RepoPreset>> 
     return { ok: true, data: (await res.json()) as RepoPreset };
   } catch {
     return { ok: false, reason: "unavailable" };
+  }
+}
+
+/** A value resolved across ADR-0111's three-layer chain: built-in default → repo config file → admin
+ * DB override (wins). Mirrors `services/control-plane/src/settings.rs`'s `Sourced<T>`. */
+export interface Sourced<T> {
+  value: T;
+  source: SettingsSource;
+}
+
+/** `GET`/`POST /admin/repositories/{id}/settings[/override]`'s resolved shape (epic #566, ADR-0111).
+ * `push_debounce` mirrors `std::time::Duration`'s serde shape verbatim (`{secs, nanos}` — confirmed
+ * live against the actual type, `nanos` is always `0` from this API and never surfaced in the UI). */
+export interface ResolvedSettings {
+  check_run_reporting: Sourced<boolean>;
+  review_on_pr_open: Sourced<boolean>;
+  review_on_push: Sourced<boolean>;
+  push_strategy: Sourced<"supersede" | "debounce" | "every">;
+  push_debounce: Sourced<{ secs: number; nanos: number }>;
+  dedup_scope: Sourced<"pr" | "commit">;
+}
+
+/** `GET /admin/repositories/{id}/settings` — the repo's effective per-repo review settings, with
+ * provenance. Needs `repo:read`. */
+export async function getRepoSettings(
+  id: number,
+): Promise<ApiResult<{ repository_id: number; settings: ResolvedSettings }>> {
+  try {
+    const t = await token();
+    if (!t) return { ok: false, reason: "unauthenticated" };
+    const res = await fetch(`${controlPlaneUrl()}/admin/repositories/${id}/settings`, {
+      headers: { authorization: `Bearer ${t}`, accept: "application/json" },
+      cache: "no-store",
+    });
+    if (!res.ok) return { ok: false, reason: classify(res.status), status: res.status };
+    return {
+      ok: true,
+      data: (await res.json()) as { repository_id: number; settings: ResolvedSettings },
+    };
+  } catch {
+    return { ok: false, reason: "unavailable" };
+  }
+}
+
+/** Mirrors the control plane's `SetSettingsBody` — each field omitted leaves the stored value alone,
+ * `null` clears the DB override (reverting to file/default), a value sets it. Never partially applies:
+ * the control plane validates every provided field before writing any of them. */
+export interface RepoSettingsPatch {
+  check_run_reporting?: boolean | null;
+  review_on_pr_open?: boolean | null;
+  review_on_push?: boolean | null;
+  push_strategy?: "supersede" | "debounce" | "every" | null;
+  push_debounce_seconds?: number | null;
+  dedup_scope?: "pr" | "commit" | null;
+}
+
+/** `POST /admin/repositories/{id}/settings/override` — set or clear one or more DB-layer setting
+ * overrides. Needs `repo:configure`. Returns whether it succeeded; the caller re-fetches to reflect
+ * the change (same convention as [`setRepoPreset`]). */
+export async function setRepoSettingsOverride(
+  id: number,
+  patch: RepoSettingsPatch,
+): Promise<boolean> {
+  const t = await token();
+  if (!t) return false;
+  try {
+    const res = await fetch(`${controlPlaneUrl()}/admin/repositories/${id}/settings/override`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${t}`,
+        accept: "application/json",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify(patch),
+      cache: "no-store",
+    });
+    return res.ok;
+  } catch {
+    return false;
   }
 }
 
