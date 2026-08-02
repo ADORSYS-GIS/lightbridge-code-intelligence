@@ -3050,5 +3050,9 @@ async fn should_report_check_run_is_false_once_a_newer_task_shares_the_head_sha(
 /// other best-effort/non-fatal check-run path.
 #[sqlx::test]
 async fn should_report_check_run_defaults_to_true_for_an_unknown_task(pool: PgPool) {
-    assert!(should_report_check_run(&pool, Uuid::new_v4()).await.unwrap());
+    assert!(
+        should_report_check_run(&pool, Uuid::new_v4())
+            .await
+            .unwrap()
+    );
 }

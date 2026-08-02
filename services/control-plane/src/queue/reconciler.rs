@@ -908,12 +908,19 @@ mod tests {
     /// A minimal local mirror of `db::tests::seed`/`pr_task` (that module is private to `db`), scoped
     /// to what the check-run staleness-guard tests below need.
     async fn seed_task(pool: &PgPool, head_sha: &str, command_text: &str) -> uuid::Uuid {
-        let repo_id = crate::db::upsert_repository(pool, Platform::GitHub, 1, "octo", "repo", "main", None)
-            .await
-            .unwrap();
-        crate::db::record_delivery(pool, Platform::GitHub, "d1", "pull_request", &serde_json::json!({}))
-            .await
-            .ok(); // idempotent — a second seed on the same pool just dedupes on `delivery_id`
+        let repo_id =
+            crate::db::upsert_repository(pool, Platform::GitHub, 1, "octo", "repo", "main", None)
+                .await
+                .unwrap();
+        crate::db::record_delivery(
+            pool,
+            Platform::GitHub,
+            "d1",
+            "pull_request",
+            &serde_json::json!({}),
+        )
+        .await
+        .ok(); // idempotent — a second seed on the same pool just dedupes on `delivery_id`
         crate::db::create_explicit_task(
             pool,
             &crate::db::NewTask {
@@ -1089,7 +1096,11 @@ mod tests {
             .await
             .expect("delivery succeeds");
         let calls = platform.resolve_calls.lock().unwrap();
-        assert_eq!(calls.len(), 1, "the latest task's resolve must reach the platform");
+        assert_eq!(
+            calls.len(),
+            1,
+            "the latest task's resolve must reach the platform"
+        );
         assert_eq!(
             calls[0].1,
             crate::integrations::platform::CheckConclusion::Success
