@@ -359,6 +359,31 @@ async fn deliver_pr_open(pool: &PgPool, row: &crate::db::OutboxRow) -> anyhow::R
     )
 }
 
+/// The staleness guard shared by `check_run_start`/`check_run_resolve` (#571): `true` means a NEWER,
+/// non-cancelled task already exists for the same PR head SHA, so this delivery must be SKIPPED — see
+/// [`crate::db::should_report_check_run`] for why. Fails/defaults to `false` (proceed) when there's no
+/// task to check against, or the check itself errored — this is best-effort cosmetic reporting, matching
+/// every other non-fatal path in this module.
+async fn check_run_task_is_stale(pool: &PgPool, task_id: Option<uuid::Uuid>, kind: &str) -> bool {
+    let Some(task) = task_id else {
+        return false;
+    };
+    match crate::db::should_report_check_run(pool, task).await {
+        Ok(true) => false,
+        Ok(false) => {
+            tracing::info!(
+                task_id = %task, kind,
+                "skipping check-run delivery: a newer task exists for the same PR head SHA (#571)"
+            );
+            true
+        }
+        Err(error) => {
+            tracing::warn!(%error, task_id = %task, kind, "check-run staleness check failed (non-fatal; proceeding)");
+            false
+        }
+    }
+}
+
 /// Open the in-progress check/status (new feature — cosmetic runner-status reporting). On success,
 /// persist the platform's id (GitHub only — GitLab/Bitbucket return `None`) onto
 /// `tasks.check_run_external_id` so `deliver_check_run_resolve` can address the SAME check run later.
@@ -371,6 +396,9 @@ async fn deliver_check_run_start(
     repo: &RepoRef,
     row: &crate::db::OutboxRow,
 ) -> anyhow::Result<Option<i64>> {
+    if check_run_task_is_stale(pool, row.task_id, "check_run_start").await {
+        return Ok(None);
+    }
     let p: crate::outbox::CheckRunStartPayload = serde_json::from_value(row.payload.clone())?;
     let external_id = platform
         .start_check_run(
@@ -398,6 +426,9 @@ async fn deliver_check_run_resolve(
     repo: &RepoRef,
     row: &crate::db::OutboxRow,
 ) -> anyhow::Result<Option<i64>> {
+    if check_run_task_is_stale(pool, row.task_id, "check_run_resolve").await {
+        return Ok(None);
+    }
     let p: crate::outbox::CheckRunResolvePayload = serde_json::from_value(row.payload.clone())?;
     // Re-read from `tasks` (not the enqueue payload) so a resolve delivered well after start still
     // sees a write that landed in between — the payload only ever carries what was known at enqueue
@@ -873,6 +904,40 @@ mod tests {
         }
     }
 
+    /// Seed the FK rows a task needs and create one PR-review task on `head_sha`, returning its id.
+    /// A minimal local mirror of `db::tests::seed`/`pr_task` (that module is private to `db`), scoped
+    /// to what the check-run staleness-guard tests below need.
+    async fn seed_task(pool: &PgPool, head_sha: &str, command_text: &str) -> uuid::Uuid {
+        let repo_id = crate::db::upsert_repository(pool, Platform::GitHub, 1, "octo", "repo", "main", None)
+            .await
+            .unwrap();
+        crate::db::record_delivery(pool, Platform::GitHub, "d1", "pull_request", &serde_json::json!({}))
+            .await
+            .ok(); // idempotent — a second seed on the same pool just dedupes on `delivery_id`
+        crate::db::create_explicit_task(
+            pool,
+            &crate::db::NewTask {
+                repository_id: repo_id,
+                installation_id: 1,
+                webhook_delivery_id: "d1".to_string(),
+                target_type: "pull_request".to_string(),
+                target_id: 7,
+                command_text: command_text.to_string(),
+                base_sha: Some("base".to_string()),
+                head_sha: Some(head_sha.to_string()),
+                run_epoch: 0,
+                preset: "fast".to_string(),
+                entry_point: "pr_open".to_string(),
+                trigger_comment_id: None,
+                trace_context: None,
+                model_override: None,
+                check_runs_enabled: true,
+            },
+        )
+        .await
+        .unwrap()
+    }
+
     fn fake_repo() -> RepoRef {
         RepoRef {
             platform: Platform::GitHub,
@@ -894,9 +959,17 @@ mod tests {
     }
 
     fn check_run_row(kind: &str, payload: serde_json::Value) -> crate::db::OutboxRow {
+        check_run_row_for_task(None, kind, payload)
+    }
+
+    fn check_run_row_for_task(
+        task_id: Option<uuid::Uuid>,
+        kind: &str,
+        payload: serde_json::Value,
+    ) -> crate::db::OutboxRow {
         crate::db::OutboxRow {
             id: 1,
-            task_id: None,
+            task_id,
             installation_id: 1,
             owner: "octo".to_string(),
             repo: "repo".to_string(),
@@ -953,6 +1026,113 @@ mod tests {
         assert_eq!(
             calls[0].1,
             crate::integrations::platform::CheckConclusion::Neutral
+        );
+    }
+
+    /// #571: an OLD task's `check_run_resolve` must be a no-op once a NEWER task shares the same PR
+    /// head SHA — otherwise a stale/failed run can clobber a fresh success (or vice versa) purely
+    /// because its delivery landed later. This is the exact scenario observed live on PR #561: a
+    /// re-review superseded an earlier run, but the earlier run's dead-lettered resolve still had a
+    /// chance to post after the newer one had already completed.
+    #[sqlx::test]
+    async fn deliver_check_run_resolve_skips_a_task_superseded_by_a_newer_run(pool: PgPool) {
+        let older = seed_task(&pool, "same-sha", "review").await;
+        sqlx::query("UPDATE tasks SET created_at = now() - interval '1 hour' WHERE id = $1")
+            .bind(older)
+            .execute(&pool)
+            .await
+            .unwrap();
+        seed_task(&pool, "same-sha", "@lightbridge-assistant review").await;
+
+        let platform = FakePlatform::default();
+        let row = check_run_row_for_task(
+            Some(older),
+            "check_run_resolve",
+            serde_json::json!({
+                "pr": 7,
+                "head_sha": "same-sha",
+                "conclusion": "failure",
+                "summary": "an old, superseded run",
+            }),
+        );
+        let repo = fake_repo();
+        let result = deliver_check_run_resolve(&pool, &platform, &repo, &row)
+            .await
+            .expect("delivery is a no-op, not an error");
+        assert_eq!(result, None);
+        assert!(
+            platform.resolve_calls.lock().unwrap().is_empty(),
+            "the stale task's resolve must never reach the platform"
+        );
+    }
+
+    /// The mirror image: the NEWEST task for a head SHA is always current and must still post
+    /// normally — the guard only skips tasks a newer run has superseded.
+    #[sqlx::test]
+    async fn deliver_check_run_resolve_still_posts_for_the_latest_task(pool: PgPool) {
+        seed_task(&pool, "same-sha", "review").await;
+        let newer = seed_task(&pool, "same-sha", "@lightbridge-assistant review").await;
+
+        let platform = FakePlatform::default();
+        let row = check_run_row_for_task(
+            Some(newer),
+            "check_run_resolve",
+            serde_json::json!({
+                "pr": 7,
+                "head_sha": "same-sha",
+                "conclusion": "success",
+                "summary": "the current run",
+            }),
+        );
+        let repo = fake_repo();
+        deliver_check_run_resolve(&pool, &platform, &repo, &row)
+            .await
+            .expect("delivery succeeds");
+        let calls = platform.resolve_calls.lock().unwrap();
+        assert_eq!(calls.len(), 1, "the latest task's resolve must reach the platform");
+        assert_eq!(
+            calls[0].1,
+            crate::integrations::platform::CheckConclusion::Success
+        );
+    }
+
+    /// The same staleness guard applies to `check_run_start` (#571): an old task's delayed start must
+    /// not re-open (or, on GitLab/Bitbucket's upsert-by-sha status API, regress to "pending") a check
+    /// a newer run has already claimed.
+    #[sqlx::test]
+    async fn deliver_check_run_start_skips_a_task_superseded_by_a_newer_run(pool: PgPool) {
+        let older = seed_task(&pool, "same-sha", "review").await;
+        sqlx::query("UPDATE tasks SET created_at = now() - interval '1 hour' WHERE id = $1")
+            .bind(older)
+            .execute(&pool)
+            .await
+            .unwrap();
+        seed_task(&pool, "same-sha", "@lightbridge-assistant review").await;
+
+        let platform = FakePlatform {
+            start_returns: Some(999),
+            ..Default::default()
+        };
+        let row = check_run_row_for_task(
+            Some(older),
+            "check_run_start",
+            serde_json::json!({ "pr": 7, "head_sha": "same-sha" }),
+        );
+        let repo = fake_repo();
+        let result = deliver_check_run_start(&pool, &platform, &repo, &row)
+            .await
+            .expect("delivery is a no-op, not an error");
+        assert_eq!(result, None);
+        assert!(
+            platform.start_calls.lock().unwrap().is_empty(),
+            "the stale task's start must never reach the platform"
+        );
+        assert_eq!(
+            crate::db::get_check_run_external_id(&pool, older)
+                .await
+                .unwrap(),
+            None,
+            "a skipped start must not persist a check_run_external_id"
         );
     }
 }
