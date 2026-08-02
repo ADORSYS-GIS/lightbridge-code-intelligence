@@ -8,9 +8,10 @@ import { Select } from "@/components/ui/select";
 import { SettingsRow, SettingsSection } from "@/components/ui/settings-section";
 import { SourceBadge } from "@/components/ui/source-badge";
 import { ApiErrorLine, StatusLine } from "@/components/ui/states";
+import { Pill } from "@/components/ui/status-pill";
 import { Toggle } from "@/components/ui/toggle";
 import { currentClaims } from "@/lib/auth/session";
-import { repoSlug } from "@/lib/domain/repos";
+import { approvalVisual, repoSlug } from "@/lib/domain/repos";
 import {
   getModelAllowlist,
   getRepoModel,
@@ -69,11 +70,22 @@ export default async function RepoSettings({ params }: { params: Promise<{ id: s
   const repo = reposResult.data.find((r) => r.id === id);
   if (!repo) notFound();
 
+  const approval = approvalVisual(repo);
+
   return (
     <Shell>
       <div>
-        <h1 className="text-lg font-medium tracking-tight">{repoSlug(repo)}</h1>
-        <p className="mt-1 text-sm text-base-content/60">Review preset settings.</p>
+        <div className="flex items-center gap-2.5">
+          <h1 className="text-lg font-medium tracking-tight">{repoSlug(repo)}</h1>
+          <Pill variant={approval.variant} label={approval.label} />
+        </div>
+        <p className="mt-1 text-sm text-base-content/60">
+          Review preset, settings, and model override. Change the approval status from{" "}
+          <Link href="/dashboard/admin" className="underline hover:text-base-content">
+            Approvals
+          </Link>
+          .
+        </p>
       </div>
 
       <Card>
