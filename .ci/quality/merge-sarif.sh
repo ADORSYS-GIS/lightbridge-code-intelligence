@@ -64,9 +64,26 @@ jq -s --arg root "$ROOT_ABS" '
     else .
     end;
 
-  # Collect all results from all runs, normalizing absolute paths to repo-relative first.
-  [.[].runs[].results[] |
+  # Collect all results from all runs, normalizing absolute paths to repo-relative first, and
+  # MATERIALIZING the effective severity of each result as an explicit `level`.
+  #
+  # Why the explicit level: SARIF lets a result omit `level`, in which case it inherits from its
+  # rule via `defaultConfiguration.level` (falling back to "warning"). Semgrep uses exactly that
+  # shape — severity lives in `tool.driver.rules[]`, and results carry no `level` of their own. This
+  # merge rebuilds `tool.driver` from scratch and therefore DROPS `rules[]`, so the severity had no
+  # surviving home: every finding reached reviewdog level-less, and reviewdog treats an absent level
+  # as `error`. That made `-fail-level=error` fail the build on WARNING-severity findings (e.g.
+  # `rust-unwrap-unchecked` in test code), which is the false failure that motivated this.
+  #
+  # Resolving it here — rather than preserving `rules[]` — keeps every result self-describing for
+  # any downstream consumer, and avoids having to merge/dedupe rule metadata across four scanners.
+  [.[] | .runs[] |
+   . as $run |
+   (($run.tool.driver.rules // []) | map({key: .id, value: .defaultConfiguration.level}) | from_entries) as $rule_levels |
+   ($run.results // [])[] |
    select(. != null) |
+   . as $result |
+   .level = ($result.level // $rule_levels[$result.ruleId // ""] // "warning") |
    .locations = (.locations // [] | map(
      .physicalLocation.artifactLocation.uri |= normalize_path
    ))
