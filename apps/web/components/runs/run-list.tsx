@@ -6,6 +6,7 @@ import { useMemo } from "react";
 import { RunTable } from "@/components/runs/run-table";
 import { RunTimeline } from "@/components/runs/run-timeline";
 import { SearchInput } from "@/components/ui/search-input";
+import { Select } from "@/components/ui/select";
 import { StatusLine } from "@/components/ui/states";
 import { repoLabel, statusVisual, type Task, triggerLabel } from "@/lib/domain/tasks";
 import { useLocalStorageState } from "@/lib/hooks/use-local-storage-state";
@@ -79,22 +80,19 @@ export function RunList({ tasks, now }: { tasks: Task[]; now: number }) {
 
         <div className="ml-auto flex items-center gap-2">
           {repos.length > 1 && (
-            <select
+            <Select
               value={repo}
-              onChange={(e) => {
-                setRepo(e.target.value);
+              onValueChange={(value) => {
+                setRepo(value);
                 resetPage();
               }}
+              options={[
+                { value: "all", label: "All repositories" },
+                ...repos.map((r) => ({ value: r, label: r })),
+              ]}
               aria-label="Filter by repository"
-              className="select select-sm max-w-[12rem]"
-            >
-              <option value="all">All repositories</option>
-              {repos.map((r) => (
-                <option key={r} value={r}>
-                  {r}
-                </option>
-              ))}
-            </select>
+              className="max-w-[12rem]"
+            />
           )}
 
           <SearchInput
