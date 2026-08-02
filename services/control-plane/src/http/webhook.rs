@@ -596,7 +596,14 @@ async fn handle_gitlab_merge_request(
     };
     let attrs = &payload["object_attributes"];
     let action = attrs["action"].as_str().unwrap_or_default();
-    if !matches!(action, "open" | "close") {
+    if !matches!(action, "open" | "update" | "close") {
+        return;
+    }
+    // Epic #566: GitLab sends `update` for label/title/description edits too, not only new commits —
+    // `oldrev` is present only when the MR's head SHA actually moved, so it is the sole reliable
+    // "new push" signal. A no-op `update` (metadata edit) is filtered out here, before any of the
+    // approval/bot/draft checks below run.
+    if action == "update" && attrs["oldrev"].as_str().is_none() {
         return;
     }
     let project = &payload["project"];
@@ -632,17 +639,20 @@ async fn handle_gitlab_merge_request(
     };
 
     match action {
-        "open" => {
+        "open" | "update" => {
+            let is_sync = action == "update";
             // Approval gate (Epic #75): a repo must be admin-approved before any review runs.
             if !approved_or_skip(pool, repository_id, delivery_id, mr_iid).await {
                 return;
             }
             // Skip draft MRs (GitLab's equivalent of GitHub's draft PRs) — not ready for review.
+            // Applies to both open and sync: a draft is, by construction, still being pushed to.
             if attrs["draft"].as_bool() == Some(true) {
                 tracing::info!(
                     delivery_id,
                     mr = mr_iid,
                     repository_id,
+                    is_sync,
                     "GitLab MR is draft; skipping automatic review"
                 );
                 return;
@@ -731,6 +741,11 @@ async fn handle_gitlab_merge_request(
                 platform_repo_id: project_id,
                 installation_id,
             };
+            let entry = if is_sync {
+                crate::preset::EntryPoint::PrSync
+            } else {
+                crate::preset::EntryPoint::PrOpen
+            };
             let (preset, settings) = crate::settings::resolve_preset_and_settings(
                 pool,
                 state
@@ -740,19 +755,26 @@ async fn handle_gitlab_merge_request(
                     .map(|client| client as &dyn CodePlatform),
                 &repo_ref,
                 base_sha.as_deref().unwrap_or(default_branch),
-                crate::preset::EntryPoint::PrOpen,
+                entry,
                 repository_id,
             )
             .await;
-            // Epic #566: a repo can opt out of the automatic on-open review and stay @mention-only.
+            // Epic #566: a repo can opt out of the automatic on-open review (stays @mention-only) and,
+            // independently, opt IN to a review on later pushes (off by default — see settings.rs).
             // Checked here rather than at dispatch so an opted-out repo creates no task at all.
-            if !settings.review_on_pr_open.value {
-                tracing::info!(
-                    delivery_id,
-                    repository_id,
-                    source = ?settings.review_on_pr_open.source,
-                    "automatic on-open review disabled for this repo; skipping (mention-triggered reviews still run)"
-                );
+            let (setting, disabled_msg) = if is_sync {
+                (
+                    &settings.review_on_push,
+                    "review-on-push disabled for this repo; skipping (mention-triggered reviews still run)",
+                )
+            } else {
+                (
+                    &settings.review_on_pr_open,
+                    "automatic on-open review disabled for this repo; skipping (mention-triggered reviews still run)",
+                )
+            };
+            if !setting.value {
+                tracing::info!(delivery_id, repository_id, is_sync, source = ?setting.source, "{disabled_msg}");
                 return;
             }
             let model_override =
@@ -768,11 +790,12 @@ async fn handle_gitlab_merge_request(
                 head_sha,
                 run_epoch: 0,
                 preset,
-                entry_point: crate::preset::EntryPoint::PrOpen.as_str().to_string(),
+                entry_point: entry.as_str().to_string(),
                 trigger_comment_id: None,
                 trace_context: lci_observability::current_traceparent(),
                 model_override,
                 check_runs_enabled: settings.check_run_reporting.value,
+                run_after_secs: None,
             };
             create_review_task(pool, task, delivery_id).await;
         }
@@ -1011,6 +1034,7 @@ async fn handle_gitlab_note(
         trace_context: lci_observability::current_traceparent(),
         model_override,
         check_runs_enabled: settings.check_run_reporting.value,
+        run_after_secs: None,
     };
     tracing::info!(
         delivery_id,
@@ -1057,10 +1081,16 @@ async fn bitbucket_default_branch_or_fallback(
     }
 }
 
-/// `pullrequest:created` → the automatic first review. `pullrequest:fulfilled` (merged) /
-/// `pullrequest:rejected` (declined) → cancel the PR's active tasks. Other actions (e.g.
-/// `pullrequest:updated`) do nothing — a re-review is requested with an `@<handle>` comment
-/// ([`handle_bitbucket_comment`]). Mirrors [`handle_gitlab_merge_request`] / [`handle_pull_request`].
+/// `pullrequest:created` → the automatic first review. `pullrequest:updated` (epic #566) → a review
+/// of the new commits, gated on the repo's `review_on_push` setting (off by default) and skipped for
+/// bots. `pullrequest:fulfilled` (merged) / `pullrequest:rejected` (declined) → cancel the PR's
+/// active tasks. Mirrors [`handle_gitlab_merge_request`] / [`handle_pull_request`].
+///
+/// Unlike GitLab's `oldrev`, Bitbucket's `pullrequest:updated` payload carries no reliable "did the
+/// head SHA actually move" signal (it also fires on reviewer/description edits) — the idempotency
+/// index is the guard here instead: a same-head redelivery collapses via `create_task`'s
+/// `ON CONFLICT DO NOTHING`, so a metadata-only update that doesn't change `source.commit.hash`
+/// creates no new task, just a harmless dedup no-op.
 async fn handle_bitbucket_pullrequest(
     state: &crate::AppState,
     event: &str,
@@ -1109,7 +1139,8 @@ async fn handle_bitbucket_pullrequest(
     };
 
     match event {
-        "pullrequest:created" => {
+        "pullrequest:created" | "pullrequest:updated" => {
+            let is_sync = event == "pullrequest:updated";
             // Approval gate (Epic #75): a repo must be admin-approved before any review runs.
             if !approved_or_skip(pool, repository_id, delivery_id, pr_number).await {
                 return;
@@ -1128,6 +1159,7 @@ async fn handle_bitbucket_pullrequest(
                     delivery_id,
                     pr = pr_number,
                     repository_id,
+                    is_sync,
                     "Bitbucket PR author appears to be a bot; skipping automatic review"
                 );
                 crate::http::metrics::review_skipped_bot_author();
@@ -1143,6 +1175,11 @@ async fn handle_bitbucket_pullrequest(
                 platform_repo_id: installation_id,
                 installation_id,
             };
+            let entry = if is_sync {
+                crate::preset::EntryPoint::PrSync
+            } else {
+                crate::preset::EntryPoint::PrOpen
+            };
             let (preset, settings) = crate::settings::resolve_preset_and_settings(
                 pool,
                 state
@@ -1152,19 +1189,26 @@ async fn handle_bitbucket_pullrequest(
                     .map(|client| client as &dyn CodePlatform),
                 &repo_ref,
                 base_sha.as_deref().unwrap_or(&default_branch),
-                crate::preset::EntryPoint::PrOpen,
+                entry,
                 repository_id,
             )
             .await;
-            // Epic #566: a repo can opt out of the automatic on-open review and stay @mention-only.
+            // Epic #566: a repo can opt out of the automatic on-open review (stays @mention-only) and,
+            // independently, opt IN to a review on later pushes (off by default — see settings.rs).
             // Checked here rather than at dispatch so an opted-out repo creates no task at all.
-            if !settings.review_on_pr_open.value {
-                tracing::info!(
-                    delivery_id,
-                    repository_id,
-                    source = ?settings.review_on_pr_open.source,
-                    "automatic on-open review disabled for this repo; skipping (mention-triggered reviews still run)"
-                );
+            let (setting, disabled_msg) = if is_sync {
+                (
+                    &settings.review_on_push,
+                    "review-on-push disabled for this repo; skipping (mention-triggered reviews still run)",
+                )
+            } else {
+                (
+                    &settings.review_on_pr_open,
+                    "automatic on-open review disabled for this repo; skipping (mention-triggered reviews still run)",
+                )
+            };
+            if !setting.value {
+                tracing::info!(delivery_id, repository_id, is_sync, source = ?setting.source, "{disabled_msg}");
                 return;
             }
             let model_override =
@@ -1180,11 +1224,12 @@ async fn handle_bitbucket_pullrequest(
                 head_sha,
                 run_epoch: 0,
                 preset,
-                entry_point: crate::preset::EntryPoint::PrOpen.as_str().to_string(),
+                entry_point: entry.as_str().to_string(),
                 trigger_comment_id: None,
                 trace_context: lci_observability::current_traceparent(),
                 model_override,
                 check_runs_enabled: settings.check_run_reporting.value,
+                run_after_secs: None,
             };
             create_review_task(pool, task, delivery_id).await;
         }
@@ -1401,6 +1446,7 @@ async fn handle_bitbucket_comment(
         trace_context: lci_observability::current_traceparent(),
         model_override,
         check_runs_enabled: settings.check_run_reporting.value,
+        run_after_secs: None,
     };
     tracing::info!(
         delivery_id,
@@ -1448,9 +1494,11 @@ fn command_from_comment(body: &str) -> String {
     body.trim().chars().take(MAX_INSTRUCTION_CHARS).collect()
 }
 
-/// `pull_request` events. `opened` → the automatic first review. `closed` → cancel the PR's active
-/// tasks (the reaper then stops their Jobs). `synchronize`/`reopened` do nothing — a re-review is
-/// requested with an `@<handle>` comment ([`handle_issue_comment`]).
+/// `pull_request` events. `opened` → the automatic first review. `synchronize` (epic #566) → a
+/// review of the new commits, gated on the repo's `review_on_push` setting (off by default) and
+/// skipped for bots/drafts. `closed` → cancel the PR's active tasks (the reaper then stops their
+/// Jobs). `reopened` does nothing — a re-review is requested with an `@<handle>` comment
+/// ([`handle_issue_comment`]).
 async fn handle_pull_request(
     state: &crate::AppState,
     payload: &serde_json::Value,
@@ -1498,7 +1546,7 @@ async fn handle_pull_request(
     };
 
     match action {
-        "opened" => {
+        "opened" | "synchronize" => {
             let Some(installation_id) = installation_id_opt else {
                 return;
             };
@@ -1507,23 +1555,43 @@ async fn handle_pull_request(
                 return;
             }
             let pr = &payload["pull_request"];
-            // RFC-0003: skip the automatic fast-tier review for bot-authored PRs (Dependabot, Renovate,
-            // another GitHub App, or ourselves) — mechanical diffs burn LLM budget on low-signal
-            // comments and risk bot-on-bot feedback loops. The `@mention` deep-review path is
-            // untouched: a human can still ask for a full review on the same PR.
+            let is_sync = action == "synchronize";
+            // RFC-0003: skip the automatic review for bot-authored PRs (Dependabot, Renovate, another
+            // GitHub App, or ourselves) — mechanical diffs burn LLM budget on low-signal comments and
+            // risk bot-on-bot feedback loops. The `@mention` deep-review path is untouched: a human
+            // can still ask for a full review on the same PR. Applies to both open and sync.
             if should_skip_bot_review(state.review.skip_bot_authored_prs(), pr) {
                 tracing::info!(
                     delivery_id,
                     pr = pr_number,
                     repository_id,
-                    "PR author is a bot; skipping automatic fast-tier review"
+                    is_sync,
+                    "PR author is a bot; skipping automatic review"
                 );
                 crate::http::metrics::review_skipped_bot_author();
                 return;
             }
+            // Epic #566: a draft PR is, by construction, still being pushed to repeatedly — reviewing
+            // every intermediate push burns budget on code the author knows isn't ready. Scoped to
+            // `synchronize` only (a NEW entry point, so this is not a behavior change to `opened`,
+            // which has never draft-gated).
+            if is_sync && pr["draft"].as_bool() == Some(true) {
+                tracing::info!(
+                    delivery_id,
+                    pr = pr_number,
+                    repository_id,
+                    "PR is a draft; skipping the on-push review (mention-triggered reviews still run)"
+                );
+                return;
+            }
             let base_sha = pr["base"]["sha"].as_str().map(str::to_string);
             let head_sha = pr["head"]["sha"].as_str().map(str::to_string);
-            // ADR-0103: resolve the repo's configured preset for the pr_open entry point, reading
+            let entry = if is_sync {
+                crate::preset::EntryPoint::PrSync
+            } else {
+                crate::preset::EntryPoint::PrOpen
+            };
+            // ADR-0103: resolve the repo's configured preset+settings, reading
             // `.lightbridge-code-review.jsonc` at the BASE ref (fork-safe by construction — never the
             // PR head) via a single small file fetch, falling back to the platform default (`fast`,
             // reproducing today's ADR-0062 behavior) when the repo declares nothing.
@@ -1541,19 +1609,26 @@ async fn handle_pull_request(
                     .map(std::sync::Arc::as_ref),
                 &repo_ref,
                 base_sha.as_deref().unwrap_or(default_branch),
-                crate::preset::EntryPoint::PrOpen,
+                entry,
                 repository_id,
             )
             .await;
-            // Epic #566: a repo can opt out of the automatic on-open review and stay @mention-only.
+            // Epic #566: a repo can opt out of the automatic on-open review (stays @mention-only) and,
+            // independently, opt IN to a review on later pushes (off by default — see settings.rs).
             // Checked here rather than at dispatch so an opted-out repo creates no task at all.
-            if !settings.review_on_pr_open.value {
-                tracing::info!(
-                    delivery_id,
-                    repository_id,
-                    source = ?settings.review_on_pr_open.source,
-                    "automatic on-open review disabled for this repo; skipping (mention-triggered reviews still run)"
-                );
+            let (setting, disabled_msg) = if is_sync {
+                (
+                    &settings.review_on_push,
+                    "review-on-push disabled for this repo; skipping (mention-triggered reviews still run)",
+                )
+            } else {
+                (
+                    &settings.review_on_pr_open,
+                    "automatic on-open review disabled for this repo; skipping (mention-triggered reviews still run)",
+                )
+            };
+            if !setting.value {
+                tracing::info!(delivery_id, repository_id, is_sync, source = ?setting.source, "{disabled_msg}");
                 return;
             }
             let model_override =
@@ -1567,15 +1642,21 @@ async fn handle_pull_request(
                 command_text: "review".to_string(),
                 base_sha,
                 head_sha,
-                run_epoch: 0, // the automatic first review
+                // Every PUSH gets its own row via the idempotency index's head_sha column (redeliveries
+                // of the SAME head still collapse via create_task's ON CONFLICT DO NOTHING); run_epoch
+                // stays 0 for every automatic review, same as `opened`.
+                run_epoch: 0,
                 preset,
-                entry_point: crate::preset::EntryPoint::PrOpen.as_str().to_string(),
-                // ADR-0068: no trigger comment on the automatic review → the lifecycle reactions land on
+                entry_point: entry.as_str().to_string(),
+                // ADR-0068: no trigger comment on an automatic review → the lifecycle reactions land on
                 // the PR body itself.
                 trigger_comment_id: None,
                 trace_context: lci_observability::current_traceparent(),
                 model_override,
                 check_runs_enabled: settings.check_run_reporting.value,
+                // Storm-strategy delay lands in #571 (supersede/debounce); `every` — this slice's only
+                // live strategy — never delays.
+                run_after_secs: None,
             };
             create_review_task(pool, task, delivery_id).await;
         }
@@ -1811,6 +1892,7 @@ async fn handle_issue_comment(
         trace_context: lci_observability::current_traceparent(),
         model_override,
         check_runs_enabled: settings.check_run_reporting.value,
+        run_after_secs: None,
     };
     tracing::info!(
         delivery_id,
@@ -2923,13 +3005,29 @@ mod tests {
     }
 
     fn gated_mr_body(path_with_namespace: &str, project_id: i64) -> Bytes {
+        gated_mr_body_with_action(path_with_namespace, project_id, "open", None)
+    }
+
+    /// Epic #566: an `update` event optionally carrying `oldrev` — GitLab's only reliable "the head
+    /// SHA actually moved" signal (it also sends `update` for label/title/description edits, which
+    /// carry no `oldrev`).
+    fn gated_mr_body_with_action(
+        path_with_namespace: &str,
+        project_id: i64,
+        action: &str,
+        oldrev: Option<&str>,
+    ) -> Bytes {
+        let mut object_attributes = serde_json::json!({
+            "action": action,
+            "iid": 11,
+            "diff_refs": { "base_sha": "base-gate", "head_sha": "head-gate-2" },
+            "last_commit": { "author": { "name": "A Human" } },
+        });
+        if let Some(oldrev) = oldrev {
+            object_attributes["oldrev"] = serde_json::Value::String(oldrev.to_string());
+        }
         let payload = serde_json::json!({
-            "object_attributes": {
-                "action": "open",
-                "iid": 11,
-                "diff_refs": { "base_sha": "base-gate", "head_sha": "head-gate" },
-                "last_commit": { "author": { "name": "A Human" } },
-            },
+            "object_attributes": object_attributes,
             "project": {
                 "id": project_id,
                 "path_with_namespace": path_with_namespace,
@@ -2938,6 +3036,182 @@ mod tests {
             "user": { "username": "a-human" },
         });
         Bytes::from(serde_json::to_vec(&payload).unwrap())
+    }
+
+    // --- epic #566: review-on-push (MR `update`) ---
+
+    /// The single most important test in this group: `review_on_push` defaults to OFF, so an `update`
+    /// event with a genuine `oldrev` — the strongest possible "a push happened" signal — must still
+    /// create NO task when the repo has configured nothing.
+    #[sqlx::test]
+    async fn mr_update_with_oldrev_is_a_noop_by_default(pool: PgPool) {
+        let mock = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/api/v4/projects/acme%2Fsyncdefault/repository/files/.lightbridge-code-review.jsonc/raw",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(404))
+            .mount(&mock)
+            .await;
+
+        let repo_id = seed_gated_gitlab_repo(&pool, "syncdefault", 2404).await;
+        let state = gated_gitlab_state(pool.clone(), &mock, 2404);
+        let response = gitlab_webhook_body(
+            state,
+            2404,
+            gated_mr_headers("sync-default"),
+            gated_mr_body_with_action("acme/syncdefault", 2404, "update", Some("old-sha")),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM tasks WHERE repository_id = $1")
+            .bind(repo_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            count, 0,
+            "review_on_push defaults to OFF; a push must not create a task unless opted in"
+        );
+    }
+
+    /// An `update` with NO `oldrev` is a metadata-only edit (label/title/description) — even with
+    /// `review_on_push` explicitly enabled, it must not create a task.
+    #[sqlx::test]
+    async fn mr_update_without_oldrev_is_ignored_as_metadata_only(pool: PgPool) {
+        let mock = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/api/v4/projects/acme%2Fmetaonly/repository/files/.lightbridge-code-review.jsonc/raw",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(404))
+            .mount(&mock)
+            .await;
+
+        let repo_id = seed_gated_gitlab_repo(&pool, "metaonly", 2405).await;
+        crate::db::set_repo_settings(
+            &pool,
+            repo_id,
+            &crate::db::RepoSettingsPatch {
+                review_on_push: Some(Some(true)),
+                ..Default::default()
+            },
+            "tester",
+        )
+        .await
+        .unwrap();
+
+        let state = gated_gitlab_state(pool.clone(), &mock, 2405);
+        let response = gitlab_webhook_body(
+            state,
+            2405,
+            gated_mr_headers("sync-metaonly"),
+            gated_mr_body_with_action("acme/metaonly", 2405, "update", None),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM tasks WHERE repository_id = $1")
+            .bind(repo_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            count, 0,
+            "an update with no oldrev is a metadata edit, not a push — no task, even when opted in"
+        );
+    }
+
+    /// The positive case: `review_on_push` enabled via DB override, an `update` WITH `oldrev` — a
+    /// genuine push — creates exactly one task, tagged with the new `pr_sync` entry point.
+    #[sqlx::test]
+    async fn mr_update_with_oldrev_creates_a_pr_sync_task_when_enabled(pool: PgPool) {
+        let mock = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/api/v4/projects/acme%2Fsyncon/repository/files/.lightbridge-code-review.jsonc/raw",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(404))
+            .mount(&mock)
+            .await;
+
+        let repo_id = seed_gated_gitlab_repo(&pool, "syncon", 2406).await;
+        crate::db::set_repo_settings(
+            &pool,
+            repo_id,
+            &crate::db::RepoSettingsPatch {
+                review_on_push: Some(Some(true)),
+                ..Default::default()
+            },
+            "tester",
+        )
+        .await
+        .unwrap();
+
+        let state = gated_gitlab_state(pool.clone(), &mock, 2406);
+        let response = gitlab_webhook_body(
+            state,
+            2406,
+            gated_mr_headers("sync-on"),
+            gated_mr_body_with_action("acme/syncon", 2406, "update", Some("old-sha")),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+        let (entry_point, preset, head_sha): (String, String, Option<String>) = sqlx::query_as(
+            "SELECT entry_point, preset, head_sha FROM tasks WHERE repository_id = $1",
+        )
+        .bind(repo_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(entry_point, "pr_sync");
+        assert_eq!(
+            preset, "fast",
+            "pr_sync defaults to the cheap tier — it fires once per push"
+        );
+        assert_eq!(head_sha.as_deref(), Some("head-gate-2"));
+    }
+
+    /// A draft MR must not be reviewed on push either — same rationale as the existing open-time
+    /// draft skip, now also covering the sync path.
+    #[sqlx::test]
+    async fn mr_update_skips_a_draft_mr_even_when_review_on_push_is_enabled(pool: PgPool) {
+        let mock = wiremock::MockServer::start().await;
+        let repo_id = seed_gated_gitlab_repo(&pool, "syncdraft", 2407).await;
+        crate::db::set_repo_settings(
+            &pool,
+            repo_id,
+            &crate::db::RepoSettingsPatch {
+                review_on_push: Some(Some(true)),
+                ..Default::default()
+            },
+            "tester",
+        )
+        .await
+        .unwrap();
+
+        let mut body_value: serde_json::Value = serde_json::from_slice(&gated_mr_body_with_action(
+            "acme/syncdraft",
+            2407,
+            "update",
+            Some("old-sha"),
+        ))
+        .unwrap();
+        body_value["object_attributes"]["draft"] = serde_json::Value::Bool(true);
+        let body = Bytes::from(serde_json::to_vec(&body_value).unwrap());
+
+        let state = gated_gitlab_state(pool.clone(), &mock, 2407);
+        let response = gitlab_webhook_body(state, 2407, gated_mr_headers("sync-draft"), body).await;
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM tasks WHERE repository_id = $1")
+            .bind(repo_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 0, "a draft MR must not be reviewed on push");
     }
 
     /// The same MR-open flow, but with no `.lightbridge-code-review.jsonc` on the repo at all (the

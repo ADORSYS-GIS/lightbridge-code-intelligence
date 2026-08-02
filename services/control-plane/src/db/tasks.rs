@@ -100,6 +100,12 @@ pub struct NewTask {
     /// use: the check's start and resolve happen minutes apart and must agree, so an operator flipping
     /// the toggle mid-run must not strand an in-progress check on the PR.
     pub check_runs_enabled: bool,
+    /// Delay before the task becomes claimable (epic #566's `debounce` push-storm strategy) — bound to
+    /// `run_after = now() + this many seconds`. `None`/`Some(0)` means claimable immediately (today's
+    /// behavior for every existing caller). Only [`create_task`] honors this; [`create_explicit_task`]
+    /// (the `@mention` path) always runs immediately — a human asking for a review should never wait
+    /// out someone else's debounce window.
+    pub run_after_secs: Option<u64>,
 }
 
 /// A task claimed by the dispatcher for execution (the subset needed to launch its Job).
@@ -160,8 +166,9 @@ pub async fn create_task(pool: &PgPool, task: &NewTask) -> Result<Option<Uuid>, 
     let inserted: Option<(Uuid, String)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "INSERT INTO tasks (id, repository_id, installation_id, webhook_delivery_id, target_type, \
          target_id, command_text, base_sha, head_sha, run_epoch, preset, entry_point, \
-         trigger_comment_id, trace_context, model_override, status) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, {INITIAL_TASK_STATUS_SQL}) \
+         trigger_comment_id, trace_context, model_override, check_runs_enabled, run_after, status) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, \
+                 now() + ($17 * interval '1 second'), {INITIAL_TASK_STATUS_SQL}) \
          ON CONFLICT (repository_id, target_type, target_id, command_text, head_sha, run_epoch) \
          DO NOTHING \
          RETURNING id, status"
@@ -182,11 +189,23 @@ pub async fn create_task(pool: &PgPool, task: &NewTask) -> Result<Option<Uuid>, 
     .bind(&task.trace_context)
     .bind(&task.model_override)
     .bind(task.check_runs_enabled)
+    .bind(task.run_after_secs.unwrap_or(0) as i64)
     .fetch_optional(pool)
     .await?;
 
     if let Some((new_id, status)) = &inserted {
-        notify_or_log_initial_status(pool, *new_id, task.repository_id, status).await;
+        // A debounced task is not yet claimable — waking the dispatcher now would be a no-op (the
+        // claim query filters on `run_after <= now()`) and just adds needless churn; the poll
+        // fallback picks it up once its delay elapses.
+        let delayed = task.run_after_secs.is_some_and(|s| s > 0);
+        if delayed && status == "queued" {
+            tracing::debug!(
+                task_id = %new_id, delay_secs = task.run_after_secs,
+                "task created with a debounce delay; skipping the immediate wake"
+            );
+        } else {
+            notify_or_log_initial_status(pool, *new_id, task.repository_id, status).await;
+        }
     }
     Ok(inserted.map(|(id, _)| id))
 }
@@ -578,8 +597,13 @@ pub async fn get_check_run_external_id(
 /// never strands reviews forever — the common `succeeded` case is the one that grounds them.
 async fn release_reviews_waiting_on_index(pool: &PgPool, index_task_id: Uuid) {
     let released: Vec<Uuid> = match sqlx::query_scalar(
+        // GREATEST(run_after, now()), NOT a flat `now()` (epic #566): a `debounce`-strategy sync task
+        // can land in `waiting_for_index` with a run_after still in the future (created while an index
+        // for the same repo happened to be in flight). A flat `now()` would fast-forward it claimable
+        // the instant the UNRELATED index finishes, defeating the whole point of the debounce window.
+        // For every other release (run_after already <= now()) this is unchanged: GREATEST picks now().
         "WITH done AS (SELECT repository_id FROM tasks WHERE id = $1 AND command_text = 'index') \
-         UPDATE tasks SET status = 'queued', run_after = now() \
+         UPDATE tasks SET status = 'queued', run_after = GREATEST(run_after, now()) \
          WHERE repository_id IN (SELECT repository_id FROM done) \
            AND status = 'waiting_for_index' \
          RETURNING id",

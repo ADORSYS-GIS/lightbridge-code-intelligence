@@ -573,6 +573,7 @@ mod tests {
             &NewTask {
                 model_override: None,
                 check_runs_enabled: true,
+                run_after_secs: None,
                 repository_id: repo_id,
                 installation_id: 99,
                 webhook_delivery_id: "d1".to_string(),
