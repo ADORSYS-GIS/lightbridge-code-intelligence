@@ -113,6 +113,31 @@ impl GitlabClient {
         }
     }
 
+    /// The commit-status body, with `target_url`/`description` inserted **only when present**.
+    ///
+    /// Mirrors the GitHub fix for the same bug class: `serde_json::json!` serializes an
+    /// `Option::None` as an explicit `null`, and GitHub was proven (live, 2026-08-02) to reject a
+    /// null optional URL with a 422 rather than treating it as absent. GitLab's own tolerance here
+    /// was never verified against a live instance, so this takes the same omit-don't-null shape
+    /// rather than betting that GitLab is more lenient than GitHub. Pure, so it is unit-tested.
+    fn commit_status_payload(
+        state: &str,
+        description: Option<&str>,
+        target_url: Option<&str>,
+    ) -> serde_json::Value {
+        let mut payload = serde_json::json!({
+            "state": state,
+            "name": CHECK_RUN_NAME,
+        });
+        if let Some(description) = description {
+            payload["description"] = serde_json::Value::String(description.to_string());
+        }
+        if let Some(target_url) = target_url {
+            payload["target_url"] = serde_json::Value::String(target_url.to_string());
+        }
+        payload
+    }
+
     /// Standard headers for every GitLab API call.
     fn api_headers(&self) -> reqwest::header::HeaderMap {
         let mut h = reqwest::header::HeaderMap::new();
@@ -883,11 +908,7 @@ impl CodePlatform for GitlabClient {
     ) -> anyhow::Result<Option<i64>> {
         let project = Self::project_encoded(repo);
         let url = self.url(&format!("/projects/{}/statuses/{}", project, req.head_sha));
-        let body = serde_json::json!({
-            "state": "running",
-            "name": CHECK_RUN_NAME,
-            "target_url": req.details_url,
-        });
+        let body = Self::commit_status_payload("running", None, req.details_url);
         let _ = self
             .http
             .post(&url)
@@ -907,12 +928,11 @@ impl CodePlatform for GitlabClient {
     ) -> anyhow::Result<()> {
         let project = Self::project_encoded(repo);
         let url = self.url(&format!("/projects/{}/statuses/{}", project, req.head_sha));
-        let body = serde_json::json!({
-            "state": Self::commit_status_state(req.conclusion),
-            "name": CHECK_RUN_NAME,
-            "description": req.summary,
-            "target_url": req.details_url,
-        });
+        let body = Self::commit_status_payload(
+            Self::commit_status_state(req.conclusion),
+            Some(req.summary),
+            req.details_url,
+        );
         let _ = self
             .http
             .post(&url)
@@ -1096,6 +1116,36 @@ mod tests {
         );
     }
 
+    /// Same omit-don't-null contract as GitHub's `details_url` (see
+    /// `check_run_payloads_omit_details_url_when_absent` in `github.rs`): an absent optional field
+    /// must not be serialized as an explicit `null`.
+    #[test]
+    fn commit_status_payload_omits_absent_optional_fields() {
+        let payload = GitlabClient::commit_status_payload("running", None, None);
+        assert_eq!(payload["state"], "running");
+        assert_eq!(payload["name"], CHECK_RUN_NAME);
+        assert!(
+            payload.get("target_url").is_none(),
+            "target_url must be absent, not null: {payload}"
+        );
+        assert!(
+            payload.get("description").is_none(),
+            "description must be absent, not null: {payload}"
+        );
+    }
+
+    #[test]
+    fn commit_status_payload_includes_present_optional_fields() {
+        let payload = GitlabClient::commit_status_payload(
+            "failed",
+            Some("it broke"),
+            Some("https://example.test/run/1"),
+        );
+        assert_eq!(payload["state"], "failed");
+        assert_eq!(payload["description"], "it broke");
+        assert_eq!(payload["target_url"], "https://example.test/run/1");
+    }
+
     fn check_repo() -> RepoRef {
         RepoRef {
             platform: crate::integrations::platform::Platform::GitLab,
@@ -1117,6 +1167,10 @@ mod tests {
             .and(wiremock::matchers::body_string_contains(
                 "\"state\":\"running\"",
             ))
+            // Regression: the absent target_url must not reach the wire as `null`.
+            .and(|req: &wiremock::Request| {
+                !String::from_utf8_lossy(&req.body).contains("target_url")
+            })
             .respond_with(wiremock::ResponseTemplate::new(201))
             .mount(&mock)
             .await;

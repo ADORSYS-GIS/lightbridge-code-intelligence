@@ -220,6 +220,86 @@ impl GithubApp {
         })
     }
 
+    /// Attach `details_url` to a check-run payload **only when it is present**.
+    ///
+    /// Load-bearing, not stylistic: GitHub rejects an explicit JSON `null` on this field with
+    /// `422 Invalid request. For 'properties/details_url', nil is not a string.` — reproduced live
+    /// against the real API on 2026-08-02, which is what made every check-run intent dead-letter
+    /// after the feature first shipped. `serde_json::json!` serializes an `Option::None` as `null`,
+    /// so the key must be inserted conditionally rather than interpolated.
+    ///
+    /// This is the SAME omit-don't-null contract ADR-0071 pinned for `start_line`/`start_side` on
+    /// the review endpoint (see `review_comment_without_start_line_serializes_unchanged`) — different
+    /// field, identical GitHub behavior, so it gets the same treatment and the same regression test.
+    fn attach_details_url(payload: &mut serde_json::Value, details_url: Option<&str>) {
+        if let Some(url) = details_url {
+            payload["details_url"] = serde_json::Value::String(url.to_string());
+        }
+    }
+
+    /// The `in_progress` check-run creation body. Pure, so the omit-don't-null contract is
+    /// unit-tested without HTTP.
+    fn check_run_start_payload(head_sha: &str, details_url: Option<&str>) -> serde_json::Value {
+        let mut payload = serde_json::json!({
+            "name": CHECK_RUN_NAME,
+            "head_sha": head_sha,
+            "status": "in_progress",
+        });
+        Self::attach_details_url(&mut payload, details_url);
+        payload
+    }
+
+    /// The `completed` check-run body for a PATCH (no `head_sha`/`name` — the run already exists).
+    fn check_run_update_payload(
+        conclusion: &str,
+        summary: &str,
+        details_url: Option<&str>,
+    ) -> serde_json::Value {
+        let mut payload = serde_json::json!({
+            "status": "completed",
+            "conclusion": conclusion,
+            "output": { "title": CHECK_RUN_NAME, "summary": summary },
+        });
+        Self::attach_details_url(&mut payload, details_url);
+        payload
+    }
+
+    /// The already-`completed` check-run creation body (the self-healing fallback).
+    fn check_run_completed_payload(
+        head_sha: &str,
+        conclusion: &str,
+        summary: &str,
+        details_url: Option<&str>,
+    ) -> serde_json::Value {
+        let mut payload = serde_json::json!({
+            "name": CHECK_RUN_NAME,
+            "head_sha": head_sha,
+            "status": "completed",
+            "conclusion": conclusion,
+            "output": { "title": CHECK_RUN_NAME, "summary": summary },
+        });
+        Self::attach_details_url(&mut payload, details_url);
+        payload
+    }
+
+    /// Fail with GitHub's OWN response body attached.
+    ///
+    /// `error_for_status()` discards the body, so a rejected check-run write surfaced only as
+    /// "github rejected the check-run creation" with no reason — the 422 above was invisible in
+    /// production logs and took a live API reproduction to identify. Anything that reaches an
+    /// operator's logs from these endpoints should say what GitHub actually complained about.
+    async fn ensure_success(
+        response: reqwest::Response,
+        context: &str,
+    ) -> anyhow::Result<reqwest::Response> {
+        let status = response.status();
+        if status.is_success() {
+            return Ok(response);
+        }
+        let body = response.text().await.unwrap_or_default();
+        anyhow::bail!("{context}: HTTP {status}: {body}")
+    }
+
     /// Open a Check Run in `in_progress` status (`POST repos/{owner}/{repo}/check-runs`). Returns its
     /// id, kept so `update_check_run_completed` can address the SAME check run later rather than
     /// opening a second one.
@@ -236,13 +316,7 @@ impl GithubApp {
         struct CheckRunResponse {
             id: i64,
         }
-        let payload = serde_json::json!({
-            "name": CHECK_RUN_NAME,
-            "head_sha": head_sha,
-            "status": "in_progress",
-            "details_url": details_url,
-        });
-        let created: CheckRunResponse = self
+        let response = self
             .http
             .post(format!(
                 "https://api.github.com/repos/{owner}/{repo}/check-runs"
@@ -251,15 +325,16 @@ impl GithubApp {
             .header("Accept", "application/vnd.github+json")
             .header("User-Agent", "lightbridge-code-intelligence")
             .header("X-GitHub-Api-Version", "2022-11-28")
-            .json(&payload)
+            .json(&Self::check_run_start_payload(head_sha, details_url))
             .send()
             .await
-            .context("opening check run")?
-            .error_for_status()
-            .context("github rejected the check-run creation")?
-            .json()
-            .await
-            .context("parsing check-run creation response")?;
+            .context("opening check run")?;
+        let created: CheckRunResponse =
+            Self::ensure_success(response, "github rejected the check-run creation")
+                .await?
+                .json()
+                .await
+                .context("parsing check-run creation response")?;
         Ok(created.id)
     }
 
@@ -276,13 +351,8 @@ impl GithubApp {
         details_url: Option<&str>,
     ) -> anyhow::Result<()> {
         use anyhow::Context;
-        let payload = serde_json::json!({
-            "status": "completed",
-            "conclusion": conclusion,
-            "details_url": details_url,
-            "output": { "title": CHECK_RUN_NAME, "summary": summary },
-        });
-        self.http
+        let response = self
+            .http
             .patch(format!(
                 "https://api.github.com/repos/{owner}/{repo}/check-runs/{check_run_id}"
             ))
@@ -290,12 +360,15 @@ impl GithubApp {
             .header("Accept", "application/vnd.github+json")
             .header("User-Agent", "lightbridge-code-intelligence")
             .header("X-GitHub-Api-Version", "2022-11-28")
-            .json(&payload)
+            .json(&Self::check_run_update_payload(
+                conclusion,
+                summary,
+                details_url,
+            ))
             .send()
             .await
-            .context("resolving check run")?
-            .error_for_status()
-            .context("github rejected the check-run update")?;
+            .context("resolving check run")?;
+        Self::ensure_success(response, "github rejected the check-run update").await?;
         Ok(())
     }
 
@@ -314,15 +387,8 @@ impl GithubApp {
         details_url: Option<&str>,
     ) -> anyhow::Result<()> {
         use anyhow::Context;
-        let payload = serde_json::json!({
-            "name": CHECK_RUN_NAME,
-            "head_sha": head_sha,
-            "status": "completed",
-            "conclusion": conclusion,
-            "details_url": details_url,
-            "output": { "title": CHECK_RUN_NAME, "summary": summary },
-        });
-        self.http
+        let response = self
+            .http
             .post(format!(
                 "https://api.github.com/repos/{owner}/{repo}/check-runs"
             ))
@@ -330,12 +396,16 @@ impl GithubApp {
             .header("Accept", "application/vnd.github+json")
             .header("User-Agent", "lightbridge-code-intelligence")
             .header("X-GitHub-Api-Version", "2022-11-28")
-            .json(&payload)
+            .json(&Self::check_run_completed_payload(
+                head_sha,
+                conclusion,
+                summary,
+                details_url,
+            ))
             .send()
             .await
-            .context("opening a completed check run")?
-            .error_for_status()
-            .context("github rejected the completed check-run creation")?;
+            .context("opening a completed check run")?;
+        Self::ensure_success(response, "github rejected the completed check-run creation").await?;
         Ok(())
     }
 
@@ -1175,6 +1245,84 @@ mod tests {
             value.get("start_side").is_none(),
             "start_side key must be absent, not null"
         );
+    }
+
+    /// REGRESSION (live 422, 2026-08-02): every check-run payload must OMIT `details_url` entirely
+    /// when there is no URL — never send it as `null`. GitHub answers an explicit null with
+    /// `422 Invalid request. For 'properties/details_url', nil is not a string.`, which is what made
+    /// every check-run intent dead-letter when this feature first shipped. Same contract, and same
+    /// style of test, as `review_comment_without_start_line_serializes_unchanged` above.
+    #[test]
+    fn check_run_payloads_omit_details_url_when_absent() {
+        for (label, payload) in [
+            ("start", GithubApp::check_run_start_payload("abc123", None)),
+            (
+                "update",
+                GithubApp::check_run_update_payload("success", "all good", None),
+            ),
+            (
+                "create-completed",
+                GithubApp::check_run_completed_payload("abc123", "success", "all good", None),
+            ),
+        ] {
+            assert!(
+                payload.get("details_url").is_none(),
+                "{label} payload must omit details_url entirely, not send null: {payload}"
+            );
+        }
+    }
+
+    /// The counterpart: when a URL IS supplied it rides as a plain string.
+    #[test]
+    fn check_run_payloads_include_details_url_when_present() {
+        let url = "https://example.test/run/1";
+        for (label, payload) in [
+            (
+                "start",
+                GithubApp::check_run_start_payload("abc123", Some(url)),
+            ),
+            (
+                "update",
+                GithubApp::check_run_update_payload("success", "all good", Some(url)),
+            ),
+            (
+                "create-completed",
+                GithubApp::check_run_completed_payload("abc123", "success", "all good", Some(url)),
+            ),
+        ] {
+            assert_eq!(
+                payload.get("details_url").and_then(|v| v.as_str()),
+                Some(url),
+                "{label} payload must carry details_url as a string"
+            );
+        }
+    }
+
+    /// The rest of each payload's shape, pinned so a future edit can't silently drop a required
+    /// field while satisfying the details_url assertions above.
+    #[test]
+    fn check_run_payloads_carry_their_required_fields() {
+        let start = GithubApp::check_run_start_payload("abc123", None);
+        assert_eq!(start["name"], CHECK_RUN_NAME);
+        assert_eq!(start["head_sha"], "abc123");
+        assert_eq!(start["status"], "in_progress");
+
+        let update = GithubApp::check_run_update_payload("neutral", "found 2 things", None);
+        assert_eq!(update["status"], "completed");
+        assert_eq!(update["conclusion"], "neutral");
+        assert_eq!(update["output"]["summary"], "found 2 things");
+        assert!(
+            update.get("head_sha").is_none(),
+            "a PATCH addresses an existing run by id; head_sha would be meaningless"
+        );
+
+        let completed =
+            GithubApp::check_run_completed_payload("abc123", "failure", "it broke", None);
+        assert_eq!(completed["name"], CHECK_RUN_NAME);
+        assert_eq!(completed["head_sha"], "abc123");
+        assert_eq!(completed["status"], "completed");
+        assert_eq!(completed["conclusion"], "failure");
+        assert_eq!(completed["output"]["summary"], "it broke");
     }
 
     /// A ranged `ReviewComment` (ADR-0071) posts `start_line` + `start_side: RIGHT` alongside the
