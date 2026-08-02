@@ -744,6 +744,17 @@ async fn handle_gitlab_merge_request(
                 repository_id,
             )
             .await;
+            // Epic #566: a repo can opt out of the automatic on-open review and stay @mention-only.
+            // Checked here rather than at dispatch so an opted-out repo creates no task at all.
+            if !settings.review_on_pr_open.value {
+                tracing::info!(
+                    delivery_id,
+                    repository_id,
+                    source = ?settings.review_on_pr_open.source,
+                    "automatic on-open review disabled for this repo; skipping (mention-triggered reviews still run)"
+                );
+                return;
+            }
             let model_override =
                 crate::model::resolve_model_override(pool, repository_id, installation_id).await;
             let task = crate::db::NewTask {
@@ -1145,6 +1156,17 @@ async fn handle_bitbucket_pullrequest(
                 repository_id,
             )
             .await;
+            // Epic #566: a repo can opt out of the automatic on-open review and stay @mention-only.
+            // Checked here rather than at dispatch so an opted-out repo creates no task at all.
+            if !settings.review_on_pr_open.value {
+                tracing::info!(
+                    delivery_id,
+                    repository_id,
+                    source = ?settings.review_on_pr_open.source,
+                    "automatic on-open review disabled for this repo; skipping (mention-triggered reviews still run)"
+                );
+                return;
+            }
             let model_override =
                 crate::model::resolve_model_override(pool, repository_id, installation_id).await;
             let task = crate::db::NewTask {
@@ -1523,6 +1545,17 @@ async fn handle_pull_request(
                 repository_id,
             )
             .await;
+            // Epic #566: a repo can opt out of the automatic on-open review and stay @mention-only.
+            // Checked here rather than at dispatch so an opted-out repo creates no task at all.
+            if !settings.review_on_pr_open.value {
+                tracing::info!(
+                    delivery_id,
+                    repository_id,
+                    source = ?settings.review_on_pr_open.source,
+                    "automatic on-open review disabled for this repo; skipping (mention-triggered reviews still run)"
+                );
+                return;
+            }
             let model_override =
                 crate::model::resolve_model_override(pool, repository_id, installation_id).await;
             let task = crate::db::NewTask {
@@ -2708,6 +2741,203 @@ mod tests {
             "the repo's .lightbridge-code-review.jsonc preset was resolved end-to-end"
         );
         assert_eq!(entry_point, "pr_open");
+    }
+
+    /// Epic #566: a repo that turns the automatic on-open review OFF creates no task at all when an
+    /// MR opens. Exercised end-to-end through the real webhook path, once per config layer.
+    ///
+    /// `mr_open_with_review_on_open_disabled_creates_no_task` covers the DB-override layer;
+    /// the file layer is covered by the sibling test below, so a regression in either layer is caught.
+    #[sqlx::test]
+    async fn mr_open_with_review_on_open_disabled_creates_no_task(pool: PgPool) {
+        let mock = wiremock::MockServer::start().await;
+        // No repo config file — so the OFF decision can only come from the DB override.
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/api/v4/projects/acme%2Fgated/repository/files/.lightbridge-code-review.jsonc/raw",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(404))
+            .mount(&mock)
+            .await;
+
+        let repo_id = seed_gated_gitlab_repo(&pool, "gated", 2401).await;
+        crate::db::set_repo_settings(
+            &pool,
+            repo_id,
+            &crate::db::RepoSettingsPatch {
+                review_on_pr_open: Some(Some(false)),
+                ..Default::default()
+            },
+            "tester",
+        )
+        .await
+        .unwrap();
+
+        let state = gated_gitlab_state(pool.clone(), &mock, 2401);
+        let response = gitlab_webhook_body(
+            state,
+            2401,
+            gated_mr_headers("gated-off"),
+            gated_mr_body("acme/gated", 2401),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::ACCEPTED,
+            "the webhook is still accepted"
+        );
+
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM tasks WHERE repository_id = $1")
+            .bind(repo_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            count, 0,
+            "review_on_pr_open=false must create NO task for an opened MR"
+        );
+    }
+
+    /// The control for the test above: with no override and no config, the built-in default (`true`)
+    /// applies and the task IS created. Without this pair, a bug that stopped creating tasks entirely
+    /// would still let the OFF assertion pass.
+    #[sqlx::test]
+    async fn mr_open_creates_a_task_when_review_on_open_is_left_at_its_default(pool: PgPool) {
+        let mock = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/api/v4/projects/acme%2Fungated/repository/files/.lightbridge-code-review.jsonc/raw",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(404))
+            .mount(&mock)
+            .await;
+
+        let repo_id = seed_gated_gitlab_repo(&pool, "ungated", 2402).await;
+        let state = gated_gitlab_state(pool.clone(), &mock, 2402);
+        let response = gitlab_webhook_body(
+            state,
+            2402,
+            gated_mr_headers("gated-on"),
+            gated_mr_body("acme/ungated", 2402),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM tasks WHERE repository_id = $1")
+            .bind(repo_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            count, 1,
+            "the default (true) still creates the on-open review"
+        );
+    }
+
+    /// The FILE layer can disable it too, with no DB row involved.
+    #[sqlx::test]
+    async fn mr_open_respects_review_on_open_false_from_the_repo_config_file(pool: PgPool) {
+        let mock = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/api/v4/projects/acme%2Ffilegated/repository/files/.lightbridge-code-review.jsonc/raw",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_string(
+                r#"{ "triggers": { "review_on_open": false } }"#,
+            ))
+            .mount(&mock)
+            .await;
+
+        let repo_id = seed_gated_gitlab_repo(&pool, "filegated", 2403).await;
+        let state = gated_gitlab_state(pool.clone(), &mock, 2403);
+        let response = gitlab_webhook_body(
+            state,
+            2403,
+            gated_mr_headers("gated-file"),
+            gated_mr_body("acme/filegated", 2403),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM tasks WHERE repository_id = $1")
+            .bind(repo_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            count, 0,
+            "the repo config file alone must be able to disable the on-open review"
+        );
+    }
+
+    // --- shared fixtures for the review_on_open gate tests ---
+
+    async fn seed_gated_gitlab_repo(pool: &PgPool, name: &str, project_id: i64) -> i64 {
+        let repo_id = crate::db::upsert_repository(
+            pool,
+            Platform::GitLab,
+            project_id,
+            "acme",
+            name,
+            "main",
+            Some(project_id),
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE repositories SET status = 'approved' WHERE id = $1")
+            .bind(repo_id)
+            .execute(pool)
+            .await
+            .unwrap();
+        repo_id
+    }
+
+    fn gated_gitlab_state(pool: PgPool, mock: &wiremock::MockServer, project_id: i64) -> AppState {
+        let section = crate::config::GitlabSection {
+            enabled: true,
+            default_api_url: Some("https://gitlab.example.com/api/v4".to_string()),
+            default_bot_handle: Some("lightbridge-bot".to_string()),
+            projects: vec![crate::config::GitlabProjectConfig {
+                project_id,
+                installation_id: None,
+                api_url: Some(format!("{}/api/v4", mock.uri())),
+                access_token: "token-gate-test".to_string(),
+                webhook_secret: "gate-secret".to_string(),
+                bot_handle: None,
+            }],
+        };
+        let registry = crate::integrations::gitlab::GitlabRegistry::from_config(&section)
+            .expect("valid config")
+            .expect("enabled registry");
+        let mut state = gitlab_only_state(pool);
+        state.gitlab = Some(registry);
+        state
+    }
+
+    fn gated_mr_headers(uuid: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-gitlab-event", "Merge Request Hook".parse().unwrap());
+        headers.insert("x-gitlab-token", "gate-secret".parse().unwrap());
+        headers.insert("x-gitlab-event-uuid", uuid.parse().unwrap());
+        headers
+    }
+
+    fn gated_mr_body(path_with_namespace: &str, project_id: i64) -> Bytes {
+        let payload = serde_json::json!({
+            "object_attributes": {
+                "action": "open",
+                "iid": 11,
+                "diff_refs": { "base_sha": "base-gate", "head_sha": "head-gate" },
+                "last_commit": { "author": { "name": "A Human" } },
+            },
+            "project": {
+                "id": project_id,
+                "path_with_namespace": path_with_namespace,
+                "default_branch": "main",
+            },
+            "user": { "username": "a-human" },
+        });
+        Bytes::from(serde_json::to_vec(&payload).unwrap())
     }
 
     /// The same MR-open flow, but with no `.lightbridge-code-review.jsonc` on the repo at all (the
