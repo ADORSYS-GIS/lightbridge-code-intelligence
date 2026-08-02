@@ -362,10 +362,13 @@ fn api_v2_router() -> Router<AppState> {
         )
         // Per-identity model selection + ACL (ADR-0110, story #501).
         .route("/admin/models", get(admin::list_model_allowlist))
-        .route("/admin/repositories/{id}/model", post(admin::set_repo_model))
+        .route(
+            "/admin/repositories/{id}/model",
+            get(admin::get_repo_model).post(admin::set_repo_model),
+        )
         .route(
             "/admin/organizations/{installation_id}/model",
-            post(admin::set_org_model),
+            get(admin::get_org_model).post(admin::set_org_model),
         )
         // Internal runner API (shared-bearer, not OIDC) — the agent Job's lifecycle callbacks.
         .route("/internal/tasks/{id}", get(internal::get_context))
