@@ -903,9 +903,207 @@ pub fn render_failure_notice() -> String {
         .to_string()
 }
 
+/// What a finalized run actually produced, captured where the counts are computed so the check-run
+/// output can describe the outcome instead of saying "finished". `None` at the call sites that
+/// resolve a check WITHOUT a finalized review (the runner-reported failure path and the reaper) —
+/// those runs never produced counts.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CheckFacts {
+    pub inline_n: i32,
+    pub deferred_n: i32,
+    pub out_of_scope_n: i32,
+    /// Findings suppressed because they were already posted on this commit (ADR-0065).
+    pub deduped_n: usize,
+    /// The model's own verdict text (or the derived clean/all-deduped note).
+    pub verdict: String,
+}
+
+impl CheckFacts {
+    /// Findings this run actually surfaced on the PR, across all three validation buckets.
+    fn total(&self) -> i32 {
+        self.inline_n + self.deferred_n + self.out_of_scope_n
+    }
+}
+
+fn plural(n: i32) -> &'static str {
+    if n == 1 { "" } else { "s" }
+}
+
+/// Render a check run's `(title, summary)` — the headline and the markdown body shown on the check.
+///
+/// The two are used differently per platform (see the `CodePlatform` impls): GitHub renders both,
+/// with `summary` as markdown; GitLab's commit-status `description` and Bitbucket's build-status
+/// `description` are short single-line fields, so they take the TITLE only — a multi-paragraph
+/// markdown blob would be truncated or rejected there.
+///
+/// Pure, so the whole matrix is unit-tested without a DB or HTTP.
+pub fn render_check_output(
+    conclusion: crate::integrations::platform::CheckConclusion,
+    facts: Option<&CheckFacts>,
+) -> (String, String) {
+    use crate::integrations::platform::CheckConclusion as C;
+
+    let Some(facts) = facts else {
+        // No finalized review to describe (failure/reaper paths, or a run that posted no PR review).
+        return match conclusion {
+            C::Failure => (
+                "Review did not complete".to_string(),
+                "The review run failed before it could post a review. Re-mention the bot on this PR \
+                 (or push a new commit) to try again."
+                    .to_string(),
+            ),
+            C::TimedOut => (
+                "Review timed out".to_string(),
+                "The review run stopped reporting before it could post a review. Re-mention the bot \
+                 on this PR (or push a new commit) to try again."
+                    .to_string(),
+            ),
+            C::Cancelled => (
+                "Review cancelled".to_string(),
+                "The review run was cancelled.".to_string(),
+            ),
+            C::Success | C::Neutral => (
+                "Review complete".to_string(),
+                "No pull-request review was posted for this run.".to_string(),
+            ),
+        };
+    };
+
+    let total = facts.total();
+    let title = match (conclusion, total) {
+        (C::Failure, _) => "Review did not complete".to_string(),
+        (C::TimedOut, _) => "Review timed out".to_string(),
+        (C::Cancelled, _) => "Review cancelled".to_string(),
+        (_, 0) => "No findings".to_string(),
+        (_, n) => format!("{n} finding{}", plural(n)),
+    };
+
+    let mut summary = String::new();
+    if total > 0 {
+        summary.push_str(&format!(
+            "**{total} finding{}** — {} inline, {} deferred, {} out of scope.\n\n",
+            plural(total),
+            facts.inline_n,
+            facts.deferred_n,
+            facts.out_of_scope_n,
+        ));
+    } else if conclusion == C::Success {
+        summary.push_str("No findings on this diff.\n\n");
+    }
+    if facts.deduped_n > 0 {
+        summary.push_str(&format!(
+            "_{} finding{} already posted on this commit {} not repeated (ADR-0065)._\n\n",
+            facts.deduped_n,
+            if facts.deduped_n == 1 { "" } else { "s" },
+            if facts.deduped_n == 1 { "was" } else { "were" },
+        ));
+    }
+    if conclusion == C::Failure {
+        summary
+            .push_str("The run could not complete — the posted note explains what happened.\n\n");
+    }
+    let verdict = facts.verdict.trim();
+    if !verdict.is_empty() {
+        summary.push_str(verdict);
+    }
+    let summary = summary.trim_end().to_string();
+    // A check with an empty body reads as broken; fall back to the headline.
+    let summary = if summary.is_empty() {
+        title.clone()
+    } else {
+        summary
+    };
+    (title, summary)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::integrations::platform::CheckConclusion as C;
+
+    fn facts(inline: i32, deferred: i32, oos: i32, verdict: &str) -> CheckFacts {
+        CheckFacts {
+            inline_n: inline,
+            deferred_n: deferred,
+            out_of_scope_n: oos,
+            deduped_n: 0,
+            verdict: verdict.to_string(),
+        }
+    }
+
+    // The check summary must describe the RUN, not just say "finished" — counts, then the model's
+    // own verdict text.
+    #[test]
+    fn check_output_reports_finding_counts_and_verdict() {
+        let (title, summary) =
+            render_check_output(C::Neutral, Some(&facts(2, 1, 0, "Two P1 issues in auth.")));
+        assert_eq!(title, "3 findings");
+        assert!(
+            summary.contains("**3 findings**") && summary.contains("2 inline, 1 deferred"),
+            "summary must break the counts down: {summary}"
+        );
+        assert!(
+            summary.contains("Two P1 issues in auth."),
+            "the model's verdict must ride along: {summary}"
+        );
+    }
+
+    #[test]
+    fn check_output_singularizes_one_finding() {
+        let (title, _) = render_check_output(C::Neutral, Some(&facts(1, 0, 0, "")));
+        assert_eq!(title, "1 finding", "no stray plural 's'");
+    }
+
+    #[test]
+    fn check_output_reports_a_clean_pass() {
+        let (title, summary) =
+            render_check_output(C::Success, Some(&facts(0, 0, 0, "Looks good to me.")));
+        assert_eq!(title, "No findings");
+        assert!(summary.contains("No findings on this diff."));
+        assert!(summary.contains("Looks good to me."));
+    }
+
+    // ADR-0065: findings suppressed as already-posted are disclosed, so a "no findings" check can't
+    // be mistaken for "nothing was ever found on this commit".
+    #[test]
+    fn check_output_discloses_deduped_findings() {
+        let mut f = facts(0, 0, 0, "");
+        f.deduped_n = 2;
+        let (_, summary) = render_check_output(C::Success, Some(&f));
+        assert!(
+            summary.contains("2 findings already posted on this commit were not repeated"),
+            "deduped findings must be disclosed: {summary}"
+        );
+    }
+
+    // The failure/reaper paths resolve a check with no finalized review behind them.
+    #[test]
+    fn check_output_without_facts_describes_the_failure_mode() {
+        let (title, summary) = render_check_output(C::Failure, None);
+        assert_eq!(title, "Review did not complete");
+        assert!(summary.contains("failed before it could post a review"));
+
+        let (title, summary) = render_check_output(C::TimedOut, None);
+        assert_eq!(title, "Review timed out");
+        assert!(summary.contains("stopped reporting"));
+
+        let (title, _) = render_check_output(C::Cancelled, None);
+        assert_eq!(title, "Review cancelled");
+
+        // A run that legitimately posted no PR review (a pure @mention question) is not a failure.
+        let (title, summary) = render_check_output(C::Success, None);
+        assert_eq!(title, "Review complete");
+        assert!(summary.contains("No pull-request review was posted"));
+    }
+
+    // A check whose body is empty renders as broken; the headline is the floor.
+    #[test]
+    fn check_output_summary_is_never_empty() {
+        let (title, summary) = render_check_output(C::Neutral, Some(&facts(0, 0, 0, "")));
+        assert!(!summary.trim().is_empty());
+        assert_eq!(summary, title);
+    }
 
     // Explicit `\n` (no backslash-continuation) so the leading diff markers (' ', '+', '-') survive.
     const PATCH: &str = "@@ -1,3 +1,4 @@ fn main() {\n let a = 1;\n-    let b = 2;\n+    let b = 3;\n+    let c = 4;\n println!(\"{a}\");";

@@ -68,6 +68,17 @@ pub async fn upsert_review(
     .map(|_| ())
 }
 
+/// The permalink to a task's posted review, when one was posted and the platform returned a URL.
+/// Read at check-run resolve time so the check's "Details" link points at the actual review comment.
+/// `None` for a suppressed clean pass (nothing was posted) or when the platform omitted the URL.
+pub async fn get_review_url(pool: &PgPool, task_id: Uuid) -> Result<Option<String>, sqlx::Error> {
+    sqlx::query_scalar("SELECT review_url FROM reviews WHERE task_id = $1")
+        .bind(task_id)
+        .fetch_optional(pool)
+        .await
+        .map(Option::flatten)
+}
+
 /// Persist the silent-clean review copy (ADR-0068) **without clobbering** — `ON CONFLICT DO NOTHING`.
 /// The clean path must never overwrite a row the reconciler wrote for a *posted* review (that would null
 /// `platform_review_id` and break the ADR-0035 feedback join); a re-run of the clean path itself is a

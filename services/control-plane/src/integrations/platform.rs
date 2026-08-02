@@ -229,7 +229,14 @@ pub struct CheckRunResolve<'a> {
     /// fallback.
     pub external_id: Option<i64>,
     pub conclusion: CheckConclusion,
+    /// One-line headline (e.g. `"3 findings"`). GitHub shows it above the summary; GitLab's
+    /// commit-status `description` and Bitbucket's build-status `description` are short single-line
+    /// fields and take THIS rather than [`Self::summary`].
+    pub title: &'a str,
+    /// Markdown body describing the outcome. GitHub renders it; the other platforms have nowhere to
+    /// put it (see [`Self::title`]).
     pub summary: &'a str,
+    /// Permalink to the posted review, when there is one — surfaced as the check's "Details" link.
     pub details_url: Option<&'a str>,
 }
 

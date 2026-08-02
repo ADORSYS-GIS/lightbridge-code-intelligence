@@ -408,6 +408,17 @@ async fn deliver_check_run_resolve(
             .unwrap_or(None),
         None => None,
     };
+    // The permalink to the review this run posted, surfaced as the check's "Details" link. Looked up
+    // HERE rather than baked into the payload (which is otherwise fully shaped at produce time,
+    // ADR-0059) because the URL does not exist yet at finalize: the review is posted later, by the
+    // `review` outbox row. That row is enqueued BEFORE this one and the drain is single-replica in
+    // `(created_at, id)` order, so `deliver_review`'s `upsert_review` has already stored the URL by
+    // the time we get here. `None` when the review was suppressed (clean pass), the platform omitted
+    // a URL, or the review delivery is still backing off — the check then simply has no link.
+    let details_url = match row.task_id {
+        Some(task) => crate::db::get_review_url(pool, task).await.unwrap_or(None),
+        None => None,
+    };
     platform
         .resolve_check_run(
             repo,
@@ -415,8 +426,9 @@ async fn deliver_check_run_resolve(
                 head_sha: &p.head_sha,
                 external_id,
                 conclusion: p.conclusion,
+                title: &p.title,
                 summary: &p.summary,
-                details_url: None,
+                details_url: details_url.as_deref(),
             },
         )
         .await?;

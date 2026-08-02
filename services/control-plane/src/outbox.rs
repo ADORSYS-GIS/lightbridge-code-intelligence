@@ -261,6 +261,11 @@ pub struct CheckRunResolvePayload {
     pub pr: i64,
     pub head_sha: String,
     pub conclusion: crate::integrations::platform::CheckConclusion,
+    /// One-line headline (e.g. `"3 findings"`). `default` so a row enqueued before titles existed
+    /// (in flight across a deploy) still deserializes — the platform impls fall back to the check
+    /// name for an empty title.
+    #[serde(default)]
+    pub title: String,
     pub summary: String,
 }
 
@@ -271,6 +276,7 @@ pub async fn enqueue_check_run_resolve(
     pr: i64,
     head_sha: &str,
     conclusion: crate::integrations::platform::CheckConclusion,
+    title: &str,
     summary: &str,
 ) -> anyhow::Result<bool> {
     let key = format!("{}:check_run:resolve", t.key_prefix(pr));
@@ -278,6 +284,7 @@ pub async fn enqueue_check_run_resolve(
         pr,
         head_sha: head_sha.to_string(),
         conclusion,
+        title: title.to_string(),
         summary: summary.to_string(),
     })?;
     let inserted = crate::db::enqueue_outbox_post(

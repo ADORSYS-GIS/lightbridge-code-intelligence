@@ -237,6 +237,16 @@ impl GithubApp {
         }
     }
 
+    /// The check's output headline. Falls back to the check name for an outbox row enqueued before
+    /// titles existed (in flight across a deploy) — GitHub rejects an empty `output.title`.
+    fn output_title(title: &str) -> &str {
+        if title.trim().is_empty() {
+            CHECK_RUN_NAME
+        } else {
+            title
+        }
+    }
+
     /// The `in_progress` check-run creation body. Pure, so the omit-don't-null contract is
     /// unit-tested without HTTP.
     fn check_run_start_payload(head_sha: &str, details_url: Option<&str>) -> serde_json::Value {
@@ -252,13 +262,14 @@ impl GithubApp {
     /// The `completed` check-run body for a PATCH (no `head_sha`/`name` — the run already exists).
     fn check_run_update_payload(
         conclusion: &str,
+        title: &str,
         summary: &str,
         details_url: Option<&str>,
     ) -> serde_json::Value {
         let mut payload = serde_json::json!({
             "status": "completed",
             "conclusion": conclusion,
-            "output": { "title": CHECK_RUN_NAME, "summary": summary },
+            "output": { "title": Self::output_title(title), "summary": summary },
         });
         Self::attach_details_url(&mut payload, details_url);
         payload
@@ -268,6 +279,7 @@ impl GithubApp {
     fn check_run_completed_payload(
         head_sha: &str,
         conclusion: &str,
+        title: &str,
         summary: &str,
         details_url: Option<&str>,
     ) -> serde_json::Value {
@@ -276,7 +288,7 @@ impl GithubApp {
             "head_sha": head_sha,
             "status": "completed",
             "conclusion": conclusion,
-            "output": { "title": CHECK_RUN_NAME, "summary": summary },
+            "output": { "title": Self::output_title(title), "summary": summary },
         });
         Self::attach_details_url(&mut payload, details_url);
         payload
@@ -347,6 +359,7 @@ impl GithubApp {
         repo: &str,
         check_run_id: i64,
         conclusion: &str,
+        title: &str,
         summary: &str,
         details_url: Option<&str>,
     ) -> anyhow::Result<()> {
@@ -362,6 +375,7 @@ impl GithubApp {
             .header("X-GitHub-Api-Version", "2022-11-28")
             .json(&Self::check_run_update_payload(
                 conclusion,
+                title,
                 summary,
                 details_url,
             ))
@@ -383,6 +397,7 @@ impl GithubApp {
         repo: &str,
         head_sha: &str,
         conclusion: &str,
+        title: &str,
         summary: &str,
         details_url: Option<&str>,
     ) -> anyhow::Result<()> {
@@ -399,6 +414,7 @@ impl GithubApp {
             .json(&Self::check_run_completed_payload(
                 head_sha,
                 conclusion,
+                title,
                 summary,
                 details_url,
             ))
@@ -1107,6 +1123,7 @@ impl CodePlatform for GithubApp {
                     name,
                     id,
                     conclusion,
+                    req.title,
                     req.summary,
                     req.details_url,
                 )
@@ -1119,6 +1136,7 @@ impl CodePlatform for GithubApp {
                     name,
                     req.head_sha,
                     conclusion,
+                    req.title,
                     req.summary,
                     req.details_url,
                 )
@@ -1258,11 +1276,17 @@ mod tests {
             ("start", GithubApp::check_run_start_payload("abc123", None)),
             (
                 "update",
-                GithubApp::check_run_update_payload("success", "all good", None),
+                GithubApp::check_run_update_payload("success", "3 findings", "all good", None),
             ),
             (
                 "create-completed",
-                GithubApp::check_run_completed_payload("abc123", "success", "all good", None),
+                GithubApp::check_run_completed_payload(
+                    "abc123",
+                    "success",
+                    "3 findings",
+                    "all good",
+                    None,
+                ),
             ),
         ] {
             assert!(
@@ -1283,11 +1307,17 @@ mod tests {
             ),
             (
                 "update",
-                GithubApp::check_run_update_payload("success", "all good", Some(url)),
+                GithubApp::check_run_update_payload("success", "3 findings", "all good", Some(url)),
             ),
             (
                 "create-completed",
-                GithubApp::check_run_completed_payload("abc123", "success", "all good", Some(url)),
+                GithubApp::check_run_completed_payload(
+                    "abc123",
+                    "success",
+                    "3 findings",
+                    "all good",
+                    Some(url),
+                ),
             ),
         ] {
             assert_eq!(
@@ -1307,7 +1337,8 @@ mod tests {
         assert_eq!(start["head_sha"], "abc123");
         assert_eq!(start["status"], "in_progress");
 
-        let update = GithubApp::check_run_update_payload("neutral", "found 2 things", None);
+        let update =
+            GithubApp::check_run_update_payload("neutral", "2 findings", "found 2 things", None);
         assert_eq!(update["status"], "completed");
         assert_eq!(update["conclusion"], "neutral");
         assert_eq!(update["output"]["summary"], "found 2 things");
@@ -1316,8 +1347,13 @@ mod tests {
             "a PATCH addresses an existing run by id; head_sha would be meaningless"
         );
 
-        let completed =
-            GithubApp::check_run_completed_payload("abc123", "failure", "it broke", None);
+        let completed = GithubApp::check_run_completed_payload(
+            "abc123",
+            "failure",
+            "Review did not complete",
+            "it broke",
+            None,
+        );
         assert_eq!(completed["name"], CHECK_RUN_NAME);
         assert_eq!(completed["head_sha"], "abc123");
         assert_eq!(completed["status"], "completed");

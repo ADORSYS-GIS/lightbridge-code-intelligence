@@ -804,11 +804,13 @@ impl CodePlatform for BitbucketClient {
             req.head_sha,
             Self::BUILD_STATUS_KEY
         ));
+        // Like GitLab, `description` is short and single-line — the headline lands here, not the
+        // markdown summary (see `render_check_output`).
         let body = serde_json::json!({
             "key": Self::BUILD_STATUS_KEY,
             "state": Self::build_status_state(req.conclusion),
             "name": CHECK_RUN_NAME,
-            "description": req.summary,
+            "description": req.title,
             "url": req.details_url.unwrap_or(""),
         });
         self.http
@@ -992,7 +994,8 @@ mod tests {
                     head_sha: "abc123",
                     external_id: None,
                     conclusion: CheckConclusion::Failure,
-                    summary: "boom",
+                    title: "boom",
+                    summary: "boom detail",
                     details_url: None,
                 },
             )
