@@ -98,7 +98,7 @@ function PermissionList({ perms }: { perms: string[] }) {
     return <Value>No permissions in your token</Value>;
   }
   return (
-    <div className="flex max-w-xs flex-wrap justify-end gap-1">
+    <div className="flex max-w-2xl flex-wrap justify-start gap-1.5">
       {perms.map((p) => (
         <code
           key={p}
