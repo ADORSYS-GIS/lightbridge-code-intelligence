@@ -27,6 +27,10 @@ use crate::integrations::platform::{CodePlatform, RepoRef};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EntryPoint {
     PrOpen,
+    /// New commits pushed to an already-open PR/MR (epic #566): GitHub `synchronize`, GitLab MR
+    /// `update`, Bitbucket `pullrequest:updated`. A distinct entry point from `PrOpen` (not a shared
+    /// mapping) because it fires N times per PR — its default preset is deliberately the cheap tier.
+    PrSync,
     Mention,
     A2a,
 }
@@ -37,6 +41,7 @@ impl EntryPoint {
     pub fn as_str(self) -> &'static str {
         match self {
             EntryPoint::PrOpen => "pr_open",
+            EntryPoint::PrSync => "pr_sync",
             EntryPoint::Mention => "mention",
             EntryPoint::A2a => "a2a",
         }
@@ -49,7 +54,11 @@ impl EntryPoint {
     /// preset — it uses this default directly rather than going through [`resolve_preset`].
     pub(crate) fn platform_default_preset(self) -> &'static str {
         match self {
-            EntryPoint::PrOpen => "fast",
+            // `PrSync` fires once per push — same cheap tier as the initial open, deliberately not
+            // `deep`: at N pushes per PR, `deep` would multiply spend by N for no proportional benefit
+            // (the PR-wide dedup landed in #570 already prevents most of the re-review noise `deep`'s
+            // thoroughness would otherwise exist to catch).
+            EntryPoint::PrOpen | EntryPoint::PrSync => "fast",
             EntryPoint::Mention | EntryPoint::A2a => "deep",
         }
     }

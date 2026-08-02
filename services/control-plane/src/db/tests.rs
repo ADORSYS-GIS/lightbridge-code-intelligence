@@ -67,6 +67,7 @@ fn pr_task(repository_id: i64, head: &str) -> NewTask {
     NewTask {
         model_override: None,
         check_runs_enabled: true,
+        run_after_secs: None,
         repository_id,
         installation_id: 99,
         webhook_delivery_id: "d1".to_string(),
@@ -641,6 +642,7 @@ async fn issue_target_task_round_trips_and_is_distinct_from_a_pr(pool: PgPool) {
     let issue = NewTask {
         model_override: None,
         check_runs_enabled: true,
+        run_after_secs: None,
         repository_id: repo_id,
         installation_id: 99,
         webhook_delivery_id: "d1".to_string(),
@@ -714,6 +716,7 @@ async fn explicit_mention_always_creates_a_task_at_the_next_epoch(pool: PgPool) 
     let mention = |head: &str| NewTask {
         model_override: None,
         check_runs_enabled: true,
+        run_after_secs: None,
         repository_id: repo_id,
         installation_id: 99,
         webhook_delivery_id: "d1".to_string(),
@@ -918,6 +921,7 @@ async fn list_repositories_summarises_activity(pool: PgPool) {
             &NewTask {
                 model_override: None,
                 check_runs_enabled: true,
+                run_after_secs: None,
                 repository_id: active,
                 installation_id: 7,
                 webhook_delivery_id: (*delivery).to_string(),
@@ -978,6 +982,7 @@ async fn list_tasks_returns_most_recent_first(pool: PgPool) {
             &NewTask {
                 model_override: None,
                 check_runs_enabled: true,
+                run_after_secs: None,
                 repository_id: repo,
                 installation_id: 7,
                 webhook_delivery_id: (*delivery).to_string(),
@@ -1838,6 +1843,7 @@ async fn get_task_context_joins_repo_identity(pool: PgPool) {
         &NewTask {
             model_override: None,
             check_runs_enabled: true,
+            run_after_secs: None,
             repository_id: repo_id,
             installation_id: 99,
             webhook_delivery_id: "d1".to_string(),

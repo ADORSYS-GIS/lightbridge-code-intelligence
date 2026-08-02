@@ -217,6 +217,7 @@ impl A2aHandler {
             trace_context: None,
             model_override,
             check_runs_enabled: settings.check_run_reporting.value,
+            run_after_secs: None,
         };
 
         // Record a synthetic delivery so the task's `webhook_delivery_id` FK is satisfied and the
