@@ -928,9 +928,11 @@ impl CodePlatform for GitlabClient {
     ) -> anyhow::Result<()> {
         let project = Self::project_encoded(repo);
         let url = self.url(&format!("/projects/{}/statuses/{}", project, req.head_sha));
+        // `description` is a short single-line field on GitLab; the markdown summary has nowhere
+        // to go here, so the headline is what lands (see `render_check_output`).
         let body = Self::commit_status_payload(
             Self::commit_status_state(req.conclusion),
-            Some(req.summary),
+            Some(req.title).filter(|t| !t.trim().is_empty()),
             req.details_url,
         );
         let _ = self
@@ -1223,7 +1225,8 @@ mod tests {
                     head_sha: "abc123",
                     external_id: None,
                     conclusion: CheckConclusion::Failure,
-                    summary: "boom",
+                    title: "boom",
+                    summary: "boom detail",
                     details_url: None,
                 },
             )

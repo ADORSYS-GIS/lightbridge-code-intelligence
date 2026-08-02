@@ -232,6 +232,8 @@ async fn enqueue_reaper_failure_notice(
     // Resolve any check/status opened at dispatch (new feature — cosmetic runner-status reporting).
     // `TimedOut` rather than `Failure`: this path is specifically "the Job stopped reporting", closer
     // to a timeout than a clean failure.
+    let (check_title, check_summary) =
+        crate::review::render_check_output(CheckConclusion::TimedOut, None);
     if let Some(head_sha) = context.head_sha.as_deref()
         && let Err(error) = crate::outbox::enqueue_check_run_resolve(
             pool,
@@ -239,7 +241,8 @@ async fn enqueue_reaper_failure_notice(
             context.target_id,
             head_sha,
             CheckConclusion::TimedOut,
-            "Review run did not complete (no report from the runner).",
+            &check_title,
+            &check_summary,
         )
         .await
     {

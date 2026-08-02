@@ -1488,6 +1488,10 @@ pub async fn finalize_review(
     // still persists the review row and reacts. `post_pr_review` (computed above) still gates the whole
     // block — a pure @mention question posts neither. (`has_inline` computed above.)
     let mut queued_review = false;
+    // Captured inside the block below (where the counts exist) so step 2b can describe the run on the
+    // check instead of posting a fixed "finished" string. Stays `None` when this run posted no PR
+    // review at all — a pure `@mention` question.
+    let mut check_facts: Option<crate::review::CheckFacts> = None;
     if post_pr_review {
         let pr = context.target_id;
         let findings: Vec<crate::review::Finding> = pending
@@ -1687,6 +1691,13 @@ pub async fn finalize_review(
             validated.deferred.len() as i32,
             validated.out_of_scope.len() as i32,
         );
+        check_facts = Some(crate::review::CheckFacts {
+            inline_n,
+            deferred_n,
+            out_of_scope_n,
+            deduped_n,
+            verdict: summary.clone(),
+        });
         // ADR-0068: an EXPLICITLY clean pass (`outcome: "finished"`, zero findings, reactions on) posts
         // NO review — the 👍 reaction is the whole GitHub response. The review row is still persisted
         // (below) so prior-review context + the console keep the verdict. Aborted (honest "couldn't
@@ -1869,13 +1880,16 @@ pub async fn finalize_review(
     {
         let conclusion =
             resolve_check_conclusion(outcome.as_deref() == Some("aborted"), queued_review);
+        let (check_title, check_summary) =
+            crate::review::render_check_output(conclusion, check_facts.as_ref());
         if let Err(error) = crate::outbox::enqueue_check_run_resolve(
             pool,
             &t,
             context.target_id,
             head_sha,
             conclusion,
-            "Lightbridge review finished.",
+            &check_title,
+            &check_summary,
         )
         .await
         {
@@ -2087,6 +2101,7 @@ async fn handle_review_failure(
     {
         tracing::warn!(%error, task_id = %id, "enqueueing failure notice failed (non-fatal)");
     }
+    let (check_title, check_summary) = crate::review::render_check_output(check_conclusion, None);
     if let Some(head_sha) = context.head_sha.as_deref()
         && let Err(error) = crate::outbox::enqueue_check_run_resolve(
             pool,
@@ -2094,7 +2109,8 @@ async fn handle_review_failure(
             context.target_id,
             head_sha,
             check_conclusion,
-            "Review run failed to complete.",
+            &check_title,
+            &check_summary,
         )
         .await
     {
