@@ -84,6 +84,30 @@ fn pr_task(repository_id: i64, head: &str) -> NewTask {
     }
 }
 
+/// Builds a `NewTask` for the `list_tasks_page` test suite below, where each task needs its own
+/// `webhook_delivery_id` + `target_id` (distinct enough to dodge `tasks_idempotency_idx`) and a
+/// per-test `head_sha` for the `q` free-text filter tests.
+fn paged_task(repository_id: i64, target_id: i64, head_sha: Option<&str>) -> NewTask {
+    NewTask {
+        model_override: None,
+        check_runs_enabled: true,
+        run_after_secs: None,
+        repository_id,
+        installation_id: 7,
+        webhook_delivery_id: format!("paged-{repository_id}-{target_id}"),
+        target_type: "pull_request".to_string(),
+        target_id,
+        command_text: "review".to_string(),
+        base_sha: None,
+        head_sha: head_sha.map(str::to_string),
+        run_epoch: 0,
+        preset: "deep".to_string(),
+        entry_point: "mention".to_string(),
+        trigger_comment_id: None,
+        trace_context: None,
+    }
+}
+
 async fn task_status(pool: &PgPool, id: Uuid) -> String {
     sqlx::query_scalar::<_, String>("SELECT status FROM tasks WHERE id = $1")
         .bind(id)
@@ -165,8 +189,10 @@ async fn task_queries_include_repo_platform(pool: PgPool) {
         .unwrap()
         .expect("task created");
 
-    // list_tasks must decode repo_platform correctly
-    let tasks = list_tasks(&pool, 10).await.unwrap();
+    // list_tasks_page must decode repo_platform correctly
+    let (tasks, _total) = list_tasks_page(&pool, TasksPageFilter::default(), 10, 0)
+        .await
+        .unwrap();
     let task = tasks
         .iter()
         .find(|t| t.id == task_id)
@@ -1015,7 +1041,7 @@ async fn list_repositories_summarises_activity(pool: PgPool) {
     assert!(idle_row.last_task_at.is_none());
 }
 
-/// `list_tasks` is the dashboard/TUI run list and must return most-recent-first. `tasks.id` is a
+/// `list_tasks_page` is the dashboard run list and must return most-recent-first. `tasks.id` is a
 /// random UUIDv4, so ordering by it is effectively random — this guards against regressing to an
 /// id-based ORDER BY (which hid recent runs entirely once older rows crowded the LIMIT window).
 #[sqlx::test]
@@ -1075,13 +1101,248 @@ async fn list_tasks_returns_most_recent_first(pool: PgPool) {
             .unwrap();
     }
 
-    let tasks = list_tasks(&pool, 100).await.unwrap();
+    let (tasks, total) = list_tasks_page(&pool, TasksPageFilter::default(), 100, 0)
+        .await
+        .unwrap();
     let order: Vec<Uuid> = tasks.iter().map(|t| t.id).collect();
     assert_eq!(
         order,
         vec![newest, middle, oldest],
-        "list_tasks must return most-recent-first by created_at"
+        "list_tasks_page must return most-recent-first by created_at"
     );
+    assert_eq!(
+        total, 3,
+        "total must count all matching rows, not just the page"
+    );
+}
+
+/// `page`/`page_size` (via `limit`/`offset`) select a window into the most-recent-first order, and
+/// `total` always reflects the FULL matching count, not the current page's length — the field the
+/// dashboard's `Pagination` component needs to render "1-2 of 5" / compute `pageCount`.
+#[sqlx::test]
+async fn list_tasks_page_paginates_with_offset(pool: PgPool) {
+    let repo = upsert_repository(&pool, Platform::GitHub, 20, "acme", "paged", "main", None)
+        .await
+        .unwrap();
+
+    let mut ids = Vec::new();
+    for target_id in 0..5 {
+        let delivery = format!("paged-{repo}-{target_id}");
+        record_delivery(
+            &pool,
+            Platform::GitHub,
+            &delivery,
+            "pull_request",
+            &json!({}),
+        )
+        .await
+        .unwrap();
+        let id = create_task(&pool, &paged_task(repo, target_id, None))
+            .await
+            .unwrap()
+            .unwrap();
+        ids.push(id);
+    }
+    // Stamp strictly descending created_at so `ids[0]` (target_id 0) is newest, `ids[4]` oldest —
+    // matching how the loop above created them, made explicit rather than relying on insertion order.
+    for (n, id) in ids.iter().enumerate() {
+        sqlx::query(
+            "UPDATE tasks SET created_at = now() - ($2 * interval '1 minute') WHERE id = $1",
+        )
+        .bind(id)
+        .bind(n as i32)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    let (page0, total0) = list_tasks_page(&pool, TasksPageFilter::default(), 2, 0)
+        .await
+        .unwrap();
+    assert_eq!(page0.iter().map(|t| t.id).collect::<Vec<_>>(), ids[0..2]);
+    assert_eq!(
+        total0, 5,
+        "total counts every matching row, not just this page"
+    );
+
+    let (page1, total1) = list_tasks_page(&pool, TasksPageFilter::default(), 2, 2)
+        .await
+        .unwrap();
+    assert_eq!(page1.iter().map(|t| t.id).collect::<Vec<_>>(), ids[2..4]);
+    assert_eq!(total1, 5);
+
+    let (page2, _) = list_tasks_page(&pool, TasksPageFilter::default(), 2, 4)
+        .await
+        .unwrap();
+    assert_eq!(
+        page2.iter().map(|t| t.id).collect::<Vec<_>>(),
+        ids[4..5],
+        "last, partial page"
+    );
+}
+
+/// `status` filtering matches only the given raw DB status values (already expanded from a
+/// `StatusVariant` by the HTTP layer — see `queue::tasks::status_variant_to_raw`), and `total`
+/// reflects that filter, not the unfiltered row count.
+#[sqlx::test]
+async fn list_tasks_page_filters_by_status(pool: PgPool) {
+    let repo = upsert_repository(
+        &pool,
+        Platform::GitHub,
+        21,
+        "acme",
+        "statused",
+        "main",
+        None,
+    )
+    .await
+    .unwrap();
+
+    let statuses = ["succeeded", "failed", "succeeded"];
+    for (target_id, status) in statuses.iter().enumerate() {
+        let target_id = target_id as i64;
+        let delivery = format!("paged-{repo}-{target_id}");
+        record_delivery(
+            &pool,
+            Platform::GitHub,
+            &delivery,
+            "pull_request",
+            &json!({}),
+        )
+        .await
+        .unwrap();
+        let id = create_task(&pool, &paged_task(repo, target_id, None))
+            .await
+            .unwrap()
+            .unwrap();
+        set_task_status(&pool, id, status, None).await.unwrap();
+    }
+
+    let (rows, total) = list_tasks_page(
+        &pool,
+        TasksPageFilter {
+            status: Some(vec!["succeeded".to_string()]),
+            ..Default::default()
+        },
+        10,
+        0,
+    )
+    .await
+    .unwrap();
+    assert_eq!(total, 2, "only the two succeeded tasks match");
+    assert!(rows.iter().all(|t| t.status == "succeeded"));
+}
+
+/// `repository_id` scopes the list to one repo, matching the Runs page's repo filter dropdown.
+#[sqlx::test]
+async fn list_tasks_page_filters_by_repository_id(pool: PgPool) {
+    let repo_a = upsert_repository(&pool, Platform::GitHub, 22, "acme", "repo-a", "main", None)
+        .await
+        .unwrap();
+    let repo_b = upsert_repository(&pool, Platform::GitHub, 23, "acme", "repo-b", "main", None)
+        .await
+        .unwrap();
+
+    for (repo, target_id) in [(repo_a, 0), (repo_a, 1), (repo_b, 0)] {
+        let delivery = format!("paged-{repo}-{target_id}");
+        record_delivery(
+            &pool,
+            Platform::GitHub,
+            &delivery,
+            "pull_request",
+            &json!({}),
+        )
+        .await
+        .unwrap();
+        create_task(&pool, &paged_task(repo, target_id, None))
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    let (rows, total) = list_tasks_page(
+        &pool,
+        TasksPageFilter {
+            repository_id: Some(repo_a),
+            ..Default::default()
+        },
+        10,
+        0,
+    )
+    .await
+    .unwrap();
+    assert_eq!(total, 2);
+    assert!(rows.iter().all(|t| t.repository_id == repo_a));
+}
+
+/// `q` matches (case-insensitively) across `head_sha` and the joined repo's `owner`/`name` — the two
+/// columns most likely to be searched from the Runs page, per the plan's covered-column list.
+#[sqlx::test]
+async fn list_tasks_page_filters_by_query_text(pool: PgPool) {
+    let zorp = upsert_repository(&pool, Platform::GitHub, 24, "zorp", "widgets", "main", None)
+        .await
+        .unwrap();
+    let other = upsert_repository(&pool, Platform::GitHub, 25, "other", "place", "main", None)
+        .await
+        .unwrap();
+
+    record_delivery(
+        &pool,
+        Platform::GitHub,
+        &format!("paged-{zorp}-0"),
+        "pull_request",
+        &json!({}),
+    )
+    .await
+    .unwrap();
+    let matching = create_task(&pool, &paged_task(zorp, 0, Some("deadbee1")))
+        .await
+        .unwrap()
+        .unwrap();
+
+    record_delivery(
+        &pool,
+        Platform::GitHub,
+        &format!("paged-{other}-0"),
+        "pull_request",
+        &json!({}),
+    )
+    .await
+    .unwrap();
+    create_task(&pool, &paged_task(other, 0, Some("cafebabe")))
+        .await
+        .unwrap()
+        .unwrap();
+
+    // Matches the repo owner.
+    let (rows, total) = list_tasks_page(
+        &pool,
+        TasksPageFilter {
+            query: Some("zorp".to_string()),
+            ..Default::default()
+        },
+        10,
+        0,
+    )
+    .await
+    .unwrap();
+    assert_eq!(total, 1);
+    assert_eq!(rows[0].id, matching);
+
+    // Matches head_sha.
+    let (rows, total) = list_tasks_page(
+        &pool,
+        TasksPageFilter {
+            query: Some("deadbee1".to_string()),
+            ..Default::default()
+        },
+        10,
+        0,
+    )
+    .await
+    .unwrap();
+    assert_eq!(total, 1);
+    assert_eq!(rows[0].id, matching);
 }
 
 /// The approval gate (Epic #75): new repos are pending; register_pending is insert-only;
