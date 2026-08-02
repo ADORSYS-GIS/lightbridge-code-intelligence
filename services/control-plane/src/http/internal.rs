@@ -2163,6 +2163,48 @@ async fn handle_review_failure(
     }
 }
 
+/// Resolve a superseded task's check run to `Cancelled` (epic #566's `supersede` push-storm strategy),
+/// so a run killed mid-flight by a newer push doesn't leave an "in progress" check hanging on the PR
+/// forever. Mirrors [`handle_review_failure`]'s check-run leg but skips the reaction/failure-notice
+/// legs — a superseded run isn't a failure, it's routine churn nobody needs paged for. Best-effort:
+/// errors are logged, never propagated, so cleanup of an old run can never block the new push's own
+/// task creation.
+pub(crate) async fn resolve_cancelled_check_run(pool: &sqlx::PgPool, task_id: Uuid) {
+    let Ok(Some(context)) = crate::db::get_task_context(pool, task_id).await else {
+        return;
+    };
+    if !context.check_runs_enabled {
+        return;
+    }
+    let Some(head_sha) = context.head_sha.as_deref() else {
+        return;
+    };
+    let t = crate::outbox::Target {
+        task_id: Some(task_id),
+        platform: context.platform,
+        installation_id: context.installation_id,
+        owner: &context.owner,
+        repo: &context.name,
+    };
+    if let Err(error) = crate::outbox::enqueue_check_run_resolve(
+        pool,
+        &t,
+        context.target_id,
+        head_sha,
+        CheckConclusion::Cancelled,
+        "Review superseded",
+        "A newer commit was pushed to this pull request before this review finished; it was \
+         cancelled in favor of the newer run.",
+    )
+    .await
+    {
+        tracing::warn!(
+            %error, task_id = %task_id,
+            "enqueueing superseded check-run resolve failed (non-fatal)"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

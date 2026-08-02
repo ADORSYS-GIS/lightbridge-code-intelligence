@@ -857,6 +857,66 @@ async fn cancel_active_tasks_for_pr_cancels_the_prs_task(pool: PgPool) {
     assert_eq!(status, "cancelled");
 }
 
+/// `cancel_superseded_pr_reviews` (epic #566's `supersede` push-storm strategy) cancels the PR's other
+/// **automatic** reviews — including one parked `waiting_for_index` (ADR-0055), which
+/// `cancel_active_tasks_for_pr` deliberately leaves out — but spares an explicit `@mention` run (even
+/// though ADR-0055's gate is repo-wide and parks it identically) and never cancels the new push's own
+/// task at `keep_head`.
+#[sqlx::test]
+async fn cancel_superseded_pr_reviews_spares_mentions_and_the_keep_head(pool: PgPool) {
+    let repo_id = seed(&pool).await;
+    // An index in flight parks every review for this repo at `waiting_for_index` instead of `queued` —
+    // both the automatic and the mention task below land there, so the test isolates the entry_point
+    // filter rather than accidentally passing on a status difference.
+    create_index_task(&pool, repo_id, 99)
+        .await
+        .unwrap()
+        .expect("index task");
+
+    let mut sync_task = pr_task(repo_id, "h-old-sync");
+    sync_task.entry_point = "pr_sync".to_string();
+    let waiting = create_task(&pool, &sync_task)
+        .await
+        .unwrap()
+        .expect("automatic sync task");
+    assert_eq!(task_status(&pool, waiting).await, "waiting_for_index");
+
+    let mut mention_task = pr_task(repo_id, "h-mention");
+    mention_task.entry_point = "mention".to_string();
+    let mention = create_task(&pool, &mention_task)
+        .await
+        .unwrap()
+        .expect("explicit mention task");
+
+    let mut new_task = pr_task(repo_id, "h-new");
+    new_task.entry_point = "pr_sync".to_string();
+    let keep = create_task(&pool, &new_task)
+        .await
+        .unwrap()
+        .expect("the new push's own task");
+
+    let cancelled = cancel_superseded_pr_reviews(&pool, repo_id, 7, "h-new")
+        .await
+        .unwrap();
+
+    assert_eq!(
+        cancelled,
+        vec![waiting],
+        "only the older automatic review is superseded"
+    );
+    assert_eq!(task_status(&pool, waiting).await, "cancelled");
+    assert_ne!(
+        task_status(&pool, mention).await,
+        "cancelled",
+        "an explicit @mention run must never be superseded by someone else's push"
+    );
+    assert_ne!(
+        task_status(&pool, keep).await,
+        "cancelled",
+        "the new push's own task must never cancel itself"
+    );
+}
+
 /// A released task returns to the queue and can be claimed again (Job-launch failure path).
 #[sqlx::test]
 async fn release_task_requeues_for_another_claim(pool: PgPool) {

@@ -296,6 +296,43 @@ pub async fn cancel_active_tasks_for_pr(
     .await
 }
 
+/// Cancel a PR's earlier **automatic** review runs when a new push supersedes them (epic #566's
+/// `supersede` push-storm strategy). Deliberately narrower than [`cancel_active_tasks_for_pr`] in two
+/// ways:
+///
+/// - Scoped to `entry_point IN ('pr_open', 'pr_sync')` — an explicit human `@mention`
+///   (`entry_point = 'mention'`) or an A2A-triggered run is never cancelled by someone else's push;
+///   only the bot's own automatic review passes are superseded.
+/// - Includes `waiting_for_index` (ADR-0055) alongside the live dispatch statuses, which
+///   `cancel_active_tasks_for_pr` leaves out — a review parked behind an in-flight index (or, after
+///   this epic, sitting out a `debounce` delay) is exactly the kind of stale not-yet-started run
+///   supersede exists to kill, not just ones already running.
+///
+/// `keep_head` (the new push's head) is excluded so a fresh push never cancels itself. Returns the
+/// cancelled task ids — the caller resolves each one's check run to `Cancelled` so a killed run's
+/// "in progress" check doesn't hang on the PR forever.
+pub async fn cancel_superseded_pr_reviews(
+    pool: &PgPool,
+    repository_id: i64,
+    pr: i64,
+    keep_head: &str,
+) -> Result<Vec<Uuid>, sqlx::Error> {
+    sqlx::query_scalar(
+        "UPDATE tasks SET status = 'cancelled', completed_at = now(), \
+             lease_owner = NULL, lease_expires_at = NULL \
+         WHERE repository_id = $1 AND target_type = 'pull_request' AND target_id = $2 \
+           AND entry_point IN ('pr_open', 'pr_sync') \
+           AND status IN ('queued', 'waiting_for_index', 'running', 'posting_result') \
+           AND head_sha IS DISTINCT FROM $3 \
+         RETURNING id",
+    )
+    .bind(repository_id)
+    .bind(pr)
+    .bind(keep_head)
+    .fetch_all(pool)
+    .await
+}
+
 /// Cancel every active (queued/running/posting) task for a repository — used when the repo is removed
 /// from the installation or denied, so in-flight Jobs are stopped (the reaper deletes them) and
 /// nothing new dispatches. Returns the cancelled task ids.

@@ -797,7 +797,7 @@ async fn handle_gitlab_merge_request(
                 check_runs_enabled: settings.check_run_reporting.value,
                 run_after_secs: None,
             };
-            create_review_task(pool, task, delivery_id).await;
+            create_review_task(pool, task, delivery_id, is_sync, &settings).await;
         }
         "close" => match crate::db::cancel_active_tasks_for_pr(pool, repository_id, mr_iid).await {
             Ok(ids) if !ids.is_empty() => tracing::info!(
@@ -1231,7 +1231,7 @@ async fn handle_bitbucket_pullrequest(
                 check_runs_enabled: settings.check_run_reporting.value,
                 run_after_secs: None,
             };
-            create_review_task(pool, task, delivery_id).await;
+            create_review_task(pool, task, delivery_id, is_sync, &settings).await;
         }
         "pullrequest:fulfilled" | "pullrequest:rejected" => {
             match crate::db::cancel_active_tasks_for_pr(pool, repository_id, pr_number).await {
@@ -1658,7 +1658,7 @@ async fn handle_pull_request(
                 // live strategy — never delays.
                 run_after_secs: None,
             };
-            create_review_task(pool, task, delivery_id).await;
+            create_review_task(pool, task, delivery_id, is_sync, &settings).await;
         }
         "closed" => {
             match crate::db::cancel_active_tasks_for_pr(pool, repository_id, pr_number).await {
@@ -1922,15 +1922,38 @@ async fn create_explicit_review_task(
     }
 }
 
-/// Insert a review task. Shared by the auto-open and manual-mention paths. No reaction is enqueued here:
-/// ADR-0068 moves 👀 to *work-started* (the dispatcher launching the Job), so receipt no longer reacts.
+/// Insert an automatic (`pr_open`/`pr_sync`) review task. No reaction is enqueued here: ADR-0068
+/// moves 👀 to *work-started* (the dispatcher launching the Job), so receipt no longer reacts.
+///
+/// `is_sync` + `settings` apply epic #566's push-storm strategy to a **new** task only — an idempotent
+/// re-delivery (`Ok(None)`) means no new head landed, so there is nothing to debounce or supersede:
+/// - `debounce` stamps `run_after_secs` on `task` *before* it's inserted, so the claim query
+///   (already `WHERE run_after <= now()`) simply won't offer it up until the quiet period elapses.
+/// - `supersede` runs *after* a genuine insert, cancelling the PR's other automatic runs and
+///   resolving each one's check run to `Cancelled` so a killed run doesn't hang "in progress" forever.
 #[tracing::instrument(name = "task.create", skip_all, fields(pr = task.target_id))]
-async fn create_review_task(pool: &sqlx::PgPool, task: crate::db::NewTask, delivery_id: &str) {
-    let (pr, run_epoch) = (task.target_id, task.run_epoch);
+async fn create_review_task(
+    pool: &sqlx::PgPool,
+    mut task: crate::db::NewTask,
+    delivery_id: &str,
+    is_sync: bool,
+    settings: &crate::settings::ResolvedSettings,
+) {
+    if is_sync && settings.push_strategy.value == crate::settings::PushStrategy::Debounce {
+        task.run_after_secs = Some(settings.push_debounce.value.as_secs());
+    }
+    let (repository_id, pr, run_epoch) = (task.repository_id, task.target_id, task.run_epoch);
+    let head_sha = task.head_sha.clone();
     match crate::db::create_task(pool, &task).await {
         Ok(Some(task_id)) => {
             crate::http::metrics::task_created();
             tracing::info!(delivery_id, %task_id, pr, run_epoch, "created review task");
+            if is_sync
+                && settings.push_strategy.value == crate::settings::PushStrategy::Supersede
+                && let Some(keep_head) = head_sha.as_deref()
+            {
+                supersede_older_reviews(pool, repository_id, pr, keep_head, delivery_id).await;
+            }
         }
         Ok(None) => tracing::info!(
             delivery_id,
@@ -1939,6 +1962,36 @@ async fn create_review_task(pool: &sqlx::PgPool, task: crate::db::NewTask, deliv
             "review task already exists; skipping (idempotent)"
         ),
         Err(error) => tracing::error!(%error, delivery_id, pr, "failed to create task"),
+    }
+}
+
+/// Cancel a PR's other active automatic review runs in favor of the one just created at `keep_head`
+/// (epic #566's `supersede` push-storm strategy), and resolve each cancelled task's check run to
+/// `Cancelled`. Best-effort — a failure here logs and returns; the new review task is already
+/// committed and must run regardless of whether its predecessors get cleaned up.
+async fn supersede_older_reviews(
+    pool: &sqlx::PgPool,
+    repository_id: i64,
+    pr: i64,
+    keep_head: &str,
+    delivery_id: &str,
+) {
+    match crate::db::cancel_superseded_pr_reviews(pool, repository_id, pr, keep_head).await {
+        Ok(ids) if !ids.is_empty() => {
+            tracing::info!(
+                delivery_id,
+                pr,
+                cancelled = ids.len(),
+                "superseded earlier automatic review(s) for this PR"
+            );
+            for id in ids {
+                crate::http::internal::resolve_cancelled_check_run(pool, id).await;
+            }
+        }
+        Ok(_) => {}
+        Err(error) => {
+            tracing::error!(%error, delivery_id, pr, "failed to cancel superseded reviews")
+        }
     }
 }
 
@@ -3017,10 +3070,28 @@ mod tests {
         action: &str,
         oldrev: Option<&str>,
     ) -> Bytes {
+        gated_mr_body_full(
+            path_with_namespace,
+            project_id,
+            action,
+            "head-gate-2",
+            oldrev,
+        )
+    }
+
+    /// Same as [`gated_mr_body_with_action`] but with the head SHA parametrized, so a test can push
+    /// through two distinct heads (e.g. an `open` then an `update`) on the same MR.
+    fn gated_mr_body_full(
+        path_with_namespace: &str,
+        project_id: i64,
+        action: &str,
+        head_sha: &str,
+        oldrev: Option<&str>,
+    ) -> Bytes {
         let mut object_attributes = serde_json::json!({
             "action": action,
             "iid": 11,
-            "diff_refs": { "base_sha": "base-gate", "head_sha": "head-gate-2" },
+            "diff_refs": { "base_sha": "base-gate", "head_sha": head_sha },
             "last_commit": { "author": { "name": "A Human" } },
         });
         if let Some(oldrev) = oldrev {
@@ -3212,6 +3283,183 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(count, 0, "a draft MR must not be reviewed on push");
+    }
+
+    // --- epic #566: push-storm strategies (`supersede` / `debounce`) ---
+
+    /// The positive case for `supersede` (the default push strategy): a push while the PR's earlier
+    /// automatic review is still queued cancels that earlier task — rather than letting both run and
+    /// post two reviews for what's now a stale head — and resolves its check run to `Cancelled` so it
+    /// doesn't hang "in progress" on the PR forever.
+    #[sqlx::test]
+    async fn mr_update_with_supersede_strategy_cancels_the_prs_earlier_automatic_review(
+        pool: PgPool,
+    ) {
+        let mock = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/api/v4/projects/acme%2Fsupersede/repository/files/.lightbridge-code-review.jsonc/raw",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(404))
+            .mount(&mock)
+            .await;
+
+        let repo_id = seed_gated_gitlab_repo(&pool, "supersede", 2408).await;
+        crate::db::set_repo_settings(
+            &pool,
+            repo_id,
+            &crate::db::RepoSettingsPatch {
+                review_on_push: Some(Some(true)),
+                push_strategy: Some(Some("supersede".to_string())),
+                ..Default::default()
+            },
+            "tester",
+        )
+        .await
+        .unwrap();
+
+        // Opening the MR lands the PR's first automatic review at "head-gate-1" — never dispatched in
+        // this test, so it's still sitting `queued` when the push below arrives.
+        let state = gated_gitlab_state(pool.clone(), &mock, 2408);
+        let opened = gitlab_webhook_body(
+            state.clone(),
+            2408,
+            gated_mr_headers("supersede-open"),
+            gated_mr_body_full("acme/supersede", 2408, "open", "head-gate-1", None),
+        )
+        .await;
+        assert_eq!(opened.status(), StatusCode::ACCEPTED);
+        let older_task: uuid::Uuid = sqlx::query_scalar(
+            "SELECT id FROM tasks WHERE repository_id = $1 AND head_sha = 'head-gate-1'",
+        )
+        .bind(repo_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        // A push supersedes it.
+        let updated = gitlab_webhook_body(
+            state,
+            2408,
+            gated_mr_headers("supersede-push"),
+            gated_mr_body_full(
+                "acme/supersede",
+                2408,
+                "update",
+                "head-gate-2",
+                Some("head-gate-1"),
+            ),
+        )
+        .await;
+        assert_eq!(updated.status(), StatusCode::ACCEPTED);
+
+        let older_status: String = sqlx::query_scalar("SELECT status FROM tasks WHERE id = $1")
+            .bind(older_task)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            older_status, "cancelled",
+            "the earlier automatic review must be superseded by the new push"
+        );
+
+        let newer_status: String = sqlx::query_scalar(
+            "SELECT status FROM tasks WHERE repository_id = $1 AND head_sha = 'head-gate-2'",
+        )
+        .bind(repo_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            newer_status, "queued",
+            "the new push's own task must survive — supersede must never cancel itself"
+        );
+
+        let cancelled_conclusion: String = sqlx::query_scalar(
+            "SELECT payload->>'conclusion' FROM outbox \
+             WHERE task_id = $1 AND kind = 'check_run_resolve'",
+        )
+        .bind(older_task)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            cancelled_conclusion, "cancelled",
+            "the superseded task's check run must resolve to cancelled, not hang in progress"
+        );
+    }
+
+    /// The positive case for `debounce`: a push under the `debounce` strategy lands its task with a
+    /// future `run_after` set from the repo's configured quiet period — the dispatcher's claim query
+    /// (`WHERE run_after <= now()`) simply won't offer it up until that window elapses.
+    #[sqlx::test]
+    async fn mr_update_with_debounce_strategy_delays_the_new_tasks_run_after(pool: PgPool) {
+        let mock = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/api/v4/projects/acme%2Fdebounce/repository/files/.lightbridge-code-review.jsonc/raw",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(404))
+            .mount(&mock)
+            .await;
+
+        let repo_id = seed_gated_gitlab_repo(&pool, "debounce", 2409).await;
+        crate::db::set_repo_settings(
+            &pool,
+            repo_id,
+            &crate::db::RepoSettingsPatch {
+                review_on_push: Some(Some(true)),
+                push_strategy: Some(Some("debounce".to_string())),
+                push_debounce_seconds: Some(Some(120)),
+                ..Default::default()
+            },
+            "tester",
+        )
+        .await
+        .unwrap();
+
+        let state = gated_gitlab_state(pool.clone(), &mock, 2409);
+        let response = gitlab_webhook_body(
+            state,
+            2409,
+            gated_mr_headers("debounce-push"),
+            gated_mr_body_full(
+                "acme/debounce",
+                2409,
+                "update",
+                "head-gate-debounce",
+                Some("old-sha"),
+            ),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+        let (status, run_after, created_at): (String, time::OffsetDateTime, time::OffsetDateTime) =
+            sqlx::query_as(
+                "SELECT status, run_after, created_at FROM tasks WHERE repository_id = $1",
+            )
+            .bind(repo_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            status, "queued",
+            "debounce delays claimability via run_after, not the stored status"
+        );
+        assert!(
+            run_after - created_at >= time::Duration::seconds(115),
+            "run_after must reflect the configured 120s debounce window (got {:?} after creation), \
+             not fire immediately",
+            run_after - created_at
+        );
+
+        let claimed = crate::db::claim_next_task(&pool, "w", std::time::Duration::from_secs(60))
+            .await
+            .unwrap();
+        assert!(
+            claimed.is_none(),
+            "a debounced task must not be claimable before its run_after elapses"
+        );
     }
 
     /// The same MR-open flow, but with no `.lightbridge-code-review.jsonc` on the repo at all (the
