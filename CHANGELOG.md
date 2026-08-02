@@ -1,5 +1,62 @@
 # Changelog
 
+## [0.7.0](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/compare/v0.6.0...v0.7.0) (2026-08-01)
+
+
+### ⚠ BREAKING CHANGES
+
+* **review:** tear out the DB run transcript — logs-only observability ([#461](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/461)) (#471)
+
+### Features
+
+* **admin:** preset-selection UI + forge-write endpoint (ADR-0109, story [#500](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/500)) ([#540](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/540)) ([981cad3](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/commit/981cad3f8bc32f1fd44f1cb34285e80c0e67b2b5))
+* **control-plane:** generalize StepRuntime, activate CodePlatform, add Bitbucket ([#353](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/353)) ([#522](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/522)) ([dfdf76b](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/commit/dfdf76ba32d7540fb25b2381c8d5442cda65d590))
+* **control-plane:** path-scoped per-forge webhook routes + GitLab installation_id validation ([#547](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/547)) ([9b63a26](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/commit/9b63a26e762555791541daaf016401e5d36f90a2))
+* **control-plane:** per-identity (repo/org) model selection + ACL (ADR-0110, story [#501](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/501)) ([#541](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/541)) ([b414b65](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/commit/b414b65b3eda48cdd14ceca8ce5850425da2d05f))
+* **control-plane:** version all API routes under /api/v2 ([#534](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/534)) ([ae7ef6e](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/commit/ae7ef6e396d4960be6a75ed9e8bc98eb29f0e08b))
+* **observability:** add review delivery and HTTP diagnostics dashboard ([#553](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/553)) ([900677a](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/commit/900677a4cc8176f261b0054a08899b755e2abd4f))
+* **observability:** rebuild token/model dashboard panels on Loki ([#472](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/472)) ([#478](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/478)) ([82be632](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/commit/82be632c4352a4bfdc454a7859d6de0671524abc))
+* **opencode-logger:** harden reasoning/content capture (F4, [#463](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/463)) ([#473](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/473)) ([a422a75](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/commit/a422a750cdeb99bb4d66c94964980d307a516bd8))
+* **opencode-logger:** surface agent signals at info ([#474](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/474)) ([0cbe222](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/commit/0cbe2229d5563e9d12f110ce255ec6b47ed37364))
+* **opencode:** fatal-situation sentinel plugin (ADR-0106) ([#539](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/539)) ([283cd6c](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/commit/283cd6c295fa1b1866ea9e78a7d824e48cf31048))
+* **opencode:** leveled agent logs — reasoning, content, tool I/O ([#462](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/462)) ([#470](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/470)) ([643a0bd](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/commit/643a0bd0c5e19f8a5227e3302929d6254c553c26))
+* **review:** add ultra as a third platform-default preset (ADR-0103) ([#533](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/533)) ([b2602d6](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/commit/b2602d61fd822ab376de45caff9a890b3655ad85))
+* **review:** full fs-tool suite — write_file/edit_file/list_directory (ADR-0104) ([#537](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/537)) ([f56f216](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/commit/f56f2164887d58ea47fcedf302e46d782b322833))
+* **review:** GitHub MCP via App-derived token, opt-in per preset (ADR-0105) ([#538](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/538)) ([e008d37](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/commit/e008d37e02ed9b2fe9d1fd94371a139a6578a9cc))
+* **review:** implement the .lightbridge-code-review.jsonc repo config reader (ADR-0030) ([#528](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/528)) ([f9093a1](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/commit/f9093a10c80a5b9752835bd9c1a6039d2373ad94))
+* **review:** tear out the DB run transcript — logs-only observability ([#461](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/461)) ([#471](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/471)) ([4eda84b](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/commit/4eda84b657f0441e30a6b2a3cec485c459ea3aad))
+* **web:** add support for GitLab repositories and platform-specific URLs in tasks and repos([#374](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/374)) ([28fda3e](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/commit/28fda3ed134184d25d4bc998001c42c6a0811499))
+* **web:** embed Grafana/Loki run logs, drop kube-client stream ([#479](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/479)) ([fb312bf](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/commit/fb312bf83542d07ea3f04b982167d232afae2b56))
+* **web:** set NEXT_PUBLIC_GRAFANA_URL for the run-logs embed ([#482](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/482)) ([e253199](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/commit/e2531995f4406e6593f2862967af2e98465f3464))
+
+
+### Bug Fixes
+
+* **agent-runner:** key exhaustion framing on entry_point, not preset name ([#530](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/530)) ([a09ae7f](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/commit/a09ae7f515f7b5f3583b2fa07873b1b874dbc753))
+* **ci:** resolve cosign parsing and missing ARC runner tools ([#551](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/551)) ([b104ad1](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/commit/b104ad186445681e6173abd07c309b6ca5b84341))
+* **ci:** use runc for podman on ubuntu-latest to bypass crun bug ([#552](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/552)) ([6d73dc7](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/commit/6d73dc7058b0e5400d164f6d6622981383a24123))
+* **gitlab:** Add webhook signature debug logging for GitLab ([#466](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/466)) ([6706313](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/commit/670631381d53428c7b5b978ee56afa5eba9d66a7))
+* **gitlab:** improve webhook token validation and error handling ([#468](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/468)) ([3b16550](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/commit/3b165508dbc87383c92cc09c53d3d6bc2e29fe2c))
+* **lint:** convert dangling doc-comment to regular comment ([#487](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/487)) ([573281a](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/commit/573281aebbdda6e26a707c87d6e8042b3be46fa0))
+* **observability:** correct the "Logs for $task_id" panel's LogQL ([#484](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/484)) ([fd7dc59](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/commit/fd7dc59d56baac8107ecc5388aed30018eadd7a8))
+* **observability:** pin task-runs logs panel id for deterministic embed ([#480](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/480)) ([6703f76](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/commit/6703f76b743276645ead73cc15f42604e5183606))
+* **review:** clamp context-line anchors to nearest added line to prevent GitLab 400 errors ([#554](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/554)) ([16d0aab](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/commit/16d0aab72d5042e048ab8f6a449be5d23c742d1f))
+* **review:** detect floor breaches from per-agent tools/permission overrides ([#485](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/485)) ([ddcdd56](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/commit/ddcdd5679c488dd1295fc0d2b54a4748c6f0d7e1))
+* **review:** give fast-tier reviews full tool/gate parity with deep ([#488](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/488)) ([34cfd41](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/commit/34cfd41d264c2d2a70a7fe372c30271f2cb9f357))
+* **review:** thread review.extra into OpenCode reviewer options (reasoning_effort parity) ([#475](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/475)) ([84e7a24](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/commit/84e7a24b08042542e063437e039b6d5e251b13aa))
+* **web:** update localhost fallback to include /api/v2 prefix ([#549](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/549)) ([4ba6d92](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/commit/4ba6d922575be476be56b86d84abb14e436e6504))
+
+
+### Documentation
+
+* ADR-0101 (ARC CI runners, no dind) + ADR-0102 (Grafana/Loki run-logs embed) ([#481](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/481)) ([615da6c](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/commit/615da6c5e28950333382daf15c7a3859d95baddc))
+* **adr:** ADR-0109 forge-write capability + ADR-0110 identity model ACL ([#535](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/535)) ([4c33a2c](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/commit/4c33a2c7b3fbbb4b0c883c0e3f8675ea8fef64de))
+* **adr:** repo-configurable OpenCode review presets replace fast/deep tiers ([#518](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/518)) ([9e55dc3](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/commit/9e55dc34b2eb3b9049669281e53c9c67b509afc1))
+* mark Epic [#491](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/491) shipped in ROADMAP.md ([#543](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/543)) ([1af8d55](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/commit/1af8d55f739437a12bab4085ec847e661b8ee86b))
+* mark the run transcript, the POST/GET /tasks/{id}/transcript endpoints, and ([4eda84b](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/commit/4eda84b657f0441e30a6b2a3cec485c459ea3aad))
+* refresh run-observability + live-review-path currency ([#459](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/459)) ([#477](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/477)) ([269618c](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/commit/269618c38fe30ad4aa79cb3d9ef97e4a380ae234))
+* rewrite tier-based reference docs for named review presets (ADR-0103) ([#532](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/532)) ([22fb17f](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/commit/22fb17f2aeecf96fbab1c734ad73bd8f7e9f0158))
+
 ## [0.6.0](https://github.com/vymalo/lightbridge-code-intelligence/compare/v0.5.1...v0.6.0) (2026-07-17)
 
 
