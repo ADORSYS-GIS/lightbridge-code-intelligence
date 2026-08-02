@@ -64,13 +64,20 @@ pub async fn list(
     };
 
     let page = query.page.unwrap_or(0).max(0);
-    let page_size = query.page_size.unwrap_or(TASK_LIST_LIMIT).clamp(1, TASK_LIST_LIMIT);
+    let page_size = query
+        .page_size
+        .unwrap_or(TASK_LIST_LIMIT)
+        .clamp(1, TASK_LIST_LIMIT);
     let status = query
         .status
         .as_deref()
         .and_then(status_variant_to_raw)
         .map(|values| values.iter().map(|s| s.to_string()).collect());
-    let filter = TasksPageFilter { status, repository_id: query.repository_id, query: query.q };
+    let filter = TasksPageFilter {
+        status,
+        repository_id: query.repository_id,
+        query: query.q,
+    };
 
     match crate::db::list_tasks_page(pool, filter, page_size, page * page_size).await {
         Ok((tasks, total)) => Json(TasksPage { tasks, total }).into_response(),
@@ -211,9 +218,18 @@ mod tests {
             status_variant_to_raw("active"),
             Some(["running", "posting_result"].as_slice())
         );
-        assert_eq!(status_variant_to_raw("success"), Some(["succeeded"].as_slice()));
-        assert_eq!(status_variant_to_raw("error"), Some(["failed", "timed_out"].as_slice()));
-        assert_eq!(status_variant_to_raw("muted"), Some(["cancelled"].as_slice()));
+        assert_eq!(
+            status_variant_to_raw("success"),
+            Some(["succeeded"].as_slice())
+        );
+        assert_eq!(
+            status_variant_to_raw("error"),
+            Some(["failed", "timed_out"].as_slice())
+        );
+        assert_eq!(
+            status_variant_to_raw("muted"),
+            Some(["cancelled"].as_slice())
+        );
     }
 
     #[test]

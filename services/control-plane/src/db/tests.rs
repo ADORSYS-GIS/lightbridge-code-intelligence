@@ -1110,7 +1110,10 @@ async fn list_tasks_returns_most_recent_first(pool: PgPool) {
         vec![newest, middle, oldest],
         "list_tasks_page must return most-recent-first by created_at"
     );
-    assert_eq!(total, 3, "total must count all matching rows, not just the page");
+    assert_eq!(
+        total, 3,
+        "total must count all matching rows, not just the page"
+    );
 }
 
 /// `page`/`page_size` (via `limit`/`offset`) select a window into the most-recent-first order, and
@@ -1125,9 +1128,15 @@ async fn list_tasks_page_paginates_with_offset(pool: PgPool) {
     let mut ids = Vec::new();
     for target_id in 0..5 {
         let delivery = format!("paged-{repo}-{target_id}");
-        record_delivery(&pool, Platform::GitHub, &delivery, "pull_request", &json!({}))
-            .await
-            .unwrap();
+        record_delivery(
+            &pool,
+            Platform::GitHub,
+            &delivery,
+            "pull_request",
+            &json!({}),
+        )
+        .await
+        .unwrap();
         let id = create_task(&pool, &paged_task(repo, target_id, None))
             .await
             .unwrap()
@@ -1137,19 +1146,24 @@ async fn list_tasks_page_paginates_with_offset(pool: PgPool) {
     // Stamp strictly descending created_at so `ids[0]` (target_id 0) is newest, `ids[4]` oldest —
     // matching how the loop above created them, made explicit rather than relying on insertion order.
     for (n, id) in ids.iter().enumerate() {
-        sqlx::query("UPDATE tasks SET created_at = now() - ($2 * interval '1 minute') WHERE id = $1")
-            .bind(id)
-            .bind(n as i32)
-            .execute(&pool)
-            .await
-            .unwrap();
+        sqlx::query(
+            "UPDATE tasks SET created_at = now() - ($2 * interval '1 minute') WHERE id = $1",
+        )
+        .bind(id)
+        .bind(n as i32)
+        .execute(&pool)
+        .await
+        .unwrap();
     }
 
     let (page0, total0) = list_tasks_page(&pool, TasksPageFilter::default(), 2, 0)
         .await
         .unwrap();
     assert_eq!(page0.iter().map(|t| t.id).collect::<Vec<_>>(), ids[0..2]);
-    assert_eq!(total0, 5, "total counts every matching row, not just this page");
+    assert_eq!(
+        total0, 5,
+        "total counts every matching row, not just this page"
+    );
 
     let (page1, total1) = list_tasks_page(&pool, TasksPageFilter::default(), 2, 2)
         .await
@@ -1160,7 +1174,11 @@ async fn list_tasks_page_paginates_with_offset(pool: PgPool) {
     let (page2, _) = list_tasks_page(&pool, TasksPageFilter::default(), 2, 4)
         .await
         .unwrap();
-    assert_eq!(page2.iter().map(|t| t.id).collect::<Vec<_>>(), ids[4..5], "last, partial page");
+    assert_eq!(
+        page2.iter().map(|t| t.id).collect::<Vec<_>>(),
+        ids[4..5],
+        "last, partial page"
+    );
 }
 
 /// `status` filtering matches only the given raw DB status values (already expanded from a
@@ -1168,17 +1186,31 @@ async fn list_tasks_page_paginates_with_offset(pool: PgPool) {
 /// reflects that filter, not the unfiltered row count.
 #[sqlx::test]
 async fn list_tasks_page_filters_by_status(pool: PgPool) {
-    let repo = upsert_repository(&pool, Platform::GitHub, 21, "acme", "statused", "main", None)
-        .await
-        .unwrap();
+    let repo = upsert_repository(
+        &pool,
+        Platform::GitHub,
+        21,
+        "acme",
+        "statused",
+        "main",
+        None,
+    )
+    .await
+    .unwrap();
 
     let statuses = ["succeeded", "failed", "succeeded"];
     for (target_id, status) in statuses.iter().enumerate() {
         let target_id = target_id as i64;
         let delivery = format!("paged-{repo}-{target_id}");
-        record_delivery(&pool, Platform::GitHub, &delivery, "pull_request", &json!({}))
-            .await
-            .unwrap();
+        record_delivery(
+            &pool,
+            Platform::GitHub,
+            &delivery,
+            "pull_request",
+            &json!({}),
+        )
+        .await
+        .unwrap();
         let id = create_task(&pool, &paged_task(repo, target_id, None))
             .await
             .unwrap()
@@ -1188,7 +1220,10 @@ async fn list_tasks_page_filters_by_status(pool: PgPool) {
 
     let (rows, total) = list_tasks_page(
         &pool,
-        TasksPageFilter { status: Some(vec!["succeeded".to_string()]), ..Default::default() },
+        TasksPageFilter {
+            status: Some(vec!["succeeded".to_string()]),
+            ..Default::default()
+        },
         10,
         0,
     )
@@ -1210,9 +1245,15 @@ async fn list_tasks_page_filters_by_repository_id(pool: PgPool) {
 
     for (repo, target_id) in [(repo_a, 0), (repo_a, 1), (repo_b, 0)] {
         let delivery = format!("paged-{repo}-{target_id}");
-        record_delivery(&pool, Platform::GitHub, &delivery, "pull_request", &json!({}))
-            .await
-            .unwrap();
+        record_delivery(
+            &pool,
+            Platform::GitHub,
+            &delivery,
+            "pull_request",
+            &json!({}),
+        )
+        .await
+        .unwrap();
         create_task(&pool, &paged_task(repo, target_id, None))
             .await
             .unwrap()
@@ -1221,7 +1262,10 @@ async fn list_tasks_page_filters_by_repository_id(pool: PgPool) {
 
     let (rows, total) = list_tasks_page(
         &pool,
-        TasksPageFilter { repository_id: Some(repo_a), ..Default::default() },
+        TasksPageFilter {
+            repository_id: Some(repo_a),
+            ..Default::default()
+        },
         10,
         0,
     )
@@ -1242,17 +1286,29 @@ async fn list_tasks_page_filters_by_query_text(pool: PgPool) {
         .await
         .unwrap();
 
-    record_delivery(&pool, Platform::GitHub, &format!("paged-{zorp}-0"), "pull_request", &json!({}))
-        .await
-        .unwrap();
+    record_delivery(
+        &pool,
+        Platform::GitHub,
+        &format!("paged-{zorp}-0"),
+        "pull_request",
+        &json!({}),
+    )
+    .await
+    .unwrap();
     let matching = create_task(&pool, &paged_task(zorp, 0, Some("deadbee1")))
         .await
         .unwrap()
         .unwrap();
 
-    record_delivery(&pool, Platform::GitHub, &format!("paged-{other}-0"), "pull_request", &json!({}))
-        .await
-        .unwrap();
+    record_delivery(
+        &pool,
+        Platform::GitHub,
+        &format!("paged-{other}-0"),
+        "pull_request",
+        &json!({}),
+    )
+    .await
+    .unwrap();
     create_task(&pool, &paged_task(other, 0, Some("cafebabe")))
         .await
         .unwrap()
@@ -1261,7 +1317,10 @@ async fn list_tasks_page_filters_by_query_text(pool: PgPool) {
     // Matches the repo owner.
     let (rows, total) = list_tasks_page(
         &pool,
-        TasksPageFilter { query: Some("zorp".to_string()), ..Default::default() },
+        TasksPageFilter {
+            query: Some("zorp".to_string()),
+            ..Default::default()
+        },
         10,
         0,
     )
@@ -1273,7 +1332,10 @@ async fn list_tasks_page_filters_by_query_text(pool: PgPool) {
     // Matches head_sha.
     let (rows, total) = list_tasks_page(
         &pool,
-        TasksPageFilter { query: Some("deadbee1".to_string()), ..Default::default() },
+        TasksPageFilter {
+            query: Some("deadbee1".to_string()),
+            ..Default::default()
+        },
         10,
         0,
     )
