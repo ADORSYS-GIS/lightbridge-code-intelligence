@@ -40,6 +40,7 @@ mod outbox;
 mod preset;
 mod review;
 mod runner_token;
+mod settings;
 mod types;
 
 // Global allocator. The release images are static-musl (ADR-0080); musl's built-in malloc regresses
