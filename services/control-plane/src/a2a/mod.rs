@@ -200,7 +200,10 @@ async fn a2a_auth(State(auth): State<A2aAuthState>, mut req: Request, next: Next
 
 /// Returns the A2A router to be mounted under `/a2a` by the unified app().
 pub fn axum_router(state: AppState) -> Router {
-    let jwt = state.jwt.clone().expect("a2a role requires OIDC_ISSUER (checked at startup)");
+    let jwt = state
+        .jwt
+        .clone()
+        .expect("a2a role requires OIDC_ISSUER (checked at startup)");
     build_router(state, jwt)
 }
 
