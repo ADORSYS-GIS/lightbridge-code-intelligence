@@ -23,11 +23,15 @@ export function RepoList({
   repos,
   now,
   gitlabLinks,
+  overrideRepoIds,
 }: {
   repos: Repository[];
   now: number;
   gitlabLinks: GitlabLinkConfig;
+  /** Repos with at least one ADR-0111 setting resolved from a DB admin override (epic #566). */
+  overrideRepoIds: number[];
 }) {
+  const overrideSet = useMemo(() => new Set(overrideRepoIds), [overrideRepoIds]);
   const [query, setQuery] = useQueryState("q", { defaultValue: "", clearOnDefault: true });
   const [page, setPage] = useQueryState("page", parseAsInteger.withDefault(0));
 
@@ -56,7 +60,13 @@ export function RepoList({
       ) : (
         <div className="grid gap-3 sm:grid-cols-2">
           {rows.map((repo) => (
-            <RepoCard key={repo.id} repo={repo} now={now} gitlabLinks={gitlabLinks} />
+            <RepoCard
+              key={repo.id}
+              repo={repo}
+              now={now}
+              gitlabLinks={gitlabLinks}
+              hasOverride={overrideSet.has(repo.id)}
+            />
           ))}
         </div>
       )}
@@ -78,10 +88,13 @@ function RepoCard({
   repo,
   now,
   gitlabLinks,
+  hasOverride,
 }: {
   repo: Repository;
   now: number;
   gitlabLinks: GitlabLinkConfig;
+  /** At least one ADR-0111 setting has an admin DB override (epic #566). */
+  hasOverride: boolean;
 }) {
   const approval = approvalVisual(repo);
   const viewLabel = repo.platform === "gitlab" ? "View on GitLab" : "View on GitHub";
@@ -109,10 +122,15 @@ function RepoCard({
         <div className="flex items-center gap-3">
           <Link
             href={`/dashboard/repositories/${repo.id}`}
-            className="inline-flex items-center gap-1 text-base-content/60 transition-colors hover:text-base-content"
-            title="Review preset settings"
+            className="relative inline-flex items-center gap-1 text-base-content/60 transition-colors hover:text-base-content"
+            title={
+              hasOverride ? "Review settings (has an admin override)" : "Review preset settings"
+            }
           >
             <Settings className="size-3 shrink-0" />
+            {hasOverride && (
+              <span className="absolute -top-0.5 -right-0.5 size-1.5 rounded-full bg-accent" />
+            )}
           </Link>
           <a
             href={repoUrl(repo, gitlabLinks)}
