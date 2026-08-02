@@ -1356,11 +1356,19 @@ fn resolve_check_conclusion(aborted: bool, queued_review: bool) -> CheckConclusi
 /// posted on this commit, `deduped_n > 0`, nothing kept) gets a truthful "no NEW findings" note — never
 /// [`DEFAULT_CLEAN_SUMMARY`], which would misrepresent (and persist, poisoning later prior-review
 /// context) a "found the same issues again" run as clean. A genuinely clean run keeps the default.
-fn effective_summary(real_summary: Option<&str>, deduped_n: usize, all_deduped: bool) -> String {
+fn effective_summary(
+    real_summary: Option<&str>,
+    deduped_n: usize,
+    all_deduped: bool,
+    across_commits: bool,
+) -> String {
     match real_summary {
         Some(s) => s.to_string(),
+        // Epic #566: say "on this PR" when any suppression came from an EARLIER commit, since
+        // "on this commit" would be a false statement about where those findings live.
         None if all_deduped => {
-            format!("No new findings — {deduped_n} prior finding(s) on this commit still stand.")
+            let scope = if across_commits { "PR" } else { "commit" };
+            format!("No new findings — {deduped_n} prior finding(s) on this {scope} still stand.")
         }
         None => DEFAULT_CLEAN_SUMMARY.to_string(),
     }
@@ -1420,6 +1428,28 @@ pub async fn finalize_review(
     // serve keeps the App key for READS only (ADR-0059): we mint a token to fetch the PR diff so the
     // review is fully *shaped* here (pre-rendered body + validated inline comments). Nothing is posted —
     // every GitHub write is enqueued to `outbox` and the reconciler delivers it.
+    let repo_ref = RepoRef {
+        platform: context.platform,
+        full_name: format!("{}/{}", context.owner, context.name),
+        platform_repo_id: context.repository_id,
+        installation_id: context.installation_id,
+    };
+    // Epic #566: finalize needs `dedup_scope`. Resolved here (all three layers) rather than
+    // snapshotted onto the task: unlike `check_runs_enabled` — where the start and resolve of one
+    // check must agree or a check is stranded — this is read exactly once, at the end of the run, so a
+    // mid-run change is harmless. The extra config-file fetch is marginal next to the PR-diff fetch
+    // this handler already performs.
+    let settings = crate::settings::resolve_repo_settings(
+        pool,
+        Some(platform.as_ref()),
+        &repo_ref,
+        context
+            .base_sha
+            .as_deref()
+            .unwrap_or(&context.default_branch),
+        context.repository_id,
+    )
+    .await;
     let t = crate::outbox::Target {
         task_id: Some(id),
         platform: context.platform,
@@ -1528,40 +1558,58 @@ pub async fn finalize_review(
         // finding count. A run whose findings were all dedup-suppressed still FOUND them — it is not a
         // clean pass and must never 👍/suppress; only the POSTING is deduped (ADR-0065 composition).
         let pre_dedup_n = findings.len();
-        let (findings, deduped_n) = match context.head_sha.as_deref() {
-            Some(head) => {
-                let posted_keys: std::collections::HashSet<(String, u32, String)> =
-                    match crate::db::posted_findings_for_head(
-                        pool,
-                        context.repository_id,
-                        &context.target_type,
-                        context.target_id,
-                        head,
-                        id,
-                    )
-                    .await
-                    {
-                        Ok(arrays) => arrays
-                            .into_iter()
-                            .flat_map(|arr| {
-                                serde_json::from_value::<Vec<crate::review::Finding>>(arr)
-                                    .unwrap_or_default()
-                            })
-                            .map(|f| crate::review::dedup_key(&f.file, f.line, &f.title))
-                            .collect(),
-                        Err(error) => {
-                            tracing::warn!(%error, task_id = %id, "posted-findings lookup failed (non-fatal, no dedup)");
-                            std::collections::HashSet::new()
+        // Epic #566: suppression now spans the WHOLE PR by default, not just the current commit.
+        // A finding still unfixed after a push would otherwise re-post at its new line every time,
+        // because line numbers drift between commits and the exact key stops matching. Prior findings
+        // are counted per key (not collected into a set) so at most as many are suppressed as were
+        // actually posted before — a genuinely NEW occurrence of a recurring issue still surfaces.
+        // `dedup_scope: "commit"` restores the pre-#566 same-commit-only behaviour as a kill switch.
+        let dedup_scope = settings.dedup_scope.value;
+        let (findings, deduped_n, deduped_across_commits) = {
+            let mut posted = crate::review::PostedFindings::default();
+            let mut across_commits = false;
+            match crate::db::posted_findings_for_target(
+                pool,
+                context.repository_id,
+                &context.target_type,
+                context.target_id,
+                id,
+            )
+            .await
+            {
+                Ok(rows) => {
+                    for (posted_head, arr) in rows {
+                        let same_head = match (posted_head.as_deref(), context.head_sha.as_deref())
+                        {
+                            (Some(a), Some(b)) => a == b,
+                            _ => false,
+                        };
+                        // PR-wide matching only applies to findings from OTHER commits, and only when
+                        // the repo hasn't opted back into commit-scoped suppression.
+                        let pr_wide = !same_head && dedup_scope == crate::settings::DedupScope::Pr;
+                        if pr_wide {
+                            across_commits = true;
                         }
-                    };
-                crate::review::dedup_against_posted(findings, &posted_keys)
+                        for f in serde_json::from_value::<Vec<crate::review::Finding>>(arr)
+                            .unwrap_or_default()
+                        {
+                            posted.add(&f.file, f.line, &f.title, same_head, pr_wide);
+                        }
+                    }
+                }
+                Err(error) => {
+                    // Best-effort, exactly as before: a lookup failure means "nothing posted yet" →
+                    // no suppression, never a failed finalize.
+                    tracing::warn!(%error, task_id = %id, "posted-findings lookup failed (non-fatal, no dedup)");
+                }
             }
-            None => (findings, 0),
+            let (kept, n) = crate::review::dedup_against_posted(findings, &posted);
+            (kept, n, across_commits && n > 0)
         };
         if deduped_n > 0 {
             tracing::info!(
-                task_id = %id, deduped_n,
-                "re-review dedup: dropped findings already posted on this head_sha (ADR-0065)"
+                task_id = %id, deduped_n, across_commits = deduped_across_commits, ?dedup_scope,
+                "re-review dedup: dropped findings already posted on this PR (ADR-0065, epic #566)"
             );
         }
         // The model's `finish` verdict, if it produced one. `None` = an exhausted/clean pass (no
@@ -1576,17 +1624,12 @@ pub async fn finalize_review(
             .map(str::trim)
             .filter(|s| !s.is_empty());
         let all_deduped = deduped_n > 0 && findings.is_empty();
-        let summary = effective_summary(real_summary, deduped_n, all_deduped);
+        let summary =
+            effective_summary(real_summary, deduped_n, all_deduped, deduped_across_commits);
 
         // The PR-diff fetch is a READ done at produce time (ADR-0059: shaping is the producer's job).
         // Platform-aware (ADR-0072): the trait's `list_changed_files` dispatches to GitHub or GitLab
         // and encapsulates auth internally — no token minting here.
-        let repo_ref = RepoRef {
-            platform: context.platform,
-            full_name: format!("{}/{}", context.owner, context.name),
-            platform_repo_id: context.repository_id,
-            installation_id: context.installation_id,
-        };
         let commentable: std::collections::HashMap<String, crate::review::DiffLines> =
             match platform.list_changed_files(&repo_ref, pr).await {
                 Ok(files) => files
@@ -2295,7 +2338,7 @@ mod tests {
         assert_eq!(p.verdict, Some(REACTION_FINDINGS), "👎 from the true count");
 
         // And the body it posts (no model verdict) is the truthful note — never the clean default.
-        let s = effective_summary(None, 5, true);
+        let s = effective_summary(None, 5, true, false);
         assert_eq!(
             s,
             "No new findings — 5 prior finding(s) on this commit still stand."
@@ -2306,18 +2349,45 @@ mod tests {
         );
     }
 
+    /// Epic #566: when suppression drew on an EARLIER commit, the note must say "PR", not "commit" —
+    /// claiming those findings are "on this commit" would be false.
+    #[test]
+    fn effective_summary_says_pr_when_suppression_spanned_commits() {
+        let across = effective_summary(None, 2, true, true);
+        assert!(
+            across.contains("on this PR"),
+            "cross-commit suppression must not claim the findings are on this commit: {across}"
+        );
+        let same = effective_summary(None, 2, true, false);
+        assert!(
+            same.contains("on this commit"),
+            "same-commit suppression keeps the original wording: {same}"
+        );
+    }
+
     #[test]
     fn effective_summary_keeps_model_verdict_and_clean_default() {
         // The model's own verdict always wins, even on an all-deduped run.
         assert_eq!(
-            effective_summary(Some("Both P1s still stand; see prior comments."), 5, true),
+            effective_summary(
+                Some("Both P1s still stand; see prior comments."),
+                5,
+                true,
+                false
+            ),
             "Both P1s still stand; see prior comments."
         );
         // A genuinely clean run (nothing found, nothing deduped) keeps the default.
-        assert_eq!(effective_summary(None, 0, false), DEFAULT_CLEAN_SUMMARY);
+        assert_eq!(
+            effective_summary(None, 0, false, false),
+            DEFAULT_CLEAN_SUMMARY
+        );
         // Partial dedup (some findings survive) also keeps the default when the model set no verdict —
         // the surviving findings carry the review; the summary is not the dedup note.
-        assert_eq!(effective_summary(None, 3, false), DEFAULT_CLEAN_SUMMARY);
+        assert_eq!(
+            effective_summary(None, 3, false, false),
+            DEFAULT_CLEAN_SUMMARY
+        );
     }
 
     // Zero findings re-derived + prior findings exist on the target → the finalize handler's
