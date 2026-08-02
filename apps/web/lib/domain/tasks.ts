@@ -5,6 +5,13 @@ import { type GitlabLinkConfig, gitlabBaseUrlForProject } from "@/lib/domain/git
  * plane's `/tasks` payload (`TaskRow` in `services/control-plane/src/db.rs`). Pure + Edge-safe.
  */
 
+/** Page size the Runs page requests from `listTasksPage` (control-plane #587) — shared between the
+ * Server Component (`app/dashboard/runs/page.tsx`) and the client `RunList`'s range-label/page-count
+ * math. Lives in this plain (non-`"use client"`) module rather than `RunList` itself: a `"use
+ * client"` file's non-component exports become a server-side throwing proxy when imported into a
+ * Server Component — Next.js only allows crossing that boundary with components, not plain values. */
+export const RUNS_PAGE_SIZE = 25;
+
 /** One task run, as returned by `GET /tasks` and `GET /tasks/{id}`. */
 export interface Task {
   id: string;

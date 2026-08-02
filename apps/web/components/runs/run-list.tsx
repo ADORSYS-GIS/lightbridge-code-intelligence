@@ -2,13 +2,15 @@
 
 import { LayoutList, Table2 } from "lucide-react";
 import { parseAsInteger, parseAsStringLiteral, useQueryState } from "nuqs";
-import { useMemo } from "react";
 import { RunTable } from "@/components/runs/run-table";
 import { RunTimeline } from "@/components/runs/run-timeline";
+import { Pagination } from "@/components/ui/pagination";
 import { SearchInput } from "@/components/ui/search-input";
 import { Select } from "@/components/ui/select";
 import { StatusLine } from "@/components/ui/states";
-import { repoLabel, statusVisual, type Task, triggerLabel } from "@/lib/domain/tasks";
+import type { Repository } from "@/lib/domain/repos";
+import { repoSlug } from "@/lib/domain/repos";
+import { RUNS_PAGE_SIZE, type Task } from "@/lib/domain/tasks";
 import { useLocalStorageState } from "@/lib/hooks/use-local-storage-state";
 import { cn } from "@/lib/utils/cn";
 
@@ -27,37 +29,59 @@ type View = (typeof VIEW_VALUES)[number];
 const isView = (value: string): value is View => (VIEW_VALUES as readonly string[]).includes(value);
 
 /** Run list with status + repo filters, text search, and a timeline/table view toggle (ADR-0024,
- * daisyUI in ADR-0027). Filters/search/page live in the URL via nuqs (shareable/bookmarkable); the
- * view toggle is a personal preference, so it persists to localStorage instead. `now` is server-passed
- * so relative times don't drift on hydration. Filtering is client-side over the page. */
-export function RunList({ tasks, now }: { tasks: Task[]; now: number }) {
+ * daisyUI in ADR-0027). Filters/search/page live in the URL via nuqs — writing them re-triggers the
+ * parent Server Component's `listTasksPage` fetch (real server-side pagination + filtering,
+ * control-plane #587), so `tasks`/`total` arriving as props are already the correct window; this
+ * component does no client-side filtering or slicing itself. The view toggle is a personal
+ * preference, so it persists to localStorage instead of the URL. `now` is server-passed so relative
+ * times don't drift on hydration. `repoOptions` is the full repo universe (not derived from `tasks`)
+ * so narrowing the filter to one repo doesn't make every other repo vanish from its own dropdown. */
+export function RunList({
+  tasks,
+  total,
+  repoOptions,
+  now,
+}: {
+  tasks: Task[];
+  total: number;
+  repoOptions: Repository[];
+  now: number;
+}) {
+  // `shallow: false` on every param here: this page's status/repo/q/page state drives a real
+  // server-side fetch (`listTasksPage`, real pagination — control-plane #587), so a URL-only change
+  // (nuqs' default `shallow: true`) would update the address bar without ever re-invoking the Server
+  // Component that owns the data. RepoList's nuqs state stays shallow (default) since that page's
+  // filtering/paging is deliberately client-side over an already-fetched list.
   const [filter, setFilter] = useQueryState(
     "status",
-    parseAsStringLiteral(FILTER_VALUES).withDefault("all"),
+    parseAsStringLiteral(FILTER_VALUES).withDefault("all").withOptions({ shallow: false }),
   );
-  const [repo, setRepo] = useQueryState("repo", { defaultValue: "all", clearOnDefault: true });
-  const [query, setQuery] = useQueryState("q", { defaultValue: "", clearOnDefault: true });
+  const [repo, setRepo] = useQueryState("repo", {
+    defaultValue: "all",
+    clearOnDefault: true,
+    shallow: false,
+  });
+  const [query, setQuery] = useQueryState("q", {
+    defaultValue: "",
+    clearOnDefault: true,
+    shallow: false,
+  });
   const [view, setView] = useLocalStorageState<View>("lci.runs.view", "timeline", isView);
-  const [page, setPage] = useQueryState("page", parseAsInteger.withDefault(0));
-
-  // Repos present in this page, for the repo filter dropdown.
-  const repos = useMemo(
-    () => Array.from(new Set(tasks.map(repoLabel))).sort((a, b) => a.localeCompare(b)),
-    [tasks],
+  const [page, setPage] = useQueryState(
+    "page",
+    parseAsInteger.withDefault(0).withOptions({ shallow: false }),
   );
-
-  const filtered = useMemo(() => {
-    const q = query.trim().toLowerCase();
-    return tasks.filter((t) => {
-      if (filter !== "all" && statusVisual(t.status).variant !== filter) return false;
-      if (repo !== "all" && repoLabel(t) !== repo) return false;
-      if (!q) return true;
-      return `${repoLabel(t)} ${triggerLabel(t)} ${t.head_sha ?? ""}`.toLowerCase().includes(q);
-    });
-  }, [tasks, filter, repo, query]);
 
   // Any filter change invalidates the current page offset, so reset to the first page.
   const resetPage = () => setPage(null);
+
+  const pageCount = Math.max(1, Math.ceil(total / RUNS_PAGE_SIZE));
+  const current = Math.min(Math.max(0, page), pageCount - 1);
+  const start = current * RUNS_PAGE_SIZE;
+  const rangeLabel =
+    total === 0
+      ? "No results"
+      : `${start + 1}–${Math.min(start + RUNS_PAGE_SIZE, total)} of ${total}`;
 
   return (
     <div className="overflow-hidden rounded-box border border-base-content/15 bg-base-200">
@@ -79,7 +103,7 @@ export function RunList({ tasks, now }: { tasks: Task[]; now: number }) {
         </div>
 
         <div className="ml-auto flex items-center gap-2">
-          {repos.length > 1 && (
+          {repoOptions.length > 1 && (
             <Select
               value={repo}
               onValueChange={(value) => {
@@ -88,7 +112,7 @@ export function RunList({ tasks, now }: { tasks: Task[]; now: number }) {
               }}
               options={[
                 { value: "all", label: "All repositories" },
-                ...repos.map((r) => ({ value: r, label: r })),
+                ...repoOptions.map((r) => ({ value: String(r.id), label: repoSlug(r) })),
               ]}
               aria-label="Filter by repository"
               className="max-w-[12rem]"
@@ -122,12 +146,22 @@ export function RunList({ tasks, now }: { tasks: Task[]; now: number }) {
         </div>
       </div>
 
-      {filtered.length === 0 ? (
+      {tasks.length === 0 ? (
         <StatusLine>No runs match the current filters.</StatusLine>
       ) : view === "timeline" ? (
-        <RunTimeline tasks={filtered} now={now} />
+        <RunTimeline tasks={tasks} now={now} />
       ) : (
-        <RunTable tasks={filtered} now={now} page={page} onPageChange={setPage} />
+        <RunTable tasks={tasks} now={now} />
+      )}
+
+      {total > RUNS_PAGE_SIZE && (
+        <Pagination
+          current={current}
+          pageCount={pageCount}
+          rangeLabel={rangeLabel}
+          onPageChange={setPage}
+          className="flex items-center justify-between gap-3 border-t border-base-content/15 px-4 py-2.5 text-xs text-base-content/60"
+        />
       )}
     </div>
   );

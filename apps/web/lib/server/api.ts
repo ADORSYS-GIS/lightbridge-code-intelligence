@@ -41,14 +41,62 @@ function classify(status: number): "unauthenticated" | "unavailable" | "error" {
   return "error";
 }
 
-/** `GET /tasks` — the run list (most recent first). */
+/** `GET /tasks`'s response envelope (real pagination, control-plane #587): a page of tasks plus the
+ * total count of rows matching the current filters (not just this page's length). */
+interface TasksPageResponse {
+  tasks: Task[];
+  total: number;
+}
+
+/** `GET /tasks` with no params — the most recent 100 runs, unfiltered. Used by the Overview page's
+ * insights, which need a plain "most recent N" batch, not a filtered/paginated window; this keeps
+ * that exact call site's signature/behavior unchanged even though the control plane's response
+ * envelope grew a `total` alongside `tasks` (unwrapped here so callers never see it). See
+ * `listTasksPage` for the Runs page's real pagination + filtering. */
 export async function listTasks(): Promise<ApiResult<Task[]>> {
   try {
     const res = await authedFetch("/tasks");
     if (!res) return { ok: false, reason: "unauthenticated" };
     if (!res.ok) return { ok: false, reason: classify(res.status), status: res.status };
     // Inside the try: a non-JSON body / dropped connection makes res.json() throw too.
-    return { ok: true, data: (await res.json()) as Task[] };
+    const body = (await res.json()) as TasksPageResponse;
+    return { ok: true, data: body.tasks };
+  } catch {
+    return { ok: false, reason: "unavailable" };
+  }
+}
+
+/** Status filter accepted by `GET /tasks` — the same `StatusVariant` values the UI already renders
+ * with (`statusVisual` in `lib/domain/tasks.ts`); `"all"` is sent as omitted (no filter). */
+export type TasksStatusFilter = "active" | "pending" | "success" | "error" | "muted";
+
+export interface TasksPageParams {
+  /** 0-based page index. */
+  page: number;
+  pageSize: number;
+  status?: TasksStatusFilter;
+  repositoryId?: number;
+  q?: string;
+}
+
+/** `GET /tasks?page=&page_size=&status=&repository_id=&q=` — real server-side pagination +
+ * filtering for the Runs page (control-plane #587). */
+export async function listTasksPage(
+  params: TasksPageParams,
+): Promise<ApiResult<TasksPageResponse>> {
+  const query = new URLSearchParams({
+    page: String(params.page),
+    page_size: String(params.pageSize),
+  });
+  if (params.status) query.set("status", params.status);
+  if (params.repositoryId !== undefined) query.set("repository_id", String(params.repositoryId));
+  if (params.q) query.set("q", params.q);
+
+  try {
+    const res = await authedFetch(`/tasks?${query.toString()}`);
+    if (!res) return { ok: false, reason: "unauthenticated" };
+    if (!res.ok) return { ok: false, reason: classify(res.status), status: res.status };
+    return { ok: true, data: (await res.json()) as TasksPageResponse };
   } catch {
     return { ok: false, reason: "unavailable" };
   }
