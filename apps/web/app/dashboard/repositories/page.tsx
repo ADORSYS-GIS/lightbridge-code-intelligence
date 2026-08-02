@@ -3,6 +3,7 @@ import { buttonClass } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { ApiErrorLine, EmptyState } from "@/components/ui/states";
 import { gitlabLinkConfig } from "@/lib/domain/gitlab-links";
+import { getRepoSettings } from "@/lib/server/admin";
 import { getDeploymentConfig, listRepositories } from "@/lib/server/api";
 import { githubAppInstallUrl } from "@/lib/utils/config";
 
@@ -16,6 +17,23 @@ export default async function Repositories() {
     cfg.ok ? cfg.data.gitlab_project_base_urls : null,
   );
   const now = Date.now();
+
+  // One GET .../settings per repo (ADR-0111). Accepted as an N+1 at this scale — same call this page
+  // already makes down in `[id]/page.tsx` for one repo, and this list is an admin console, not a
+  // customer-facing catalog (see that page's own comment on the identical tradeoff). A failed fetch for
+  // one repo just means its card shows no override indicator, never blocks the rest of the list.
+  const overrideRepoIds = result.ok
+    ? (
+        await Promise.all(
+          result.data.map(async (repo) => {
+            const settings = await getRepoSettings(repo.id);
+            const hasOverride =
+              settings.ok && Object.values(settings.data.settings).some((s) => s.source === "db");
+            return hasOverride ? repo.id : null;
+          }),
+        )
+      ).filter((id): id is number => id !== null)
+    : [];
 
   return (
     <div className="flex flex-col gap-6">
@@ -48,7 +66,12 @@ export default async function Repositories() {
           pull request).
         </EmptyState>
       ) : (
-        <RepoList repos={result.data} now={now} gitlabLinks={gitlabLinks} />
+        <RepoList
+          repos={result.data}
+          now={now}
+          gitlabLinks={gitlabLinks}
+          overrideRepoIds={overrideRepoIds}
+        />
       )}
     </div>
   );
