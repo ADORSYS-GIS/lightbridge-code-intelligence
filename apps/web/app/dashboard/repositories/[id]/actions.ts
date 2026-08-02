@@ -5,6 +5,7 @@ import { currentClaims } from "@/lib/auth/session";
 import {
   hasPermission,
   type RepoSettingsPatch,
+  setRepoModel,
   setRepoPreset,
   setRepoSettingsOverride,
 } from "@/lib/server/admin";
@@ -100,6 +101,23 @@ export async function setPresetAction(formData: FormData): Promise<void> {
   }
   if (!(await setRepoPreset(id, preset))) {
     throw new Error("Failed to commit the new preset");
+  }
+  revalidatePath(`/dashboard/repositories/${id}`);
+}
+
+/**
+ * Set or clear a repo's model override (ADR-0110). Gated on `model:configure` — a distinct permission
+ * from `repo:configure`, since model selection is operator-cost-relevant, not a repo-owner setting. An
+ * empty submitted value clears the override (falls back to org override / the preset's own model).
+ */
+export async function setRepoModelAction(formData: FormData): Promise<void> {
+  if (!hasPermission(await currentClaims(), "model:configure")) {
+    throw new Error("Unauthorized: model:configure permission required");
+  }
+  const id = requireRepoId(formData);
+  const raw = String(formData.get("model") ?? "").trim();
+  if (!(await setRepoModel(id, raw === "" ? null : raw))) {
+    throw new Error("Failed to save the model override");
   }
   revalidatePath(`/dashboard/repositories/${id}`);
 }

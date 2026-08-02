@@ -8,17 +8,25 @@ import { Select } from "@/components/ui/select";
 import { SettingsRow, SettingsSection } from "@/components/ui/settings-section";
 import { SourceBadge } from "@/components/ui/source-badge";
 import { ApiErrorLine, StatusLine } from "@/components/ui/states";
+import { Pill } from "@/components/ui/status-pill";
 import { Toggle } from "@/components/ui/toggle";
 import { currentClaims } from "@/lib/auth/session";
-import { repoSlug } from "@/lib/domain/repos";
+import { approvalVisual, repoSlug } from "@/lib/domain/repos";
 import {
+  getModelAllowlist,
+  getRepoModel,
   getRepoPreset,
   getRepoSettings,
   hasPermission,
   listAdminRepos,
   type RepoSettingsPatch,
 } from "@/lib/server/admin";
-import { clearRepoSettingAction, setPresetAction, setRepoSettingAction } from "./actions";
+import {
+  clearRepoSettingAction,
+  setPresetAction,
+  setRepoModelAction,
+  setRepoSettingAction,
+} from "./actions";
 
 export const dynamic = "force-dynamic";
 
@@ -38,13 +46,17 @@ export default async function RepoSettings({ params }: { params: Promise<{ id: s
   // No single-repo GET endpoint exists control-plane-side — the list is small (an admin console, not
   // a customer-facing catalog), so finding the repo in the already-existing list call is the
   // pragmatic choice over adding a new endpoint for one field (owner/name) this page needs.
-  const [reposResult, presetResult, settingsResult, claims] = await Promise.all([
-    listAdminRepos(),
-    getRepoPreset(id),
-    getRepoSettings(id),
-    currentClaims(),
-  ]);
+  const [reposResult, presetResult, settingsResult, modelResult, allowlistResult, claims] =
+    await Promise.all([
+      listAdminRepos(),
+      getRepoPreset(id),
+      getRepoSettings(id),
+      getRepoModel(id),
+      getModelAllowlist(),
+      currentClaims(),
+    ]);
   const canConfigure = hasPermission(claims, "repo:configure");
+  const canConfigureModel = hasPermission(claims, "model:configure");
 
   if (!reposResult.ok) {
     return (
@@ -58,11 +70,22 @@ export default async function RepoSettings({ params }: { params: Promise<{ id: s
   const repo = reposResult.data.find((r) => r.id === id);
   if (!repo) notFound();
 
+  const approval = approvalVisual(repo);
+
   return (
     <Shell>
       <div>
-        <h1 className="text-lg font-medium tracking-tight">{repoSlug(repo)}</h1>
-        <p className="mt-1 text-sm text-base-content/60">Review preset settings.</p>
+        <div className="flex items-center gap-2.5">
+          <h1 className="text-lg font-medium tracking-tight">{repoSlug(repo)}</h1>
+          <Pill variant={approval.variant} label={approval.label} />
+        </div>
+        <p className="mt-1 text-sm text-base-content/60">
+          Review preset, settings, and model override. Change the approval status from{" "}
+          <Link href="/dashboard/admin" className="underline hover:text-base-content">
+            Approvals
+          </Link>
+          .
+        </p>
       </div>
 
       <Card>
@@ -295,6 +318,65 @@ export default async function RepoSettings({ params }: { params: Promise<{ id: s
           />
         </SettingsSection>
       )}
+
+      <Card>
+        <CardHeader>
+          <CardTitle>Model override</CardTitle>
+        </CardHeader>
+        <CardBody>
+          {!modelResult.ok ? (
+            <ApiErrorLine result={modelResult} />
+          ) : (
+            <div className="flex flex-wrap items-center gap-3">
+              <span
+                className={
+                  modelResult.data.source === "repo"
+                    ? "badge badge-xs badge-accent badge-soft"
+                    : modelResult.data.source === "org"
+                      ? "badge badge-xs badge-neutral badge-soft"
+                      : "badge badge-xs badge-ghost"
+                }
+              >
+                {modelResult.data.source === "repo"
+                  ? "Repo override"
+                  : modelResult.data.source === "org"
+                    ? "Org override"
+                    : "Platform default"}
+              </span>
+              {modelResult.data.model && (
+                <code className="rounded bg-base-200 px-1.5 py-0.5 text-sm">
+                  {modelResult.data.model}
+                </code>
+              )}
+              {!canConfigureModel ? (
+                <StatusLine>
+                  You need the <code>model:configure</code> permission to change this. Ask an
+                  administrator to grant it.
+                </StatusLine>
+              ) : !allowlistResult.ok ? (
+                <ApiErrorLine result={allowlistResult} />
+              ) : (
+                <form action={setRepoModelAction} className="contents">
+                  <input type="hidden" name="id" value={id} />
+                  <Select
+                    name="model"
+                    value={modelResult.data.model ?? ""}
+                    aria-label="Model override"
+                    options={[
+                      { value: "", label: "— none (preset default) —" },
+                      ...allowlistResult.data.map((m) => ({ value: m, label: m })),
+                    ]}
+                  />
+                </form>
+              )}
+            </div>
+          )}
+          <p className="mt-3 text-xs text-base-content/60">
+            Overrides which model the review preset uses for this repo. Falls back to an org-wide
+            override, then the preset's own configured model, when unset.
+          </p>
+        </CardBody>
+      </Card>
     </Shell>
   );
 }
