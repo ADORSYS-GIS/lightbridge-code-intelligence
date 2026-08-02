@@ -939,6 +939,7 @@ mod tests {
                 trace_context: None,
                 model_override: None,
                 check_runs_enabled: true,
+                run_after_secs: None,
             },
         )
         .await
