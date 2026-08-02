@@ -218,3 +218,70 @@ export async function setRepoPreset(id: number, preset: string): Promise<boolean
     return false;
   }
 }
+
+/** A repo's effective model-override provenance (ADR-0110). Unlike the six ADR-0111 settings, there is
+ * no repo-config-file layer for models — `source` is `"repo"` (this repo's own override),
+ * `"org"` (falls through to the installation-wide override), or `"none"` (the preset's own configured
+ * model applies, untouched). Mirrors `GET /admin/repositories/{id}/model`'s JSON shape exactly. */
+export interface RepoModelOverride {
+  repository_id: number;
+  model: string | null;
+  source: "repo" | "org" | "none";
+}
+
+/** `GET /admin/repositories/{id}/model` — needs `repo:read`. */
+export async function getRepoModel(id: number): Promise<ApiResult<RepoModelOverride>> {
+  try {
+    const t = await token();
+    if (!t) return { ok: false, reason: "unauthenticated" };
+    const res = await fetch(`${controlPlaneUrl()}/admin/repositories/${id}/model`, {
+      headers: { authorization: `Bearer ${t}`, accept: "application/json" },
+      cache: "no-store",
+    });
+    if (!res.ok) return { ok: false, reason: classify(res.status), status: res.status };
+    return { ok: true, data: (await res.json()) as RepoModelOverride };
+  } catch {
+    return { ok: false, reason: "unavailable" };
+  }
+}
+
+/** `GET /admin/models` — the operator-curated model allowlist (ADR-0110). Needs `repo:read`. Reference
+ * data for the picker below; the control plane re-validates on write regardless. */
+export async function getModelAllowlist(): Promise<ApiResult<string[]>> {
+  try {
+    const t = await token();
+    if (!t) return { ok: false, reason: "unauthenticated" };
+    const res = await fetch(`${controlPlaneUrl()}/admin/models`, {
+      headers: { authorization: `Bearer ${t}`, accept: "application/json" },
+      cache: "no-store",
+    });
+    if (!res.ok) return { ok: false, reason: classify(res.status), status: res.status };
+    return { ok: true, data: (await res.json()) as string[] };
+  } catch {
+    return { ok: false, reason: "unavailable" };
+  }
+}
+
+/** `POST /admin/repositories/{id}/model` — set (`model` provided) or clear (`model: null`) this repo's
+ * model override. Needs `model:configure` — a distinct permission from `repo:configure`, since model
+ * selection is operator-cost-relevant (ADR-0110), not a repo-owner setting. Returns whether it
+ * succeeded; the caller re-fetches to reflect the change. */
+export async function setRepoModel(id: number, model: string | null): Promise<boolean> {
+  const t = await token();
+  if (!t) return false;
+  try {
+    const res = await fetch(`${controlPlaneUrl()}/admin/repositories/${id}/model`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${t}`,
+        accept: "application/json",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ model }),
+      cache: "no-store",
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
