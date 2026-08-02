@@ -76,36 +76,40 @@ const MAX_CONFIG_BYTES: usize = 64 * 1024;
 pub(crate) struct RepoPresetConfig {
     pub(crate) preset: Option<String>,
     pub(crate) entry_points: HashMap<String, String>,
+    /// Per-repo review-behaviour settings — the FILE layer of [`crate::settings`]'s three-layer
+    /// resolution. Nested under one key deliberately: the agent-runner's `RepoReviewConfig` is
+    /// `deny_unknown_fields`, so every new top-level key must be mirrored there or the runner rejects
+    /// the whole file. One nested object means one mirrored key, not six, and a later
+    /// control-plane-only setting needs no further runner change.
+    pub(crate) triggers: Option<TriggersConfig>,
 }
 
-/// Resolve the preset name a task under `entry` should run with. Fetches the repo's
-/// `.lightbridge-code-review.jsonc` at `ref_` via `platform` (a single small file fetch, not a clone —
-/// keeps task creation cheap per story #494's NFR). Never fails: every error path (fetch failure,
-/// absent file, oversized, malformed JSONC, schema-invalid) degrades to the platform-default mapping.
-pub async fn resolve_preset(
-    platform: &dyn CodePlatform,
-    repo: &RepoRef,
-    ref_: &str,
-    entry: EntryPoint,
-) -> String {
-    let config = fetch_repo_preset_config(platform, repo, ref_).await;
-    resolve_from_config(config.as_ref(), entry)
+/// The `triggers` block of `.lightbridge-code-review.jsonc`. Every field is optional — an absent field
+/// means "not configured at this layer", which is what lets [`crate::settings::merge_settings`] fall
+/// through to the built-in default.
+///
+/// `push_strategy` / `dedup_scope` are `Option<String>`, NOT typed enums, on purpose: with a typed
+/// enum a single typo would fail the whole `RepoPresetConfig` parse and silently cost the repo its
+/// *preset* too. They are parsed (and warned about) during merge instead.
+///
+/// Deliberately NOT `deny_unknown_fields`, so a key added here later can never brick a repo whose
+/// runner is still on an older build.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default)]
+pub(crate) struct TriggersConfig {
+    pub(crate) check_runs: Option<bool>,
+    pub(crate) review_on_open: Option<bool>,
+    pub(crate) review_on_push: Option<bool>,
+    pub(crate) push_strategy: Option<String>,
+    pub(crate) push_debounce_seconds: Option<i32>,
+    pub(crate) dedup_scope: Option<String>,
 }
 
-/// Like [`resolve_preset`], but tolerates a missing platform client (`platform: None` — e.g. GitHub
-/// App env unset in a dev deploy) by falling back straight to the platform-default mapping, same as
-/// any other resolution failure. Every webhook call site goes through this rather than `resolve_preset`
-/// directly, since "is this platform even configured" varies per handler.
-pub async fn resolve_preset_or_default(
-    platform: Option<&dyn CodePlatform>,
-    repo: &RepoRef,
-    ref_: &str,
-    entry: EntryPoint,
-) -> String {
-    match platform {
-        Some(platform) => resolve_preset(platform, repo, ref_, entry).await,
-        None => entry.platform_default_preset().to_string(),
-    }
+/// Map an already-fetched config to the preset for `entry`. Pure — split out so
+/// [`crate::settings::resolve_preset_and_settings`] can derive the preset from the SAME fetch it uses
+/// for the settings, instead of paying a second `get_repo_file` per webhook.
+pub(crate) fn preset_from_config(config: Option<&RepoPresetConfig>, entry: EntryPoint) -> String {
+    resolve_from_config(config, entry)
 }
 
 fn resolve_from_config(config: Option<&RepoPresetConfig>, entry: EntryPoint) -> String {
@@ -175,6 +179,7 @@ mod tests {
         let config = RepoPresetConfig {
             preset: Some("ultra".to_string()),
             entry_points: HashMap::new(),
+            ..Default::default()
         };
         assert_eq!(
             resolve_from_config(Some(&config), EntryPoint::PrOpen),
@@ -191,6 +196,7 @@ mod tests {
         let config = RepoPresetConfig {
             preset: Some("ultra".to_string()),
             entry_points: HashMap::from([("pr_open".to_string(), "fast".to_string())]),
+            ..Default::default()
         };
         assert_eq!(
             resolve_from_config(Some(&config), EntryPoint::PrOpen),

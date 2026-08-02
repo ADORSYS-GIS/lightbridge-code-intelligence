@@ -192,6 +192,11 @@ impl A2aHandler {
         // read — so the A2A role resolves it exactly like every webhook entry point.
         let model_override =
             crate::model::resolve_model_override(&self.pool, repo.id, installation_id).await;
+        // Epic #566: same credential story as the preset above — the file layer needs a forge client
+        // this role doesn't have, so settings resolve from the DB override + built-in defaults only
+        // (`platform: None`). A repo that configures `triggers` in its config file therefore does not
+        // affect A2A-created tasks; an operator DB override does.
+        let settings = crate::settings::resolve_repo_settings_db_only(&self.pool, repo.id).await;
         let new_task = db::NewTask {
             repository_id: repo.id,
             installation_id,
@@ -211,6 +216,7 @@ impl A2aHandler {
             // webhook path); a future A2A trace root is a separate, unscoped addition.
             trace_context: None,
             model_override,
+            check_runs_enabled: settings.check_run_reporting.value,
         };
 
         // Record a synthetic delivery so the task's `webhook_delivery_id` FK is satisfied and the

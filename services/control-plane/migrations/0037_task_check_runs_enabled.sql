@@ -1,0 +1,11 @@
+-- Snapshot the resolved `check_run_reporting` setting onto the task at creation time.
+--
+-- Why snapshot instead of re-reading per use: a check run's START (dispatcher) and its RESOLVE
+-- (finalize / failure handler / reaper) happen minutes apart, and they MUST agree — the existing
+-- invariant is "a check is never opened without ever being resolved, and never resolved without
+-- having been opened". Re-reading the setting at each site would let an operator flipping the toggle
+-- mid-run strand an in-progress check on the PR forever, or resolve a check that was never opened.
+--
+-- DEFAULT true matches the built-in default (check runs shipped on for everyone in #559), so every
+-- pre-existing task row keeps behaving exactly as it does today.
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS check_runs_enabled BOOLEAN NOT NULL DEFAULT true;

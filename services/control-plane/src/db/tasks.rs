@@ -96,6 +96,10 @@ pub struct NewTask {
     /// called at the same task-creation sites as preset resolution. `None` when neither a repo nor an
     /// org override is set; the runner then applies the preset's own configured model unchanged.
     pub model_override: Option<String>,
+    /// Resolved `check_run_reporting` setting (epic #566), SNAPSHOTTED here rather than re-read at each
+    /// use: the check's start and resolve happen minutes apart and must agree, so an operator flipping
+    /// the toggle mid-run must not strand an in-progress check on the PR.
+    pub check_runs_enabled: bool,
 }
 
 /// A task claimed by the dispatcher for execution (the subset needed to launch its Job).
@@ -177,6 +181,7 @@ pub async fn create_task(pool: &PgPool, task: &NewTask) -> Result<Option<Uuid>, 
     .bind(task.trigger_comment_id)
     .bind(&task.trace_context)
     .bind(&task.model_override)
+    .bind(task.check_runs_enabled)
     .fetch_optional(pool)
     .await?;
 
@@ -210,8 +215,8 @@ pub async fn create_explicit_task(pool: &PgPool, task: &NewTask) -> Result<Uuid,
         let result = sqlx::query_as::<_, (Uuid, String)>(sqlx::AssertSqlSafe(format!(
             "INSERT INTO tasks (id, repository_id, installation_id, webhook_delivery_id, target_type, \
              target_id, command_text, base_sha, head_sha, preset, entry_point, trigger_comment_id, \
-             trace_context, model_override, run_epoch, status) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, \
+             trace_context, model_override, check_runs_enabled, run_epoch, status) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, \
                (SELECT COALESCE(MAX(run_epoch), -1) + 1 FROM tasks \
                 WHERE repository_id = $2 AND target_type = $5 AND target_id = $6 \
                   AND command_text = $7 AND head_sha IS NOT DISTINCT FROM $9), \
@@ -232,6 +237,7 @@ pub async fn create_explicit_task(pool: &PgPool, task: &NewTask) -> Result<Uuid,
         .bind(task.trigger_comment_id)
         .bind(&task.trace_context)
         .bind(&task.model_override)
+        .bind(task.check_runs_enabled)
         .fetch_one(pool)
         .await;
         match result {
@@ -485,6 +491,9 @@ pub struct TaskContextRow {
     /// Resolved repo/org model override (ADR-0110, story #501), or `None` for no override — the
     /// runner then applies the preset's own configured model unchanged.
     pub model_override: Option<String>,
+    /// Whether this task posts a check run / commit status (epic #566), snapshotted at creation. Read
+    /// by all four check-run sites so start and resolve can never disagree.
+    pub check_runs_enabled: bool,
 }
 
 /// Load a task's execution context, or `None` if no such task exists. INNER JOIN on `repositories`:
@@ -496,7 +505,7 @@ pub async fn get_task_context(
     sqlx::query_as::<_, TaskContextRow>(
         "SELECT t.id, t.repository_id, t.installation_id, r.owner, r.name, r.default_branch, r.platform, \
                 t.target_type, t.target_id, t.command_text, t.kind, t.preset, t.entry_point, t.base_sha, \
-                t.head_sha, t.trigger_comment_id, t.model_override \
+                t.head_sha, t.trigger_comment_id, t.model_override, t.check_runs_enabled \
          FROM tasks t JOIN repositories r ON r.id = t.repository_id \
          WHERE t.id = $1",
     )

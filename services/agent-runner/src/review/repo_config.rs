@@ -63,6 +63,34 @@ pub struct RepoReviewConfig {
     pub instructions: Option<String>,
     /// Minimum severity to surface on the posted review.
     pub severity: Option<SeverityFilter>,
+    /// Per-repo review-behaviour settings, consumed **control-plane-side** (check-run reporting, review
+    /// triggers, push-storm strategy, dedup scope — see `control_plane::settings`). The runner itself
+    /// ignores this block entirely.
+    ///
+    /// It is declared here anyway, and MUST stay in sync with the control plane's copy, because this
+    /// struct is `deny_unknown_fields`: a repo that adds `triggers` to its config would otherwise fail
+    /// this parse outright and silently lose its `conventions`/`instructions`/`severity` — the
+    /// settings would appear to work (the control plane reads them fine) while quietly breaking
+    /// everything else the file configures.
+    pub triggers: Option<TriggersConfig>,
+}
+
+/// The `triggers` block — a control-plane concern mirrored here only to satisfy this file's
+/// `deny_unknown_fields` (see [`RepoReviewConfig::triggers`]).
+///
+/// Deliberately NOT `deny_unknown_fields` itself: a control-plane-only setting added to this block in
+/// a later release must not brick config parsing for a repo whose runner is still on an older build.
+/// Fields are typed loosely for the same reason the control plane types them loosely — a typo should
+/// degrade one setting, not fail the whole file.
+#[derive(Debug, Default, Clone, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct TriggersConfig {
+    pub check_runs: Option<bool>,
+    pub review_on_open: Option<bool>,
+    pub review_on_push: Option<bool>,
+    pub push_strategy: Option<String>,
+    pub push_debounce_seconds: Option<i32>,
+    pub dedup_scope: Option<String>,
 }
 
 /// `{ "min": "P1" }` — reuses the review agent's existing `P0`/`P1`/`P2` priority vocabulary
@@ -272,6 +300,42 @@ mod tests {
     #[test]
     fn render_context_block_is_none_when_nothing_is_set() {
         assert_eq!(RepoReviewConfig::default().render_context_block(), None);
+    }
+
+    /// REGRESSION: this struct is `deny_unknown_fields`, so a control-plane-only key added to the
+    /// shared config file must be declared here too — otherwise the whole parse fails and the repo
+    /// SILENTLY loses its conventions/instructions/severity while the new setting appears to work.
+    /// Mutation check: delete `RepoReviewConfig::triggers` and this test fails.
+    #[test]
+    fn a_config_using_triggers_still_parses_and_keeps_its_other_fields() {
+        let raw = r#"{
+            // control-plane-side settings
+            "triggers": { "check_runs": false, "review_on_push": true, "push_strategy": "debounce" },
+            "conventions": ["errors are values"],
+            "instructions": "be terse",
+            "severity": { "min": "P1" }
+        }"#;
+        let parsed = parse(raw)
+            .expect("matches the schema — if this fails, `triggers` is missing from the struct");
+        assert_eq!(parsed.conventions, vec!["errors are values".to_string()]);
+        assert_eq!(parsed.instructions.as_deref(), Some("be terse"));
+        assert!(
+            parsed.severity.is_some(),
+            "severity must survive alongside a triggers block"
+        );
+        let triggers = parsed.triggers.expect("triggers parsed");
+        assert_eq!(triggers.check_runs, Some(false));
+        assert_eq!(triggers.review_on_push, Some(true));
+        assert_eq!(triggers.push_strategy.as_deref(), Some("debounce"));
+    }
+
+    /// The `triggers` block itself is NOT `deny_unknown_fields`, so a control-plane-only setting added
+    /// in a later release cannot brick a repo running an older agent build.
+    #[test]
+    fn an_unknown_key_inside_triggers_is_tolerated() {
+        let raw = r#"{ "triggers": { "check_runs": true, "some_future_setting": 42 } }"#;
+        let parsed = parse(raw).expect("an unknown key inside triggers must not fail the file");
+        assert_eq!(parsed.triggers.and_then(|t| t.check_runs), Some(true));
     }
 
     #[test]
