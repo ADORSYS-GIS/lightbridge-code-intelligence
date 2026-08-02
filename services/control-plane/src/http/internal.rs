@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::AppState;
-use crate::integrations::platform::{CodePlatform, Platform, RepoRef};
+use crate::integrations::platform::{CheckConclusion, CodePlatform, Platform, RepoRef};
 use crate::runner_token::RunnerTokenSigner;
 
 /// Authenticates a runner request: its `Authorization: Bearer` token must verify against the
@@ -1336,6 +1336,21 @@ fn finalize_policy(
     }
 }
 
+/// The check-run/commit-status conclusion for a finalized run (new feature — cosmetic runner-status
+/// reporting), derived from the same signals `finalize_review` already computes. Pure, so the mapping
+/// is unit-tested without the DB/outbox. `aborted` (the run posted an apology, not a verdict) always
+/// means `Failure` — it never finished. Otherwise: findings posted → `Neutral` (findings aren't a build
+/// break); no review posted (a clean pass, or a suppressed clean pass, or a pure `ask`) → `Success`.
+fn resolve_check_conclusion(aborted: bool, queued_review: bool) -> CheckConclusion {
+    if aborted {
+        CheckConclusion::Failure
+    } else if queued_review {
+        CheckConclusion::Neutral
+    } else {
+        CheckConclusion::Success
+    }
+}
+
 /// The summary that is posted AND persisted for a review (pure, unit-tested). The model's own verdict
 /// always wins. Without one, an **all-deduped** run (ADR-0065: every finding it re-derived was already
 /// posted on this commit, `deduped_n > 0`, nothing kept) gets a truthful "no NEW findings" note — never
@@ -1846,6 +1861,28 @@ pub async fn finalize_review(
         }
     }
 
+    // 2b) Resolve the check/status opened at dispatch (new feature — cosmetic runner-status
+    // reporting), mirroring the `post_pr_review` gate at dispatch time so a check is never resolved
+    // without ever being opened. Best-effort: the review itself already finalized above.
+    if context.target_type == "pull_request"
+        && let Some(head_sha) = context.head_sha.as_deref()
+    {
+        let conclusion =
+            resolve_check_conclusion(outcome.as_deref() == Some("aborted"), queued_review);
+        if let Err(error) = crate::outbox::enqueue_check_run_resolve(
+            pool,
+            &t,
+            context.target_id,
+            head_sha,
+            conclusion,
+            "Lightbridge review finished.",
+        )
+        .await
+        {
+            tracing::warn!(%error, task_id = %id, "enqueueing check-run resolve failed (non-fatal)");
+        }
+    }
+
     // 3) Record the emergent run kind (ADR-0037).
     let kind = match (has_inline, queued_reply) {
         (true, true) => "mixed",
@@ -1953,11 +1990,20 @@ pub async fn set_status(
             // review never finalized (ADR-0056), so the author isn't left in silence. Success is
             // acknowledged by the verdict reaction (👍/👎, ADR-0068) in `finalize_review`, so we don't
             // double-react here.
-            if matches!(update.status.as_str(), "failed" | "timed_out") {
+            // The check-run/commit-status conclusion (new feature) distinguishes a genuine failure from
+            // a timeout — `handle_review_failure`'s own 😕/failure-notice logic doesn't need this
+            // distinction (both read as "review failed to complete"), so it's threaded in only for the
+            // conclusion, not derived again inside the function.
+            let check_conclusion = match update.status.as_str() {
+                "failed" => Some(CheckConclusion::Failure),
+                "timed_out" => Some(CheckConclusion::TimedOut),
+                _ => None,
+            };
+            if let Some(check_conclusion) = check_conclusion {
                 let state = state.clone();
                 let pool = pool.clone();
                 tokio::spawn(async move {
-                    handle_review_failure(&state, &pool, id).await;
+                    handle_review_failure(&state, &pool, id, check_conclusion).await;
                 });
             }
             StatusCode::NO_CONTENT.into_response()
@@ -1998,11 +2044,17 @@ pub async fn get_status(
 }
 
 /// GitHub feedback when a **PR** review task fails terminally (runner-reported `failed`/`timed_out`):
-/// **enqueue** a 😕 reaction (gated on the toggle) and the ADR-0056 failure notice. Both ride the
-/// egress outbox (ADR-0059) — serve no longer posts — and the reconciler re-checks `has_posted_to_github`
+/// **enqueue** a 😕 reaction (gated on the toggle) and the ADR-0056 failure notice, plus (new feature)
+/// resolving any check/status opened at dispatch to `check_conclusion`. All three ride the egress
+/// outbox (ADR-0059) — serve no longer posts — and the reconciler re-checks `has_posted_to_github`
 /// before the notice, so a finalize-then-fail stays quiet. The *uncatchable*-kill path (no status report
 /// reaches serve) is covered by the reaper enqueueing the same notice (ADR-0057, now via the outbox).
-async fn handle_review_failure(state: &AppState, pool: &sqlx::PgPool, id: Uuid) {
+async fn handle_review_failure(
+    state: &AppState,
+    pool: &sqlx::PgPool,
+    id: Uuid,
+    check_conclusion: CheckConclusion,
+) {
     let context = match crate::db::get_task_context(pool, id).await {
         Ok(Some(context)) if context.target_type == "pull_request" => context,
         _ => return,
@@ -2034,6 +2086,19 @@ async fn handle_review_failure(state: &AppState, pool: &sqlx::PgPool, id: Uuid) 
             .await
     {
         tracing::warn!(%error, task_id = %id, "enqueueing failure notice failed (non-fatal)");
+    }
+    if let Some(head_sha) = context.head_sha.as_deref()
+        && let Err(error) = crate::outbox::enqueue_check_run_resolve(
+            pool,
+            &t,
+            context.target_id,
+            head_sha,
+            check_conclusion,
+            "Review run failed to complete.",
+        )
+        .await
+    {
+        tracing::warn!(%error, task_id = %id, "enqueueing check-run resolve failed (non-fatal)");
     }
 }
 
@@ -2173,6 +2238,29 @@ mod tests {
         assert_eq!(p.verdict, None);
         let p = finalize_policy(Some("aborted"), false, false);
         assert!(!p.react_confused);
+    }
+
+    #[test]
+    fn resolve_check_conclusion_maps_run_outcome_to_platform_conclusion() {
+        // Aborted always wins — the run never provably finished, regardless of what it posted.
+        assert_eq!(
+            resolve_check_conclusion(true, true),
+            CheckConclusion::Failure
+        );
+        assert_eq!(
+            resolve_check_conclusion(true, false),
+            CheckConclusion::Failure
+        );
+        // Findings posted (not aborted) → Neutral: findings aren't a build break.
+        assert_eq!(
+            resolve_check_conclusion(false, true),
+            CheckConclusion::Neutral
+        );
+        // No review posted (clean/suppressed clean/pure ask) → Success.
+        assert_eq!(
+            resolve_check_conclusion(false, false),
+            CheckConclusion::Success
+        );
     }
 
     // ADR-0065 × ADR-0068 composition: the verdict reads the PRE-dedup finding count, the post reads

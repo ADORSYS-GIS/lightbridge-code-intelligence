@@ -24,6 +24,7 @@ use sqlx::PgPool;
 
 use crate::db;
 use crate::integrations::k8s::{JobLiveness, TaskLauncher};
+use crate::integrations::platform::CheckConclusion;
 #[cfg(test)]
 use crate::integrations::platform::Platform;
 
@@ -227,6 +228,22 @@ async fn enqueue_reaper_failure_notice(
             .await
     {
         tracing::warn!(%error, task_id = %task_id, "reaper: enqueueing failure notice failed (non-fatal)");
+    }
+    // Resolve any check/status opened at dispatch (new feature — cosmetic runner-status reporting).
+    // `TimedOut` rather than `Failure`: this path is specifically "the Job stopped reporting", closer
+    // to a timeout than a clean failure.
+    if let Some(head_sha) = context.head_sha.as_deref()
+        && let Err(error) = crate::outbox::enqueue_check_run_resolve(
+            pool,
+            &t,
+            context.target_id,
+            head_sha,
+            CheckConclusion::TimedOut,
+            "Review run did not complete (no report from the runner).",
+        )
+        .await
+    {
+        tracing::warn!(%error, task_id = %task_id, "reaper: enqueueing check-run resolve failed (non-fatal)");
     }
 }
 

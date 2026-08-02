@@ -218,6 +218,83 @@ pub async fn enqueue_failure_notice(
     Ok(inserted)
 }
 
+/// The `check_run_start` intent: open an in-progress check/status on a PR/MR's head SHA (new feature —
+/// see the module doc). One per task (`<task>:check_run:start`).
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CheckRunStartPayload {
+    pub pr: i64,
+    pub head_sha: String,
+}
+
+/// Enqueue the "check in progress" signal.
+pub async fn enqueue_check_run_start(
+    pool: &PgPool,
+    t: &Target<'_>,
+    pr: i64,
+    head_sha: &str,
+) -> anyhow::Result<bool> {
+    let key = format!("{}:check_run:start", t.key_prefix(pr));
+    let value = serde_json::to_value(CheckRunStartPayload {
+        pr,
+        head_sha: head_sha.to_string(),
+    })?;
+    let inserted = crate::db::enqueue_outbox_post(
+        pool,
+        t.platform,
+        t.task_id,
+        t.installation_id,
+        t.owner,
+        t.repo,
+        "check_run_start",
+        &value,
+        &key,
+    )
+    .await?;
+    Ok(inserted)
+}
+
+/// The `check_run_resolve` intent: resolve a previously-opened check/status to its final outcome. One
+/// per task (`<task>:check_run:resolve`) — `ON CONFLICT DO NOTHING` on the shared dedup key means the
+/// FIRST resolve to reach the outbox wins if two terminal paths ever somehow raced for the same task.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CheckRunResolvePayload {
+    pub pr: i64,
+    pub head_sha: String,
+    pub conclusion: crate::integrations::platform::CheckConclusion,
+    pub summary: String,
+}
+
+/// Enqueue the check resolution.
+pub async fn enqueue_check_run_resolve(
+    pool: &PgPool,
+    t: &Target<'_>,
+    pr: i64,
+    head_sha: &str,
+    conclusion: crate::integrations::platform::CheckConclusion,
+    summary: &str,
+) -> anyhow::Result<bool> {
+    let key = format!("{}:check_run:resolve", t.key_prefix(pr));
+    let value = serde_json::to_value(CheckRunResolvePayload {
+        pr,
+        head_sha: head_sha.to_string(),
+        conclusion,
+        summary: summary.to_string(),
+    })?;
+    let inserted = crate::db::enqueue_outbox_post(
+        pool,
+        t.platform,
+        t.task_id,
+        t.installation_id,
+        t.owner,
+        t.repo,
+        "check_run_resolve",
+        &value,
+        &key,
+    )
+    .await?;
+    Ok(inserted)
+}
+
 /// The `pr_open` intent (ADR-0088): everything the egress plane needs to push a branch + open a PR,
 /// with the branch itself **offloaded** — `content_hash` points at the `pr_open_blob` row holding the
 /// `git format-patch` bytes (the offload rule; the intent on the wire carries the key + hash, not the
@@ -285,6 +362,27 @@ mod tests {
         assert_eq!(pr_open_dedup_key(task, 0), pr_open_dedup_key(task, 0));
         assert_ne!(pr_open_dedup_key(task, 0), pr_open_dedup_key(task, 1));
         assert!(pr_open_dedup_key(task, 3).ends_with(":3:pr_open"));
+    }
+
+    // The check-run start/resolve dedup keys are stable per task and distinct from each other and from
+    // every other intent kind, so a re-dispatch/re-finalize never double-enqueues either signal.
+    #[test]
+    fn check_run_dedup_keys_are_stable_per_task_and_distinct() {
+        let t = Target {
+            task_id: Some(Uuid::from_u128(1)),
+            platform: Platform::GitHub,
+            installation_id: 1,
+            owner: "octo",
+            repo: "repo",
+        };
+        assert_eq!(t.key_prefix(7), t.key_prefix(7), "stable for the same task");
+        assert!(format!("{}:check_run:start", t.key_prefix(7)).ends_with(":check_run:start"));
+        assert!(format!("{}:check_run:resolve", t.key_prefix(7)).ends_with(":check_run:resolve"));
+        assert_ne!(
+            format!("{}:check_run:start", t.key_prefix(7)),
+            format!("{}:check_run:resolve", t.key_prefix(7)),
+            "start and resolve must not share a dedup key"
+        );
     }
 
     // ADR-0068: the reaction payload carries `comment_id` ONLY when the task was @mention-triggered, so

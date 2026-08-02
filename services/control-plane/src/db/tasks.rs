@@ -524,6 +524,35 @@ pub async fn get_task_status(pool: &PgPool, id: Uuid) -> Result<Option<String>, 
         .await
 }
 
+/// Persist the GitHub check-run id opened for a task, so a later resolve can address the SAME check
+/// run (new feature — see `outbox::enqueue_check_run_start`). GitLab/Bitbucket never call this (their
+/// status APIs upsert by sha, no id to remember).
+pub async fn set_check_run_external_id(
+    pool: &PgPool,
+    id: Uuid,
+    external_id: i64,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE tasks SET check_run_external_id = $2 WHERE id = $1")
+        .bind(id)
+        .bind(external_id)
+        .execute(pool)
+        .await
+        .map(|_| ())
+}
+
+/// Read back a task's check-run id, or `None` when no start ever recorded one (not yet delivered,
+/// dead-lettered, or a platform that doesn't use one).
+pub async fn get_check_run_external_id(
+    pool: &PgPool,
+    id: Uuid,
+) -> Result<Option<i64>, sqlx::Error> {
+    sqlx::query_scalar("SELECT check_run_external_id FROM tasks WHERE id = $1")
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+        .map(Option::flatten)
+}
+
 /// Apply a runner-reported status transition. Terminal states (`succeeded`/`failed`/`timed_out`/
 /// `cancelled`) stamp `completed_at` and clear the dispatcher lease so the reaper (Phase 2) won't
 /// reclaim a finished task; `running` stamps `started_at` if unset. Returns `false` if no task

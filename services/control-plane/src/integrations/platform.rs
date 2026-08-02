@@ -180,6 +180,59 @@ pub struct ReviewCommentRef {
     pub line: Option<i64>,
 }
 
+/// A fixed, stable name for the check/status a review run posts — the SAME value used at start and
+/// resolve, so GitHub updates one check run (by id) and GitLab/Bitbucket's upsert-by-(sha, name/key)
+/// semantics land on the same slot rather than creating a new one each time.
+pub const CHECK_RUN_NAME: &str = "Lightbridge Review";
+
+/// The resolved outcome of a review run, mapped onto each platform's status vocabulary. Lives here
+/// (not in `db` or `outbox`) because it's the platform-facing contract, exactly like `ReviewPost`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckConclusion {
+    Success,
+    Failure,
+    Neutral,
+    Cancelled,
+    TimedOut,
+}
+
+impl CheckConclusion {
+    /// GitHub's `conclusion` vocabulary — a 1:1 mapping (GitHub is the only platform with all five
+    /// values natively).
+    pub fn github_str(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::Failure => "failure",
+            Self::Neutral => "neutral",
+            Self::Cancelled => "cancelled",
+            Self::TimedOut => "timed_out",
+        }
+    }
+}
+
+/// Parameters to open an in-progress check/status on a commit.
+#[derive(Debug, Clone)]
+pub struct CheckRunStart<'a> {
+    pub head_sha: &'a str,
+    pub details_url: Option<&'a str>,
+}
+
+/// Parameters to resolve a previously-opened check/status.
+#[derive(Debug, Clone)]
+pub struct CheckRunResolve<'a> {
+    pub head_sha: &'a str,
+    /// GitHub's check-run id from the `start_check_run` call, `None` when no id was ever recorded (the
+    /// start intent hasn't posted yet, dead-lettered on a 403, or predates this feature). GitLab and
+    /// Bitbucket implementations ignore this — their status APIs upsert by sha + a fixed name/key, no
+    /// id needed — GitHub uses it to choose PATCH-by-id vs. the self-healing create-already-completed
+    /// fallback.
+    pub external_id: Option<i64>,
+    pub conclusion: CheckConclusion,
+    pub summary: &'a str,
+    pub details_url: Option<&'a str>,
+}
+
 /// The platform trait. GitHub (`GithubApp`) and GitLab (`GitlabClient`, future) both implement this.
 ///
 /// The trait encapsulates auth: GitHub mints an installation token internally using
@@ -295,6 +348,23 @@ pub trait CodePlatform: Send + Sync {
         labels: &[String],
     ) -> anyhow::Result<()>;
 
+    /// Open an in-progress check/status on a commit (a PR/MR's head SHA). Returns the platform's id
+    /// for the created check run when the platform has one to correlate later (GitHub); `None` when
+    /// the platform's status API is upsert-by-sha with no id (GitLab, Bitbucket) — the caller persists
+    /// a `Some` onto `tasks.check_run_external_id` for `resolve_check_run` to read back.
+    async fn start_check_run(
+        &self,
+        repo: &RepoRef,
+        req: CheckRunStart<'_>,
+    ) -> anyhow::Result<Option<i64>>;
+
+    /// Resolve a previously-started check/status to its final outcome.
+    async fn resolve_check_run(
+        &self,
+        repo: &RepoRef,
+        req: CheckRunResolve<'_>,
+    ) -> anyhow::Result<()>;
+
     // --- Feedback polling ---
 
     /// List the inline comments of a posted review (for feedback correlation).
@@ -343,6 +413,19 @@ mod tests {
             assert_eq!(Platform::parse(&text.to_ascii_uppercase()), Some(platform));
         }
         assert_eq!(Platform::parse("unknown"), None);
+    }
+
+    #[test]
+    fn check_conclusion_github_str_covers_every_variant() {
+        for (conclusion, text) in [
+            (CheckConclusion::Success, "success"),
+            (CheckConclusion::Failure, "failure"),
+            (CheckConclusion::Neutral, "neutral"),
+            (CheckConclusion::Cancelled, "cancelled"),
+            (CheckConclusion::TimedOut, "timed_out"),
+        ] {
+            assert_eq!(conclusion.github_str(), text);
+        }
     }
 
     #[test]

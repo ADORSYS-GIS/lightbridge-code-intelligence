@@ -115,6 +115,26 @@ impl BitbucketClient {
         }
     }
 
+    /// Bitbucket's build-status `key` is a URL PATH SEGMENT (`.../statuses/build/{key}`), unlike
+    /// GitHub/GitLab where the check/status name is only ever a JSON body value — [`CHECK_RUN_NAME`]
+    /// ("Lightbridge Review") contains a space, which is not a valid raw path segment. Use a
+    /// URL-safe slug for `key` and keep `CHECK_RUN_NAME` for the human-readable `name`/`description`
+    /// fields, mirroring Bitbucket's own key-vs-name distinction for build statuses.
+    const BUILD_STATUS_KEY: &str = "lightbridge-review";
+
+    /// Map [`CheckConclusion`] onto Bitbucket Cloud's build-status `state` vocabulary
+    /// (`SUCCESSFUL|FAILED|INPROGRESS|STOPPED`) — narrower still than GitLab's: no neutral/timed-out
+    /// distinction either, so `Neutral` → `SUCCESSFUL` and `TimedOut` → `FAILED` (same documented
+    /// lossy-mapping treatment as GitLab; this module's doc comment already flags Bitbucket's overall
+    /// narrower verb set).
+    fn build_status_state(conclusion: CheckConclusion) -> &'static str {
+        match conclusion {
+            CheckConclusion::Success | CheckConclusion::Neutral => "SUCCESSFUL",
+            CheckConclusion::Failure | CheckConclusion::TimedOut => "FAILED",
+            CheckConclusion::Cancelled => "STOPPED",
+        }
+    }
+
     /// Split a raw unified diff (as returned by `/pullrequests/{id}/diff`) into per-file chunks on
     /// `"diff --git a/... b/..."` boundaries. Bitbucket Cloud has no per-file JSON diff endpoint —
     /// this reconstructs the `ChangedFile { path, patch }` shape from the one text endpoint available.
@@ -377,6 +397,22 @@ impl CodePlatform for BitbucketPlatformRouter {
         self.client(repo)?
             .add_labels(repo, issue_number, labels)
             .await
+    }
+
+    async fn start_check_run(
+        &self,
+        repo: &RepoRef,
+        req: CheckRunStart<'_>,
+    ) -> anyhow::Result<Option<i64>> {
+        self.client(repo)?.start_check_run(repo, req).await
+    }
+
+    async fn resolve_check_run(
+        &self,
+        repo: &RepoRef,
+        req: CheckRunResolve<'_>,
+    ) -> anyhow::Result<()> {
+        self.client(repo)?.resolve_check_run(repo, req).await
     }
 
     async fn list_review_comments(
@@ -725,6 +761,66 @@ impl CodePlatform for BitbucketClient {
         Ok(())
     }
 
+    async fn start_check_run(
+        &self,
+        _repo: &RepoRef,
+        req: CheckRunStart<'_>,
+    ) -> anyhow::Result<Option<i64>> {
+        // Build status is a PUT keyed by (sha, key) — an upsert, so there's no id to remember for the
+        // resolve call. `url` is a Bitbucket-documented required field on this endpoint; no per-task
+        // dashboard URL exists today, so an absent `details_url` falls back to an empty string (new
+        // integration surface, confirm against a real Bitbucket workspace before relying on it in
+        // production — see this module's doc comment on the webhook-signature caveat for precedent).
+        let url = self.url(&format!(
+            "{}/commit/{}/statuses/build/{}",
+            self.repo_base(),
+            req.head_sha,
+            Self::BUILD_STATUS_KEY
+        ));
+        let body = serde_json::json!({
+            "key": Self::BUILD_STATUS_KEY,
+            "state": "INPROGRESS",
+            "name": CHECK_RUN_NAME,
+            "url": req.details_url.unwrap_or(""),
+        });
+        self.http
+            .put(&url)
+            .basic_auth(&self.email, Some(&self.api_token))
+            .json(&body)
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(None)
+    }
+
+    async fn resolve_check_run(
+        &self,
+        _repo: &RepoRef,
+        req: CheckRunResolve<'_>,
+    ) -> anyhow::Result<()> {
+        let url = self.url(&format!(
+            "{}/commit/{}/statuses/build/{}",
+            self.repo_base(),
+            req.head_sha,
+            Self::BUILD_STATUS_KEY
+        ));
+        let body = serde_json::json!({
+            "key": Self::BUILD_STATUS_KEY,
+            "state": Self::build_status_state(req.conclusion),
+            "name": CHECK_RUN_NAME,
+            "description": req.summary,
+            "url": req.details_url.unwrap_or(""),
+        });
+        self.http
+            .put(&url)
+            .basic_auth(&self.email, Some(&self.api_token))
+            .json(&body)
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
+    }
+
     async fn list_review_comments(
         &self,
         _repo: &RepoRef,
@@ -821,6 +917,112 @@ mod tests {
         let section = BitbucketSection::default();
         let registry = BitbucketRegistry::from_config(&section).expect("disabled config is valid");
         assert!(registry.is_none());
+    }
+
+    fn check_repo() -> RepoRef {
+        RepoRef {
+            platform: crate::integrations::platform::Platform::Bitbucket,
+            full_name: "ws/repo".to_string(),
+            platform_repo_id: 0,
+            installation_id: 0,
+        }
+    }
+
+    fn test_client(api_url: String) -> BitbucketClient {
+        BitbucketClient::new(
+            api_url,
+            "ws".to_string(),
+            "repo".to_string(),
+            "bot@example.com".to_string(),
+            "token".to_string(),
+            "secret".to_string(),
+        )
+        .expect("client")
+    }
+
+    /// New integration surface — proves the URL-safe `key` path segment (not the space-containing
+    /// display name) and the `INPROGRESS` state a real Bitbucket workspace would see.
+    #[tokio::test]
+    async fn start_check_run_puts_an_inprogress_build_status_keyed_by_slug() {
+        let mock = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path(
+                "/repositories/ws/repo/commit/abc123/statuses/build/lightbridge-review",
+            ))
+            .and(wiremock::matchers::body_string_contains(
+                "\"state\":\"INPROGRESS\"",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(201))
+            .mount(&mock)
+            .await;
+
+        test_client(mock.uri())
+            .start_check_run(
+                &check_repo(),
+                CheckRunStart {
+                    head_sha: "abc123",
+                    details_url: None,
+                },
+            )
+            .await
+            .expect("start succeeds");
+    }
+
+    #[tokio::test]
+    async fn resolve_check_run_puts_the_mapped_state_and_description() {
+        let mock = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path(
+                "/repositories/ws/repo/commit/abc123/statuses/build/lightbridge-review",
+            ))
+            .and(wiremock::matchers::body_string_contains(
+                "\"state\":\"FAILED\"",
+            ))
+            .and(wiremock::matchers::body_string_contains(
+                "\"description\":\"boom\"",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(201))
+            .mount(&mock)
+            .await;
+
+        test_client(mock.uri())
+            .resolve_check_run(
+                &check_repo(),
+                CheckRunResolve {
+                    head_sha: "abc123",
+                    external_id: None,
+                    conclusion: CheckConclusion::Failure,
+                    summary: "boom",
+                    details_url: None,
+                },
+            )
+            .await
+            .expect("resolve succeeds");
+    }
+
+    #[test]
+    fn build_status_state_maps_every_conclusion_including_the_lossy_ones() {
+        // Bitbucket has no neutral/timed-out state either — pin the documented lossy mapping.
+        assert_eq!(
+            BitbucketClient::build_status_state(CheckConclusion::Success),
+            "SUCCESSFUL"
+        );
+        assert_eq!(
+            BitbucketClient::build_status_state(CheckConclusion::Neutral),
+            "SUCCESSFUL"
+        );
+        assert_eq!(
+            BitbucketClient::build_status_state(CheckConclusion::Failure),
+            "FAILED"
+        );
+        assert_eq!(
+            BitbucketClient::build_status_state(CheckConclusion::TimedOut),
+            "FAILED"
+        );
+        assert_eq!(
+            BitbucketClient::build_status_state(CheckConclusion::Cancelled),
+            "STOPPED"
+        );
     }
 
     #[test]

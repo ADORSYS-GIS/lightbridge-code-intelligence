@@ -346,6 +346,10 @@ async fn dispatch<L: TaskLauncher + Sync>(
                     // @mention-triggered tasks react; the target is the @mention comment when
                     // mention-triggered, else the PR body.
                     react_work_started(pool, task, review).await;
+                    // Cosmetic runner-status reporting (new feature): open a check/status on the PR's
+                    // head SHA now the Job is launched, mirroring the 👀 reaction above. Independent of
+                    // the reactions toggle — this is not a reaction.
+                    start_check_run_signal(pool, task).await;
                 }
                 Err(error) => {
                     crate::http::metrics::dispatch_outcome("failed");
@@ -413,6 +417,41 @@ async fn react_work_started(pool: &PgPool, task: &db::ClaimedTask, review: &Revi
     .await
     {
         tracing::warn!(%error, task_id = %task.id, "enqueueing 👀 work-started failed (non-fatal)");
+    }
+}
+
+/// Open the "check in progress" signal for a just-dispatched PR task (new feature — cosmetic
+/// runner-status reporting, see `outbox::enqueue_check_run_start`). Best-effort, same shape as
+/// `react_work_started` — a failure here must never fail the dispatch. Only PR-scoped tasks with a
+/// known head_sha get a check: an index task or a plain-issue @mention has no commit to anchor a check
+/// to (mirrored at resolve time in `internal.rs`/`reaper.rs`, so a check is never opened without ever
+/// being resolved, or resolved without ever being opened).
+async fn start_check_run_signal(pool: &PgPool, task: &db::ClaimedTask) {
+    if task.command_text == "index" || task.target_type != "pull_request" {
+        return;
+    }
+    let Some(head_sha) = task.head_sha.as_deref() else {
+        return;
+    };
+    let context = match db::get_task_context(pool, task.id).await {
+        Ok(Some(c)) => c,
+        Ok(None) => return,
+        Err(error) => {
+            tracing::warn!(%error, task_id = %task.id, "load context for check-run start failed (non-fatal)");
+            return;
+        }
+    };
+    let t = crate::outbox::Target {
+        task_id: Some(task.id),
+        platform: context.platform,
+        installation_id: context.installation_id,
+        owner: &context.owner,
+        repo: &context.name,
+    };
+    if let Err(error) =
+        crate::outbox::enqueue_check_run_start(pool, &t, context.target_id, head_sha).await
+    {
+        tracing::warn!(%error, task_id = %task.id, "enqueueing check-run start failed (non-fatal)");
     }
 }
 
