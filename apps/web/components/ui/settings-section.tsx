@@ -25,16 +25,20 @@ export function SettingsSection({
 }
 
 /** One row in a [`SettingsSection`]: a label (+ optional description) on the left, a control on the
- * right. Pass the control via `control`; falls back to `children`. */
+ * right. Pass the control via `control`; falls back to `children`. `badge` is an optional trailing
+ * indicator before the control (e.g. a [`SourceBadge`](./source-badge) provenance tag) — a generic
+ * layout slot, not settings-specific. */
 export function SettingsRow({
   label,
   description,
   control,
+  badge,
   children,
 }: {
   label: string;
   description?: ReactNode;
   control?: ReactNode;
+  badge?: ReactNode;
   children?: ReactNode;
 }) {
   return (
@@ -43,7 +47,10 @@ export function SettingsRow({
         <div className="text-sm font-medium">{label}</div>
         {description && <div className="mt-0.5 text-xs text-base-content/60">{description}</div>}
       </div>
-      <div className="shrink-0 text-sm text-base-content/60">{control ?? children}</div>
+      <div className="flex shrink-0 items-center gap-2.5 text-sm text-base-content/60">
+        {badge}
+        {control ?? children}
+      </div>
     </div>
   );
 }
