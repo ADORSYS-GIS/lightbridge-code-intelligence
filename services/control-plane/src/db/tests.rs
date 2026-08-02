@@ -2941,3 +2941,29 @@ async fn list_reapable_tasks_ties_break_on_id(pool: PgPool) {
         "a started_at tie must break on id ascending"
     );
 }
+
+/// New feature (cosmetic runner-status reporting): `check_run_external_id` persists the GitHub
+/// check-run id opened at dispatch so a later resolve can address the SAME check run. A fresh task
+/// has no id recorded; setting it round-trips exactly.
+#[sqlx::test]
+async fn check_run_external_id_round_trips_and_defaults_to_none(pool: PgPool) {
+    let repo_id = seed(&pool).await;
+    let task_id = create_task(&pool, &pr_task(repo_id, "head1"))
+        .await
+        .unwrap()
+        .expect("task");
+
+    assert_eq!(
+        get_check_run_external_id(&pool, task_id).await.unwrap(),
+        None,
+        "a fresh task has no check-run id recorded"
+    );
+
+    set_check_run_external_id(&pool, task_id, 4242)
+        .await
+        .unwrap();
+    assert_eq!(
+        get_check_run_external_id(&pool, task_id).await.unwrap(),
+        Some(4242)
+    );
+}

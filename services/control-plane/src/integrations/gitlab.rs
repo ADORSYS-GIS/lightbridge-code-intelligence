@@ -101,6 +101,18 @@ impl GitlabClient {
         }
     }
 
+    /// Map [`CheckConclusion`] onto GitLab's commit-status `state` vocabulary
+    /// (`pending|running|success|failed|canceled`) — narrower than GitHub's: there is no
+    /// neutral/timed-out state, so `Neutral` → `success` and `TimedOut` → `failed` (documented lossy
+    /// mapping, same capability-gap treatment `add_reaction`/`add_labels` use elsewhere in this file).
+    fn commit_status_state(conclusion: CheckConclusion) -> &'static str {
+        match conclusion {
+            CheckConclusion::Success | CheckConclusion::Neutral => "success",
+            CheckConclusion::Failure | CheckConclusion::TimedOut => "failed",
+            CheckConclusion::Cancelled => "canceled",
+        }
+    }
+
     /// Standard headers for every GitLab API call.
     fn api_headers(&self) -> reqwest::header::HeaderMap {
         let mut h = reqwest::header::HeaderMap::new();
@@ -402,6 +414,22 @@ impl CodePlatform for GitlabPlatformRouter {
         self.client(repo)?
             .add_labels(repo, issue_number, labels)
             .await
+    }
+
+    async fn start_check_run(
+        &self,
+        repo: &RepoRef,
+        req: CheckRunStart<'_>,
+    ) -> anyhow::Result<Option<i64>> {
+        self.client(repo)?.start_check_run(repo, req).await
+    }
+
+    async fn resolve_check_run(
+        &self,
+        repo: &RepoRef,
+        req: CheckRunResolve<'_>,
+    ) -> anyhow::Result<()> {
+        self.client(repo)?.resolve_check_run(repo, req).await
     }
 
     async fn list_review_comments(
@@ -848,6 +876,54 @@ impl CodePlatform for GitlabClient {
         Ok(())
     }
 
+    async fn start_check_run(
+        &self,
+        repo: &RepoRef,
+        req: CheckRunStart<'_>,
+    ) -> anyhow::Result<Option<i64>> {
+        let project = Self::project_encoded(repo);
+        let url = self.url(&format!("/projects/{}/statuses/{}", project, req.head_sha));
+        let body = serde_json::json!({
+            "state": "running",
+            "name": CHECK_RUN_NAME,
+            "target_url": req.details_url,
+        });
+        let _ = self
+            .http
+            .post(&url)
+            .headers(self.api_headers())
+            .json(&body)
+            .send()
+            .await?
+            .error_for_status()?;
+        // Upsert-by-sha: nothing to persist for the resolve call to read back.
+        Ok(None)
+    }
+
+    async fn resolve_check_run(
+        &self,
+        repo: &RepoRef,
+        req: CheckRunResolve<'_>,
+    ) -> anyhow::Result<()> {
+        let project = Self::project_encoded(repo);
+        let url = self.url(&format!("/projects/{}/statuses/{}", project, req.head_sha));
+        let body = serde_json::json!({
+            "state": Self::commit_status_state(req.conclusion),
+            "name": CHECK_RUN_NAME,
+            "description": req.summary,
+            "target_url": req.details_url,
+        });
+        let _ = self
+            .http
+            .post(&url)
+            .headers(self.api_headers())
+            .json(&body)
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
+    }
+
     async fn list_review_comments(
         &self,
         repo: &RepoRef,
@@ -993,6 +1069,112 @@ mod tests {
             webhook_secret: secret.to_string(),
             bot_handle: None,
         }
+    }
+
+    #[test]
+    fn commit_status_state_maps_every_conclusion_including_the_lossy_ones() {
+        // GitLab has no neutral/timed-out state — pin the documented lossy mapping.
+        assert_eq!(
+            GitlabClient::commit_status_state(CheckConclusion::Success),
+            "success"
+        );
+        assert_eq!(
+            GitlabClient::commit_status_state(CheckConclusion::Neutral),
+            "success"
+        );
+        assert_eq!(
+            GitlabClient::commit_status_state(CheckConclusion::Failure),
+            "failed"
+        );
+        assert_eq!(
+            GitlabClient::commit_status_state(CheckConclusion::TimedOut),
+            "failed"
+        );
+        assert_eq!(
+            GitlabClient::commit_status_state(CheckConclusion::Cancelled),
+            "canceled"
+        );
+    }
+
+    fn check_repo() -> RepoRef {
+        RepoRef {
+            platform: crate::integrations::platform::Platform::GitLab,
+            full_name: "acme/widgets".to_string(),
+            platform_repo_id: 0,
+            installation_id: 0,
+        }
+    }
+
+    /// New integration surface (no prior test exercised the actual GitLab HTTP shape for a status
+    /// post) — proves the URL, method, and `state` field a real GitLab instance would see.
+    #[tokio::test]
+    async fn start_check_run_posts_a_running_status_to_the_head_sha() {
+        let mock = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/api/v4/projects/acme%2Fwidgets/statuses/abc123",
+            ))
+            .and(wiremock::matchers::body_string_contains(
+                "\"state\":\"running\"",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(201))
+            .mount(&mock)
+            .await;
+
+        let client = GitlabClient::new(
+            format!("{}/api/v4", mock.uri()),
+            "token".to_string(),
+            "secret".to_string(),
+        )
+        .expect("client");
+        client
+            .start_check_run(
+                &check_repo(),
+                CheckRunStart {
+                    head_sha: "abc123",
+                    details_url: None,
+                },
+            )
+            .await
+            .expect("start succeeds");
+    }
+
+    #[tokio::test]
+    async fn resolve_check_run_posts_the_mapped_state_and_summary() {
+        let mock = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/api/v4/projects/acme%2Fwidgets/statuses/abc123",
+            ))
+            .and(wiremock::matchers::body_string_contains(
+                "\"state\":\"failed\"",
+            ))
+            .and(wiremock::matchers::body_string_contains(
+                "\"description\":\"boom\"",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(201))
+            .mount(&mock)
+            .await;
+
+        let client = GitlabClient::new(
+            format!("{}/api/v4", mock.uri()),
+            "token".to_string(),
+            "secret".to_string(),
+        )
+        .expect("client");
+        client
+            .resolve_check_run(
+                &check_repo(),
+                CheckRunResolve {
+                    head_sha: "abc123",
+                    external_id: None,
+                    conclusion: CheckConclusion::Failure,
+                    summary: "boom",
+                    details_url: None,
+                },
+            )
+            .await
+            .expect("resolve succeeds");
     }
 
     #[test]

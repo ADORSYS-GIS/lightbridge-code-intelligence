@@ -26,7 +26,9 @@ use sqlx::postgres::PgListener;
 use tracing::Instrument;
 
 use crate::config::ReviewSection;
-use crate::integrations::platform::{CodePlatform, Platform, ReactionTarget, RepoRef};
+use crate::integrations::platform::{
+    CheckRunResolve, CheckRunStart, CodePlatform, Platform, ReactionTarget, RepoRef,
+};
 
 /// How many intents to claim per drain pass.
 const DRAIN_BATCH: i64 = 50;
@@ -314,6 +316,8 @@ async fn deliver(
             Ok(posted.id)
         }
         "review" => deliver_review(pool, platform, repo, review, row).await,
+        "check_run_start" => deliver_check_run_start(pool, platform, repo, row).await,
+        "check_run_resolve" => deliver_check_run_resolve(pool, platform, repo, row).await,
         // ADR-0088 open mode: rehydrate + verify the offloaded branch, but the credentialed push +
         // PR-open is **deferred, gated on a security sign-off** — so no `open` task is created in prod
         // and this arm is never reached there. The producer path (offload + dedup'd intent) is real and
@@ -353,6 +357,70 @@ async fn deliver_pr_open(pool: &PgPool, row: &crate::db::OutboxRow) -> anyhow::R
         payload.branch,
         patch.len()
     )
+}
+
+/// Open the in-progress check/status (new feature — cosmetic runner-status reporting). On success,
+/// persist the platform's id (GitHub only — GitLab/Bitbucket return `None`) onto
+/// `tasks.check_run_external_id` so `deliver_check_run_resolve` can address the SAME check run later.
+/// That write is best-effort: a failure here just means resolve later falls back to GitHub's
+/// self-healing create-completed path — never a hard failure of this delivery (the row is still
+/// correctly `posted`).
+async fn deliver_check_run_start(
+    pool: &PgPool,
+    platform: &dyn CodePlatform,
+    repo: &RepoRef,
+    row: &crate::db::OutboxRow,
+) -> anyhow::Result<Option<i64>> {
+    let p: crate::outbox::CheckRunStartPayload = serde_json::from_value(row.payload.clone())?;
+    let external_id = platform
+        .start_check_run(
+            repo,
+            CheckRunStart {
+                head_sha: &p.head_sha,
+                // No per-task dashboard URL exists today (PR #553 added a Grafana dashboard, not an
+                // HTTP-served per-task page) — omit rather than invent a URL scheme.
+                details_url: None,
+            },
+        )
+        .await?;
+    if let (Some(task), Some(id)) = (row.task_id, external_id)
+        && let Err(error) = crate::db::set_check_run_external_id(pool, task, id).await
+    {
+        tracing::warn!(%error, task_id = %task, "persisting check_run_external_id failed (non-fatal)");
+    }
+    Ok(external_id)
+}
+
+/// Resolve a previously-opened check/status to its outcome (new feature).
+async fn deliver_check_run_resolve(
+    pool: &PgPool,
+    platform: &dyn CodePlatform,
+    repo: &RepoRef,
+    row: &crate::db::OutboxRow,
+) -> anyhow::Result<Option<i64>> {
+    let p: crate::outbox::CheckRunResolvePayload = serde_json::from_value(row.payload.clone())?;
+    // Re-read from `tasks` (not the enqueue payload) so a resolve delivered well after start still
+    // sees a write that landed in between — the payload only ever carries what was known at enqueue
+    // time.
+    let external_id = match row.task_id {
+        Some(task) => crate::db::get_check_run_external_id(pool, task)
+            .await
+            .unwrap_or(None),
+        None => None,
+    };
+    platform
+        .resolve_check_run(
+            repo,
+            CheckRunResolve {
+                head_sha: &p.head_sha,
+                external_id,
+                conclusion: p.conclusion,
+                summary: &p.summary,
+                details_url: None,
+            },
+        )
+        .await?;
+    Ok(None)
 }
 
 /// Post the grouped review and its success side-effects (persist the copy, fetch inline ids, apply
@@ -653,5 +721,226 @@ mod tests {
     fn outbox_step_name_is_keyed_by_row_id() {
         let name = StepName::from(format!("outbox:{}", 123_i64));
         assert_eq!(name.as_str(), "outbox:123");
+    }
+
+    /// A minimal `CodePlatform` test double that only implements `start_check_run`/`resolve_check_run`
+    /// meaningfully (recording calls); every other method is unreachable from the two `deliver` arms
+    /// under test here. Mirrors `reaper.rs`'s `FakeLauncher` pattern — a hand-rolled stub for a trait
+    /// this crate has no mock-generation macro for.
+    #[derive(Default)]
+    struct FakePlatform {
+        start_calls: std::sync::Mutex<Vec<String>>,
+        resolve_calls:
+            std::sync::Mutex<Vec<(String, crate::integrations::platform::CheckConclusion)>>,
+        start_returns: Option<i64>,
+    }
+
+    #[async_trait::async_trait]
+    impl CodePlatform for FakePlatform {
+        fn name(&self) -> &'static str {
+            "fake"
+        }
+        fn verify_webhook(&self, _headers: &axum::http::HeaderMap, _body: &[u8]) -> bool {
+            unimplemented!("not exercised by the check-run delivery tests")
+        }
+        fn delivery_id(&self, _headers: &axum::http::HeaderMap) -> Option<String> {
+            unimplemented!("not exercised by the check-run delivery tests")
+        }
+        fn event_type(&self, _headers: &axum::http::HeaderMap) -> Option<String> {
+            unimplemented!("not exercised by the check-run delivery tests")
+        }
+        async fn list_changed_files(
+            &self,
+            _repo: &RepoRef,
+            _pr_number: i64,
+        ) -> anyhow::Result<Vec<crate::integrations::platform::ChangedFile>> {
+            unimplemented!("not exercised by the check-run delivery tests")
+        }
+        async fn default_branch(&self, _repo: &RepoRef) -> anyhow::Result<String> {
+            unimplemented!("not exercised by the check-run delivery tests")
+        }
+        async fn pr_shas(
+            &self,
+            _repo: &RepoRef,
+            _pr_number: i64,
+        ) -> anyhow::Result<(Option<String>, Option<String>)> {
+            unimplemented!("not exercised by the check-run delivery tests")
+        }
+        async fn get_repo_file(
+            &self,
+            _repo: &RepoRef,
+            _ref_: &str,
+            _path: &str,
+        ) -> anyhow::Result<Option<String>> {
+            unimplemented!("not exercised by the check-run delivery tests")
+        }
+        async fn update_repo_file(
+            &self,
+            _repo: &RepoRef,
+            _path: &str,
+            _mutate: Box<dyn FnOnce(Option<String>) -> String + Send>,
+            _message: &str,
+        ) -> anyhow::Result<()> {
+            unimplemented!("not exercised by the check-run delivery tests")
+        }
+        async fn post_review(
+            &self,
+            _repo: &RepoRef,
+            _review: &crate::integrations::platform::ReviewPost,
+        ) -> anyhow::Result<crate::integrations::platform::PostedReview> {
+            unimplemented!("not exercised by the check-run delivery tests")
+        }
+        async fn post_comment(
+            &self,
+            _repo: &RepoRef,
+            _issue_number: i64,
+            _body: &str,
+            _noteable_type: Option<&str>,
+        ) -> anyhow::Result<crate::integrations::platform::PostedComment> {
+            unimplemented!("not exercised by the check-run delivery tests")
+        }
+        async fn add_reaction(
+            &self,
+            _repo: &RepoRef,
+            _target: ReactionTarget,
+            _emoji: &str,
+            _noteable_type: Option<&str>,
+        ) -> anyhow::Result<()> {
+            unimplemented!("not exercised by the check-run delivery tests")
+        }
+        async fn add_labels(
+            &self,
+            _repo: &RepoRef,
+            _issue_number: i64,
+            _labels: &[String],
+        ) -> anyhow::Result<()> {
+            unimplemented!("not exercised by the check-run delivery tests")
+        }
+        async fn start_check_run(
+            &self,
+            _repo: &RepoRef,
+            req: CheckRunStart<'_>,
+        ) -> anyhow::Result<Option<i64>> {
+            self.start_calls
+                .lock()
+                .unwrap()
+                .push(req.head_sha.to_string());
+            Ok(self.start_returns)
+        }
+        async fn resolve_check_run(
+            &self,
+            _repo: &RepoRef,
+            req: CheckRunResolve<'_>,
+        ) -> anyhow::Result<()> {
+            self.resolve_calls
+                .lock()
+                .unwrap()
+                .push((req.head_sha.to_string(), req.conclusion));
+            Ok(())
+        }
+        async fn list_review_comments(
+            &self,
+            _repo: &RepoRef,
+            _pr_number: i64,
+            _review_id: i64,
+        ) -> anyhow::Result<Vec<crate::integrations::platform::ReviewCommentRef>> {
+            unimplemented!("not exercised by the check-run delivery tests")
+        }
+        async fn list_comment_reactions(
+            &self,
+            _repo: &RepoRef,
+            _comment_id: i64,
+            _is_review_comment: bool,
+            _iid: Option<i64>,
+            _noteable_type: Option<&str>,
+        ) -> anyhow::Result<Vec<crate::integrations::platform::Reaction>> {
+            unimplemented!("not exercised by the check-run delivery tests")
+        }
+        fn clone_url(&self, _repo: &RepoRef) -> String {
+            unimplemented!("not exercised by the check-run delivery tests")
+        }
+    }
+
+    fn fake_repo() -> RepoRef {
+        RepoRef {
+            platform: Platform::GitHub,
+            full_name: "octo/repo".to_string(),
+            platform_repo_id: 0,
+            installation_id: 1,
+        }
+    }
+
+    /// A `PgPool` that never actually connects — valid for these tests because both delivery
+    /// functions only touch the pool when `row.task_id` is `Some` (the persistence/read-back
+    /// branches), and these tests use `task_id: None` to isolate the routing/parsing logic from the
+    /// DB-backed persistence, which is covered separately by
+    /// `db::tests::check_run_external_id_round_trips_and_defaults_to_none`.
+    fn unconnected_pool() -> PgPool {
+        sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://localhost/unused")
+            .expect("lazy pool construction never touches the network")
+    }
+
+    fn check_run_row(kind: &str, payload: serde_json::Value) -> crate::db::OutboxRow {
+        crate::db::OutboxRow {
+            id: 1,
+            task_id: None,
+            installation_id: 1,
+            owner: "octo".to_string(),
+            repo: "repo".to_string(),
+            kind: kind.to_string(),
+            payload,
+            attempts: 0,
+            platform: Platform::GitHub,
+            trace_context: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn deliver_routes_check_run_start_to_the_platform_and_returns_its_id() {
+        let pool = unconnected_pool();
+        let platform = FakePlatform {
+            start_returns: Some(999),
+            ..Default::default()
+        };
+        let row = check_run_row(
+            "check_run_start",
+            serde_json::json!({ "pr": 7, "head_sha": "abc123" }),
+        );
+        let repo = fake_repo();
+        let result = deliver_check_run_start(&pool, &platform, &repo, &row)
+            .await
+            .expect("delivery succeeds");
+        assert_eq!(result, Some(999));
+        assert_eq!(platform.start_calls.lock().unwrap().as_slice(), ["abc123"]);
+    }
+
+    #[tokio::test]
+    async fn deliver_routes_check_run_resolve_to_the_platform_with_no_stored_id() {
+        let pool = unconnected_pool();
+        let platform = FakePlatform::default();
+        let row = check_run_row(
+            "check_run_resolve",
+            serde_json::json!({
+                "pr": 7,
+                "head_sha": "abc123",
+                "conclusion": "neutral",
+                "summary": "found 2 things",
+            }),
+        );
+        let repo = fake_repo();
+        let result = deliver_check_run_resolve(&pool, &platform, &repo, &row)
+            .await
+            .expect("delivery succeeds");
+        // `check_run_resolve` never carries a platform id to `mark_outbox_posted` — unlike `review`,
+        // it isn't itself the thing being correlated back.
+        assert_eq!(result, None);
+        let calls = platform.resolve_calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "abc123");
+        assert_eq!(
+            calls[0].1,
+            crate::integrations::platform::CheckConclusion::Neutral
+        );
     }
 }

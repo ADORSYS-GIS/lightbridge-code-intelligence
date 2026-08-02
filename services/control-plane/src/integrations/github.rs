@@ -220,6 +220,125 @@ impl GithubApp {
         })
     }
 
+    /// Open a Check Run in `in_progress` status (`POST repos/{owner}/{repo}/check-runs`). Returns its
+    /// id, kept so `update_check_run_completed` can address the SAME check run later rather than
+    /// opening a second one.
+    pub async fn create_check_run_in_progress(
+        &self,
+        token: &str,
+        owner: &str,
+        repo: &str,
+        head_sha: &str,
+        details_url: Option<&str>,
+    ) -> anyhow::Result<i64> {
+        use anyhow::Context;
+        #[derive(Deserialize)]
+        struct CheckRunResponse {
+            id: i64,
+        }
+        let payload = serde_json::json!({
+            "name": CHECK_RUN_NAME,
+            "head_sha": head_sha,
+            "status": "in_progress",
+            "details_url": details_url,
+        });
+        let created: CheckRunResponse = self
+            .http
+            .post(format!(
+                "https://api.github.com/repos/{owner}/{repo}/check-runs"
+            ))
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Accept", "application/vnd.github+json")
+            .header("User-Agent", "lightbridge-code-intelligence")
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .json(&payload)
+            .send()
+            .await
+            .context("opening check run")?
+            .error_for_status()
+            .context("github rejected the check-run creation")?
+            .json()
+            .await
+            .context("parsing check-run creation response")?;
+        Ok(created.id)
+    }
+
+    /// Resolve a previously-opened Check Run (`PATCH repos/{owner}/{repo}/check-runs/{id}`).
+    #[allow(clippy::too_many_arguments)] // mirrors db::outbox::enqueue_outbox_post's precedent
+    pub async fn update_check_run_completed(
+        &self,
+        token: &str,
+        owner: &str,
+        repo: &str,
+        check_run_id: i64,
+        conclusion: &str,
+        summary: &str,
+        details_url: Option<&str>,
+    ) -> anyhow::Result<()> {
+        use anyhow::Context;
+        let payload = serde_json::json!({
+            "status": "completed",
+            "conclusion": conclusion,
+            "details_url": details_url,
+            "output": { "title": CHECK_RUN_NAME, "summary": summary },
+        });
+        self.http
+            .patch(format!(
+                "https://api.github.com/repos/{owner}/{repo}/check-runs/{check_run_id}"
+            ))
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Accept", "application/vnd.github+json")
+            .header("User-Agent", "lightbridge-code-intelligence")
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .json(&payload)
+            .send()
+            .await
+            .context("resolving check run")?
+            .error_for_status()
+            .context("github rejected the check-run update")?;
+        Ok(())
+    }
+
+    /// Self-healing fallback: create a Check Run that is ALREADY `completed`, in one call — used when
+    /// no id was ever recorded for the start (e.g. the start intent dead-lettered on a permission-
+    /// missing installation). Still gives the PR SOME check on this SHA rather than none.
+    #[allow(clippy::too_many_arguments)] // mirrors db::outbox::enqueue_outbox_post's precedent
+    pub async fn create_check_run_completed(
+        &self,
+        token: &str,
+        owner: &str,
+        repo: &str,
+        head_sha: &str,
+        conclusion: &str,
+        summary: &str,
+        details_url: Option<&str>,
+    ) -> anyhow::Result<()> {
+        use anyhow::Context;
+        let payload = serde_json::json!({
+            "name": CHECK_RUN_NAME,
+            "head_sha": head_sha,
+            "status": "completed",
+            "conclusion": conclusion,
+            "details_url": details_url,
+            "output": { "title": CHECK_RUN_NAME, "summary": summary },
+        });
+        self.http
+            .post(format!(
+                "https://api.github.com/repos/{owner}/{repo}/check-runs"
+            ))
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Accept", "application/vnd.github+json")
+            .header("User-Agent", "lightbridge-code-intelligence")
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .json(&payload)
+            .send()
+            .await
+            .context("opening a completed check run")?
+            .error_for_status()
+            .context("github rejected the completed check-run creation")?;
+        Ok(())
+    }
+
     /// Post a plain comment on an issue or PR thread (`POST issues/{n}/comments`). Used for the `ask`
     /// run kind (ADR-0033): a conversational answer, not a diff-scoped review. PRs share the issues
     /// comment endpoint, so this works for either target. Returns the comment's `id` (kept so the
@@ -887,6 +1006,55 @@ impl CodePlatform for GithubApp {
         let token = self.token_for(repo).await?;
         self.add_labels(&token, owner, name, issue_number, labels)
             .await
+    }
+
+    async fn start_check_run(
+        &self,
+        repo: &RepoRef,
+        req: CheckRunStart<'_>,
+    ) -> anyhow::Result<Option<i64>> {
+        let (owner, name) = repo.owner_repo();
+        let token = self.token_for(repo).await?;
+        let id = self
+            .create_check_run_in_progress(&token, owner, name, req.head_sha, req.details_url)
+            .await?;
+        Ok(Some(id))
+    }
+
+    async fn resolve_check_run(
+        &self,
+        repo: &RepoRef,
+        req: CheckRunResolve<'_>,
+    ) -> anyhow::Result<()> {
+        let (owner, name) = repo.owner_repo();
+        let token = self.token_for(repo).await?;
+        let conclusion = req.conclusion.github_str();
+        match req.external_id {
+            Some(id) => {
+                self.update_check_run_completed(
+                    &token,
+                    owner,
+                    name,
+                    id,
+                    conclusion,
+                    req.summary,
+                    req.details_url,
+                )
+                .await
+            }
+            None => {
+                self.create_check_run_completed(
+                    &token,
+                    owner,
+                    name,
+                    req.head_sha,
+                    conclusion,
+                    req.summary,
+                    req.details_url,
+                )
+                .await
+            }
+        }
     }
 
     async fn list_review_comments(
