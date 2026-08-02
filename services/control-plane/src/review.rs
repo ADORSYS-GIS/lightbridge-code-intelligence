@@ -360,26 +360,92 @@ pub fn dedup_key(file: &str, line: u32, title: &str) -> (String, u32, String) {
     (file, line, title)
 }
 
-/// Drop, from `findings`, any finding whose [`dedup_key`] matches one already posted on this PR by a
-/// prior Lightbridge review (ADR-0065, Option B). `posted` is the set of prior findings' normalized keys
-/// (from `reviews.findings` on the SAME head_sha — line numbers drift across commits, so cross-commit
-/// matching is unsafe). Returns `(kept, deduped_n)`; `deduped_n` is logged/counted by the caller.
+/// Line-INSENSITIVE dedup key, for matching a finding against one posted on a **different commit** of
+/// the same PR (epic #566). Line numbers drift as a PR evolves — an unfixed issue moves when unrelated
+/// code above it changes — so [`dedup_key`]'s exact `(file, line, title)` match silently stops matching
+/// and the same finding is re-posted at its new line on every push. Dropping the line is what makes
+/// suppression survive that drift.
+///
+/// The cost of dropping it is real: two DIFFERENT occurrences of the same issue in one file collapse to
+/// one key. [`dedup_against_posted`] bounds that with occurrence COUNTS rather than set membership —
+/// see its docs.
+pub fn pr_dedup_key(file: &str, title: &str) -> (String, String) {
+    let (file, _line, title) = dedup_key(file, 0, title);
+    (file, title)
+}
+
+/// Prior findings to suppress against, as occurrence **counts** per key.
+///
+/// Counts, not a set, are load-bearing. With a `HashSet`, if a file previously had ONE "unchecked
+/// unwrap" and this run finds THREE, all three vanish — the two genuinely new ones are silently hidden
+/// forever, which is strictly worse than repeating a finding. With counts, at most as many are
+/// suppressed as were previously posted, so new occurrences always surface.
+#[derive(Debug, Default, Clone)]
+pub struct PostedFindings {
+    /// Keys posted on the CURRENT head — matched exactly, including line.
+    pub same_head: HashMap<(String, u32, String), usize>,
+    /// Keys posted on ANY commit of this PR — matched without the line (see [`pr_dedup_key`]). Empty
+    /// when the repo's `dedup_scope` is `commit`, which reduces this to the pre-#566 behaviour.
+    pub pr_wide: HashMap<(String, String), usize>,
+}
+
+impl PostedFindings {
+    /// Count a prior finding into the appropriate bucket. `same_head` is whether the finding was posted
+    /// on the same commit this run is reviewing.
+    pub fn add(&mut self, file: &str, line: u32, title: &str, same_head: bool, pr_wide: bool) {
+        if same_head {
+            *self
+                .same_head
+                .entry(dedup_key(file, line, title))
+                .or_insert(0) += 1;
+        }
+        if pr_wide {
+            *self.pr_wide.entry(pr_dedup_key(file, title)).or_insert(0) += 1;
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.same_head.is_empty() && self.pr_wide.is_empty()
+    }
+}
+
+/// Drop, from `findings`, those already posted on this PR by a prior Lightbridge review (ADR-0065
+/// Option B, extended PR-wide by epic #566). Returns `(kept, deduped_n)`.
+///
+/// Two tiers, tried in order per finding:
+/// 1. **Same commit** — exact `(file, line, title)`. Unchanged pre-existing semantics.
+/// 2. **Any commit of this PR** — `(file, title)`, line dropped so suppression survives line drift.
+///
+/// Both tiers decrement an occurrence count, so a key posted once suppresses at most one finding this
+/// run. That bound is the whole safety story for tier 2: without it, a recurring issue's genuinely new
+/// occurrences would be hidden silently and permanently.
 pub fn dedup_against_posted(
     findings: Vec<Finding>,
-    posted: &HashSet<(String, u32, String)>,
+    posted: &PostedFindings,
 ) -> (Vec<Finding>, usize) {
     if posted.is_empty() {
         return (findings, 0);
     }
+    // Local mutable budgets — consumed as findings match, so counts bound suppression per run.
+    let mut same_head = posted.same_head.clone();
+    let mut pr_wide = posted.pr_wide.clone();
     let mut deduped_n = 0usize;
     let kept = findings
         .into_iter()
         .filter(|f| {
-            let matched = posted.contains(&dedup_key(&f.file, f.line, &f.title));
-            if matched {
+            let exact = dedup_key(&f.file, f.line, &f.title);
+            if let Some(budget) = same_head.get_mut(&exact).filter(|b| **b > 0) {
+                *budget -= 1;
                 deduped_n += 1;
+                return false;
             }
-            !matched
+            let wide = pr_dedup_key(&f.file, &f.title);
+            if let Some(budget) = pr_wide.get_mut(&wide).filter(|b| **b > 0) {
+                *budget -= 1;
+                deduped_n += 1;
+                return false;
+            }
+            true
         })
         .collect();
     (kept, deduped_n)
@@ -1415,17 +1481,22 @@ mod tests {
 
     #[test]
     fn dedup_against_posted_drops_normalized_identical_findings() {
-        // A prior review posted these two findings on this head_sha.
-        let posted: HashSet<(String, u32, String)> = [
-            dedup_key("src/store.ts", 65, "IndexedDB connection leak in tx()"),
-            dedup_key(
-                "src/store.ts",
-                156,
-                "Non-numeric exp treated as never-expired",
-            ),
-        ]
-        .into_iter()
-        .collect();
+        // A prior review posted these two findings on THIS head_sha.
+        let mut posted = PostedFindings::default();
+        posted.add(
+            "src/store.ts",
+            65,
+            "IndexedDB connection leak in tx()",
+            true,
+            false,
+        );
+        posted.add(
+            "src/store.ts",
+            156,
+            "Non-numeric exp treated as never-expired",
+            true,
+            false,
+        );
 
         let current = vec![
             // Same file/line, title differs only in whitespace + casing → normalized-identical → dropped.
@@ -1443,11 +1514,99 @@ mod tests {
         assert_eq!(deduped_n, 2, "the two re-posted findings are dropped");
         assert_eq!(kept.len(), 1, "only the genuinely-new finding survives");
         assert_eq!(kept[0].title, "New race condition");
+    }
 
-        // Empty posted-set is a fast no-op that keeps everything.
-        let (kept, n) = dedup_against_posted(vec![finding("a.ts", 1, "x")], &HashSet::new());
-        assert_eq!(n, 0);
+    /// Epic #566: an unfixed finding whose LINE moved (because unrelated code above it changed) must
+    /// still be suppressed. The same-commit exact key cannot match it; the PR-wide key can.
+    #[test]
+    fn pr_wide_dedup_survives_line_drift_between_commits() {
+        let mut posted = PostedFindings::default();
+        // Posted on an EARLIER commit at line 65 — so it lands in the pr_wide bucket, not same_head.
+        posted.add("src/store.ts", 65, "IndexedDB connection leak", false, true);
+
+        // This run finds the same issue, now at line 71.
+        let current = vec![finding("src/store.ts", 71, "IndexedDB connection leak")];
+        let (kept, deduped_n) = dedup_against_posted(current, &posted);
+        assert_eq!(deduped_n, 1, "line drift must not defeat suppression");
+        assert!(kept.is_empty());
+    }
+
+    /// The safety bound, and the single most important test here. Prior findings are COUNTS, not a
+    /// set: if a file previously had ONE occurrence and this run finds THREE, exactly one is
+    /// suppressed and the two genuinely-new ones still post.
+    ///
+    /// A `HashSet` implementation passes every other test in this file and fails this one — it would
+    /// silently hide the new occurrences forever, which is strictly worse than repeating a finding.
+    #[test]
+    fn pr_wide_dedup_suppresses_at_most_the_number_previously_posted() {
+        let mut posted = PostedFindings::default();
+        posted.add("src/a.rs", 10, "unchecked unwrap", false, true);
+
+        let current = vec![
+            finding("src/a.rs", 10, "unchecked unwrap"),
+            finding("src/a.rs", 42, "unchecked unwrap"),
+            finding("src/a.rs", 99, "unchecked unwrap"),
+        ];
+        let (kept, deduped_n) = dedup_against_posted(current, &posted);
+        assert_eq!(
+            deduped_n, 1,
+            "only ONE was previously posted, so only one is suppressed"
+        );
+        assert_eq!(
+            kept.len(),
+            2,
+            "the two genuinely-new occurrences must still surface"
+        );
+    }
+
+    /// With `dedup_scope: commit` the caller puts nothing in the pr_wide bucket, which must reduce
+    /// behaviour exactly to the pre-#566 same-commit-only semantics.
+    #[test]
+    fn commit_scope_does_not_suppress_across_commits() {
+        let mut posted = PostedFindings::default();
+        // `pr_wide: false` is what the caller passes when the repo opted into commit scope.
+        posted.add(
+            "src/store.ts",
+            65,
+            "IndexedDB connection leak",
+            false,
+            false,
+        );
+
+        let current = vec![finding("src/store.ts", 71, "IndexedDB connection leak")];
+        let (kept, deduped_n) = dedup_against_posted(current, &posted);
+        assert_eq!(deduped_n, 0, "commit scope must not match across commits");
         assert_eq!(kept.len(), 1);
+    }
+
+    /// The exact same-commit key still requires the line to match, so two DIFFERENT occurrences on the
+    /// same commit are both kept — the pre-existing contract, unchanged.
+    #[test]
+    fn same_commit_dedup_still_requires_the_line_to_match() {
+        let mut posted = PostedFindings::default();
+        posted.add("src/a.rs", 10, "unchecked unwrap", true, false);
+
+        let current = vec![finding("src/a.rs", 99, "unchecked unwrap")];
+        let (kept, deduped_n) = dedup_against_posted(current, &posted);
+        assert_eq!(deduped_n, 0);
+        assert_eq!(
+            kept.len(),
+            1,
+            "a different line on the same commit is a different finding"
+        );
+    }
+
+    #[test]
+    fn pr_dedup_key_ignores_the_line_but_still_normalizes_path_and_title() {
+        assert_eq!(
+            pr_dedup_key("./src/a.rs", "Some   FINDING"),
+            pr_dedup_key("src/a.rs", "some finding"),
+        );
+        assert_ne!(
+            pr_dedup_key("src/a.rs", "finding one"),
+            pr_dedup_key("src/b.rs", "finding one"),
+            "different files stay distinct"
+        );
     }
 
     #[test]

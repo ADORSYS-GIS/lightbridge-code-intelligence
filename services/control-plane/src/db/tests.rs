@@ -1422,7 +1422,7 @@ async fn all_prior_reviews_are_target_scoped_ordered_and_exclude_current(pool: P
 /// ADR-0065 (Option B): the finalize dedup source — findings already posted on the SAME head_sha,
 /// excluding the current task. A prior review on a *different* head_sha is not returned (line drift).
 #[sqlx::test]
-async fn posted_findings_for_head_is_head_scoped_and_excludes_current(pool: PgPool) {
+async fn posted_findings_for_target_spans_commits_and_excludes_the_current_task(pool: PgPool) {
     let repo_id = seed(&pool).await;
     let prior_same_head = create_task(&pool, &pr_task(repo_id, "same"))
         .await
@@ -1475,23 +1475,45 @@ async fn posted_findings_for_head_is_head_scoped_and_excludes_current(pool: PgPo
     .await
     .unwrap();
 
-    let posted = posted_findings_for_head(&pool, repo_id, "pull_request", 7, "same", current)
+    let posted = posted_findings_for_target(&pool, repo_id, "pull_request", 7, current)
         .await
         .unwrap();
-    assert_eq!(posted.len(), 1, "only the same-head prior is returned");
-    assert_eq!(posted[0][0]["title"], "leak");
+    // Epic #566: suppression now spans the whole PR, so BOTH heads come back, each tagged with the
+    // head_sha it was posted on so the caller can pick the exact vs line-insensitive key.
+    assert_eq!(
+        posted.len(),
+        2,
+        "priors from every commit of this PR are returned"
+    );
+    let mut by_head: Vec<(String, String)> = posted
+        .iter()
+        .map(|(head, arr)| {
+            (
+                head.clone().unwrap_or_default(),
+                arr[0]["title"].as_str().unwrap_or_default().to_string(),
+            )
+        })
+        .collect();
+    by_head.sort();
+    assert_eq!(
+        by_head,
+        vec![
+            ("other".to_string(), "other".to_string()),
+            ("same".to_string(), "leak".to_string()),
+        ]
+    );
 
     // The current task never dedups against its own (not-yet-posted) review.
     upsert_review(&pool, current, "v", "b", 1, 0, 0, &f_same, None, None)
         .await
         .unwrap();
-    let posted = posted_findings_for_head(&pool, repo_id, "pull_request", 7, "same", current)
+    let posted = posted_findings_for_target(&pool, repo_id, "pull_request", 7, current)
         .await
         .unwrap();
     assert_eq!(
         posted.len(),
-        1,
-        "still only the *other* task's review, not its own"
+        2,
+        "the current task never suppresses against its own not-yet-posted review"
     );
 
     // A review ENQUEUED but not yet delivered (pending `outbox` row — reconciler backoff, or
@@ -1525,12 +1547,18 @@ async fn posted_findings_for_head_is_head_scoped_and_excludes_current(pool: PgPo
     )
     .await
     .unwrap();
-    let posted = posted_findings_for_head(&pool, repo_id, "pull_request", 7, "same", current)
+    let posted = posted_findings_for_target(&pool, repo_id, "pull_request", 7, current)
         .await
         .unwrap();
-    assert_eq!(posted.len(), 2, "pending outbox review counts as posted");
+    assert_eq!(
+        posted.len(),
+        3,
+        "pending outbox review counts as posted, alongside both prior heads"
+    );
     assert!(
-        posted.iter().any(|arr| arr[0]["title"] == "queued finding"),
+        posted
+            .iter()
+            .any(|(_, arr)| arr[0]["title"] == "queued finding"),
         "the queued review's findings come from the outbox payload"
     );
 
@@ -1541,13 +1569,13 @@ async fn posted_findings_for_head_is_head_scoped_and_excludes_current(pool: PgPo
         .execute(&pool)
         .await
         .unwrap();
-    let posted = posted_findings_for_head(&pool, repo_id, "pull_request", 7, "same", current)
+    let posted = posted_findings_for_target(&pool, repo_id, "pull_request", 7, current)
         .await
         .unwrap();
     assert_eq!(
         posted.len(),
-        1,
-        "a delivered outbox row no longer contributes (reviews row takes over)"
+        2,
+        "a delivered outbox row no longer contributes (reviews row takes over); both prior heads remain"
     );
 }
 

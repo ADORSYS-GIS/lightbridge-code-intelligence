@@ -213,47 +213,34 @@ pub async fn target_has_prior_findings(
     .await
 }
 
-/// The `findings` JSON arrays already posted — or **queued for posting** — by prior Lightbridge reviews
-/// on the **same head_sha** as the current run (ADR-0065, Option B — finalize dedup). We match on
-/// head_sha, not just the target, because line numbers drift across commits: a `(file, line, title)`
-/// dedup key is only safe within one commit.
+/// Prior findings posted on this PR/MR across **every** commit, each paired with the `head_sha` it was
+/// posted on so the caller can tell same-commit matches (exact key) from earlier-commit ones (line
+/// dropped — see `review::pr_dedup_key`). Epic #566.
 ///
-/// Two sources, unioned:
-/// - `reviews` — reviews the reconciler already delivered (persisted at post time, ADR-0035);
-/// - `outbox` `review`-kind rows still `pending` — a review **enqueued but not yet posted**
-///   (reconciler backoff, or two rapid re-reviews racing finalize). Without these, the second finalize
-///   wouldn't see the first run's findings and would double-post; their findings ride in the payload
-///   (`payload->'findings_json'`, baked at produce time per ADR-0059). `posted` rows are skipped — the
-///   reconciler persists them into `reviews` on delivery, so the first arm already covers them.
-///
-/// Excludes the current task in both arms (a re-finalize must not dedup against its own in-flight
-/// review). Returns one `Value` (a findings array) per prior review; the caller flattens them into a set
-/// of normalized keys. Best-effort: a query error is treated by the caller as "nothing posted yet" (no
-/// dedup), never fatal.
-pub async fn posted_findings_for_head(
+/// Two-arm union — persisted `reviews` plus still-pending `outbox` review intents, so a finding queued
+/// but not yet delivered still suppresses. Supersedes the earlier commit-scoped `posted_findings_for_head`.
+pub async fn posted_findings_for_target(
     pool: &PgPool,
     repository_id: i64,
     target_type: &str,
     target_id: i64,
-    head_sha: &str,
     current_task_id: Uuid,
-) -> Result<Vec<Value>, sqlx::Error> {
-    sqlx::query_scalar::<_, Value>(
-        "SELECT r.findings \
+) -> Result<Vec<(Option<String>, Value)>, sqlx::Error> {
+    sqlx::query_as::<_, (Option<String>, Value)>(
+        "SELECT t.head_sha, r.findings \
          FROM reviews r JOIN tasks t ON t.id = r.task_id \
          WHERE t.repository_id = $1 AND t.target_type = $2 AND t.target_id = $3 \
-           AND t.head_sha = $4 AND r.task_id <> $5 \
+           AND r.task_id <> $4 \
          UNION ALL \
-         SELECT o.payload->'findings_json' \
+         SELECT t.head_sha, o.payload->'findings_json' \
          FROM outbox o JOIN tasks t ON t.id = o.task_id \
          WHERE o.kind = 'review' AND o.status = 'pending' \
            AND t.repository_id = $1 AND t.target_type = $2 AND t.target_id = $3 \
-           AND t.head_sha = $4 AND o.task_id <> $5",
+           AND o.task_id <> $4",
     )
     .bind(repository_id)
     .bind(target_type)
     .bind(target_id)
-    .bind(head_sha)
     .bind(current_task_id)
     .fetch_all(pool)
     .await
