@@ -2,7 +2,83 @@
 
 import { revalidatePath } from "next/cache";
 import { currentClaims } from "@/lib/auth/session";
-import { hasPermission, setRepoPreset } from "@/lib/server/admin";
+import {
+  hasPermission,
+  type RepoSettingsPatch,
+  setRepoPreset,
+  setRepoSettingsOverride,
+} from "@/lib/server/admin";
+
+const BOOLEAN_FIELDS = ["check_run_reporting", "review_on_pr_open", "review_on_push"] as const;
+const STRING_FIELDS = ["push_strategy", "dedup_scope"] as const;
+
+function requireConfigurablePermission(): Promise<void> {
+  return currentClaims().then((claims) => {
+    if (!hasPermission(claims, "repo:configure")) {
+      throw new Error("Unauthorized: repo:configure permission required");
+    }
+  });
+}
+
+function requireRepoId(formData: FormData): number {
+  const id = Number(formData.get("id"));
+  if (!Number.isInteger(id) || id <= 0) {
+    throw new Error("Invalid repository id");
+  }
+  return id;
+}
+
+/**
+ * One per-repo setting's `<form action={...}>` submit (epic #566, ADR-0111). Each of the six settings
+ * rows is its own single-field form — never one giant settings form — so a failed save on one field
+ * can never risk clobbering another, matching the control plane's own per-field `Option<Option<T>>`
+ * PATCH semantics 1:1. The field being saved is read from a hidden `field` input rather than one
+ * action per field, since the shape (read one named value, build a one-key patch) is identical across
+ * all six.
+ */
+export async function setRepoSettingAction(formData: FormData): Promise<void> {
+  await requireConfigurablePermission();
+  const id = requireRepoId(formData);
+  const field = String(formData.get("field") ?? "");
+  const patch: RepoSettingsPatch = {};
+
+  if ((BOOLEAN_FIELDS as readonly string[]).includes(field)) {
+    // An unchecked checkbox is simply absent from FormData — `.get` returns `null`, so this correctly
+    // reads as `false` without a separate "was it present" check.
+    (patch as Record<string, boolean>)[field] = formData.get(field) === "on";
+  } else if (field === "push_debounce_seconds") {
+    const raw = Number(formData.get(field));
+    if (!Number.isInteger(raw)) {
+      throw new Error("Enter a whole number of seconds");
+    }
+    patch.push_debounce_seconds = raw;
+  } else if ((STRING_FIELDS as readonly string[]).includes(field)) {
+    (patch as Record<string, string>)[field] = String(formData.get(field) ?? "");
+  } else {
+    throw new Error(`Unknown settings field: ${field}`);
+  }
+
+  if (!(await setRepoSettingsOverride(id, patch))) {
+    throw new Error("Failed to save the setting — check the value is within range");
+  }
+  revalidatePath(`/dashboard/repositories/${id}`);
+}
+
+/**
+ * Clear a single DB-layer setting override back to the repo file/default — the [`SourceBadge`]'s reset
+ * affordance. Bound to `(id, field)` at the call site:
+ * `<form action={clearRepoSettingAction.bind(null, id, "review_on_push")}>`.
+ */
+export async function clearRepoSettingAction(
+  id: number,
+  field: keyof RepoSettingsPatch,
+): Promise<void> {
+  await requireConfigurablePermission();
+  if (!(await setRepoSettingsOverride(id, { [field]: null } as RepoSettingsPatch))) {
+    throw new Error("Failed to reset the setting");
+  }
+  revalidatePath(`/dashboard/repositories/${id}`);
+}
 
 /**
  * Commit a new review preset to the repo's `.lightbridge-code-review.jsonc` (story #500, ADR-0109).

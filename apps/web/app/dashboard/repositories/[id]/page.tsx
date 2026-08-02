@@ -1,22 +1,34 @@
-import { ArrowLeft } from "lucide-react";
+import { ArrowLeft, RotateCcw } from "lucide-react";
 import Link from "next/link";
 import { notFound } from "next/navigation";
 import { PresetPicker } from "@/components/repos/preset-picker";
 import { Button } from "@/components/ui/button";
 import { Card, CardBody, CardHeader, CardTitle } from "@/components/ui/card";
+import { Select } from "@/components/ui/select";
+import { SettingsRow, SettingsSection } from "@/components/ui/settings-section";
+import { SourceBadge } from "@/components/ui/source-badge";
 import { ApiErrorLine, StatusLine } from "@/components/ui/states";
+import { Toggle } from "@/components/ui/toggle";
 import { currentClaims } from "@/lib/auth/session";
 import { repoSlug } from "@/lib/domain/repos";
-import { getRepoPreset, hasPermission, listAdminRepos } from "@/lib/server/admin";
-import { setPresetAction } from "./actions";
+import {
+  getRepoPreset,
+  getRepoSettings,
+  hasPermission,
+  listAdminRepos,
+  type RepoSettingsPatch,
+} from "@/lib/server/admin";
+import { clearRepoSettingAction, setPresetAction, setRepoSettingAction } from "./actions";
 
 export const dynamic = "force-dynamic";
 
 /**
- * A repo's review-preset settings (story #500, ADR-0109). Deliberately narrow: this is NOT the
- * fuller per-repo detail page Epic #493 tracks (Grafana embeds, approve/deny here too, etc.) — just
- * the preset display/selector this story's AC asks for, standing up the `[id]` route as a minimal
- * slice so it has somewhere to live.
+ * A repo's review settings: preset (story #500, ADR-0109) and, since ADR-0111, per-repo check-run
+ * reporting / review-on-open / review-on-push / push-storm strategy / dedup scope, each independently
+ * resolved across a built-in default → repo config file → admin DB override chain. Grown from the
+ * original preset-only stub into the fuller per-repo detail page (ADR-0112 formally decided apps/web
+ * keeps investing rather than being retired) — model override and inline approval status are later,
+ * separate slices of the same page.
  */
 export default async function RepoSettings({ params }: { params: Promise<{ id: string }> }) {
   const { id: rawId } = await params;
@@ -26,9 +38,10 @@ export default async function RepoSettings({ params }: { params: Promise<{ id: s
   // No single-repo GET endpoint exists control-plane-side — the list is small (an admin console, not
   // a customer-facing catalog), so finding the repo in the already-existing list call is the
   // pragmatic choice over adding a new endpoint for one field (owner/name) this page needs.
-  const [reposResult, presetResult, claims] = await Promise.all([
+  const [reposResult, presetResult, settingsResult, claims] = await Promise.all([
     listAdminRepos(),
     getRepoPreset(id),
+    getRepoSettings(id),
     currentClaims(),
   ]);
   const canConfigure = hasPermission(claims, "repo:configure");
@@ -104,7 +117,198 @@ export default async function RepoSettings({ params }: { params: Promise<{ id: s
           </p>
         </CardBody>
       </Card>
+
+      {!settingsResult.ok ? (
+        <Card>
+          <ApiErrorLine result={settingsResult} />
+        </Card>
+      ) : (
+        <SettingsSection title="Review settings">
+          {!canConfigure && (
+            <div className="px-4 py-3">
+              <StatusLine>
+                You need the <code>repo:configure</code> permission to change these. Ask an
+                administrator to grant it.
+              </StatusLine>
+            </div>
+          )}
+
+          <SettingsRow
+            label="Check-run reporting"
+            description="Post a check/status on the pull request for each review run."
+            badge={
+              <SourceBadge
+                source={settingsResult.data.settings.check_run_reporting.source}
+                reset={canConfigure && <ResetOverride id={id} field="check_run_reporting" />}
+              />
+            }
+            control={
+              // Its own single-field form — NOT wrapping the row (the badge's reset button carries
+              // its own independent form; nesting <form> is invalid HTML and silently breaks clicks).
+              <form action={setRepoSettingAction} className="contents">
+                <input type="hidden" name="id" value={id} />
+                <input type="hidden" name="field" value="check_run_reporting" />
+                <Toggle
+                  name="check_run_reporting"
+                  defaultChecked={settingsResult.data.settings.check_run_reporting.value}
+                  disabled={!canConfigure}
+                  aria-label="Check-run reporting"
+                />
+              </form>
+            }
+          />
+
+          <SettingsRow
+            label="Review on PR open"
+            description="Automatically review when a pull request is opened."
+            badge={
+              <SourceBadge
+                source={settingsResult.data.settings.review_on_pr_open.source}
+                reset={canConfigure && <ResetOverride id={id} field="review_on_pr_open" />}
+              />
+            }
+            control={
+              <form action={setRepoSettingAction} className="contents">
+                <input type="hidden" name="id" value={id} />
+                <input type="hidden" name="field" value="review_on_pr_open" />
+                <Toggle
+                  name="review_on_pr_open"
+                  defaultChecked={settingsResult.data.settings.review_on_pr_open.value}
+                  disabled={!canConfigure}
+                  aria-label="Review on PR open"
+                />
+              </form>
+            }
+          />
+
+          <SettingsRow
+            label="Review on push"
+            description="Re-review new commits pushed to an already-open pull request. Off by
+            default — this multiplies review runs by push frequency."
+            badge={
+              <SourceBadge
+                source={settingsResult.data.settings.review_on_push.source}
+                reset={canConfigure && <ResetOverride id={id} field="review_on_push" />}
+              />
+            }
+            control={
+              <form action={setRepoSettingAction} className="contents">
+                <input type="hidden" name="id" value={id} />
+                <input type="hidden" name="field" value="review_on_push" />
+                <Toggle
+                  name="review_on_push"
+                  defaultChecked={settingsResult.data.settings.review_on_push.value}
+                  disabled={!canConfigure}
+                  aria-label="Review on push"
+                />
+              </form>
+            }
+          />
+
+          <SettingsRow
+            label="Push-storm strategy"
+            description="How rapid successive pushes to an open PR are handled."
+            badge={
+              <SourceBadge
+                source={settingsResult.data.settings.push_strategy.source}
+                reset={canConfigure && <ResetOverride id={id} field="push_strategy" />}
+              />
+            }
+            control={
+              <form action={setRepoSettingAction} className="contents">
+                <input type="hidden" name="id" value={id} />
+                <input type="hidden" name="field" value="push_strategy" />
+                <Select
+                  name="push_strategy"
+                  value={settingsResult.data.settings.push_strategy.value}
+                  disabled={!canConfigure}
+                  aria-label="Push-storm strategy"
+                  options={[
+                    { value: "supersede", label: "Supersede — cancel the older run" },
+                    { value: "debounce", label: "Debounce — wait for a quiet period" },
+                    { value: "every", label: "Every push" },
+                  ]}
+                />
+              </form>
+            }
+          />
+
+          {settingsResult.data.settings.push_strategy.value === "debounce" && (
+            <SettingsRow
+              label="Debounce window"
+              description="Seconds to wait after a push before reviewing (10–900)."
+              badge={
+                <SourceBadge
+                  source={settingsResult.data.settings.push_debounce.source}
+                  reset={canConfigure && <ResetOverride id={id} field="push_debounce_seconds" />}
+                />
+              }
+              control={
+                <form action={setRepoSettingAction} className="contents">
+                  <input type="hidden" name="id" value={id} />
+                  <input type="hidden" name="field" value="push_debounce_seconds" />
+                  <input
+                    type="number"
+                    name="push_debounce_seconds"
+                    min={10}
+                    max={900}
+                    defaultValue={settingsResult.data.settings.push_debounce.value.secs}
+                    disabled={!canConfigure}
+                    className="input input-sm w-20"
+                  />
+                  {canConfigure && (
+                    <Button type="submit" size="sm">
+                      Save
+                    </Button>
+                  )}
+                </form>
+              }
+            />
+          )}
+
+          <SettingsRow
+            label="Finding suppression scope"
+            description="Suppress an already-reported finding across the whole PR, or only within
+            the same commit."
+            badge={
+              <SourceBadge
+                source={settingsResult.data.settings.dedup_scope.source}
+                reset={canConfigure && <ResetOverride id={id} field="dedup_scope" />}
+              />
+            }
+            control={
+              <form action={setRepoSettingAction} className="contents">
+                <input type="hidden" name="id" value={id} />
+                <input type="hidden" name="field" value="dedup_scope" />
+                <Select
+                  name="dedup_scope"
+                  value={settingsResult.data.settings.dedup_scope.value}
+                  disabled={!canConfigure}
+                  aria-label="Finding suppression scope"
+                  options={[
+                    { value: "pr", label: "Whole PR" },
+                    { value: "commit", label: "Same commit only" },
+                  ]}
+                />
+              </form>
+            }
+          />
+        </SettingsSection>
+      )}
     </Shell>
+  );
+}
+
+/** The [`SourceBadge`] reset affordance: a tiny bound-Server-Action form, not client state — clearing
+ * an override is itself a mutation. */
+function ResetOverride({ id, field }: { id: number; field: keyof RepoSettingsPatch }) {
+  const clear = clearRepoSettingAction.bind(null, id, field);
+  return (
+    <form action={clear}>
+      <button type="submit" className="btn btn-ghost btn-xs" title="Reset to file/default">
+        <RotateCcw className="size-3" />
+      </button>
+    </form>
   );
 }
 
