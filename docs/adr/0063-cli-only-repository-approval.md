@@ -1,6 +1,8 @@
 # ADR-0063: CLI-only repository approval (retire the web approval gate)
 
-- **Status:** Accepted
+- **Status:** Superseded by [ADR-0112](0112-invest-in-apps-web-supersede-0063.md) — the decision to
+  retire `apps/web` is reversed; `apps/web` and `clients/lci` now coexist permanently. Everything else
+  below (the CLI/TUI design, the authz reuse, the imperative-vs-GitOps tension) stands unchanged.
 - **Date:** 2026-06-28
 - **Amended:** 2026-07-03
 - **Deciders:** @stephane-segning

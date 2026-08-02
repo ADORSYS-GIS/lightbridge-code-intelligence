@@ -85,6 +85,12 @@ _Last updated: 2026-08-02._
   runner accepts the field, but no operator can set it until the chart surfaces it.
 - **Remove the dead native review path** — now unblocked (SAST is ported); delete `run_native_agent` and
   its native-only modules.
+- **`apps/web` full revamp** ([ADR-0112](docs/adr/0112-invest-in-apps-web-supersede-0063.md), supersedes
+  the retirement plan) — new shared `Toggle`/`Select`/provenance-badge components, then a full
+  `/dashboard/repositories/[id]` page exposing ADR-0111's per-repo settings (check-run reporting,
+  review-on-open, review-on-push, push-storm strategy, dedup scope) and a model-override picker
+  (ADR-0110), followed by a lower-priority consistency pass across Repositories/Runs/Overview/Settings.
+  Sliced per-page, in progress.
 - **A2A per-finding review streaming** — stream findings as they are confirmed at finalize.
   ([ADR-0098](https://github.com/vymalo/lightbridge-code-intelligence/pull/458), #458 — open)
 
@@ -102,9 +108,6 @@ _Last updated: 2026-08-02._
   [0108](docs/adr/0108-codeplatform-github-gitlab-bitbucket.md)). Remaining: promoting
   `CheckpointRuntime` to the production default for any role stays gated on #363's open P1s; a
   per-role durable store (beyond `Passthrough`) is follow-up work, not done here.
-- **Retire `apps/web`** (Epic #241) — the web console is down to its last function (the repo approval
-  gate); the `lci` admin TUI ([ADR-0063](docs/adr/0063-cli-only-repository-approval.md)) and Grafana absorb the rest,
-  then `apps/web` is deleted.
 - **Review quality & reliability** (Epic #252) — the durable quality track: a fast-tier eval harness to
   catch calibration regressions (not started, being reframed around presets — see #491), the #285
   severity-stability watch, and the observability work above.
