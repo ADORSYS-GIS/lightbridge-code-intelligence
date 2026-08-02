@@ -28,6 +28,7 @@
 mod a2a;
 mod http;
 mod integrations;
+mod mcp;
 mod queue;
 
 // Foundational modules the groups above build on.
@@ -460,6 +461,7 @@ fn api_v2_router() -> Router<AppState> {
 }
 
 fn app(state: AppState) -> Router {
+    let mcp = crate::mcp::mcp_router(state.clone());
     Router::new()
         .route("/healthz", get(liveness))
         .route("/readyz", get(readiness))
@@ -467,6 +469,7 @@ fn app(state: AppState) -> Router {
         .nest("/api/v2", api_v2_router())
         .layer(axum::middleware::from_fn(track_http_metrics))
         .with_state(state)
+        .merge(mcp)
 }
 
 async fn liveness() -> &'static str {
