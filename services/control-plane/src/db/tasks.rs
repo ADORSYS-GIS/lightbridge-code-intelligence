@@ -490,17 +490,68 @@ pub async fn renew_lease(pool: &PgPool, id: Uuid, lease: Duration) -> Result<boo
     Ok(result.rows_affected() > 0)
 }
 
-/// Most recent tasks first (the dashboard run list).
-pub async fn list_tasks(pool: &PgPool, limit: i64) -> Result<Vec<TaskRow>, sqlx::Error> {
-    sqlx::query_as::<_, TaskRow>(
+/// Optional filters for [`list_tasks_page`]. `status` is already-expanded raw DB status values (the
+/// UI's `StatusVariant` → raw-status mapping lives in the HTTP handler, so this module stays free of
+/// API-shape concerns) — `None` means "no status filter", matching `repository_id`/`query`.
+#[derive(Debug, Default)]
+pub struct TasksPageFilter {
+    pub status: Option<Vec<String>>,
+    pub repository_id: Option<i64>,
+    pub query: Option<String>,
+}
+
+/// A page of tasks (most-recent-first) plus the total matching row count — the real pagination behind
+/// `GET /tasks`'s `page`/`page_size`/`status`/`repository_id`/`q` query params. `query` matches
+/// (case-insensitively) against `command_text`, `head_sha`, `target_id`, and the joined repo's
+/// `owner`/`name` — the practical equivalent of the dashboard's old client-side search, not the
+/// rendered trigger label verbatim.
+pub async fn list_tasks_page(
+    pool: &PgPool,
+    filter: TasksPageFilter,
+    limit: i64,
+    offset: i64,
+) -> Result<(Vec<TaskRow>, i64), sqlx::Error> {
+    // sqlx 0.9's `SqlSafeStr` lint requires literal `&'static str` queries (no `format!`/runtime
+    // string building, even from a compile-time-constant fragment) — the WHERE clause is duplicated
+    // below rather than spliced in, to satisfy that without an `AssertSqlSafe` escape hatch.
+    let tasks = sqlx::query_as::<_, TaskRow>(
         "SELECT t.*, r.owner AS repo_owner, r.name AS repo_name, \
          r.default_branch AS repo_default_branch, r.platform AS repo_platform \
          FROM tasks t LEFT JOIN repositories r ON r.id = t.repository_id \
-         ORDER BY t.created_at DESC, t.id DESC LIMIT $1",
+         WHERE ($1::text[] IS NULL OR t.status = ANY($1)) \
+           AND ($2::bigint IS NULL OR t.repository_id = $2) \
+           AND ($3::text IS NULL OR t.command_text ILIKE '%' || $3 || '%' \
+                OR t.head_sha ILIKE '%' || $3 || '%' \
+                OR t.target_id::text ILIKE '%' || $3 || '%' \
+                OR r.owner ILIKE '%' || $3 || '%' OR r.name ILIKE '%' || $3 || '%') \
+         ORDER BY t.created_at DESC, t.id DESC \
+         LIMIT $4 OFFSET $5",
     )
+    .bind(&filter.status)
+    .bind(filter.repository_id)
+    .bind(&filter.query)
     .bind(limit)
+    .bind(offset)
     .fetch_all(pool)
-    .await
+    .await?;
+
+    let total: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) \
+         FROM tasks t LEFT JOIN repositories r ON r.id = t.repository_id \
+         WHERE ($1::text[] IS NULL OR t.status = ANY($1)) \
+           AND ($2::bigint IS NULL OR t.repository_id = $2) \
+           AND ($3::text IS NULL OR t.command_text ILIKE '%' || $3 || '%' \
+                OR t.head_sha ILIKE '%' || $3 || '%' \
+                OR t.target_id::text ILIKE '%' || $3 || '%' \
+                OR r.owner ILIKE '%' || $3 || '%' OR r.name ILIKE '%' || $3 || '%')",
+    )
+    .bind(&filter.status)
+    .bind(filter.repository_id)
+    .bind(&filter.query)
+    .fetch_one(pool)
+    .await?;
+
+    Ok((tasks, total))
 }
 
 /// A single task by id.
