@@ -9,9 +9,18 @@ open a PR to fix this file.
 > **Keeping this current is part of "done."** When a PR meaningfully ships, unblocks, or retires an item
 > here, update its status in the **same PR** (see [AGENTS.md](AGENTS.md)).
 
-_Last updated: 2026-07-29._
+_Last updated: 2026-08-02._
 
 ## Recently shipped
+
+- **Per-repo review settings + review on new commits** (Epic #566) — check-run reporting, the
+  automatic on-PR-open review, and a new review-on-new-commits trigger are now individually
+  configurable per repo via a three-layer resolution (built-in default → repo config file → DB
+  override, operator wins). `review_on_push` defaults off; when enabled, findings are suppressed
+  PR-wide (not just within one commit) and a push storm is handled per the repo's chosen strategy —
+  `supersede` (cancel the superseded run, default), `debounce` (delay into a quiet period), or
+  `every` (one review per push). ([ADR-0111](docs/adr/0111-per-repo-review-settings-and-review-on-push.md),
+  #567/#568/#569/#570/#572/#573/#574/#575/#576)
 
 - **Review runs on OpenCode** — the live code-review path is hosted on OpenCode-over-ACP instead of the
   in-house agent loop; the tuned review gates and tools are reused, not reimplemented.

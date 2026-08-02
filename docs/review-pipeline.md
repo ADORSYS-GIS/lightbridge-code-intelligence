@@ -27,6 +27,7 @@ no fallback model: a single model is wrapped in retry/backoff/circuit-breaker re
 flowchart TD
     subgraph GH[GitHub]
         E1[pull_request opened]
+        E1S["pull_request synchronize (opt-in, ADR-0111)"]
         E2[issue/PR comment @mention]
     end
     subgraph CP[control-plane: serve role]
@@ -50,6 +51,7 @@ flowchart TD
     REC[control-plane: reconciler] --> GH
 
     E1 -->|entry_point = pr_open| W
+    E1S -->|entry_point = pr_sync| W
     E2 -->|entry_point = mention| W
     W --> T --> J --> CLONE --> IDX
     IDX -->|no / index task| FULLIDX[semantic + structural index]
@@ -63,36 +65,46 @@ flowchart TD
 ```
 
 A task carries a resolved `preset` column (`fast` | `deep` | any operator-defined name) plus an
-`entry_point` column (`pr_open` | `mention` | `a2a`, migration `0033_task_preset`); the runner picks its
-`ReviewConfig` by `preset`, and the control plane shapes the posted body by `entry_point`
-([ADR-0103](adr/0103-repo-configurable-opencode-review-presets.md)) — see below for why the two are kept
-separate.
+`entry_point` column (`pr_open` | `pr_sync` | `mention` | `a2a`, migration `0033_task_preset`); the
+runner picks its `ReviewConfig` by `preset`, and the control plane shapes the posted body by
+`entry_point` ([ADR-0103](adr/0103-repo-configurable-opencode-review-presets.md)) — see below for why
+the two are kept separate.
 
-## 1. Trigger and preset resolution (ADR-0103 + ADR-0030)
+## 1. Trigger and preset resolution (ADR-0103 + ADR-0030 + ADR-0111)
 
 Which **entry point** created the task is still decided in the webhook handler,
 `services/control-plane/src/http/webhook.rs`:
 
-- **`pull_request` `opened`** → the automatic on-open pass, entry point `pr_open`. This is the only
-  automatic review trigger; `synchronize`/`reopened` do nothing, and `closed` cancels the PR's active
-  tasks (the reaper then stops their Jobs).
+- **`pull_request` `opened`** → the automatic on-open pass, entry point `pr_open`. Gated on the repo's
+  `review_on_pr_open` setting (default **on** — [ADR-0111](adr/0111-per-repo-review-settings-and-review-on-push.md)).
+- **`pull_request` `synchronize`** (GitLab MR `update` with an `oldrev`; Bitbucket
+  `pullrequest:updated`) → a review of the new commits, entry point `pr_sync`. Gated on the repo's
+  `review_on_push` setting, **default off** ([ADR-0111](adr/0111-per-repo-review-settings-and-review-on-push.md)) —
+  a repo must opt in. When several pushes land in a burst, the repo's `push_strategy`
+  (`supersede`/`debounce`/`every`) decides whether the older in-flight review is cancelled, delayed, or
+  left to run alongside the new one. `closed` cancels the PR's active tasks regardless of these
+  settings (the reaper then stops their Jobs).
 - **An `@mention`** of the App handle on a PR or issue comment → entry point `mention`, whether the
   target is a PR (review) or an issue (conversational answer). The mention is matched against
-  `state.app_handle` (`GITHUB_APP_HANDLE`).
+  `state.app_handle` (`GITHUB_APP_HANDLE`). Never gated by `review_on_pr_open`/`review_on_push` — an
+  explicit human request always runs.
 - **A2A** task creation (`a2a/handler/lifecycle.rs`) → entry point `a2a`.
 
 Each entry point then resolves a **named preset** — `services/control-plane/src/preset.rs`'s
-`EntryPoint::{PrOpen,Mention,A2a}` plus `resolve_preset`/`resolve_preset_or_default` (the latter
-tolerates an unconfigured platform client, used by every webhook call site). Resolution fetches the
-repo's `.lightbridge-code-review.jsonc` ([ADR-0030](adr/0030-repo-review-config.md)) at the PR's **base**
-ref via a single small `CodePlatform::get_repo_file` call — never a clone, so task creation stays cheap —
-and picks, in order: (1) a per-entry-point override in the file's `entry_points` map (e.g.
-`{"pr_open": "fast"}`), (2) else the file's flat `preset` field, (3) else the platform-default mapping
-(`EntryPoint::platform_default_preset`: `pr_open` → `fast`, `mention`/`a2a` → `deep`) — reproducing
-today's pre-ADR-0103 fast/deep split exactly for a repo that configures nothing. Any fetch failure,
-absent file, oversized file (>64 KiB), or malformed/schema-invalid JSONC degrades to step 3; preset
-resolution never fails task creation. The A2A entry point skips repo-config resolution entirely and
-uses the platform default directly — the A2A role holds no forge credentials to fetch the file with.
+`EntryPoint::{PrOpen,PrSync,Mention,A2a}` plus `settings::resolve_preset_and_settings` (which also
+resolves the ADR-0111 settings below off the **same** repo-file fetch — one forge call serves both).
+Resolution fetches the repo's `.lightbridge-code-review.jsonc`
+([ADR-0030](adr/0030-repo-review-config.md)) at the PR's **base** ref via a single small
+`CodePlatform::get_repo_file` call — never a clone, so task creation stays cheap — and picks, in order:
+(1) a per-entry-point override in the file's `entry_points` map (e.g. `{"pr_open": "fast"}`), (2) else
+the file's flat `preset` field, (3) else the platform-default mapping
+(`EntryPoint::platform_default_preset`: `pr_open`/`pr_sync` → `fast`, `mention`/`a2a` → `deep`) —
+reproducing today's pre-ADR-0103 fast/deep split exactly for a repo that configures nothing (`pr_sync`
+deliberately shares `pr_open`'s cheap default rather than `deep`, since it can fire many times per PR).
+Any fetch failure, absent file, oversized file (>64 KiB), or malformed/schema-invalid JSONC degrades to
+step 3; preset resolution never fails task creation. The A2A entry point skips repo-config resolution
+entirely and uses the platform default directly — the A2A role holds no forge credentials to fetch the
+file with.
 
 The resolved name is persisted on `tasks.preset` (renamed from `tasks.tier` by migration
 `0033_task_preset`), alongside the new `tasks.entry_point` column (default `mention`, the old `tier`
@@ -516,7 +528,8 @@ author isn't left in silence.
 | Knob | Where | Notes |
 |---|---|---|
 | `preset` | task column (`tasks.preset`, resolved via repo config or the platform default) | e.g. `fast`/`deep`, or any operator-defined name (ADR-0103) |
-| `entry_point` | task column (`tasks.entry_point`, set in webhook/lifecycle) | `pr_open` / `mention` / `a2a` — drives body framing, never the preset lookup |
+| `entry_point` | task column (`tasks.entry_point`, set in webhook/lifecycle) | `pr_open` / `pr_sync` / `mention` / `a2a` — drives body framing, never the preset lookup |
+| `check_run_reporting` / `review_on_pr_open` / `review_on_push` / `push_strategy` / `push_debounce_seconds` / `dedup_scope` | three-layer resolved: built-in default → repo config file's `triggers` block → `repo_settings` DB row (wins) | Per-repo review behaviour ([ADR-0111](adr/0111-per-repo-review-settings-and-review-on-push.md)); `GET`/`POST /admin/repositories/{id}/settings[/override]` reports/sets provenance per field |
 | `review.presets.<name>` | `agent.json` | complete per-preset blocks; a platform-default name (`fast`/`deep`) falls back to the flat `review.*` when absent |
 | `review.presets.<name>.tools` | `agent.json` | closed `ReviewTool` enum; unknown/empty fails config; unset = full built-in surface for any preset |
 | `review.presets.<name>.system_prompt_file` | ai-helm → e.g. `review-system.md` / `review-system-fast.md` for the default presets | required (fail-closed), operator-owned, one per preset |
