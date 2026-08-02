@@ -3067,3 +3067,86 @@ async fn check_run_external_id_round_trips_and_defaults_to_none(pool: PgPool) {
         Some(4242)
     );
 }
+
+/// #571: repeated review runs against the SAME PR head SHA (an automatic open-review followed by a
+/// mention-triggered re-review, or several re-review mentions in a row) must not let a stale, older
+/// task's check-run resolve clobber a newer one's verdict. `should_report_check_run` is the guard —
+/// only the most-recently-created, non-cancelled task for a given `(repository_id, target_type,
+/// target_id, head_sha)` group may post.
+#[sqlx::test]
+async fn should_report_check_run_is_false_once_a_newer_task_shares_the_head_sha(pool: PgPool) {
+    let repo_id = seed(&pool).await;
+
+    // The automatic open-review task, backdated so its `created_at` is unambiguously the OLDEST —
+    // real concurrent inserts could otherwise land within the same clock tick.
+    let older = create_task(&pool, &pr_task(repo_id, "same-sha"))
+        .await
+        .unwrap()
+        .expect("task");
+    sqlx::query("UPDATE tasks SET created_at = now() - interval '1 hour' WHERE id = $1")
+        .bind(older)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // A single task in isolation is trivially its own group's latest.
+    assert!(
+        should_report_check_run(&pool, older).await.unwrap(),
+        "the only task for its head sha is always current"
+    );
+
+    // A mention-triggered re-review on the SAME head sha — a different `command_text`, proving the
+    // guard orders by `created_at`/`id`, not by the per-command_text `run_epoch` (which would restart
+    // at 0 for this new command_text group, per `create_explicit_task`).
+    let newer = create_explicit_task(
+        &pool,
+        &NewTask {
+            command_text: "@lightbridge-assistant review".to_string(),
+            ..pr_task(repo_id, "same-sha")
+        },
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        !should_report_check_run(&pool, older).await.unwrap(),
+        "a newer task on the identical head sha makes the older one stale"
+    );
+    assert!(
+        should_report_check_run(&pool, newer).await.unwrap(),
+        "the newest task for the group is always current"
+    );
+
+    // A DIFFERENT head sha (e.g. a fresh push) never competes with this group.
+    let other_sha = create_task(&pool, &pr_task(repo_id, "different-sha"))
+        .await
+        .unwrap()
+        .expect("task");
+    assert!(
+        should_report_check_run(&pool, newer).await.unwrap(),
+        "a task on a different head sha does not make this group stale"
+    );
+    assert!(
+        should_report_check_run(&pool, other_sha).await.unwrap(),
+        "the other head sha's own task is current in its own group"
+    );
+
+    // Cancelling the newer task means it never produced a competing verdict — the older task's
+    // resolve must not be blocked by a run that was superseded before it ever reviewed anything.
+    assert!(cancel_task_by_id(&pool, newer).await.unwrap());
+    assert!(
+        should_report_check_run(&pool, older).await.unwrap(),
+        "a cancelled newer task must not block the older task's resolve"
+    );
+}
+
+/// An unknown task id has nothing to compare against — the guard fails open (proceed), matching every
+/// other best-effort/non-fatal check-run path.
+#[sqlx::test]
+async fn should_report_check_run_defaults_to_true_for_an_unknown_task(pool: PgPool) {
+    assert!(
+        should_report_check_run(&pool, Uuid::new_v4())
+            .await
+            .unwrap()
+    );
+}

@@ -618,6 +618,44 @@ pub async fn get_check_run_external_id(
         .map(Option::flatten)
 }
 
+/// Whether `task_id` is still the most-recently-created, non-cancelled task for its `(repository_id,
+/// target_type, target_id, head_sha)` group — i.e. no NEWER run has been created against the SAME PR/MR
+/// head SHA. Multiple review runs can land on the identical SHA (repeated `@mention` re-reviews, or the
+/// automatic open-review followed by a mention-triggered one); each one enqueues its own
+/// `check_run_resolve`/`check_run_start` outbox row, but every platform's check/status is addressed by
+/// `(head_sha, name)` (GitHub also self-heals via its `filter=latest` `created_at` ordering when an
+/// `external_id` is known — but not when it's missing, e.g. a dead-lettered start; GitLab/Bitbucket have
+/// no self-healing at all, upserting unconditionally by sha+name/key). Without this guard, whichever
+/// task's resolve is *delivered* last (which can lag hours behind a retry backoff) wins regardless of
+/// which run is actually newest or authoritative (#571, a design gap left by #558/#559).
+///
+/// `newer.status <> 'cancelled'` excludes a superseded task that was itself cancelled before it ever
+/// reviewed anything (e.g. the PR closed) — that never produces a competing verdict, so it must not
+/// block an older task's own resolve. Ordering is `(created_at, id)`, not `run_epoch`: `run_epoch` is
+/// scoped per `(repo, target, command_text, head_sha)` (see [`create_explicit_task`]), so two tasks on
+/// the same SHA with different `command_text` (e.g. differently-worded mentions) can both start at
+/// epoch 0 — it is not a global ordering across the SHA the way `created_at` is.
+///
+/// Returns `true` (proceed) when `task_id` is unknown — there is nothing to compare against, and the
+/// call sites already treat this delivery as best-effort/non-fatal.
+pub async fn should_report_check_run(pool: &PgPool, task_id: Uuid) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT NOT EXISTS ( \
+             SELECT 1 FROM tasks newer \
+             JOIN tasks self ON self.id = $1 \
+             WHERE newer.repository_id = self.repository_id \
+               AND newer.target_type = self.target_type \
+               AND newer.target_id = self.target_id \
+               AND newer.head_sha IS NOT DISTINCT FROM self.head_sha \
+               AND newer.status <> 'cancelled' \
+               AND (newer.created_at, newer.id) > (self.created_at, self.id) \
+         )",
+    )
+    .bind(task_id)
+    .fetch_one(pool)
+    .await
+}
+
 /// Apply a runner-reported status transition. Terminal states (`succeeded`/`failed`/`timed_out`/
 /// `cancelled`) stamp `completed_at` and clear the dispatcher lease so the reaper (Phase 2) won't
 /// reclaim a finished task; `running` stamps `started_at` if unset. Returns `false` if no task
