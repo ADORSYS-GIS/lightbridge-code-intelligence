@@ -470,6 +470,92 @@ pub async fn list_model_allowlist(caller: Caller, State(state): State<AppState>)
     Json(state.model_allowlist.as_ref()).into_response()
 }
 
+/// `GET /admin/repositories/{id}/model` — the repo's effective model-override provenance (ADR-0110),
+/// resolved with the same precedence [`crate::model::resolve_model_override`] applies at task
+/// creation (repo override → org override → none — no repo-file layer for models, unlike the
+/// ADR-0111 settings resolver): `source` is `"repo"`/`"org"`/`"none"`, `model` is the resolved value or
+/// `null`. A dashboard needs this to render the current state before offering a "set" form — there was
+/// previously no read path at all, only the two `POST` writes below. Requires `repo:read`.
+pub async fn get_repo_model(
+    caller: Caller,
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Response {
+    if let Err(e) = caller.require("repo:read") {
+        return e.into_response();
+    }
+    let Some(pool) = state.db.as_ref() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "no database").into_response();
+    };
+    match crate::db::get_repo_model_override(pool, id).await {
+        Ok(Some(model)) => {
+            Json(serde_json::json!({ "repository_id": id, "model": model, "source": "repo" }))
+                .into_response()
+        }
+        Ok(None) => {
+            let installation_id = match crate::db::repository_installation_id(pool, id).await {
+                Ok(Some(installation_id)) => installation_id,
+                Ok(None) => {
+                    return Json(
+                        serde_json::json!({ "repository_id": id, "model": null, "source": "none" }),
+                    )
+                    .into_response();
+                }
+                Err(error) => {
+                    tracing::error!(%error, repo_id = id, "repository installation_id lookup failed");
+                    return (StatusCode::INTERNAL_SERVER_ERROR, "query error").into_response();
+                }
+            };
+            match crate::db::get_org_model_override(pool, installation_id).await {
+                Ok(Some(model)) => Json(
+                    serde_json::json!({ "repository_id": id, "model": model, "source": "org" }),
+                )
+                .into_response(),
+                Ok(None) => Json(
+                    serde_json::json!({ "repository_id": id, "model": null, "source": "none" }),
+                )
+                .into_response(),
+                Err(error) => {
+                    tracing::error!(%error, installation_id, "org model override lookup failed");
+                    (StatusCode::INTERNAL_SERVER_ERROR, "query error").into_response()
+                }
+            }
+        }
+        Err(error) => {
+            tracing::error!(%error, repo_id = id, "repo model override lookup failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "query error").into_response()
+        }
+    }
+}
+
+/// `GET /admin/organizations/{installation_id}/model` — the org-level model override, if any.
+/// Requires `repo:read`.
+pub async fn get_org_model(
+    caller: Caller,
+    State(state): State<AppState>,
+    Path(installation_id): Path<i64>,
+) -> Response {
+    if let Err(e) = caller.require("repo:read") {
+        return e.into_response();
+    }
+    let Some(pool) = state.db.as_ref() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "no database").into_response();
+    };
+    match crate::db::get_org_model_override(pool, installation_id).await {
+        Ok(model) => {
+            let source = if model.is_some() { "org" } else { "none" };
+            Json(
+                serde_json::json!({ "installation_id": installation_id, "model": model, "source": source }),
+            )
+            .into_response()
+        }
+        Err(error) => {
+            tracing::error!(%error, installation_id, "org model override lookup failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "query error").into_response()
+        }
+    }
+}
+
 /// `POST /admin/repositories/{id}/model` — set or clear a repository's model override (ADR-0110).
 /// Requires `model:configure`. A named model is validated against the operator allowlist before
 /// writing — an unlisted model is rejected with a clear 400 naming the allowlist, never a silent
@@ -1582,6 +1668,118 @@ mod tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[sqlx::test]
+    async fn get_repo_model_reports_none_when_nothing_is_overridden(pool: PgPool) {
+        let repo_id = crate::db::upsert_repository(
+            &pool,
+            Platform::GitHub,
+            10,
+            "octo",
+            "repo10",
+            "main",
+            None,
+        )
+        .await
+        .unwrap();
+        let state = test_state(pool, vec!["claude-opus-5".to_string()]);
+        let response = get_repo_model(caller(&["repo:read"]), State(state), Path(repo_id)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert_eq!(body["repository_id"], repo_id);
+        assert_eq!(body["model"], serde_json::Value::Null);
+        assert_eq!(body["source"], "none");
+    }
+
+    #[sqlx::test]
+    async fn get_repo_model_reports_the_repo_override_when_set(pool: PgPool) {
+        let repo_id = crate::db::upsert_repository(
+            &pool,
+            Platform::GitHub,
+            11,
+            "octo",
+            "repo11",
+            "main",
+            None,
+        )
+        .await
+        .unwrap();
+        crate::db::set_repo_model_override(&pool, repo_id, "claude-opus-5", "tester")
+            .await
+            .unwrap();
+        let state = test_state(pool, vec!["claude-opus-5".to_string()]);
+        let response = get_repo_model(caller(&["repo:read"]), State(state), Path(repo_id)).await;
+        let body = body_json(response).await;
+        assert_eq!(body["model"], "claude-opus-5");
+        assert_eq!(body["source"], "repo");
+    }
+
+    /// The repo lookup itself is silent on a missing repo override — it must fall through to the
+    /// repo's `installation_id` and check the org layer, matching
+    /// `crate::model::resolve_model_override`'s own precedence exactly, not a separate/divergent read.
+    #[sqlx::test]
+    async fn get_repo_model_falls_through_to_the_org_override(pool: PgPool) {
+        let repo_id = crate::db::upsert_repository(
+            &pool,
+            Platform::GitHub,
+            12,
+            "octo",
+            "repo12",
+            "main",
+            Some(4242),
+        )
+        .await
+        .unwrap();
+        crate::db::set_org_model_override(&pool, 4242, "gpt-5", "tester")
+            .await
+            .unwrap();
+        let state = test_state(pool, vec!["gpt-5".to_string()]);
+        let response = get_repo_model(caller(&["repo:read"]), State(state), Path(repo_id)).await;
+        let body = body_json(response).await;
+        assert_eq!(body["model"], "gpt-5");
+        assert_eq!(body["source"], "org");
+    }
+
+    #[sqlx::test]
+    async fn get_repo_model_without_permission_is_forbidden(pool: PgPool) {
+        let repo_id = crate::db::upsert_repository(
+            &pool,
+            Platform::GitHub,
+            13,
+            "octo",
+            "repo13",
+            "main",
+            None,
+        )
+        .await
+        .unwrap();
+        let state = test_state(pool, vec!["claude-opus-5".to_string()]);
+        let response = get_repo_model(caller(&[]), State(state), Path(repo_id)).await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[sqlx::test]
+    async fn get_org_model_reports_none_when_nothing_is_overridden(pool: PgPool) {
+        let state = test_state(pool, vec!["claude-opus-5".to_string()]);
+        let response = get_org_model(caller(&["repo:read"]), State(state), Path(888)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert_eq!(body["installation_id"], 888);
+        assert_eq!(body["model"], serde_json::Value::Null);
+        assert_eq!(body["source"], "none");
+    }
+
+    #[sqlx::test]
+    async fn get_org_model_reports_the_override_when_set(pool: PgPool) {
+        crate::db::set_org_model_override(&pool, 999, "claude-opus-5", "tester")
+            .await
+            .unwrap();
+        let state = test_state(pool, vec!["claude-opus-5".to_string()]);
+        let response = get_org_model(caller(&["repo:read"]), State(state), Path(999)).await;
+        let body = body_json(response).await;
+        assert_eq!(body["model"], "claude-opus-5");
+        assert_eq!(body["source"], "org");
     }
 
     #[sqlx::test]
