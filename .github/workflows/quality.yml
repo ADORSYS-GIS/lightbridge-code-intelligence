@@ -145,7 +145,7 @@ jobs:
             -f sarif \
             -reporter github-pr-check \
             -filter-mode added \
-            -fail-on-error \
+            -fail-level error \
             -name "Quality Gate" \
             < .ci/quality/reports/quality.sarif
 
