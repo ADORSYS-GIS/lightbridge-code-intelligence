@@ -422,6 +422,7 @@ async fn dedups_against_a_webhook_triggered_review(pool: PgPool) {
         &pool,
         &db::NewTask {
             model_override: None,
+            check_runs_enabled: true,
             repository_id: repo_id,
             installation_id: 111,
             webhook_delivery_id: "wh-1".to_string(),
@@ -757,6 +758,7 @@ async fn get_update_is_fk_safe_after_underlying_task_deleted(pool: PgPool) {
         &pool,
         &db::NewTask {
             model_override: None,
+            check_runs_enabled: true,
             repository_id: repo_id,
             installation_id: 111,
             webhook_delivery_id: "wh-fk".to_string(),
@@ -941,6 +943,7 @@ async fn transitions_append_gapfree_events_and_non_a2a_appends_none(pool: PgPool
         &pool,
         &db::NewTask {
             model_override: None,
+            check_runs_enabled: true,
             repository_id: seed_approved_repo(&pool, "acme", "api", 111).await,
             installation_id: 111,
             webhook_delivery_id: "wh-plain".to_string(),

@@ -582,6 +582,155 @@ pub async fn set_org_model(
     }
 }
 
+/// The per-field patch body for `POST /admin/repositories/{id}/settings/override`.
+///
+/// Each field is `Option<Option<T>>` with `#[serde(default)]`, which distinguishes the three cases the
+/// override semantics need: **absent** = leave the stored value alone, explicit **`null`** = clear the
+/// override (fall back to the repo file / built-in default), **value** = set it. This is subtle enough
+/// that both the absent and null cases are unit-tested.
+#[derive(Debug, Default, PartialEq, Deserialize)]
+pub struct SetSettingsBody {
+    #[serde(default, deserialize_with = "double_option")]
+    pub check_run_reporting: Option<Option<bool>>,
+    #[serde(default, deserialize_with = "double_option")]
+    pub review_on_pr_open: Option<Option<bool>>,
+    #[serde(default, deserialize_with = "double_option")]
+    pub review_on_push: Option<Option<bool>>,
+    #[serde(default, deserialize_with = "double_option")]
+    pub push_strategy: Option<Option<String>>,
+    #[serde(default, deserialize_with = "double_option")]
+    pub push_debounce_seconds: Option<Option<i32>>,
+    #[serde(default, deserialize_with = "double_option")]
+    pub dedup_scope: Option<Option<String>>,
+}
+
+/// Deserialize a present-but-null field as `Some(None)` rather than `None`, so an explicit `null`
+/// (clear the override) is distinguishable from an omitted key (leave it alone). `#[serde(default)]`
+/// alone collapses both to `None`.
+fn double_option<'de, T, D>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    T: Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    Deserialize::deserialize(deserializer).map(Some)
+}
+
+impl SetSettingsBody {
+    fn into_patch(self) -> crate::db::RepoSettingsPatch {
+        crate::db::RepoSettingsPatch {
+            check_run_reporting: self.check_run_reporting,
+            review_on_pr_open: self.review_on_pr_open,
+            review_on_push: self.review_on_push,
+            push_strategy: self.push_strategy,
+            push_debounce_seconds: self.push_debounce_seconds,
+            dedup_scope: self.dedup_scope,
+        }
+    }
+}
+
+/// `GET /admin/repositories/{id}/settings` — a repo's **effective** review settings, each with the
+/// layer that produced it (`default` / `file` / `db`). Requires `repo:read`.
+///
+/// The provenance is the point: with three layers, "why is this repo not posting check runs?" is
+/// otherwise unanswerable without reading both the repo file and the database by hand.
+pub async fn get_settings(
+    caller: Caller,
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Response {
+    if let Err(e) = caller.require("repo:read") {
+        return e.into_response();
+    }
+    let Some(pool) = state.db.as_ref() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "no database").into_response();
+    };
+    let (repo, repo_ref) = match load_repo_ref(pool, id).await {
+        Ok(pair) => pair,
+        Err(response) => return *response,
+    };
+    // An unconfigured platform is not fatal here (unlike `set_preset`, which must write): resolution
+    // simply skips the file layer and reports default/db values, which is still useful.
+    let platform = pick_platform(&state, repo.platform, repo_ref.installation_id).ok();
+    let resolved =
+        crate::settings::resolve_repo_settings(pool, platform, &repo_ref, &repo.default_branch, id)
+            .await;
+    Json(serde_json::json!({ "repository_id": id, "settings": resolved })).into_response()
+}
+
+/// `POST /admin/repositories/{id}/settings/override` — set or clear this repo's DB-side overrides,
+/// which BEAT the repo's own `.lightbridge-code-review.jsonc`. Requires `repo:configure`.
+///
+/// The `/override` path segment is deliberate: `POST .../preset` commits to the repo **file**, whereas
+/// this writes the operator row that wins over it. Values are validated here rather than only by the
+/// table's CHECK constraints so a typo returns a self-explanatory 400 instead of a 500.
+pub async fn set_settings_override(
+    caller: Caller,
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(body): Json<SetSettingsBody>,
+) -> Response {
+    if let Err(e) = caller.require("repo:configure") {
+        return e.into_response();
+    }
+    let Some(pool) = state.db.as_ref() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "no database").into_response();
+    };
+    let patch = body.into_patch();
+    if patch.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            "no settings supplied; send at least one field (a null value clears that override)",
+        )
+            .into_response();
+    }
+    if let Some(Some(strategy)) = patch.push_strategy.as_ref()
+        && crate::settings::PushStrategy::parse_public(strategy).is_none()
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!("unknown push_strategy {strategy:?}; expected supersede, debounce or every"),
+        )
+            .into_response();
+    }
+    if let Some(Some(scope)) = patch.dedup_scope.as_ref()
+        && crate::settings::DedupScope::parse_public(scope).is_none()
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!("unknown dedup_scope {scope:?}; expected pr or commit"),
+        )
+            .into_response();
+    }
+    if let Some(Some(secs)) = patch.push_debounce_seconds
+        && !crate::settings::debounce_seconds_in_range(secs)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!("push_debounce_seconds {secs} out of range; expected 10..=900"),
+        )
+            .into_response();
+    }
+    // 404 on an unknown repo before writing, mirroring `set_repo_model`.
+    match crate::db::repository_status(pool, id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return (StatusCode::NOT_FOUND, "repository not found").into_response(),
+        Err(error) => {
+            tracing::error!(%error, repo_id = id, "settings override: repository lookup failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "query error").into_response();
+        }
+    }
+    match crate::db::set_repo_settings(pool, id, &patch, caller.claims.identity()).await {
+        Ok(()) => {
+            tracing::info!(repo_id = id, by = %caller.claims.identity(), "repo settings override updated");
+            (StatusCode::NO_CONTENT).into_response()
+        }
+        Err(error) => {
+            tracing::error!(%error, repo_id = id, "writing repo settings override failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "query error").into_response()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use axum::body::to_bytes;
@@ -649,6 +798,228 @@ mod tests {
             permissions_claim: std::sync::Arc::new("permissions".to_string()),
             model_allowlist: std::sync::Arc::new(Vec::new()),
         }
+    }
+
+    // --- Per-repo settings overrides (epic #566) ---
+
+    /// The override endpoint writes the DB layer, which BEATS the repo file — so it must be gated on
+    /// `repo:configure`, not merely `repo:read`.
+    #[sqlx::test]
+    async fn set_settings_override_without_permission_is_forbidden(pool: sqlx::PgPool) {
+        let repo_id = insert_gitlab_repo(&pool).await;
+        let state = gitlab_only_state(pool, "http://unused");
+        let response = set_settings_override(
+            caller_with(&["repo:read"]),
+            State(state),
+            Path(repo_id),
+            Json(SetSettingsBody {
+                check_run_reporting: Some(Some(false)),
+                ..Default::default()
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[sqlx::test]
+    async fn set_settings_override_rejects_an_empty_body(pool: sqlx::PgPool) {
+        let repo_id = insert_gitlab_repo(&pool).await;
+        let state = gitlab_only_state(pool, "http://unused");
+        let response = set_settings_override(
+            caller_with(&["repo:configure"]),
+            State(state),
+            Path(repo_id),
+            Json(SetSettingsBody::default()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// A typo must come back as a self-explanatory 400, not a CHECK-constraint 500.
+    #[sqlx::test]
+    async fn set_settings_override_rejects_unknown_enum_values(pool: sqlx::PgPool) {
+        let repo_id = insert_gitlab_repo(&pool).await;
+        let state = gitlab_only_state(pool.clone(), "http://unused");
+        let response = set_settings_override(
+            caller_with(&["repo:configure"]),
+            State(state),
+            Path(repo_id),
+            Json(SetSettingsBody {
+                push_strategy: Some(Some("supercede".to_string())),
+                ..Default::default()
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let state = gitlab_only_state(pool.clone(), "http://unused");
+        let response = set_settings_override(
+            caller_with(&["repo:configure"]),
+            State(state),
+            Path(repo_id),
+            Json(SetSettingsBody {
+                push_debounce_seconds: Some(Some(99_999)),
+                ..Default::default()
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        // Nothing may have been written by either rejected call.
+        assert!(
+            crate::db::get_repo_settings(&pool, repo_id)
+                .await
+                .unwrap()
+                .is_none(),
+            "a rejected override must not write a row"
+        );
+    }
+
+    #[sqlx::test]
+    async fn set_settings_override_unknown_repo_is_not_found(pool: sqlx::PgPool) {
+        let state = gitlab_only_state(pool, "http://unused");
+        let response = set_settings_override(
+            caller_with(&["repo:configure"]),
+            State(state),
+            Path(999_999),
+            Json(SetSettingsBody {
+                review_on_push: Some(Some(true)),
+                ..Default::default()
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// The three-way body semantics: absent leaves a stored value alone, explicit null clears it.
+    #[sqlx::test]
+    async fn override_absent_field_is_left_alone_and_explicit_null_clears(pool: sqlx::PgPool) {
+        let repo_id = insert_gitlab_repo(&pool).await;
+
+        // Set two fields.
+        let state = gitlab_only_state(pool.clone(), "http://unused");
+        let response = set_settings_override(
+            caller_with(&["repo:configure"]),
+            State(state),
+            Path(repo_id),
+            Json(SetSettingsBody {
+                check_run_reporting: Some(Some(false)),
+                review_on_push: Some(Some(true)),
+                ..Default::default()
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        // Touch only one of them; the other must survive untouched.
+        let state = gitlab_only_state(pool.clone(), "http://unused");
+        set_settings_override(
+            caller_with(&["repo:configure"]),
+            State(state),
+            Path(repo_id),
+            Json(SetSettingsBody {
+                review_on_push: Some(Some(false)),
+                ..Default::default()
+            }),
+        )
+        .await;
+        let row = crate::db::get_repo_settings(&pool, repo_id)
+            .await
+            .unwrap()
+            .expect("row");
+        assert_eq!(
+            row.check_run_reporting,
+            Some(false),
+            "an ABSENT field must not clobber the stored value"
+        );
+        assert_eq!(row.review_on_push, Some(false));
+
+        // An explicit null clears just that field.
+        let state = gitlab_only_state(pool.clone(), "http://unused");
+        set_settings_override(
+            caller_with(&["repo:configure"]),
+            State(state),
+            Path(repo_id),
+            Json(SetSettingsBody {
+                check_run_reporting: Some(None),
+                ..Default::default()
+            }),
+        )
+        .await;
+        let row = crate::db::get_repo_settings(&pool, repo_id)
+            .await
+            .unwrap()
+            .expect("row");
+        assert_eq!(
+            row.check_run_reporting, None,
+            "an explicit null must clear the override back to file/default"
+        );
+        assert_eq!(
+            row.review_on_push,
+            Some(false),
+            "clearing one field must not disturb another"
+        );
+    }
+
+    /// `Option<Option<T>>` + the custom deserializer is what makes absent-vs-null distinguishable;
+    /// plain `#[serde(default)]` collapses both to `None`.
+    #[test]
+    fn settings_body_distinguishes_absent_from_explicit_null() {
+        let absent: SetSettingsBody = serde_json::from_str("{}").unwrap();
+        assert!(absent.check_run_reporting.is_none(), "absent = leave alone");
+
+        let null: SetSettingsBody =
+            serde_json::from_str(r#"{"check_run_reporting": null}"#).unwrap();
+        assert_eq!(
+            null.check_run_reporting,
+            Some(None),
+            "explicit null = clear the override"
+        );
+
+        let set: SetSettingsBody =
+            serde_json::from_str(r#"{"check_run_reporting": true}"#).unwrap();
+        assert_eq!(set.check_run_reporting, Some(Some(true)));
+    }
+
+    /// The read endpoint reports which layer produced each value — the thing that makes a
+    /// three-layer system debuggable.
+    #[sqlx::test]
+    async fn get_settings_reports_defaults_then_the_db_layer(pool: sqlx::PgPool) {
+        let repo_id = insert_gitlab_repo(&pool).await;
+
+        let state = gitlab_only_state(pool.clone(), "http://unused");
+        let response = get_settings(caller_with(&["repo:read"]), State(state), Path(repo_id)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["settings"]["check_run_reporting"]["value"], true);
+        assert_eq!(json["settings"]["check_run_reporting"]["source"], "default");
+
+        crate::db::set_repo_settings(
+            &pool,
+            repo_id,
+            &crate::db::RepoSettingsPatch {
+                check_run_reporting: Some(Some(false)),
+                ..Default::default()
+            },
+            "tester",
+        )
+        .await
+        .unwrap();
+
+        let state = gitlab_only_state(pool, "http://unused");
+        let response = get_settings(caller_with(&["repo:read"]), State(state), Path(repo_id)).await;
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["settings"]["check_run_reporting"]["value"], false);
+        assert_eq!(
+            json["settings"]["check_run_reporting"]["source"], "db",
+            "provenance must name the layer that won"
+        );
     }
 
     async fn insert_gitlab_repo(pool: &sqlx::PgPool) -> i64 {

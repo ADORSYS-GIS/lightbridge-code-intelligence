@@ -105,34 +105,11 @@ pub(crate) struct TriggersConfig {
     pub(crate) dedup_scope: Option<String>,
 }
 
-/// Resolve the preset name a task under `entry` should run with. Fetches the repo's
-/// `.lightbridge-code-review.jsonc` at `ref_` via `platform` (a single small file fetch, not a clone —
-/// keeps task creation cheap per story #494's NFR). Never fails: every error path (fetch failure,
-/// absent file, oversized, malformed JSONC, schema-invalid) degrades to the platform-default mapping.
-pub async fn resolve_preset(
-    platform: &dyn CodePlatform,
-    repo: &RepoRef,
-    ref_: &str,
-    entry: EntryPoint,
-) -> String {
-    let config = fetch_repo_preset_config(platform, repo, ref_).await;
-    resolve_from_config(config.as_ref(), entry)
-}
-
-/// Like [`resolve_preset`], but tolerates a missing platform client (`platform: None` — e.g. GitHub
-/// App env unset in a dev deploy) by falling back straight to the platform-default mapping, same as
-/// any other resolution failure. Every webhook call site goes through this rather than `resolve_preset`
-/// directly, since "is this platform even configured" varies per handler.
-pub async fn resolve_preset_or_default(
-    platform: Option<&dyn CodePlatform>,
-    repo: &RepoRef,
-    ref_: &str,
-    entry: EntryPoint,
-) -> String {
-    match platform {
-        Some(platform) => resolve_preset(platform, repo, ref_, entry).await,
-        None => entry.platform_default_preset().to_string(),
-    }
+/// Map an already-fetched config to the preset for `entry`. Pure — split out so
+/// [`crate::settings::resolve_preset_and_settings`] can derive the preset from the SAME fetch it uses
+/// for the settings, instead of paying a second `get_repo_file` per webhook.
+pub(crate) fn preset_from_config(config: Option<&RepoPresetConfig>, entry: EntryPoint) -> String {
+    resolve_from_config(config, entry)
 }
 
 fn resolve_from_config(config: Option<&RepoPresetConfig>, entry: EntryPoint) -> String {
@@ -202,6 +179,7 @@ mod tests {
         let config = RepoPresetConfig {
             preset: Some("ultra".to_string()),
             entry_points: HashMap::new(),
+            ..Default::default()
         };
         assert_eq!(
             resolve_from_config(Some(&config), EntryPoint::PrOpen),
@@ -218,6 +196,7 @@ mod tests {
         let config = RepoPresetConfig {
             preset: Some("ultra".to_string()),
             entry_points: HashMap::from([("pr_open".to_string(), "fast".to_string())]),
+            ..Default::default()
         };
         assert_eq!(
             resolve_from_config(Some(&config), EntryPoint::PrOpen),

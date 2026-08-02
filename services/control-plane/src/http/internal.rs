@@ -1876,6 +1876,7 @@ pub async fn finalize_review(
     // reporting), mirroring the `post_pr_review` gate at dispatch time so a check is never resolved
     // without ever being opened. Best-effort: the review itself already finalized above.
     if context.target_type == "pull_request"
+        && context.check_runs_enabled
         && let Some(head_sha) = context.head_sha.as_deref()
     {
         let conclusion =
@@ -2102,7 +2103,8 @@ async fn handle_review_failure(
         tracing::warn!(%error, task_id = %id, "enqueueing failure notice failed (non-fatal)");
     }
     let (check_title, check_summary) = crate::review::render_check_output(check_conclusion, None);
-    if let Some(head_sha) = context.head_sha.as_deref()
+    if context.check_runs_enabled
+        && let Some(head_sha) = context.head_sha.as_deref()
         && let Err(error) = crate::outbox::enqueue_check_run_resolve(
             pool,
             &t,

@@ -9,7 +9,7 @@
 //! no repo PR needed, and it beats the file.
 //!
 //! Posture is copied deliberately from [`crate::model::resolve_model_override`] and
-//! [`crate::preset::resolve_preset_or_default`]: [`resolve_repo_settings`] does its own I/O, tolerates
+//! [`crate::settings::resolve_preset_and_settings`]: [`resolve_repo_settings`] does its own I/O, tolerates
 //! an absent platform (the A2A path holds no forge credentials), degrades with a `tracing::warn!` on
 //! every error, and returns no `Result` — **resolving settings must never fail task creation**.
 //!
@@ -50,12 +50,10 @@ impl PushStrategy {
         }
     }
 
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Supersede => "supersede",
-            Self::Debounce => "debounce",
-            Self::Every => "every",
-        }
+    /// Validation entry point for the admin API, so an operator's typo is a self-explanatory 400
+    /// rather than a CHECK-constraint 500. Same parser the resolution layer uses.
+    pub fn parse_public(s: &str) -> Option<Self> {
+        Self::parse(s)
     }
 }
 
@@ -78,11 +76,9 @@ impl DedupScope {
         }
     }
 
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Pr => "pr",
-            Self::Commit => "commit",
-        }
+    /// See [`PushStrategy::parse_public`].
+    pub fn parse_public(s: &str) -> Option<Self> {
+        Self::parse(s)
     }
 }
 
@@ -142,6 +138,13 @@ const DEFAULT_DEDUP_SCOPE: DedupScope = DedupScope::Pr;
 const DEBOUNCE_MIN_SECS: u64 = 10;
 const DEBOUNCE_MAX_SECS: u64 = 900;
 
+/// Whether a debounce quiet period is inside the accepted range. Used by the admin API to reject an
+/// out-of-range value up front; resolution itself clamps rather than rejects, since a value already in
+/// the database or a repo file must never break task creation.
+pub fn debounce_seconds_in_range(secs: i32) -> bool {
+    (DEBOUNCE_MIN_SECS..=DEBOUNCE_MAX_SECS).contains(&(secs.max(0) as u64)) && secs >= 0
+}
+
 /// Apply the precedence rule: DB override, else file, else built-in default — **per field**, so a repo
 /// can override one setting in the file and another in the DB without either clobbering the other.
 ///
@@ -150,11 +153,7 @@ pub(crate) fn merge_settings(
     file: Option<&TriggersConfig>,
     db: Option<&RepoSettingsRow>,
 ) -> ResolvedSettings {
-    fn pick_bool(
-        db: Option<bool>,
-        file: Option<bool>,
-        default: bool,
-    ) -> Sourced<bool> {
+    fn pick_bool(db: Option<bool>, file: Option<bool>, default: bool) -> Sourced<bool> {
         match (db, file) {
             (Some(v), _) => Sourced::new(v, Layer::Db),
             (None, Some(v)) => Sourced::new(v, Layer::File),
@@ -243,12 +242,62 @@ fn clamp_debounce(secs: i32, layer: Layer) -> Duration {
     Duration::from_secs(clamped)
 }
 
+/// Resolve a task's preset **and** the repo's settings from a SINGLE config-file fetch.
+///
+/// Every webhook call site needs both, and they read the same file. Calling
+/// [`crate::settings::resolve_preset_and_settings`] and [`resolve_repo_settings`] separately would issue
+/// two `get_repo_file` round-trips per webhook — task creation is on the hot path (story #494's NFR),
+/// so the fetch is done once here and both values derived from it.
+pub async fn resolve_preset_and_settings(
+    pool: &PgPool,
+    platform: Option<&dyn CodePlatform>,
+    repo: &RepoRef,
+    ref_: &str,
+    entry: crate::preset::EntryPoint,
+    repository_id: i64,
+) -> (String, ResolvedSettings) {
+    let file = match platform {
+        Some(platform) => crate::preset::fetch_repo_preset_config(platform, repo, ref_).await,
+        None => None,
+    };
+    let preset = crate::preset::preset_from_config(file.as_ref(), entry);
+    let db = read_db_settings(pool, repository_id).await;
+    let settings = merge_settings(file.and_then(|c| c.triggers).as_ref(), db.as_ref());
+    (preset, settings)
+}
+
+/// Read the DB override row, degrading to `None` (with a warning) on any error — a database blip must
+/// fall through to the file/default layers, never fail task creation.
+async fn read_db_settings(pool: &PgPool, repository_id: i64) -> Option<RepoSettingsRow> {
+    match crate::db::get_repo_settings(pool, repository_id).await {
+        Ok(row) => row,
+        Err(error) => {
+            tracing::warn!(
+                %error, repository_id,
+                "reading repo settings failed (non-fatal); falling back to file/default"
+            );
+            None
+        }
+    }
+}
+
+/// Resolve a repo's settings from the DB override + built-in defaults only, skipping the config-file
+/// layer entirely.
+///
+/// For callers that hold NO forge credentials — the A2A role's trust boundary means it cannot fetch
+/// `.lightbridge-code-review.jsonc` at all (the same reason it uses the entry point's default preset
+/// rather than resolving one). Taking a dedicated entry point instead of a `platform: None` plus a
+/// fabricated `RepoRef` keeps that constraint explicit at the call site.
+pub async fn resolve_repo_settings_db_only(pool: &PgPool, repository_id: i64) -> ResolvedSettings {
+    merge_settings(None, read_db_settings(pool, repository_id).await.as_ref())
+}
+
 /// Resolve a repo's settings across all three layers.
 ///
 /// Does its own I/O and swallows every error (with a warning) so a DB blip or an unreachable forge
 /// degrades to the next layer instead of failing task creation. `platform: None` skips the file layer
 /// entirely — the A2A path holds no forge credentials, exactly as
-/// [`crate::preset::resolve_preset_or_default`] already handles.
+/// [`crate::settings::resolve_preset_and_settings`] already handles.
 pub async fn resolve_repo_settings(
     pool: &PgPool,
     platform: Option<&dyn CodePlatform>,
@@ -262,16 +311,7 @@ pub async fn resolve_repo_settings(
             .and_then(|c| c.triggers),
         None => None,
     };
-    let db = match crate::db::get_repo_settings(pool, repository_id).await {
-        Ok(row) => row,
-        Err(error) => {
-            tracing::warn!(
-                %error, repository_id,
-                "reading repo settings failed (non-fatal); falling back to file/default"
-            );
-            None
-        }
-    };
+    let db = read_db_settings(pool, repository_id).await;
     merge_settings(file.as_ref(), db.as_ref())
 }
 
@@ -363,7 +403,10 @@ mod tests {
         let s = merge_settings(Some(&file), Some(&db));
         assert!(!s.check_run_reporting.value);
         assert_eq!(s.check_run_reporting.source, Layer::Db);
-        assert!(s.review_on_push.value, "file value survives a partial db row");
+        assert!(
+            s.review_on_push.value,
+            "file value survives a partial db row"
+        );
         assert_eq!(s.review_on_push.source, Layer::File);
         assert_eq!(
             s.review_on_pr_open.source,
@@ -393,8 +436,7 @@ mod tests {
         );
         assert_eq!(s.push_strategy.source, Layer::File);
         assert_eq!(
-            s.dedup_scope.value,
-            DEFAULT_DEDUP_SCOPE,
+            s.dedup_scope.value, DEFAULT_DEDUP_SCOPE,
             "a bad value with no other layer falls to the default"
         );
         assert_eq!(s.dedup_scope.source, Layer::Default);
@@ -431,20 +473,24 @@ mod tests {
 
     #[test]
     fn strategy_and_scope_parse_case_insensitively_and_round_trip() {
-        assert_eq!(PushStrategy::parse("SuperSede"), Some(PushStrategy::Supersede));
+        assert_eq!(
+            PushStrategy::parse("SuperSede"),
+            Some(PushStrategy::Supersede)
+        );
         assert_eq!(PushStrategy::parse(" every "), Some(PushStrategy::Every));
         assert_eq!(PushStrategy::parse("nope"), None);
         assert_eq!(DedupScope::parse("PR"), Some(DedupScope::Pr));
         assert_eq!(DedupScope::parse("nope"), None);
-        for s in [
-            PushStrategy::Supersede,
-            PushStrategy::Debounce,
-            PushStrategy::Every,
+        // The wire strings must match the CHECK constraint in migration 0036 exactly.
+        for (text, expected) in [
+            ("supersede", PushStrategy::Supersede),
+            ("debounce", PushStrategy::Debounce),
+            ("every", PushStrategy::Every),
         ] {
-            assert_eq!(PushStrategy::parse(s.as_str()), Some(s));
+            assert_eq!(PushStrategy::parse(text), Some(expected));
         }
-        for s in [DedupScope::Pr, DedupScope::Commit] {
-            assert_eq!(DedupScope::parse(s.as_str()), Some(s));
+        for (text, expected) in [("pr", DedupScope::Pr), ("commit", DedupScope::Commit)] {
+            assert_eq!(DedupScope::parse(text), Some(expected));
         }
     }
 }

@@ -731,7 +731,8 @@ async fn handle_gitlab_merge_request(
                 platform_repo_id: project_id,
                 installation_id,
             };
-            let preset = crate::preset::resolve_preset_or_default(
+            let (preset, settings) = crate::settings::resolve_preset_and_settings(
+                pool,
                 state
                     .gitlab
                     .as_ref()
@@ -740,6 +741,7 @@ async fn handle_gitlab_merge_request(
                 &repo_ref,
                 base_sha.as_deref().unwrap_or(default_branch),
                 crate::preset::EntryPoint::PrOpen,
+                repository_id,
             )
             .await;
             let model_override =
@@ -759,6 +761,7 @@ async fn handle_gitlab_merge_request(
                 trigger_comment_id: None,
                 trace_context: lci_observability::current_traceparent(),
                 model_override,
+                check_runs_enabled: settings.check_run_reporting.value,
             };
             create_review_task(pool, task, delivery_id).await;
         }
@@ -963,7 +966,8 @@ async fn handle_gitlab_note(
         platform_repo_id: project_id,
         installation_id,
     };
-    let preset = crate::preset::resolve_preset_or_default(
+    let (preset, settings) = crate::settings::resolve_preset_and_settings(
+        pool,
         state
             .gitlab
             .as_ref()
@@ -972,6 +976,7 @@ async fn handle_gitlab_note(
         &repo_ref,
         base_sha.as_deref().unwrap_or(default_branch),
         crate::preset::EntryPoint::Mention,
+        repository_id,
     )
     .await;
 
@@ -994,6 +999,7 @@ async fn handle_gitlab_note(
         trigger_comment_id,
         trace_context: lci_observability::current_traceparent(),
         model_override,
+        check_runs_enabled: settings.check_run_reporting.value,
     };
     tracing::info!(
         delivery_id,
@@ -1126,7 +1132,8 @@ async fn handle_bitbucket_pullrequest(
                 platform_repo_id: installation_id,
                 installation_id,
             };
-            let preset = crate::preset::resolve_preset_or_default(
+            let (preset, settings) = crate::settings::resolve_preset_and_settings(
+                pool,
                 state
                     .bitbucket
                     .as_ref()
@@ -1135,6 +1142,7 @@ async fn handle_bitbucket_pullrequest(
                 &repo_ref,
                 base_sha.as_deref().unwrap_or(&default_branch),
                 crate::preset::EntryPoint::PrOpen,
+                repository_id,
             )
             .await;
             let model_override =
@@ -1154,6 +1162,7 @@ async fn handle_bitbucket_pullrequest(
                 trigger_comment_id: None,
                 trace_context: lci_observability::current_traceparent(),
                 model_override,
+                check_runs_enabled: settings.check_run_reporting.value,
             };
             create_review_task(pool, task, delivery_id).await;
         }
@@ -1340,11 +1349,13 @@ async fn handle_bitbucket_comment(
         }
     };
 
-    let preset = crate::preset::resolve_preset_or_default(
+    let (preset, settings) = crate::settings::resolve_preset_and_settings(
+        pool,
         Some(client as &dyn CodePlatform),
         &repo_ref,
         base_sha.as_deref().unwrap_or(&default_branch),
         crate::preset::EntryPoint::Mention,
+        repository_id,
     )
     .await;
 
@@ -1367,6 +1378,7 @@ async fn handle_bitbucket_comment(
         trigger_comment_id,
         trace_context: lci_observability::current_traceparent(),
         model_override,
+        check_runs_enabled: settings.check_run_reporting.value,
     };
     tracing::info!(
         delivery_id,
@@ -1499,7 +1511,8 @@ async fn handle_pull_request(
                 platform_repo_id: github_repo_id,
                 installation_id,
             };
-            let preset = crate::preset::resolve_preset_or_default(
+            let (preset, settings) = crate::settings::resolve_preset_and_settings(
+                pool,
                 state
                     .platforms
                     .get(&Platform::GitHub)
@@ -1507,6 +1520,7 @@ async fn handle_pull_request(
                 &repo_ref,
                 base_sha.as_deref().unwrap_or(default_branch),
                 crate::preset::EntryPoint::PrOpen,
+                repository_id,
             )
             .await;
             let model_override =
@@ -1528,6 +1542,7 @@ async fn handle_pull_request(
                 trigger_comment_id: None,
                 trace_context: lci_observability::current_traceparent(),
                 model_override,
+                check_runs_enabled: settings.check_run_reporting.value,
             };
             create_review_task(pool, task, delivery_id).await;
         }
@@ -1719,11 +1734,13 @@ async fn handle_issue_comment(
 
     // ADR-0103: resolve the repo's configured preset for the mention entry point, reading the repo
     // config at the PR's BASE ref when there is one (fork-safe), else the default branch.
-    let preset = crate::preset::resolve_preset_or_default(
+    let (preset, settings) = crate::settings::resolve_preset_and_settings(
+        pool,
         github_platform.map(std::sync::Arc::as_ref),
         &repo_ref,
         base_sha.as_deref().unwrap_or(default_branch),
         crate::preset::EntryPoint::Mention,
+        repository_id,
     )
     .await;
 
@@ -1760,6 +1777,7 @@ async fn handle_issue_comment(
         trigger_comment_id,
         trace_context: lci_observability::current_traceparent(),
         model_override,
+        check_runs_enabled: settings.check_run_reporting.value,
     };
     tracing::info!(
         delivery_id,

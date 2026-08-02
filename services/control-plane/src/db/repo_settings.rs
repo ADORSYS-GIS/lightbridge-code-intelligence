@@ -107,13 +107,3 @@ pub async fn set_repo_settings(
     .await
     .map(|_| ())
 }
-
-/// Drop a repo's settings row entirely (every setting back to file/default). Returns whether a row
-/// existed.
-pub async fn clear_repo_settings(pool: &PgPool, repository_id: i64) -> Result<bool, sqlx::Error> {
-    sqlx::query("DELETE FROM repo_settings WHERE repository_id = $1")
-        .bind(repository_id)
-        .execute(pool)
-        .await
-        .map(|r| r.rows_affected() > 0)
-}

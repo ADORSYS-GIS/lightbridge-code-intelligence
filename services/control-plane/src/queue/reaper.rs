@@ -234,7 +234,8 @@ async fn enqueue_reaper_failure_notice(
     // to a timeout than a clean failure.
     let (check_title, check_summary) =
         crate::review::render_check_output(CheckConclusion::TimedOut, None);
-    if let Some(head_sha) = context.head_sha.as_deref()
+    if context.check_runs_enabled
+        && let Some(head_sha) = context.head_sha.as_deref()
         && let Err(error) = crate::outbox::enqueue_check_run_resolve(
             pool,
             &t,
@@ -365,6 +366,7 @@ mod tests {
             pool,
             &db::NewTask {
                 model_override: None,
+                check_runs_enabled: true,
                 repository_id: repo_id,
                 installation_id: 99,
                 webhook_delivery_id: "d1".to_string(),

@@ -441,6 +441,11 @@ async fn start_check_run_signal(pool: &PgPool, task: &db::ClaimedTask) {
             return;
         }
     };
+    // Epic #566: per-repo opt-out, snapshotted onto the task at creation so this gate and the resolve
+    // gates can never disagree about whether a check exists.
+    if !context.check_runs_enabled {
+        return;
+    }
     let t = crate::outbox::Target {
         task_id: Some(task.id),
         platform: context.platform,
@@ -567,6 +572,7 @@ mod tests {
             pool,
             &NewTask {
                 model_override: None,
+                check_runs_enabled: true,
                 repository_id: repo_id,
                 installation_id: 99,
                 webhook_delivery_id: "d1".to_string(),

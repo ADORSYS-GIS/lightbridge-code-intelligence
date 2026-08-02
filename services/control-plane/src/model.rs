@@ -15,7 +15,7 @@ use sqlx::PgPool;
 /// Resolve the model override a new task should run under: `repo_model_overrides` (if set) → else
 /// `org_model_overrides` keyed by the repo's `installation_id` (if set) → else `None` (the preset's
 /// own configured model applies unchanged). Never fails a task creation: a lookup error degrades to
-/// `None`, same as [`crate::preset::resolve_preset_or_default`]'s error handling.
+/// `None`, same as [`crate::settings::resolve_preset_and_settings`]'s error handling.
 pub async fn resolve_model_override(
     pool: &PgPool,
     repository_id: i64,

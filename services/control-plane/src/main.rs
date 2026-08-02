@@ -349,6 +349,14 @@ fn api_v2_router() -> Router<AppState> {
         .route("/admin/repositories/{id}/approve", post(admin::approve))
         .route("/admin/repositories/{id}/deny", post(admin::deny))
         .route(
+            "/admin/repositories/{id}/settings",
+            axum::routing::get(admin::get_settings),
+        )
+        .route(
+            "/admin/repositories/{id}/settings/override",
+            post(admin::set_settings_override),
+        )
+        .route(
             "/admin/repositories/{id}/preset",
             get(admin::get_preset).post(admin::set_preset),
         )
