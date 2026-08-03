@@ -139,6 +139,7 @@ rmcp = { version = "2.2", default-features = false, features = [
     "transport-streamable-http-client-reqwest",
     "server",
     "transport-streamable-http-server",
+    "macros",
 ] }
 
 # --- control-plane: A2A agent surface (RFC-0006 / ADR pending, ticket #299) ---

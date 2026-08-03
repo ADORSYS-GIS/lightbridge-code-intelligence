@@ -4,8 +4,18 @@ use axum::{
     http::{HeaderValue, StatusCode, header},
     middleware::Next,
     response::{IntoResponse, Response},
-    routing::{get, post},
 };
+use rmcp::{
+    ServerHandler,
+    handler::server::{router::tool::ToolRouter, wrapper::Parameters},
+    model::{ServerCapabilities, ServerInfo},
+    schemars, tool, tool_handler, tool_router,
+    transport::streamable_http_server::{
+        StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
+    },
+};
+use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 use crate::{AppState, jwt::AuthError};
 
@@ -48,24 +58,64 @@ async fn mcp_auth(
     next.run(req).await
 }
 
-async fn mcp_sse_handler(State(_state): State<AppState>) -> impl IntoResponse {
-    (StatusCode::NOT_IMPLEMENTED, "SSE not yet implemented")
+#[derive(Clone)]
+struct McpServer {
+    state: AppState,
+    tool_router: ToolRouter<Self>,
 }
 
-async fn mcp_message_handler(State(_state): State<AppState>, _body: String) -> impl IntoResponse {
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        "Message routing not yet implemented",
-    )
+impl McpServer {
+    fn new(state: AppState) -> Self {
+        Self {
+            state,
+            tool_router: Self::tool_router(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+struct VectorSearchArgs {
+    platform: String,
+    org: String,
+    repo: String,
+    query: String,
+    limit: Option<usize>,
+}
+
+#[tool_router]
+impl McpServer {
+    #[tool(description = "Search vector index across the repository")]
+    async fn vector_search(
+        &self,
+        Parameters(args): Parameters<VectorSearchArgs>,
+    ) -> Result<String, rmcp::ErrorData> {
+        // Placeholder for actual vector search DB call
+        Ok(format!(
+            "Vector search executed on {}/{}/{} with query: {}",
+            args.platform, args.org, args.repo, args.query
+        ))
+    }
+}
+
+#[tool_handler(router = self.tool_router)]
+impl ServerHandler for McpServer {
+    fn get_info(&self) -> ServerInfo {
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    }
 }
 
 pub fn mcp_router(state: AppState) -> Router {
-    let sse = get(mcp_sse_handler);
-    let message = post(mcp_message_handler);
+    let service: StreamableHttpService<McpServer, LocalSessionManager> = StreamableHttpService::new(
+        {
+            let state = state.clone();
+            move || Ok(McpServer::new(state.clone()))
+        },
+        Arc::new(LocalSessionManager::default()),
+        StreamableHttpServerConfig::default().disable_allowed_hosts(), // Allow Traefik/Ingress external hosts
+    );
 
     Router::new()
-        .route("/mcp", sse)
-        .route("/mcp/message", message)
+        .nest_service("/mcp", service)
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             mcp_auth,
