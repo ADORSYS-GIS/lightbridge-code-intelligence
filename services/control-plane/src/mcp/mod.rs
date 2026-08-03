@@ -22,7 +22,7 @@ fn bind_addr() -> String {
 }
 
 pub async fn run(state: AppState) -> anyhow::Result<()> {
-    // The MCP role requires a database and OIDC config, similar to A2A.
+    // The MCP role requires a database and OIDC config.
     if state.db.is_none() {
         anyhow::bail!("the mcp role requires DATABASE_URL");
     }
