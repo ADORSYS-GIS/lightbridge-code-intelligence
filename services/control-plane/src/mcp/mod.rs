@@ -8,6 +8,19 @@ use rmcp::transport::streamable_http_server::{
 };
 use std::sync::Arc;
 
+const DEFAULT_BIND: &str = "0.0.0.0:8080";
+
+fn bind_addr_from(value: Option<String>) -> String {
+    match value {
+        Some(v) if !v.trim().is_empty() => v,
+        _ => DEFAULT_BIND.to_string(),
+    }
+}
+
+fn bind_addr() -> String {
+    bind_addr_from(std::env::var("MCP_BIND").ok())
+}
+
 pub async fn run(state: AppState) -> anyhow::Result<()> {
     // The MCP role requires a database and OIDC config, similar to A2A.
     if state.db.is_none() {
@@ -19,7 +32,7 @@ pub async fn run(state: AppState) -> anyhow::Result<()> {
 
     crate::spawn_metrics_server(state.metrics.clone());
 
-    let addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
+    let addr = bind_addr();
 
     // Wire up the RMCP Streamable HTTP service with our ServerHandler.
     let service: StreamableHttpService<handler::LightbridgeMcpHandler, LocalSessionManager> =
