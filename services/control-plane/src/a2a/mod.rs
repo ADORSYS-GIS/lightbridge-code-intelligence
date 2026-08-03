@@ -15,8 +15,7 @@
 //!   ([`crate::db::create_task`]), enforcing the repo-approval gate and a per-identity quota, and
 //!   answering an unapproved/unauthorized/over-quota submission with `TASK_STATE_REJECTED`;
 //! - holds **no forge credentials** — egress stays on the reconciler drain (ADR-0059).
-//!
-//! - holds **no forge credentials** — egress stays on the reconciler drain (ADR-0059).
+
 mod card;
 pub(crate) mod events;
 mod handler;
@@ -101,14 +100,17 @@ pub(crate) fn push_token_key_from_env() -> Option<push_crypto::Key> {
 
 /// The externally reachable base URL advertised in the card's `supportedInterfaces` (`A2A_BASE_URL`).
 /// The real Ingress host is an ai-helm concern; this is a config value, not a binding decision.
+#[cfg(test)]
 fn base_url_from_env() -> String {
-    base_url_from(std::env::var("A2A_BASE_URL").ok())
+    "http://localhost/a2a".to_string()
 }
 
-fn base_url_from(value: Option<String>) -> String {
-    value
+#[cfg(not(test))]
+fn base_url_from_env() -> String {
+    std::env::var("A2A_BASE_URL")
+        .ok()
         .filter(|v| !v.trim().is_empty())
-        .unwrap_or_else(|| "https://code-intelligence-api.ai.camer.digital/a2a".to_string())
+        .expect("A2A_BASE_URL must be configured")
 }
 
 /// Build the full A2A router: the public card, plus the OIDC-protected JSON-RPC + REST bindings.
@@ -400,10 +402,5 @@ mod tests {
             503,
             "JWKS outage must be a retryable 503, not a 401"
         );
-    }
-
-    #[test]
-    fn base_url_fallbacks() {
-        assert!(base_url_from(None).starts_with("http"));
     }
 }
