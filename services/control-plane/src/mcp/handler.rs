@@ -1,12 +1,14 @@
-use crate::AppState;
 use super::auth::McpCallerContext;
+use crate::AppState;
 use rmcp::{
     ErrorData, RoleServer, ServerHandler,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
-    model::{ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerInfo},
+    model::{ServerCapabilities, ServerInfo},
+    schemars,
     service::RequestContext,
-    tool_handler,
+    tool, tool_handler, tool_router,
 };
+use serde::{Deserialize, Serialize};
 
 #[derive(Clone)]
 pub struct LightbridgeMcpHandler {
@@ -40,45 +42,41 @@ pub(crate) fn caller_from_request_context(
     Ok(caller.clone())
 }
 
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct VectorSearchArgs {
+    pub platform: String,
+    pub org: String,
+    pub repo: String,
+    pub query: String,
+    pub limit: Option<usize>,
+}
+
+#[tool_router]
+impl LightbridgeMcpHandler {
+    #[tool(
+        name = "vector_search",
+        description = "Search vector index across the repository"
+    )]
+    async fn vector_search_tool(
+        &self,
+        context: RequestContext<RoleServer>,
+        Parameters(args): Parameters<VectorSearchArgs>,
+    ) -> std::result::Result<String, ErrorData> {
+        let caller = caller_from_request_context(&context)?;
+
+        // Placeholder for actual vector search DB call.
+        // Needs proper integration with pgvector and access checks.
+        Ok(format!(
+            "Vector search executed on {}/{}/{} with query: {} (caller: {})",
+            args.platform, args.org, args.repo, args.query, caller.sub
+        ))
+    }
+}
+
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for LightbridgeMcpHandler {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
-            "MCP interface for Lightbridge Code Intelligence",
-        )
-    }
-
-    async fn list_tools(
-        &self,
-        _request: Option<PaginatedRequestParams>,
-        _context: RequestContext<RoleServer>,
-    ) -> std::result::Result<ListToolsResult, ErrorData> {
-        Ok(ListToolsResult::with_all_items(self.tool_router.list_all()))
-    }
-
-    async fn call_tool(
-        &self,
-        request: rmcp::model::CallToolRequestParams,
-        context: RequestContext<RoleServer>,
-    ) -> std::result::Result<rmcp::model::CallToolResponse, ErrorData> {
-        let tool = request.name.clone();
-        
-        let caller = caller_from_request_context(&context)?;
-        
-        let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
-        let result = self.tool_router.call(tcc).await;
-        
-        let outcome = match &result {
-            Ok(rmcp::model::CallToolResponse::Complete(call_result))
-                if call_result.is_error.unwrap_or(false) =>
-            {
-                "error"
-            }
-            Ok(_) => "ok",
-            Err(_) => "error",
-        };
-        
-        tracing::info!(tool = %tool, subject = %caller.sub, outcome, "mcp tool invoked");
-        result
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_instructions("MCP interface for Lightbridge Code Intelligence")
     }
 }

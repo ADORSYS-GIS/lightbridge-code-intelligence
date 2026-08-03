@@ -1,6 +1,5 @@
 pub mod auth;
 pub mod handler;
-pub mod tools;
 
 use crate::AppState;
 use axum::Router;
@@ -21,7 +20,7 @@ pub async fn run(state: AppState) -> anyhow::Result<()> {
     crate::spawn_metrics_server(state.metrics.clone());
 
     let addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
-    
+
     // Wire up the RMCP Streamable HTTP service with our ServerHandler.
     let service: StreamableHttpService<handler::LightbridgeMcpHandler, LocalSessionManager> =
         StreamableHttpService::new(

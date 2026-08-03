@@ -42,7 +42,9 @@ pub async fn mcp_auth(
         Err(_) => return (StatusCode::UNAUTHORIZED, "invalid token").into_response(),
     };
 
-    let caller = McpCallerContext { sub: claims.sub.clone() };
+    let caller = McpCallerContext {
+        sub: claims.sub.clone(),
+    };
 
     // Inject caller into request for downstream MCP handlers via request extensions
     req.extensions_mut().insert(caller);
