@@ -26,9 +26,9 @@
 //! (review validation).
 
 mod a2a;
-mod mcp;
 mod http;
 mod integrations;
+mod mcp;
 mod queue;
 
 // Foundational modules the groups above build on.
