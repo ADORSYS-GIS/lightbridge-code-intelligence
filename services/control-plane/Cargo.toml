@@ -54,7 +54,7 @@ k8s-openapi.workspace = true
 metrics.workspace = true
 metrics-exporter-prometheus.workspace = true
 neo4rs.workspace = true
-rmcp = { workspace = true, features = ["server", "transport-streamable-http-server"] }
+rmcp.workspace = true
 futures.workspace = true
 async-stream.workspace = true
 # A2A agent surface (RFC-0006 / #299): the `a2a` role serves these SDK traits over our Postgres state.
