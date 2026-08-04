@@ -173,8 +173,8 @@ impl LightbridgeMcpHandler {
         Parameters(args): Parameters<GetReviewStatusArgs>,
     ) -> std::result::Result<String, ErrorData> {
         let caller = caller_from_request_context(&context)?;
-        caller.require("repo:read").map_err(|_| {
-            ErrorData::invalid_params("Missing required permission: repo:read", None)
+        caller.require("review:read").map_err(|_| {
+            ErrorData::invalid_params("Missing required permission: review:read", None)
         })?;
 
         let pool = self
@@ -219,7 +219,7 @@ impl LightbridgeMcpHandler {
             &args.commit_sha,
             &args.query_type,
             &args.term,
-            args.limit.unwrap_or(50),
+            args.limit.unwrap_or(50).clamp(1, 100),
         )
         .await?;
         Ok(result.to_string())
@@ -261,8 +261,8 @@ impl LightbridgeMcpHandler {
         Parameters(args): Parameters<ListRecentReviewsArgs>,
     ) -> std::result::Result<String, ErrorData> {
         let caller = caller_from_request_context(&context)?;
-        caller.require("repo:read").map_err(|_| {
-            ErrorData::invalid_params("Missing required permission: repo:read", None)
+        caller.require("review:read").map_err(|_| {
+            ErrorData::invalid_params("Missing required permission: review:read", None)
         })?;
 
         let pool = self
