@@ -1,16 +1,13 @@
-use crate::{AppState, jwt::AuthError};
+use crate::{
+    AppState,
+    jwt::{AuthError, Caller},
+};
 use axum::{
     extract::State,
     http::{HeaderValue, StatusCode, header},
     middleware::Next,
     response::{IntoResponse, Response},
 };
-
-/// The authenticated caller context for MCP.
-#[derive(Clone, Debug)]
-pub struct McpCallerContext {
-    pub sub: String,
-}
 
 /// OIDC auth middleware for MCP.
 pub async fn mcp_auth(
@@ -42,18 +39,20 @@ pub async fn mcp_auth(
         Err(_) => return (StatusCode::UNAUTHORIZED, "invalid token").into_response(),
     };
 
-    let caller = McpCallerContext {
-        sub: claims.sub.clone(),
+    let permissions = claims.permissions(&state.permissions_claim);
+    let caller = Caller {
+        claims,
+        permissions,
     };
-
-    // Inject caller into request for downstream MCP handlers via request extensions
-    req.extensions_mut().insert(caller);
 
     // Also keep the header for debugging or logging if needed
     req.headers_mut().insert(
         "x-lb-mcp-caller",
-        HeaderValue::from_str(&claims.sub).unwrap_or(HeaderValue::from_static("unknown")),
+        HeaderValue::from_str(&caller.claims.sub).unwrap_or(HeaderValue::from_static("unknown")),
     );
+
+    // Inject caller into request for downstream MCP handlers via request extensions
+    req.extensions_mut().insert(caller);
 
     next.run(req).await
 }

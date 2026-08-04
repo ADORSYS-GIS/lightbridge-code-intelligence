@@ -239,6 +239,7 @@ impl FromRequestParts<AppState> for Claims {
 /// Extractor that authenticates a request AND carries the caller's **permissions** (ADR-0023), read
 /// from the configured claim (`state.permissions_claim`, from `PERMISSIONS_CLAIM`, default
 /// `permissions`). Handlers call [`Caller::require`] to authorize a specific capability.
+#[derive(Clone)]
 pub struct Caller {
     pub claims: Claims,
     pub permissions: std::collections::HashSet<String>,

@@ -809,3 +809,20 @@ pub async fn set_task_status(
     }
     Ok(result.rows_affected() > 0)
 }
+
+pub async fn count_recent_mcp_runs(
+    pool: &PgPool,
+    caller_id: &str,
+    window_secs: i64,
+) -> Result<i64, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM webhook_deliveries \
+         WHERE event_name = 'mcp.review' \
+           AND payload_json->>'caller' = $1 \
+           AND received_at > now() - make_interval(secs => $2::double precision)",
+    )
+    .bind(caller_id)
+    .bind(window_secs as f64)
+    .fetch_one(pool)
+    .await
+}

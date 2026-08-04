@@ -22,6 +22,26 @@ fn bind_addr() -> String {
     bind_addr_from(std::env::var("MCP_BIND").ok())
 }
 
+#[derive(Clone, Debug)]
+pub struct McpQuotaConfig {
+    pub max: i64,
+    pub window_secs: i64,
+}
+
+fn quota_from_env() -> McpQuotaConfig {
+    let max = std::env::var("MCP_QUOTA_MAX")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(20)
+        .max(1);
+    let window_secs = std::env::var("MCP_QUOTA_WINDOW_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3600)
+        .max(1);
+    McpQuotaConfig { max, window_secs }
+}
+
 pub async fn run(state: AppState) -> anyhow::Result<()> {
     // The MCP role requires a database and OIDC config.
     if state.db.is_none() {
@@ -35,12 +55,20 @@ pub async fn run(state: AppState) -> anyhow::Result<()> {
 
     let addr = bind_addr();
 
+    let quota = quota_from_env();
+
     // Wire up the RMCP Streamable HTTP service with our ServerHandler.
     let service: StreamableHttpService<handler::LightbridgeMcpHandler, LocalSessionManager> =
         StreamableHttpService::new(
             {
                 let state = state.clone();
-                move || Ok(handler::LightbridgeMcpHandler::new(state.clone()))
+                let quota = quota.clone();
+                move || {
+                    Ok(handler::LightbridgeMcpHandler::new(
+                        state.clone(),
+                        quota.clone(),
+                    ))
+                }
             },
             Arc::new(LocalSessionManager::default()),
             StreamableHttpServerConfig::default().disable_allowed_hosts(), // Allow Traefik/Ingress external hosts

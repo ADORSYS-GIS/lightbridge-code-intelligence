@@ -1,5 +1,4 @@
-use super::auth::McpCallerContext;
-use crate::AppState;
+use crate::{AppState, jwt::Caller};
 use rmcp::{
     ErrorData, RoleServer, ServerHandler,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
@@ -15,13 +14,15 @@ use uuid::Uuid;
 pub struct LightbridgeMcpHandler {
     #[allow(dead_code)]
     state: AppState,
+    quota: super::McpQuotaConfig,
     tool_router: ToolRouter<Self>,
 }
 
 impl LightbridgeMcpHandler {
-    pub fn new(state: AppState) -> Self {
+    pub fn new(state: AppState, quota: super::McpQuotaConfig) -> Self {
         Self {
             state,
+            quota,
             tool_router: Self::tool_router(),
         }
     }
@@ -29,7 +30,7 @@ impl LightbridgeMcpHandler {
 
 pub(crate) fn caller_from_request_context(
     context: &RequestContext<RoleServer>,
-) -> std::result::Result<McpCallerContext, ErrorData> {
+) -> std::result::Result<Caller, ErrorData> {
     let parts = context
         .extensions
         .get::<axum::http::request::Parts>()
@@ -37,7 +38,7 @@ pub(crate) fn caller_from_request_context(
 
     let caller = parts
         .extensions
-        .get::<McpCallerContext>()
+        .get::<Caller>()
         .ok_or_else(|| ErrorData::internal_error("missing caller context", None))?;
 
     Ok(caller.clone())
@@ -105,10 +106,13 @@ impl LightbridgeMcpHandler {
         Parameters(args): Parameters<VectorSearchArgs>,
     ) -> std::result::Result<String, ErrorData> {
         let caller = caller_from_request_context(&context)?;
+        caller.require("repo:read").map_err(|_| {
+            ErrorData::invalid_params("Missing required permission: repo:read", None)
+        })?;
 
         Ok(format!(
             "Vector search executed on {}/{}/{} with query: {} (caller: {})",
-            args.platform, args.org, args.repo, args.query, caller.sub
+            args.platform, args.org, args.repo, args.query, caller.claims.sub
         ))
     }
 
@@ -122,12 +126,29 @@ impl LightbridgeMcpHandler {
         Parameters(args): Parameters<StartReviewArgs>,
     ) -> std::result::Result<String, ErrorData> {
         let caller = caller_from_request_context(&context)?;
+        caller.require("repo:read").map_err(|_| {
+            ErrorData::invalid_params("Missing required permission: repo:read", None)
+        })?;
 
         let pool = self
             .state
             .db
             .as_ref()
             .ok_or_else(|| ErrorData::internal_error("Database not available", None))?;
+
+        let recent =
+            crate::db::count_recent_mcp_runs(pool, &caller.claims.sub, self.quota.window_secs)
+                .await
+                .map_err(|e| {
+                    ErrorData::internal_error("Database error", Some(e.to_string().into()))
+                })?;
+
+        if recent >= self.quota.max {
+            return Err(ErrorData::invalid_params(
+                "Per-identity deep-run quota exceeded",
+                None,
+            ));
+        }
 
         super::tools::start_review(
             pool,
@@ -137,7 +158,7 @@ impl LightbridgeMcpHandler {
             args.pr_number,
             &args.head_sha,
             args.prompt,
-            &caller.sub,
+            &caller.claims.sub,
         )
         .await
     }
@@ -148,9 +169,14 @@ impl LightbridgeMcpHandler {
     )]
     async fn get_review_status_tool(
         &self,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
         Parameters(args): Parameters<GetReviewStatusArgs>,
     ) -> std::result::Result<String, ErrorData> {
+        let caller = caller_from_request_context(&context)?;
+        caller.require("repo:read").map_err(|_| {
+            ErrorData::invalid_params("Missing required permission: repo:read", None)
+        })?;
+
         let pool = self
             .state
             .db
@@ -170,9 +196,14 @@ impl LightbridgeMcpHandler {
     )]
     async fn graph_search_tool(
         &self,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
         Parameters(args): Parameters<GraphSearchArgs>,
     ) -> std::result::Result<String, ErrorData> {
+        let caller = caller_from_request_context(&context)?;
+        caller.require("repo:read").map_err(|_| {
+            ErrorData::invalid_params("Missing required permission: repo:read", None)
+        })?;
+
         let pool = self
             .state
             .db
@@ -200,9 +231,14 @@ impl LightbridgeMcpHandler {
     )]
     async fn get_repository_settings_tool(
         &self,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
         Parameters(args): Parameters<GetRepoSettingsArgs>,
     ) -> std::result::Result<String, ErrorData> {
+        let caller = caller_from_request_context(&context)?;
+        caller.require("repo:read").map_err(|_| {
+            ErrorData::invalid_params("Missing required permission: repo:read", None)
+        })?;
+
         let pool = self
             .state
             .db
@@ -221,9 +257,14 @@ impl LightbridgeMcpHandler {
     )]
     async fn list_recent_reviews_tool(
         &self,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
         Parameters(args): Parameters<ListRecentReviewsArgs>,
     ) -> std::result::Result<String, ErrorData> {
+        let caller = caller_from_request_context(&context)?;
+        caller.require("repo:read").map_err(|_| {
+            ErrorData::invalid_params("Missing required permission: repo:read", None)
+        })?;
+
         let pool = self
             .state
             .db
