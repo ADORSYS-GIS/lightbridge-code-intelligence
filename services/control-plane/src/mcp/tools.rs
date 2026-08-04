@@ -1,17 +1,15 @@
+use crate::integrations::platform::Platform;
 use crate::{
-    db,
-    model::resolve_model_override,
-    preset::EntryPoint,
-    settings::resolve_repo_settings_db_only,
+    db, model::resolve_model_override, preset::EntryPoint, settings::resolve_repo_settings_db_only,
 };
 use rmcp::ErrorData;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sqlx::{PgPool, Row};
-use std::sync::Arc;
-use crate::integrations::platform::Platform;
 use std::str::FromStr;
+use std::sync::Arc;
 use uuid::Uuid;
 
+#[allow(clippy::too_many_arguments)]
 pub async fn start_review(
     pool: &PgPool,
     platform: &str,
@@ -22,19 +20,27 @@ pub async fn start_review(
     prompt: Option<String>,
     caller_id: &str,
 ) -> Result<String, ErrorData> {
-    let platform_enum = Platform::from_str(platform).map_err(|_| ErrorData::invalid_params("Invalid platform", None))?;
+    let platform_enum = Platform::from_str(platform)
+        .map_err(|_| ErrorData::invalid_params("Invalid platform", None))?;
     let repo = db::find_repository(pool, platform_enum, org, repo_name)
         .await
         .map_err(|e| ErrorData::internal_error("Database error", Some(e.to_string().into())))?;
 
-    let repo = repo.ok_or_else(|| ErrorData::invalid_params("Repository not found or not connected", None))?;
+    let repo = repo
+        .ok_or_else(|| ErrorData::invalid_params("Repository not found or not connected", None))?;
 
     if repo.status != "approved" {
-        return Err(ErrorData::invalid_params("Repository is not approved", None));
+        return Err(ErrorData::invalid_params(
+            "Repository is not approved",
+            None,
+        ));
     }
 
     let installation_id = repo.installation_id.ok_or_else(|| {
-        ErrorData::invalid_params("Repository is not fully provisioned (no installation)", None)
+        ErrorData::invalid_params(
+            "Repository is not fully provisioned (no installation)",
+            None,
+        )
     })?;
 
     let model_override = resolve_model_override(pool, repo.id, installation_id).await;
@@ -72,7 +78,9 @@ pub async fn start_review(
 
     db::record_delivery(pool, platform_enum, &delivery_id, "mcp.review", &provenance)
         .await
-        .map_err(|e| ErrorData::internal_error("Failed to record delivery", Some(e.to_string().into())))?;
+        .map_err(|e| {
+            ErrorData::internal_error("Failed to record delivery", Some(e.to_string().into()))
+        })?;
 
     let underlying = match db::create_task(pool, &new_task).await {
         Ok(Some(id)) => id,
@@ -80,16 +88,18 @@ pub async fn start_review(
             .await
             .map_err(|e| ErrorData::internal_error("Database error", Some(e.to_string().into())))?
             .ok_or_else(|| ErrorData::internal_error("Failed to dedup task", None))?,
-        Err(e) => return Err(ErrorData::internal_error("Failed to create task", Some(e.to_string().into()))),
+        Err(e) => {
+            return Err(ErrorData::internal_error(
+                "Failed to create task",
+                Some(e.to_string().into()),
+            ));
+        }
     };
 
     Ok(underlying.to_string())
 }
 
-pub async fn get_review_status(
-    pool: &PgPool,
-    task_id: Uuid,
-) -> Result<Value, ErrorData> {
+pub async fn get_review_status(pool: &PgPool, task_id: Uuid) -> Result<Value, ErrorData> {
     let task = db::get_task(pool, task_id)
         .await
         .map_err(|e| ErrorData::internal_error("Database error", Some(e.to_string().into())))?
@@ -116,6 +126,7 @@ pub async fn get_review_status(
     Ok(response)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn graph_search(
     neo4j: Option<&Arc<neo4rs::Graph>>,
     pool: &PgPool,
@@ -127,9 +138,11 @@ pub async fn graph_search(
     term: &str,
     limit: i64,
 ) -> Result<Value, ErrorData> {
-    let graph = neo4j.ok_or_else(|| ErrorData::internal_error("Neo4j graph not configured", None))?;
+    let graph =
+        neo4j.ok_or_else(|| ErrorData::internal_error("Neo4j graph not configured", None))?;
 
-    let platform_enum = Platform::from_str(platform).map_err(|_| ErrorData::invalid_params("Invalid platform", None))?;
+    let platform_enum = Platform::from_str(platform)
+        .map_err(|_| ErrorData::invalid_params("Invalid platform", None))?;
     let repo = db::find_repository(pool, platform_enum, org, repo_name)
         .await
         .map_err(|e| ErrorData::internal_error("Database error", Some(e.to_string().into())))?
@@ -137,20 +150,31 @@ pub async fn graph_search(
 
     let results = match query_type {
         "find_symbol" => {
-            let nodes = crate::integrations::neo4j::find_symbol(graph, repo.id, commit_sha, term, limit)
-                .await
-                .map_err(|e| ErrorData::internal_error("Graph query failed", Some(e.to_string().into())))?;
+            let nodes =
+                crate::integrations::neo4j::find_symbol(graph, repo.id, commit_sha, term, limit)
+                    .await
+                    .map_err(|e| {
+                        ErrorData::internal_error("Graph query failed", Some(e.to_string().into()))
+                    })?;
             json!(nodes)
         }
         "get_callers" => {
             // wait: get_callers signature might be different. Let's pass the term as a string for now, assuming it finds the node by term or id.
             // Actually, get_callers in neo4j.rs takes `node_id: &str`.
-            let edges = crate::integrations::neo4j::get_callers(graph, repo.id, commit_sha, term, limit)
-                .await
-                .map_err(|e| ErrorData::internal_error("Graph query failed", Some(e.to_string().into())))?;
+            let edges =
+                crate::integrations::neo4j::get_callers(graph, repo.id, commit_sha, term, limit)
+                    .await
+                    .map_err(|e| {
+                        ErrorData::internal_error("Graph query failed", Some(e.to_string().into()))
+                    })?;
             json!(edges)
         }
-        _ => return Err(ErrorData::invalid_params("Invalid query_type. Use 'find_symbol' or 'get_callers'", None)),
+        _ => {
+            return Err(ErrorData::invalid_params(
+                "Invalid query_type. Use 'find_symbol' or 'get_callers'",
+                None,
+            ));
+        }
     };
 
     Ok(results)
@@ -162,7 +186,8 @@ pub async fn get_repository_settings(
     org: &str,
     repo_name: &str,
 ) -> Result<Value, ErrorData> {
-    let platform_enum = Platform::from_str(platform).map_err(|_| ErrorData::invalid_params("Invalid platform", None))?;
+    let platform_enum = Platform::from_str(platform)
+        .map_err(|_| ErrorData::invalid_params("Invalid platform", None))?;
     let repo = db::find_repository(pool, platform_enum, org, repo_name)
         .await
         .map_err(|e| ErrorData::internal_error("Database error", Some(e.to_string().into())))?
@@ -184,7 +209,8 @@ pub async fn list_recent_reviews(
     repo_name: &str,
     limit: i64,
 ) -> Result<Value, ErrorData> {
-    let platform_enum = Platform::from_str(platform).map_err(|_| ErrorData::invalid_params("Invalid platform", None))?;
+    let platform_enum = Platform::from_str(platform)
+        .map_err(|_| ErrorData::invalid_params("Invalid platform", None))?;
     let repo = db::find_repository(pool, platform_enum, org, repo_name)
         .await
         .map_err(|e| ErrorData::internal_error("Database error", Some(e.to_string().into())))?
@@ -197,7 +223,7 @@ pub async fn list_recent_reviews(
         WHERE repository_id = $1 AND target_type = 'pull_request'
         ORDER BY created_at DESC
         LIMIT $2
-        "#
+        "#,
     )
     .bind(repo.id)
     .bind(limit)
@@ -205,14 +231,17 @@ pub async fn list_recent_reviews(
     .await
     .map_err(|e| ErrorData::internal_error("Database error", Some(e.to_string().into())))?;
 
-    let recent = rows.into_iter().map(|r| {
-        json!({
-            "task_id": r.try_get::<Uuid, _>("id").ok(),
-            "pr_number": r.try_get::<i64, _>("target_id").ok(),
-            "status": r.try_get::<String, _>("status").ok(),
-            "created_at": r.try_get::<String, _>("created_at").ok(),
+    let recent = rows
+        .into_iter()
+        .map(|r| {
+            json!({
+                "task_id": r.try_get::<Uuid, _>("id").ok(),
+                "pr_number": r.try_get::<i64, _>("target_id").ok(),
+                "status": r.try_get::<String, _>("status").ok(),
+                "created_at": r.try_get::<String, _>("created_at").ok(),
+            })
         })
-    }).collect::<Vec<_>>();
+        .collect::<Vec<_>>();
 
     Ok(json!(recent))
 }

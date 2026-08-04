@@ -122,8 +122,12 @@ impl LightbridgeMcpHandler {
         Parameters(args): Parameters<StartReviewArgs>,
     ) -> std::result::Result<String, ErrorData> {
         let caller = caller_from_request_context(&context)?;
-        
-        let pool = self.state.db.as_ref().ok_or_else(|| ErrorData::internal_error("Database not available", None))?;
+
+        let pool = self
+            .state
+            .db
+            .as_ref()
+            .ok_or_else(|| ErrorData::internal_error("Database not available", None))?;
 
         super::tools::start_review(
             pool,
@@ -134,7 +138,8 @@ impl LightbridgeMcpHandler {
             &args.head_sha,
             args.prompt,
             &caller.sub,
-        ).await
+        )
+        .await
     }
 
     #[tool(
@@ -146,8 +151,12 @@ impl LightbridgeMcpHandler {
         _context: RequestContext<RoleServer>,
         Parameters(args): Parameters<GetReviewStatusArgs>,
     ) -> std::result::Result<String, ErrorData> {
-        let pool = self.state.db.as_ref().ok_or_else(|| ErrorData::internal_error("Database not available", None))?;
-        
+        let pool = self
+            .state
+            .db
+            .as_ref()
+            .ok_or_else(|| ErrorData::internal_error("Database not available", None))?;
+
         let task_id = Uuid::parse_str(&args.task_id)
             .map_err(|_| ErrorData::invalid_params("Invalid task UUID format", None))?;
 
@@ -164,7 +173,11 @@ impl LightbridgeMcpHandler {
         _context: RequestContext<RoleServer>,
         Parameters(args): Parameters<GraphSearchArgs>,
     ) -> std::result::Result<String, ErrorData> {
-        let pool = self.state.db.as_ref().ok_or_else(|| ErrorData::internal_error("Database not available", None))?;
+        let pool = self
+            .state
+            .db
+            .as_ref()
+            .ok_or_else(|| ErrorData::internal_error("Database not available", None))?;
 
         let result = super::tools::graph_search(
             self.state.neo4j.as_ref(),
@@ -176,7 +189,8 @@ impl LightbridgeMcpHandler {
             &args.query_type,
             &args.term,
             args.limit.unwrap_or(50),
-        ).await?;
+        )
+        .await?;
         Ok(result.to_string())
     }
 
@@ -189,14 +203,15 @@ impl LightbridgeMcpHandler {
         _context: RequestContext<RoleServer>,
         Parameters(args): Parameters<GetRepoSettingsArgs>,
     ) -> std::result::Result<String, ErrorData> {
-        let pool = self.state.db.as_ref().ok_or_else(|| ErrorData::internal_error("Database not available", None))?;
+        let pool = self
+            .state
+            .db
+            .as_ref()
+            .ok_or_else(|| ErrorData::internal_error("Database not available", None))?;
 
-        let result = super::tools::get_repository_settings(
-            pool,
-            &args.platform,
-            &args.org,
-            &args.repo,
-        ).await?;
+        let result =
+            super::tools::get_repository_settings(pool, &args.platform, &args.org, &args.repo)
+                .await?;
         Ok(result.to_string())
     }
 
@@ -209,7 +224,11 @@ impl LightbridgeMcpHandler {
         _context: RequestContext<RoleServer>,
         Parameters(args): Parameters<ListRecentReviewsArgs>,
     ) -> std::result::Result<String, ErrorData> {
-        let pool = self.state.db.as_ref().ok_or_else(|| ErrorData::internal_error("Database not available", None))?;
+        let pool = self
+            .state
+            .db
+            .as_ref()
+            .ok_or_else(|| ErrorData::internal_error("Database not available", None))?;
 
         let result = super::tools::list_recent_reviews(
             pool,
@@ -217,7 +236,8 @@ impl LightbridgeMcpHandler {
             &args.org,
             &args.repo,
             args.limit.unwrap_or(10),
-        ).await?;
+        )
+        .await?;
         Ok(result.to_string())
     }
 }
