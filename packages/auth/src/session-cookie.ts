@@ -1,5 +1,6 @@
 /** Name of the httpOnly cookie holding the OIDC access token (the browser's session handle). */
 export const SESSION_COOKIE = "lb_session";
+export const REFRESH_COOKIE = "lb_refresh";
 
 /** Short-lived cookies that carry PKCE/state across the authorization redirect. */
 export const PKCE_COOKIE = "lb_pkce";
