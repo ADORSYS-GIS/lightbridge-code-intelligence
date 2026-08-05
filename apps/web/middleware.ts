@@ -43,12 +43,6 @@ export async function middleware(req: NextRequest) {
         return res;
       }
 
-      if (refreshed.reason === "unavailable") {
-        // Transient failure. Fall through without a session cookie; downstream fetches will
-        // cleanly fail and surface errors/retries in the UI rather than forcing an interactive login.
-        return NextResponse.next();
-      }
-
       // Anchor to the configured public origin — `req.url`'s host is the pod's internal bind
       // address behind the ingress.
       const res = NextResponse.redirect(new URL("/api/auth/login", appBaseUrl()));
