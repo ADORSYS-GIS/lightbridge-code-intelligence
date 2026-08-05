@@ -19,6 +19,8 @@ pub async fn start_review(
     head_sha: &str,
     prompt: Option<String>,
     caller_id: &str,
+    quota_max: i64,
+    quota_window_secs: i64,
 ) -> Result<String, ErrorData> {
     let platform_enum = Platform::from_str(platform)
         .map_err(|_| ErrorData::invalid_params("Invalid platform", None))?;
@@ -76,11 +78,27 @@ pub async fn start_review(
         "pr": pr_number,
     });
 
-    db::record_delivery(pool, platform_enum, &delivery_id, "mcp.review", &provenance)
-        .await
-        .map_err(|e| {
-            ErrorData::internal_error("Failed to record delivery", Some(e.to_string().into()))
-        })?;
+    // Atomically check the per-identity quota AND record the delivery in one step (db::tasks::
+    // reserve_mcp_run_slot) — a separate count-then-insert would race under concurrent calls from the
+    // same caller.
+    let reserved = db::reserve_mcp_run_slot(
+        pool,
+        caller_id,
+        quota_window_secs,
+        quota_max,
+        platform_enum,
+        &delivery_id,
+        &provenance,
+    )
+    .await
+    .map_err(|e| ErrorData::internal_error("Database error", Some(e.to_string().into())))?;
+
+    if !reserved {
+        return Err(ErrorData::invalid_params(
+            "Per-identity deep-run quota exceeded",
+            None,
+        ));
+    }
 
     let underlying = match db::create_task(pool, &new_task).await {
         Ok(Some(id)) => id,

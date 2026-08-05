@@ -29,16 +29,17 @@ pub struct McpQuotaConfig {
 }
 
 fn quota_from_env() -> McpQuotaConfig {
-    let max = std::env::var("MCP_QUOTA_MAX")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(20)
-        .max(1);
-    let window_secs = std::env::var("MCP_QUOTA_WINDOW_SECS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(3600)
-        .max(1);
+    quota_from(|name| std::env::var(name).ok())
+}
+
+/// Injectable core of [`quota_from_env`] (mirrors `a2a::quota_from`) — takes a lookup function
+/// instead of reading `std::env` directly, so the defaulting/clamping logic is testable without
+/// mutating real process env vars.
+fn quota_from(env: impl Fn(&str) -> Option<String>) -> McpQuotaConfig {
+    let env_i64 =
+        |name: &str, default: i64| env(name).and_then(|v| v.parse().ok()).unwrap_or(default);
+    let max = env_i64("MCP_QUOTA_MAX", 20).max(1);
+    let window_secs = env_i64("MCP_QUOTA_WINDOW_SECS", 3600).max(1);
     McpQuotaConfig { max, window_secs }
 }
 
@@ -87,4 +88,43 @@ pub async fn run(state: AppState) -> anyhow::Result<()> {
     tracing::info!(addr = %addr, "mcp role listening");
     axum::serve(listener, router).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bind_addr_falls_back_on_unset_or_blank() {
+        assert_eq!(bind_addr_from(None), DEFAULT_BIND);
+        assert_eq!(bind_addr_from(Some("   ".to_string())), DEFAULT_BIND);
+        assert_eq!(
+            bind_addr_from(Some("0.0.0.0:9999".to_string())),
+            "0.0.0.0:9999"
+        );
+    }
+
+    #[test]
+    fn quota_defaults_and_clamps() {
+        let quota = |max: Option<&str>, window: Option<&str>| {
+            quota_from(|name| match name {
+                "MCP_QUOTA_MAX" => max.map(str::to_string),
+                "MCP_QUOTA_WINDOW_SECS" => window.map(str::to_string),
+                _ => None,
+            })
+        };
+
+        let q = quota(None, None);
+        assert_eq!((q.max, q.window_secs), (20, 3600));
+
+        let q = quota(Some("0"), Some("-5"));
+        assert_eq!(
+            (q.max, q.window_secs),
+            (1, 1),
+            "a non-positive max/window is clamped to 1 (never unbounded / never a no-op window)"
+        );
+
+        let q = quota(Some("7"), Some("60"));
+        assert_eq!((q.max, q.window_secs), (7, 60));
+    }
 }

@@ -810,12 +810,37 @@ pub async fn set_task_status(
     Ok(result.rows_affected() > 0)
 }
 
-pub async fn count_recent_mcp_runs(
+/// Atomically check-and-reserve one per-identity MCP deep-run slot (mirrors A2A's per-identity quota,
+/// `a2a::store::count_recent` + its caller — see `a2a/handler/lifecycle.rs::submit_review`).
+///
+/// A plain "count, then insert" (as a caller and a separate `record_delivery` call) is a TOCTOU race:
+/// two concurrent calls for the SAME identity can both observe `count < max` before either's insert is
+/// visible, and both proceed — the quota is bypassable under concurrency. This closes that by running
+/// the count and the reservation INSERT in one transaction, serialized per-caller by a
+/// transaction-scoped Postgres advisory lock (`pg_advisory_xact_lock`, auto-released on commit OR
+/// rollback — no manual unlock needed). `hashtextextended` folds the caller id into the bigint key the
+/// lock function requires; a second identity hashing to the same key only adds harmless extra
+/// contention, never a false quota grant, since the count itself is still scoped to `caller_id`.
+///
+/// Returns `Ok(true)` and durably records the delivery row (same shape `record_delivery` would have
+/// written) iff the caller is under quota; `Ok(false)` (nothing written) once they're at/over it.
+pub async fn reserve_mcp_run_slot(
     pool: &PgPool,
     caller_id: &str,
     window_secs: i64,
-) -> Result<i64, sqlx::Error> {
-    sqlx::query_scalar(
+    max: i64,
+    platform: Platform,
+    delivery_id: &str,
+    payload: &serde_json::Value,
+) -> Result<bool, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(caller_id)
+        .execute(&mut *tx)
+        .await?;
+
+    let recent: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM webhook_deliveries \
          WHERE event_name = 'mcp.review' \
            AND payload_json->>'caller' = $1 \
@@ -823,6 +848,169 @@ pub async fn count_recent_mcp_runs(
     )
     .bind(caller_id)
     .bind(window_secs as f64)
-    .fetch_one(pool)
-    .await
+    .fetch_one(&mut *tx)
+    .await?;
+
+    if recent >= max {
+        // Rolling back also releases the advisory lock; nothing was written.
+        tx.rollback().await?;
+        return Ok(false);
+    }
+
+    sqlx::query(
+        "INSERT INTO webhook_deliveries (platform, delivery_id, event_name, payload_json) \
+         VALUES ($1, $2, 'mcp.review', $3) ON CONFLICT (delivery_id) DO NOTHING",
+    )
+    .bind(platform)
+    .bind(delivery_id)
+    .bind(payload)
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+    Ok(true)
+}
+
+#[cfg(test)]
+mod mcp_quota_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn payload(caller: &str) -> serde_json::Value {
+        json!({ "source": "mcp", "caller": caller, "repo": "acme/widgets", "pr": 1 })
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn grants_up_to_max_then_denies(pool: PgPool) {
+        assert!(
+            reserve_mcp_run_slot(
+                &pool,
+                "svc-a",
+                3600,
+                2,
+                Platform::GitHub,
+                "mcp:1",
+                &payload("svc-a")
+            )
+            .await
+            .unwrap()
+        );
+        assert!(
+            reserve_mcp_run_slot(
+                &pool,
+                "svc-a",
+                3600,
+                2,
+                Platform::GitHub,
+                "mcp:2",
+                &payload("svc-a")
+            )
+            .await
+            .unwrap()
+        );
+        // Third call for the SAME identity, still inside the window: over quota, denied, nothing
+        // written (a 4th call at max=2 would still see count=2, not 3).
+        assert!(
+            !reserve_mcp_run_slot(
+                &pool,
+                "svc-a",
+                3600,
+                2,
+                Platform::GitHub,
+                "mcp:3",
+                &payload("svc-a")
+            )
+            .await
+            .unwrap()
+        );
+
+        // A different identity has its own, independent quota.
+        assert!(
+            reserve_mcp_run_slot(
+                &pool,
+                "svc-b",
+                3600,
+                2,
+                Platform::GitHub,
+                "mcp:4",
+                &payload("svc-b")
+            )
+            .await
+            .unwrap()
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn zero_window_never_counts_past_deliveries(pool: PgPool) {
+        assert!(
+            reserve_mcp_run_slot(
+                &pool,
+                "svc-a",
+                0,
+                1,
+                Platform::GitHub,
+                "mcp:1",
+                &payload("svc-a")
+            )
+            .await
+            .unwrap()
+        );
+        // A `0`-second lookback window never counts the delivery just written (its `received_at` is
+        // never strictly greater than `now() - 0s` computed at the SAME instant), so a caller with a
+        // window this narrow is effectively ungated — that's a config footgun, not this function's
+        // job to prevent (mirrors the mcp module's own `.max(1)` clamp on the configured window).
+        assert!(
+            reserve_mcp_run_slot(
+                &pool,
+                "svc-a",
+                0,
+                1,
+                Platform::GitHub,
+                "mcp:2",
+                &payload("svc-a")
+            )
+            .await
+            .unwrap()
+        );
+    }
+
+    /// The load-bearing regression test for the TOCTOU fix: fire `attempts` concurrent reservations
+    /// for the SAME identity against a `max` well below `attempts`, and assert EXACTLY `max` succeed.
+    /// A naive "count, then insert" (the bug this replaces) lets concurrent callers all observe the
+    /// same stale count and all pass — this fails deterministically under that bug and passes only
+    /// because `reserve_mcp_run_slot` serializes same-caller reservations on a Postgres advisory lock.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn concurrent_reservations_for_one_identity_never_exceed_quota(pool: PgPool) {
+        const MAX: i64 = 3;
+        const ATTEMPTS: usize = 10;
+
+        let mut handles = Vec::with_capacity(ATTEMPTS);
+        for i in 0..ATTEMPTS {
+            let pool = pool.clone();
+            handles.push(tokio::spawn(async move {
+                reserve_mcp_run_slot(
+                    &pool,
+                    "svc-contended",
+                    3600,
+                    MAX,
+                    Platform::GitHub,
+                    &format!("mcp:{i}"),
+                    &payload("svc-contended"),
+                )
+                .await
+                .unwrap()
+            }));
+        }
+
+        let mut granted = 0;
+        for h in handles {
+            if h.await.unwrap() {
+                granted += 1;
+            }
+        }
+        assert_eq!(
+            granted, MAX as usize,
+            "quota must not be bypassable by racing"
+        );
+    }
 }

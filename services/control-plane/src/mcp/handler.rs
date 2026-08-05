@@ -126,8 +126,14 @@ impl LightbridgeMcpHandler {
         Parameters(args): Parameters<StartReviewArgs>,
     ) -> std::result::Result<String, ErrorData> {
         let caller = caller_from_request_context(&context)?;
-        caller.require("repo:read").map_err(|_| {
-            ErrorData::invalid_params("Missing required permission: repo:read", None)
+        // A dedicated action-level permission, not `repo:read`: starting a deep review spends compute
+        // (an expensive runner job), so it needs a stricter grant than "can read repo config/settings"
+        // — mirroring A2A's `submit_review`, which requires its own `a2a:review` rather than any
+        // read-tier scope (a2a/handler.rs::REVIEW_PERMISSION). This matters more once `a2a` and `mcp`
+        // share one OIDC audience (ai-helm-values): a token minted for read-only MCP/dashboard use must
+        // not also be sufficient to trigger paid runner work.
+        caller.require("review:trigger").map_err(|_| {
+            ErrorData::invalid_params("Missing required permission: review:trigger", None)
         })?;
 
         let pool = self
@@ -135,20 +141,6 @@ impl LightbridgeMcpHandler {
             .db
             .as_ref()
             .ok_or_else(|| ErrorData::internal_error("Database not available", None))?;
-
-        let recent =
-            crate::db::count_recent_mcp_runs(pool, &caller.claims.sub, self.quota.window_secs)
-                .await
-                .map_err(|e| {
-                    ErrorData::internal_error("Database error", Some(e.to_string().into()))
-                })?;
-
-        if recent >= self.quota.max {
-            return Err(ErrorData::invalid_params(
-                "Per-identity deep-run quota exceeded",
-                None,
-            ));
-        }
 
         super::tools::start_review(
             pool,
@@ -159,6 +151,8 @@ impl LightbridgeMcpHandler {
             &args.head_sha,
             args.prompt,
             &caller.claims.sub,
+            self.quota.max,
+            self.quota.window_secs,
         )
         .await
     }
