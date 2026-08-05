@@ -43,13 +43,19 @@ export async function middleware(req: NextRequest) {
         return res;
       }
 
+      if (refreshed.reason === "unavailable") {
+        // Transient failure. Fall through without a session cookie; downstream fetches will
+        // cleanly fail and surface errors/retries in the UI rather than forcing an interactive login.
+        return NextResponse.next();
+      }
+
       // Anchor to the configured public origin — `req.url`'s host is the pod's internal bind
       // address behind the ingress.
       const res = NextResponse.redirect(new URL("/api/auth/login", appBaseUrl()));
       res.cookies.delete(SESSION_COOKIE);
-      if (refreshed.reason === "unauthenticated") {
-        res.cookies.delete(REFRESH_COOKIE);
-      }
+      // We explicitly do NOT delete REFRESH_COOKIE here to gracefully handle rotation races.
+      // If two tabs refresh concurrently, one fails with invalid_grant. If we deleted it here,
+      // we would wipe out the new valid cookie set by the winning tab.
       return res;
     }
 

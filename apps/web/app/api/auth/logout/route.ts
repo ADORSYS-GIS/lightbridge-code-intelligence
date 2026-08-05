@@ -1,4 +1,4 @@
-import { SESSION_COOKIE } from "@lightbridge/auth";
+import { REFRESH_COOKIE, SESSION_COOKIE } from "@lightbridge/auth";
 import { NextResponse } from "next/server";
 import * as client from "openid-client";
 import { getOidc } from "@/lib/auth/oidc";
@@ -21,5 +21,6 @@ export async function GET() {
 
   const res = NextResponse.redirect(target);
   res.cookies.delete(SESSION_COOKIE);
+  res.cookies.delete(REFRESH_COOKIE);
   return res;
 }
