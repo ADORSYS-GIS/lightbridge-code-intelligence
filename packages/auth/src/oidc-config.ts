@@ -13,7 +13,12 @@ export interface OidcClientConfig {
   clientSecret?: string;
   redirectUri: string;
   postLogoutRedirectUri: string;
-  /** Space-delimited scopes; defaults to `openid profile email`. */
+  /**
+   * Space-delimited scopes; defaults to `openid profile email offline_access`.
+   * Note: The `offline_access` scope is required for the refresh token feature to work.
+   * If overriding `OIDC_SCOPE` in production, ensure `offline_access` is included, otherwise
+   * the background session renewal will silently no-op.
+   */
   scope: string;
 }
 
@@ -31,8 +36,16 @@ export function oidcClientConfigFromEnv(): OidcClientConfig {
     clientSecret: process.env.OIDC_CLIENT_SECRET || undefined,
     redirectUri: process.env.OIDC_REDIRECT_URI ?? "http://localhost:3000/api/auth/callback",
     postLogoutRedirectUri: process.env.OIDC_POST_LOGOUT_REDIRECT_URI ?? "http://localhost:3000",
-    scope: process.env.OIDC_SCOPE ?? "openid profile email",
+    scope: process.env.OIDC_SCOPE ?? "openid profile email offline_access",
   };
+}
+
+/** Get the OIDC token endpoint URL, used for refresh grants. Edge-safe. */
+export function oidcTokenUri(issuer: string): string {
+  // Keycloak's standard token endpoint; could be driven by .well-known or env vars if generalized
+  return (
+    process.env.OIDC_TOKEN_URI ?? `${issuer.replace(/\/+$/, "")}/protocol/openid-connect/token`
+  );
 }
 
 /**
