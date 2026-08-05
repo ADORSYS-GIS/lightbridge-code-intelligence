@@ -23,7 +23,7 @@ export async function middleware(req: NextRequest) {
     if (refreshToken) {
       const refreshed = await performRefreshGrant(refreshToken, oidcClientConfigFromEnv());
 
-      if (refreshed.type === "success") {
+      if (refreshed.ok) {
         const res = NextResponse.next();
         res.cookies.set(
           SESSION_COOKIE,
@@ -47,7 +47,7 @@ export async function middleware(req: NextRequest) {
       // address behind the ingress.
       const res = NextResponse.redirect(new URL("/api/auth/login", appBaseUrl()));
       res.cookies.delete(SESSION_COOKIE);
-      if (refreshed.type === "invalid") {
+      if (refreshed.reason === "unauthenticated") {
         res.cookies.delete(REFRESH_COOKIE);
       }
       return res;

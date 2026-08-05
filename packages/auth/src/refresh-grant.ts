@@ -8,10 +8,15 @@ export interface RefreshGrantResult {
   refreshExpiresIn?: number;
 }
 
-export type RefreshResult =
-  | { type: "success"; data: RefreshGrantResult }
-  | { type: "invalid" }
-  | { type: "transient" };
+export type AuthResult<T> =
+  | { ok: true; data: T }
+  | { ok: false; reason: "unauthenticated" | "unavailable" | "error"; status?: number };
+
+function classify(status: number): "unauthenticated" | "unavailable" | "error" {
+  if (status === 400 || status === 401 || status === 403) return "unauthenticated";
+  if (status === 503) return "unavailable";
+  return "error";
+}
 
 /**
  * Exchanges a refresh token for a new access token using the OIDC token endpoint.
@@ -20,7 +25,7 @@ export type RefreshResult =
 export async function performRefreshGrant(
   refreshToken: string,
   config: OidcClientConfig,
-): Promise<RefreshResult> {
+): Promise<AuthResult<RefreshGrantResult>> {
   const tokenUri = oidcTokenUri(config.issuer);
 
   const body = new URLSearchParams();
@@ -43,19 +48,16 @@ export async function performRefreshGrant(
     });
 
     if (!response.ok) {
-      if (response.status === 400 || response.status === 401 || response.status === 403) {
-        return { type: "invalid" };
-      }
-      return { type: "transient" };
+      return { ok: false, reason: classify(response.status), status: response.status };
     }
 
     const data = (await response.json()) as any;
     if (!data.access_token) {
-      return { type: "invalid" };
+      return { ok: false, reason: "error" };
     }
 
     return {
-      type: "success",
+      ok: true,
       data: {
         accessToken: data.access_token,
         refreshToken: data.refresh_token,
@@ -65,6 +67,6 @@ export async function performRefreshGrant(
       },
     };
   } catch {
-    return { type: "transient" };
+    return { ok: false, reason: "unavailable" };
   }
 }
