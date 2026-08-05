@@ -43,15 +43,10 @@ export async function performRefreshGrant(
     });
 
     if (!response.ok) {
-      if (
-        response.status >= 500 ||
-        response.status === 408 ||
-        response.status === 425 ||
-        response.status === 429
-      ) {
-        return { type: "transient" };
+      if (response.status === 400 || response.status === 401 || response.status === 403) {
+        return { type: "invalid" };
       }
-      return { type: "invalid" };
+      return { type: "transient" };
     }
 
     const data = (await response.json()) as any;
