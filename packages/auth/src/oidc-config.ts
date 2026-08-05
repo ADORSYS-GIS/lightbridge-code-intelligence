@@ -13,7 +13,12 @@ export interface OidcClientConfig {
   clientSecret?: string;
   redirectUri: string;
   postLogoutRedirectUri: string;
-  /** Space-delimited scopes; defaults to `openid profile email`. */
+  /**
+   * Space-delimited scopes; defaults to `openid profile email offline_access`.
+   * Note: The `offline_access` scope is required for the refresh token feature to work.
+   * If overriding `OIDC_SCOPE` in production, ensure `offline_access` is included, otherwise
+   * the background session renewal will silently no-op.
+   */
   scope: string;
 }
 
