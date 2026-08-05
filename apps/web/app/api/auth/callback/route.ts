@@ -40,6 +40,8 @@ export async function GET(req: NextRequest) {
     return NextResponse.redirect(new URL("/sign-in?error=exchange_failed", appOrigin));
   }
 
+  // The access token is the bearer credential sent to the control plane (resource server) and the
+  // value the middleware validates. Cookie lifetime tracks the token's own expiry.
   const maxAge = typeof tokens.expires_in === "number" ? tokens.expires_in : 1800;
 
   const res = NextResponse.redirect(new URL("/dashboard", appOrigin));

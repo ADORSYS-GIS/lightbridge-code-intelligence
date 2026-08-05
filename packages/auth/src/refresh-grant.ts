@@ -8,6 +8,11 @@ export interface RefreshGrantResult {
   refreshExpiresIn?: number;
 }
 
+export type RefreshResult =
+  | { type: "success"; data: RefreshGrantResult }
+  | { type: "invalid" }
+  | { type: "transient" };
+
 /**
  * Exchanges a refresh token for a new access token using the OIDC token endpoint.
  * This function uses standard `fetch` and is fully Edge-runtime compatible.
@@ -15,7 +20,7 @@ export interface RefreshGrantResult {
 export async function performRefreshGrant(
   refreshToken: string,
   config: OidcClientConfig,
-): Promise<RefreshGrantResult | null> {
+): Promise<RefreshResult> {
   const tokenUri = oidcTokenUri(config.issuer);
 
   const body = new URLSearchParams();
@@ -34,25 +39,32 @@ export async function performRefreshGrant(
         "Content-Type": "application/x-www-form-urlencoded",
       },
       body: body.toString(),
+      signal: AbortSignal.timeout(5000),
     });
 
     if (!response.ok) {
-      return null;
+      if (response.status >= 400 && response.status < 500) {
+        return { type: "invalid" };
+      }
+      return { type: "transient" };
     }
 
     const data = (await response.json()) as any;
     if (!data.access_token) {
-      return null;
+      return { type: "invalid" };
     }
 
     return {
-      accessToken: data.access_token,
-      refreshToken: data.refresh_token,
-      expiresIn: typeof data.expires_in === "number" ? data.expires_in : 1800,
-      refreshExpiresIn:
-        typeof data.refresh_expires_in === "number" ? data.refresh_expires_in : undefined,
+      type: "success",
+      data: {
+        accessToken: data.access_token,
+        refreshToken: data.refresh_token,
+        expiresIn: typeof data.expires_in === "number" ? data.expires_in : 1800,
+        refreshExpiresIn:
+          typeof data.refresh_expires_in === "number" ? data.refresh_expires_in : undefined,
+      },
     };
   } catch {
-    return null;
+    return { type: "transient" };
   }
 }
