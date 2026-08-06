@@ -2,25 +2,21 @@
 
 import { revalidatePath } from "next/cache";
 import { currentClaims } from "@/lib/auth/session";
-import { hasPermission, setRepoStatus } from "@/lib/server/admin";
+import { mutateRepoApproval } from "@/lib/server/admin";
 
 /**
  * Shared body for the approve/deny actions. Server Actions are public POST endpoints, so this
- * authorizes the caller on the specific permission (`repo:approve` / `repo:deny`, ADR-0023) and
- * validates input here too — defense in depth on top of the control plane's own gate — and throws on
- * failure so the UI surfaces it instead of a silent "success". (Not exported: a "use server" module
- * may only export actions.)
+ * authorizes the caller on the specific permission (`repo:approve` / `repo:deny`, ADR-0023) via
+ * [`mutateRepoApproval`] — shared with the per-repo detail page (story #514) so the two surfaces
+ * can't drift on the permission check or the failure message — and throws on failure so the UI
+ * surfaces it instead of a silent "success". (Not exported: a "use server" module may only export
+ * actions.)
  */
 async function mutate(formData: FormData, action: "approve" | "deny"): Promise<void> {
-  if (!hasPermission(await currentClaims(), `repo:${action}`)) {
-    throw new Error(`Unauthorized: repo:${action} permission required`);
-  }
   const id = Number(formData.get("id"));
-  if (!Number.isInteger(id) || id <= 0) {
-    throw new Error("Invalid repository id");
-  }
-  if (!(await setRepoStatus(id, action))) {
-    throw new Error(`Failed to ${action} repository`);
+  const result = await mutateRepoApproval(await currentClaims(), id, action);
+  if (!result.ok) {
+    throw new Error(result.error);
   }
   revalidatePath("/dashboard/admin");
 }
