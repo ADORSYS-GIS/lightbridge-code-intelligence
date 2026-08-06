@@ -1,6 +1,6 @@
 use crate::{AppState, jwt::Caller};
 use rmcp::{
-    ErrorData, RoleServer, ServerHandler,
+    ErrorData, Json, RoleServer, ServerHandler,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{ServerCapabilities, ServerInfo},
     schemars,
@@ -45,20 +45,13 @@ pub(crate) fn caller_from_request_context(
 }
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
-pub struct VectorSearchArgs {
-    pub platform: String,
-    pub org: String,
-    pub repo: String,
-    pub query: String,
-    pub limit: Option<usize>,
-}
-
-#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct StartReviewArgs {
     pub platform: String,
     pub org: String,
     pub repo: String,
     pub pr_number: i64,
+    /// The PR's head commit SHA. This server has no tool to look it up — get it from the
+    /// platform's own API/MCP server (e.g. GitHub's) first.
     pub head_sha: String,
     pub prompt: Option<String>,
 }
@@ -73,6 +66,9 @@ pub struct GraphSearchArgs {
     pub platform: String,
     pub org: String,
     pub repo: String,
+    /// The commit the structural graph was indexed at. This server has no tool to look it up —
+    /// get it from the platform's own API/MCP server (e.g. GitHub's), or from a prior
+    /// `start_review`/`get_review_status` result's context if you already have one for this repo.
     pub commit_sha: String,
     pub query_type: String,
     pub term: String,
@@ -97,26 +93,6 @@ pub struct ListRecentReviewsArgs {
 #[tool_router]
 impl LightbridgeMcpHandler {
     #[tool(
-        name = "vector_search",
-        description = "Search vector index across the repository"
-    )]
-    async fn vector_search_tool(
-        &self,
-        context: RequestContext<RoleServer>,
-        Parameters(args): Parameters<VectorSearchArgs>,
-    ) -> std::result::Result<String, ErrorData> {
-        let caller = caller_from_request_context(&context)?;
-        caller.require("repo:read").map_err(|_| {
-            ErrorData::invalid_params("Missing required permission: repo:read", None)
-        })?;
-
-        Ok(format!(
-            "Vector search executed on {}/{}/{} with query: {} (caller: {})",
-            args.platform, args.org, args.repo, args.query, caller.claims.sub
-        ))
-    }
-
-    #[tool(
         name = "start_review",
         description = "Start a deep code review on a pull request"
     )]
@@ -124,7 +100,7 @@ impl LightbridgeMcpHandler {
         &self,
         context: RequestContext<RoleServer>,
         Parameters(args): Parameters<StartReviewArgs>,
-    ) -> std::result::Result<String, ErrorData> {
+    ) -> std::result::Result<Json<super::tools::StartReviewResult>, ErrorData> {
         let caller = caller_from_request_context(&context)?;
         // A dedicated action-level permission, not `repo:read`: starting a deep review spends compute
         // (an expensive runner job), so it needs a stricter grant than "can read repo config/settings"
@@ -155,6 +131,7 @@ impl LightbridgeMcpHandler {
             self.quota.window_secs,
         )
         .await
+        .map(Json)
     }
 
     #[tool(
@@ -165,7 +142,7 @@ impl LightbridgeMcpHandler {
         &self,
         context: RequestContext<RoleServer>,
         Parameters(args): Parameters<GetReviewStatusArgs>,
-    ) -> std::result::Result<String, ErrorData> {
+    ) -> std::result::Result<Json<super::tools::GetReviewStatusResult>, ErrorData> {
         let caller = caller_from_request_context(&context)?;
         caller.require("review:read").map_err(|_| {
             ErrorData::invalid_params("Missing required permission: review:read", None)
@@ -180,8 +157,9 @@ impl LightbridgeMcpHandler {
         let task_id = Uuid::parse_str(&args.task_id)
             .map_err(|_| ErrorData::invalid_params("Invalid task UUID format", None))?;
 
-        let result = super::tools::get_review_status(pool, task_id).await?;
-        Ok(result.to_string())
+        super::tools::get_review_status(pool, task_id)
+            .await
+            .map(Json)
     }
 
     #[tool(
@@ -192,7 +170,7 @@ impl LightbridgeMcpHandler {
         &self,
         context: RequestContext<RoleServer>,
         Parameters(args): Parameters<GraphSearchArgs>,
-    ) -> std::result::Result<String, ErrorData> {
+    ) -> std::result::Result<Json<super::tools::GraphSearchResult>, ErrorData> {
         let caller = caller_from_request_context(&context)?;
         caller.require("repo:read").map_err(|_| {
             ErrorData::invalid_params("Missing required permission: repo:read", None)
@@ -204,7 +182,7 @@ impl LightbridgeMcpHandler {
             .as_ref()
             .ok_or_else(|| ErrorData::internal_error("Database not available", None))?;
 
-        let result = super::tools::graph_search(
+        super::tools::graph_search(
             self.state.neo4j.as_ref(),
             pool,
             &args.platform,
@@ -215,8 +193,8 @@ impl LightbridgeMcpHandler {
             &args.term,
             args.limit.unwrap_or(50).clamp(1, 100),
         )
-        .await?;
-        Ok(result.to_string())
+        .await
+        .map(Json)
     }
 
     #[tool(
@@ -227,7 +205,7 @@ impl LightbridgeMcpHandler {
         &self,
         context: RequestContext<RoleServer>,
         Parameters(args): Parameters<GetRepoSettingsArgs>,
-    ) -> std::result::Result<String, ErrorData> {
+    ) -> std::result::Result<Json<super::tools::GetRepositorySettingsResult>, ErrorData> {
         let caller = caller_from_request_context(&context)?;
         caller.require("repo:read").map_err(|_| {
             ErrorData::invalid_params("Missing required permission: repo:read", None)
@@ -239,10 +217,9 @@ impl LightbridgeMcpHandler {
             .as_ref()
             .ok_or_else(|| ErrorData::internal_error("Database not available", None))?;
 
-        let result =
-            super::tools::get_repository_settings(pool, &args.platform, &args.org, &args.repo)
-                .await?;
-        Ok(result.to_string())
+        super::tools::get_repository_settings(pool, &args.platform, &args.org, &args.repo)
+            .await
+            .map(Json)
     }
 
     #[tool(
@@ -253,7 +230,7 @@ impl LightbridgeMcpHandler {
         &self,
         context: RequestContext<RoleServer>,
         Parameters(args): Parameters<ListRecentReviewsArgs>,
-    ) -> std::result::Result<String, ErrorData> {
+    ) -> std::result::Result<Json<super::tools::ListRecentReviewsResult>, ErrorData> {
         let caller = caller_from_request_context(&context)?;
         caller.require("review:read").map_err(|_| {
             ErrorData::invalid_params("Missing required permission: review:read", None)
@@ -265,15 +242,15 @@ impl LightbridgeMcpHandler {
             .as_ref()
             .ok_or_else(|| ErrorData::internal_error("Database not available", None))?;
 
-        let result = super::tools::list_recent_reviews(
+        super::tools::list_recent_reviews(
             pool,
             &args.platform,
             &args.org,
             &args.repo,
             args.limit.unwrap_or(10),
         )
-        .await?;
-        Ok(result.to_string())
+        .await
+        .map(Json)
     }
 }
 

@@ -1,13 +1,68 @@
+use crate::integrations::neo4j::SymbolHit;
 use crate::integrations::platform::Platform;
 use crate::{
     db, model::resolve_model_override, preset::EntryPoint, settings::resolve_repo_settings_db_only,
 };
-use rmcp::ErrorData;
+use rmcp::{ErrorData, schemars};
+use serde::Serialize;
 use serde_json::{Value, json};
 use sqlx::{PgPool, Row};
 use std::str::FromStr;
 use std::sync::Arc;
 use uuid::Uuid;
+
+/// `start_review`'s result: the caller MUST capture `task_id` to poll `get_review_status` — that's
+/// the only way an external client (which has no other view into this system's internal IDs) learns
+/// it. Spelled out in `message` too, since a bare UUID with no field name gives an LLM client nothing
+/// to recognize it by.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct StartReviewResult {
+    /// `uuid::Uuid` has no `JsonSchema` impl in this workspace's dependency set — stringified,
+    /// matching how every tool's task-id *input* args already take it (e.g. `GetReviewStatusArgs`).
+    pub task_id: String,
+    pub status: String,
+    pub message: String,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct GetReviewStatusResult {
+    pub status: String,
+    pub repo_owner: Option<String>,
+    pub repo_name: Option<String>,
+    pub target_id: i64,
+    pub created_at: String,
+    pub review_url: Option<String>,
+    pub summary: Option<String>,
+    /// Structured findings as posted (severity/file/line/body per finding) — shape is the review
+    /// pipeline's own, not re-typed here, since it already varies by finding kind.
+    pub findings: Option<Value>,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct GraphSearchResult {
+    pub query_type: String,
+    pub results: Vec<SymbolHit>,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct GetRepositorySettingsResult {
+    pub check_run_reporting: bool,
+    pub review_on_pr_open: bool,
+    pub review_on_push: bool,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct RecentReviewEntry {
+    pub task_id: Option<String>,
+    pub pr_number: Option<i64>,
+    pub status: Option<String>,
+    pub created_at: Option<String>,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct ListRecentReviewsResult {
+    pub reviews: Vec<RecentReviewEntry>,
+}
 
 #[allow(clippy::too_many_arguments)]
 pub async fn start_review(
@@ -21,7 +76,7 @@ pub async fn start_review(
     caller_id: &str,
     quota_max: i64,
     quota_window_secs: i64,
-) -> Result<String, ErrorData> {
+) -> Result<StartReviewResult, ErrorData> {
     let platform_enum = Platform::from_str(platform)
         .map_err(|_| ErrorData::invalid_params("Invalid platform", None))?;
     let repo = db::find_repository(pool, platform_enum, org, repo_name)
@@ -114,10 +169,17 @@ pub async fn start_review(
         }
     };
 
-    Ok(underlying.to_string())
+    Ok(StartReviewResult {
+        task_id: underlying.to_string(),
+        status: "queued".to_string(),
+        message: "Poll get_review_status with this task_id to check progress.".to_string(),
+    })
 }
 
-pub async fn get_review_status(pool: &PgPool, task_id: Uuid) -> Result<Value, ErrorData> {
+pub async fn get_review_status(
+    pool: &PgPool,
+    task_id: Uuid,
+) -> Result<GetReviewStatusResult, ErrorData> {
     let task = db::get_task(pool, task_id)
         .await
         .map_err(|e| ErrorData::internal_error("Database error", Some(e.to_string().into())))?
@@ -127,21 +189,23 @@ pub async fn get_review_status(pool: &PgPool, task_id: Uuid) -> Result<Value, Er
         .await
         .map_err(|e| ErrorData::internal_error("Database error", Some(e.to_string().into())))?;
 
-    let mut response = json!({
-        "status": task.status,
-        "repo_owner": task.repo_owner,
-        "repo_name": task.repo_name,
-        "target_id": task.target_id,
-        "created_at": task.created_at,
-    });
+    let created_at = task
+        .created_at
+        .format(&time::format_description::well_known::Rfc3339)
+        .map_err(|e| {
+            ErrorData::internal_error("Timestamp formatting error", Some(e.to_string().into()))
+        })?;
 
-    if let Some(r) = review {
-        response["review_url"] = json!(r.review_url);
-        response["summary"] = json!(r.summary);
-        response["findings"] = json!(r.findings);
-    }
-
-    Ok(response)
+    Ok(GetReviewStatusResult {
+        status: task.status,
+        repo_owner: task.repo_owner,
+        repo_name: task.repo_name,
+        target_id: task.target_id,
+        created_at,
+        review_url: review.as_ref().and_then(|r| r.review_url.clone()),
+        summary: review.as_ref().map(|r| r.summary.clone()),
+        findings: review.map(|r| r.findings),
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -155,7 +219,7 @@ pub async fn graph_search(
     query_type: &str,
     term: &str,
     limit: i64,
-) -> Result<Value, ErrorData> {
+) -> Result<GraphSearchResult, ErrorData> {
     let graph =
         neo4j.ok_or_else(|| ErrorData::internal_error("Neo4j graph not configured", None))?;
 
@@ -168,24 +232,18 @@ pub async fn graph_search(
 
     let results = match query_type {
         "find_symbol" => {
-            let nodes =
-                crate::integrations::neo4j::find_symbol(graph, repo.id, commit_sha, term, limit)
-                    .await
-                    .map_err(|e| {
-                        ErrorData::internal_error("Graph query failed", Some(e.to_string().into()))
-                    })?;
-            json!(nodes)
+            crate::integrations::neo4j::find_symbol(graph, repo.id, commit_sha, term, limit)
+                .await
+                .map_err(|e| {
+                    ErrorData::internal_error("Graph query failed", Some(e.to_string().into()))
+                })?
         }
         "get_callers" => {
-            // wait: get_callers signature might be different. Let's pass the term as a string for now, assuming it finds the node by term or id.
-            // Actually, get_callers in neo4j.rs takes `node_id: &str`.
-            let edges =
-                crate::integrations::neo4j::get_callers(graph, repo.id, commit_sha, term, limit)
-                    .await
-                    .map_err(|e| {
-                        ErrorData::internal_error("Graph query failed", Some(e.to_string().into()))
-                    })?;
-            json!(edges)
+            crate::integrations::neo4j::get_callers(graph, repo.id, commit_sha, term, limit)
+                .await
+                .map_err(|e| {
+                    ErrorData::internal_error("Graph query failed", Some(e.to_string().into()))
+                })?
         }
         _ => {
             return Err(ErrorData::invalid_params(
@@ -195,7 +253,10 @@ pub async fn graph_search(
         }
     };
 
-    Ok(results)
+    Ok(GraphSearchResult {
+        query_type: query_type.to_string(),
+        results,
+    })
 }
 
 pub async fn get_repository_settings(
@@ -203,7 +264,7 @@ pub async fn get_repository_settings(
     platform: &str,
     org: &str,
     repo_name: &str,
-) -> Result<Value, ErrorData> {
+) -> Result<GetRepositorySettingsResult, ErrorData> {
     let platform_enum = Platform::from_str(platform)
         .map_err(|_| ErrorData::invalid_params("Invalid platform", None))?;
     let repo = db::find_repository(pool, platform_enum, org, repo_name)
@@ -213,11 +274,11 @@ pub async fn get_repository_settings(
 
     let settings = resolve_repo_settings_db_only(pool, repo.id).await;
 
-    Ok(json!({
-        "check_run_reporting": settings.check_run_reporting.value,
-        "review_on_pr_open": settings.review_on_pr_open.value,
-        "review_on_push": settings.review_on_push.value,
-    }))
+    Ok(GetRepositorySettingsResult {
+        check_run_reporting: settings.check_run_reporting.value,
+        review_on_pr_open: settings.review_on_pr_open.value,
+        review_on_push: settings.review_on_push.value,
+    })
 }
 
 pub async fn list_recent_reviews(
@@ -226,7 +287,7 @@ pub async fn list_recent_reviews(
     org: &str,
     repo_name: &str,
     limit: i64,
-) -> Result<Value, ErrorData> {
+) -> Result<ListRecentReviewsResult, ErrorData> {
     let platform_enum = Platform::from_str(platform)
         .map_err(|_| ErrorData::invalid_params("Invalid platform", None))?;
     let repo = db::find_repository(pool, platform_enum, org, repo_name)
@@ -249,17 +310,15 @@ pub async fn list_recent_reviews(
     .await
     .map_err(|e| ErrorData::internal_error("Database error", Some(e.to_string().into())))?;
 
-    let recent = rows
+    let reviews = rows
         .into_iter()
-        .map(|r| {
-            json!({
-                "task_id": r.try_get::<Uuid, _>("id").ok(),
-                "pr_number": r.try_get::<i64, _>("target_id").ok(),
-                "status": r.try_get::<String, _>("status").ok(),
-                "created_at": r.try_get::<String, _>("created_at").ok(),
-            })
+        .map(|r| RecentReviewEntry {
+            task_id: r.try_get::<Uuid, _>("id").ok().map(|id| id.to_string()),
+            pr_number: r.try_get::<i64, _>("target_id").ok(),
+            status: r.try_get::<String, _>("status").ok(),
+            created_at: r.try_get::<String, _>("created_at").ok(),
         })
         .collect::<Vec<_>>();
 
-    Ok(json!(recent))
+    Ok(ListRecentReviewsResult { reviews })
 }

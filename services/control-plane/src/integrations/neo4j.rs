@@ -7,6 +7,7 @@
 //! plane rather than direct DB access.
 
 use neo4rs::{Graph, query};
+use rmcp::schemars;
 use serde::Serialize;
 
 /// One graph node submitted by the runner (from `lci-codegraph`).
@@ -161,7 +162,7 @@ pub async fn prune_graph(
 }
 
 /// A symbol returned by a graph query. Serialized straight to the retrieval API the graph MCP calls.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct SymbolHit {
     pub node_id: String,
     pub label: String,
