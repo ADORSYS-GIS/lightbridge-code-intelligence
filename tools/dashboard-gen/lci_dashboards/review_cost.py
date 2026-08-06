@@ -120,7 +120,14 @@ def dashboard_builder() -> dashboard.Dashboard:
     )
 
     # --- Row 1: headline KPIs over the selected range (all from the gateway logs) ---
-    total_cost = _stat("Billed cost (range)", _COST_RANGE, layout, unit="currencyUSD")
+    total_cost = (
+        _stat("Billed cost (range)", _COST_RANGE, layout, unit="currencyUSD")
+        # explicit id pinned so the apps/web d-solo embed URL is deterministic
+        # (repo-analytics-embed.tsx), mirroring task_runs.py's run_logs panel. High constant
+        # (100) avoids collision with Grafana's auto-assigned ids for the other id-less panels,
+        # which start at 1.
+        .id(100)
+    )
     reviews = _stat("Reviews (range)", _RUNS_RANGE, layout)
     # Mean cost across runs, as ONE aggregation: sum cost per run (`by oidc_jti`), then
     # `avg` over runs. Not a division of two separate aggregations — LogQL rejected

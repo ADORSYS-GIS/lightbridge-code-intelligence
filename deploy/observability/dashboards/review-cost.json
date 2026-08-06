@@ -21,6 +21,7 @@
         "x": 0,
         "y": 0
       },
+      "id": 100,
       "options": null,
       "repeatDirection": "h",
       "targets": [
