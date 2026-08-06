@@ -75,9 +75,11 @@ pub async fn run(state: AppState) -> anyhow::Result<()> {
             StreamableHttpServerConfig::default().disable_allowed_hosts(), // Allow Traefik/Ingress external hosts
         );
 
-    // Provide the service on the root path since Traefik strips the /mcp prefix.
+    // Provide the service on the root path since Traefik strips the /mcp prefix. axum 0.8 no longer
+    // allows `nest_service("/", ...)` (panics: "Nesting at the root is no longer supported") —
+    // `fallback_service` is the documented replacement for mounting a service at the root.
     let router = Router::new()
-        .nest_service("/", service)
+        .fallback_service(service)
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             auth::mcp_auth,
