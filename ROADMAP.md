@@ -13,6 +13,20 @@ _Last updated: 2026-08-02._
 
 ## Recently shipped
 
+- **`lci-codegraph` extracted to its own repository** — the structural-graph engine now lives at
+  [vymalo/codegraph](https://github.com/vymalo/codegraph) instead of `services/codegraph/`, and
+  `agent-runner` consumes it as a git dependency pinned by exact commit (a plain crates.io version
+  once it is published). The design is unchanged ([ADR-0086](docs/adr/0086-in-house-code-graph-crate.md)
+  amended, not superseded); the move bought it a standalone test suite — 182 tests at 93.8% line
+  coverage, including Docker-backed suites that round-trip the emitted graph through a real Neo4j and
+  build the crate under both glibc and musl. Extraction also surfaced three latent defects: a
+  `lopdf` stack-overflow advisory that this workspace inherits the fix for
+  ([RUSTSEC-2026-0187](https://rustsec.org/advisories/RUSTSEC-2026-0187), uncatchable by the crate's
+  `catch_unwind`), plus two open behaviour bugs tracked upstream
+  ([codegraph#1](https://github.com/vymalo/codegraph/issues/1) — trait methods without a default body
+  are never extracted; [codegraph#2](https://github.com/vymalo/codegraph/issues/2) — the binary/NUL
+  guard is bypassed on the graph path).
+
 - **Per-repo review settings + review on new commits** (Epic #566) — check-run reporting, the
   automatic on-PR-open review, and a new review-on-new-commits trigger are now individually
   configurable per repo via a three-layer resolution (built-in default → repo config file → DB

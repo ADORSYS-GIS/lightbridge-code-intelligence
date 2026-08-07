@@ -1,6 +1,11 @@
 # ADR-0086: In-house code-graph crate — retire Graphify
 
 - **Status:** Accepted — Implemented (Graphify fully removed; `lci-codegraph` is the sole graph engine)
+- **Amendment (2026-08-07):** the crate was extracted out of this monorepo into its own repository,
+  [vymalo/codegraph](https://github.com/vymalo/codegraph), and is now consumed as a pinned git
+  dependency by `agent-runner` (headed for a crates.io release as `lci-codegraph`). **The decision in
+  this ADR is unchanged** — same crate, same API, same in-process tree-sitter design, no flag and no
+  fallback. Only where the source lives changed.
 - **Date:** 2026-07-12 (implemented 2026-07-13)
 - **Deciders:** @stephane-segning
 - **Supersedes:** [ADR-0019](0019-graphify-cli-structural-graph.md); the graph half of [ADR-0010](0010-graphify-treesitter-indexing-baseline.md)

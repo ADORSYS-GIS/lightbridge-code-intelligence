@@ -48,8 +48,10 @@ Two independent indexers run in the same task:
 - **Structural** — the in-house `lci-codegraph` crate walks the same checkout (in-process, tree-sitter)
   and produces symbol nodes + `contains`/`method`/`calls` edges; the runner submits them and the
   control plane writes Neo4j. Code: `services/agent-runner/src/indexer/graph.rs` (the host that calls
-  the crate), `services/codegraph/`, `services/control-plane/src/integrations/neo4j.rs`. This replaced
-  the Python Graphify CLI (ADR-0086); there is no flag and no fallback.
+  the crate), `services/control-plane/src/integrations/neo4j.rs`. This replaced the Python Graphify
+  CLI (ADR-0086); there is no flag and no fallback. The crate itself is no longer in this repo — it
+  lives at [vymalo/codegraph](https://github.com/vymalo/codegraph) and is consumed as a pinned git
+  dependency (see `services/agent-runner/Cargo.toml`).
 
 The structural pass is **best-effort**: it runs after the semantic pass, and a graph failure (or
 an unconfigured graph store returning 503) is logged, not fatal — the task still succeeds with a
