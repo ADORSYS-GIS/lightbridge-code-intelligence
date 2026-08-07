@@ -9,23 +9,27 @@ open a PR to fix this file.
 > **Keeping this current is part of "done."** When a PR meaningfully ships, unblocks, or retires an item
 > here, update its status in the **same PR** (see [AGENTS.md](AGENTS.md)).
 
-_Last updated: 2026-08-02._
+_Last updated: 2026-08-07._
 
 ## Recently shipped
 
 - **`lci-codegraph` extracted to its own repository** — the structural-graph engine now lives at
-  [vymalo/codegraph](https://github.com/vymalo/codegraph) instead of `services/codegraph/`, and
+  [vymalo/lci-codegraph](https://github.com/vymalo/lci-codegraph) instead of `services/codegraph/`, and
   `agent-runner` consumes it as a git dependency pinned by exact commit (a plain crates.io version
   once it is published). The design is unchanged ([ADR-0086](docs/adr/0086-in-house-code-graph-crate.md)
   amended, not superseded); the move bought it a standalone test suite — 182 tests at 93.8% line
   coverage, including Docker-backed suites that round-trip the emitted graph through a real Neo4j and
-  build the crate under both glibc and musl. Extraction also surfaced three latent defects: a
-  `lopdf` stack-overflow advisory that this workspace inherits the fix for
-  ([RUSTSEC-2026-0187](https://rustsec.org/advisories/RUSTSEC-2026-0187), uncatchable by the crate's
-  `catch_unwind`), plus two open behaviour bugs tracked upstream
-  ([codegraph#1](https://github.com/vymalo/codegraph/issues/1) — trait methods without a default body
-  are never extracted; [codegraph#2](https://github.com/vymalo/codegraph/issues/2) — the binary/NUL
-  guard is bypassed on the graph path).
+  build the crate under both glibc and musl. Extraction surfaced three latent defects, **all now
+  fixed upstream and consumed here**: a `lopdf` stack-overflow advisory
+  ([RUSTSEC-2026-0187](https://rustsec.org/advisories/RUSTSEC-2026-0187) — an abort, so uncatchable by
+  the crate's `catch_unwind`), plus two behaviour bugs
+  ([lci-codegraph#1](https://github.com/vymalo/lci-codegraph/issues/1) — Rust trait methods with no
+  default body were extracted by nothing, so trait interfaces contributed zero symbols to structural
+  *or* semantic search; [lci-codegraph#2](https://github.com/vymalo/lci-codegraph/issues/2) — the
+  binary/NUL guard was bypassed on the graph path, the one path production runs, letting raw NUL bytes
+  into chunk content that PostgreSQL's `text` type rejects outright). Adversarial review of that fix
+  then found the same declaration-vs-implementation ambiguity in the Java tags path, still open
+  upstream as [lci-codegraph#5](https://github.com/vymalo/lci-codegraph/issues/5).
 
 - **Per-repo review settings + review on new commits** (Epic #566) — check-run reporting, the
   automatic on-PR-open review, and a new review-on-new-commits trigger are now individually

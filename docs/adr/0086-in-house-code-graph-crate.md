@@ -2,7 +2,7 @@
 
 - **Status:** Accepted — Implemented (Graphify fully removed; `lci-codegraph` is the sole graph engine)
 - **Amendment (2026-08-07):** the crate was extracted out of this monorepo into its own repository,
-  [vymalo/codegraph](https://github.com/vymalo/codegraph), and is now consumed as a pinned git
+  [vymalo/lci-codegraph](https://github.com/vymalo/lci-codegraph), and is now consumed as a pinned git
   dependency by `agent-runner` (headed for a crates.io release as `lci-codegraph`). **The decision in
   this ADR is unchanged** — same crate, same API, same in-process tree-sitter design, no flag and no
   fallback. Only where the source lives changed.

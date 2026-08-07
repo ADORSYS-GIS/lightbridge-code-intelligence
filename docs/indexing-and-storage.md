@@ -50,7 +50,7 @@ Two independent indexers run in the same task:
   control plane writes Neo4j. Code: `services/agent-runner/src/indexer/graph.rs` (the host that calls
   the crate), `services/control-plane/src/integrations/neo4j.rs`. This replaced the Python Graphify
   CLI (ADR-0086); there is no flag and no fallback. The crate itself is no longer in this repo — it
-  lives at [vymalo/codegraph](https://github.com/vymalo/codegraph) and is consumed as a pinned git
+  lives at [vymalo/lci-codegraph](https://github.com/vymalo/lci-codegraph) and is consumed as a pinned git
   dependency (see `services/agent-runner/Cargo.toml`).
 
 The structural pass is **best-effort**: it runs after the semantic pass, and a graph failure (or

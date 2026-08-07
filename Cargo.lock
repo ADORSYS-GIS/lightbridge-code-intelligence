@@ -2764,7 +2764,7 @@ dependencies = [
 [[package]]
 name = "lci-codegraph"
 version = "0.1.0"
-source = "git+https://github.com/vymalo/codegraph?rev=03aa2b4bb573896ef62e5f5330bb4b39e090b0b5#03aa2b4bb573896ef62e5f5330bb4b39e090b0b5"
+source = "git+https://github.com/vymalo/lci-codegraph?rev=287d590e143656fcf52116fc0b6655904c764b4d#287d590e143656fcf52116fc0b6655904c764b4d"
 dependencies = [
  "anyhow",
  "bon",
