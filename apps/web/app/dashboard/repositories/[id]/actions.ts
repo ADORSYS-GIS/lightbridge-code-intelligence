@@ -4,6 +4,7 @@ import { revalidatePath } from "next/cache";
 import { currentClaims } from "@/lib/auth/session";
 import {
   hasPermission,
+  mutateRepoApproval,
   type RepoSettingsPatch,
   setRepoModel,
   setRepoPreset,
@@ -77,6 +78,33 @@ export async function clearRepoSettingAction(
   await requireConfigurablePermission();
   if (!(await setRepoSettingsOverride(id, { [field]: null } as RepoSettingsPatch))) {
     throw new Error("Failed to reset the setting");
+  }
+  revalidatePath(`/dashboard/repositories/${id}`);
+}
+
+/**
+ * Approve this repository (opens the gate + triggers its base index), then refresh the page (story
+ * #514). Shares its permission check + failure message with the admin approval queue via
+ * [`mutateRepoApproval`] — this page is an additional surface, not a replacement for it.
+ */
+export async function approveRepoAction(formData: FormData): Promise<void> {
+  const id = requireRepoId(formData);
+  const result = await mutateRepoApproval(await currentClaims(), id, "approve");
+  if (!result.ok) {
+    throw new Error(result.error);
+  }
+  revalidatePath(`/dashboard/repositories/${id}`);
+}
+
+/**
+ * Deny this repository (keeps it out of scope + purges any index data), then refresh the page
+ * (story #514). See [`approveRepoAction`].
+ */
+export async function denyRepoAction(formData: FormData): Promise<void> {
+  const id = requireRepoId(formData);
+  const result = await mutateRepoApproval(await currentClaims(), id, "deny");
+  if (!result.ok) {
+    throw new Error(result.error);
   }
   revalidatePath(`/dashboard/repositories/${id}`);
 }

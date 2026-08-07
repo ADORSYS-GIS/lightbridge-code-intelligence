@@ -92,6 +92,26 @@ export async function setRepoStatus(id: number, action: "approve" | "deny"): Pro
   }
 }
 
+/** Shared approve/deny mutation: permission-checks the caller on `repo:{action}`, validates `id`,
+ * then calls [`setRepoStatus`]. Used by both the admin approval queue and the per-repo detail page
+ * (story #514) so the two surfaces can't drift on the permission check or the failure message. */
+export async function mutateRepoApproval(
+  claims: SessionClaims | null,
+  id: number,
+  action: "approve" | "deny",
+): Promise<{ ok: true } | { ok: false; error: string }> {
+  if (!hasPermission(claims, `repo:${action}`)) {
+    return { ok: false, error: `Unauthorized: repo:${action} permission required` };
+  }
+  if (!Number.isInteger(id) || id <= 0) {
+    return { ok: false, error: "Invalid repository id" };
+  }
+  if (!(await setRepoStatus(id, action))) {
+    return { ok: false, error: `Failed to ${action} repository` };
+  }
+  return { ok: true };
+}
+
 /** A repo's currently-configured review preset (story #500, ADR-0109). Mirrors
  * `GET`/`POST /admin/repositories/{id}/preset`'s JSON shape. */
 export interface RepoPreset {

@@ -1,4 +1,4 @@
-import { ArrowLeft, RotateCcw } from "lucide-react";
+import { ArrowLeft, Check, RotateCcw, X } from "lucide-react";
 import Link from "next/link";
 import { notFound } from "next/navigation";
 import { PresetPicker } from "@/components/repos/preset-picker";
@@ -22,7 +22,9 @@ import {
   type RepoSettingsPatch,
 } from "@/lib/server/admin";
 import {
+  approveRepoAction,
   clearRepoSettingAction,
+  denyRepoAction,
   setPresetAction,
   setRepoModelAction,
   setRepoSettingAction,
@@ -31,12 +33,13 @@ import {
 export const dynamic = "force-dynamic";
 
 /**
- * A repo's review settings: preset (story #500, ADR-0109) and, since ADR-0111, per-repo check-run
+ * A repo's review settings: preset (story #500, ADR-0109), since ADR-0111, per-repo check-run
  * reporting / review-on-open / review-on-push / push-storm strategy / dedup scope, each independently
- * resolved across a built-in default → repo config file → admin DB override chain. Grown from the
- * original preset-only stub into the fuller per-repo detail page (ADR-0112 formally decided apps/web
- * keeps investing rather than being retired) — model override and inline approval status are later,
- * separate slices of the same page.
+ * resolved across a built-in default → repo config file → admin DB override chain, and inline
+ * approve/deny (story #514) alongside the existing `/dashboard/admin` queue — this page is an
+ * additional surface, not a replacement for it. Grown from the original preset-only stub into the
+ * fuller per-repo detail page (ADR-0112 formally decided apps/web keeps investing rather than being
+ * retired) — model override is a later, separate slice of the same page.
  */
 export default async function RepoSettings({ params }: { params: Promise<{ id: string }> }) {
   const { id: rawId } = await params;
@@ -57,6 +60,8 @@ export default async function RepoSettings({ params }: { params: Promise<{ id: s
     ]);
   const canConfigure = hasPermission(claims, "repo:configure");
   const canConfigureModel = hasPermission(claims, "model:configure");
+  const canApprove = hasPermission(claims, "repo:approve");
+  const canDeny = hasPermission(claims, "repo:deny");
 
   if (!reposResult.ok) {
     return (
@@ -75,16 +80,35 @@ export default async function RepoSettings({ params }: { params: Promise<{ id: s
   return (
     <Shell>
       <div>
-        <div className="flex items-center gap-2.5">
+        <div className="flex flex-wrap items-center gap-2.5">
           <h1 className="text-lg font-medium tracking-tight">{repoSlug(repo)}</h1>
           <Pill variant={approval.variant} label={approval.label} />
+          {/* Approve is available unless already approved; Deny unless already disabled — so any
+              state is reachable from any other (the control plane enforces the permission per
+              action). Mirrors the admin approval queue's RepoRow (`/dashboard/admin`), which stays
+              the better surface for triaging many pending repos at once — this is an additional
+              surface, not a replacement. */}
+          {canApprove && repo.status !== "approved" && (
+            <form action={approveRepoAction}>
+              <input type="hidden" name="id" value={id} />
+              <Button type="submit" variant="primary" size="xs">
+                <Check className="size-3.5" />
+                Approve
+              </Button>
+            </form>
+          )}
+          {canDeny && repo.status !== "disabled" && (
+            <form action={denyRepoAction}>
+              <input type="hidden" name="id" value={id} />
+              <Button type="submit" size="xs">
+                <X className="size-3.5" />
+                Deny
+              </Button>
+            </form>
+          )}
         </div>
         <p className="mt-1 text-sm text-base-content/60">
-          Review preset, settings, and model override. Change the approval status from{" "}
-          <Link href="/dashboard/admin" className="underline hover:text-base-content">
-            Approvals
-          </Link>
-          .
+          Review preset, settings, and model override.
         </p>
       </div>
 
