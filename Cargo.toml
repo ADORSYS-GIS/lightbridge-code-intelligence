@@ -16,7 +16,6 @@ members = [
     "services/agent-sast",
     "services/agent-loop",
     "services/agent-status",
-    "services/codegraph",
     "services/agent-testkit",
     "services/review-agent",
     "services/open-agent",
@@ -157,18 +156,14 @@ tree-sitter-rust = "0.24"
 tree-sitter-javascript = "0.25"
 tree-sitter-typescript = "0.23.2"
 tree-sitter-python = "0.25"
-tree-sitter-java = "0.23"
-# --- lci-codegraph: in-house code-graph crate (ADR-0086 / RFC-0007 slice 1) ---
+# NOTE: the Java grammar and `pdf-extract` used to be declared here for the in-tree `lci-codegraph`
+# crate. That crate now lives at https://github.com/vymalo/codegraph and carries its own pinned
+# dependencies, so both were removed — nothing in THIS workspace used them. The grammars above are
+# still used directly by `agent-runner`'s own chunker.
 # ripgrep's ignore engine: honours the repo's own `.gitignore` (git_ignore) AND lets us layer an
-# operator-configurable glob list on top with the SAME gitignore semantics (`GitignoreBuilder`). This
-# is how the crate *composes with* — rather than replaces — the repo ignores (ADR-0086 R3). Default
-# features are fine; no globset/regex-heavy extras needed beyond the gitignore matcher we use.
+# operator-configurable glob list on top with the SAME gitignore semantics (`GitignoreBuilder`).
+# Used by `agent-runner`'s repo-config discovery.
 ignore = "0.4"
-# Pure-Rust PDF *text* extraction (ADR-0086 capability 3). `pdf-extract` is purpose-built for
-# text-out (it wraps `lopdf` and walks content streams for us), so we don't hand-roll stream parsing
-# the way raw `lopdf` would force. Treated as untrusted-input code: bytes are capped BEFORE the parser
-# sees them and the parse is wrapped in `catch_unwind` (it can panic on malformed input) — ADR-0086 R2.
-pdf-extract = "0.9"
 # Regex selectors for the per-tier tool allowlist's `mcp__<server>__<tool>` patterns (ADR-0066).
 regex = "1.13"
 # Run-config audit trail (ADR-0034/0062/0066): base64 for the redacted-config encoding; url to strip
