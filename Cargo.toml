@@ -157,7 +157,7 @@ tree-sitter-javascript = "0.25"
 tree-sitter-typescript = "0.23.2"
 tree-sitter-python = "0.25"
 # NOTE: the Java grammar and `pdf-extract` used to be declared here for the in-tree `lci-codegraph`
-# crate. That crate now lives at https://github.com/vymalo/codegraph and carries its own pinned
+# crate. That crate now lives at https://github.com/vymalo/lci-codegraph and carries its own pinned
 # dependencies, so both were removed — nothing in THIS workspace used them. The grammars above are
 # still used directly by `agent-runner`'s own chunker.
 # ripgrep's ignore engine: honours the repo's own `.gitignore` (git_ignore) AND lets us layer an

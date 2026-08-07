@@ -41,7 +41,7 @@ lci-config = { path = "../config" }
 # In-house code-graph crate (ADR-0086 / RFC-0007 slice 1). The sole structural-graph engine, built
 # in-process (tree-sitter); replaced the retired Python Graphify CLI (ADR-0019).
 #
-# It now lives in its OWN repository — https://github.com/vymalo/codegraph — and is no longer a
+# It now lives in its OWN repository — https://github.com/vymalo/lci-codegraph — and is no longer a
 # workspace member here. Pinned by exact `rev`, not a branch: a floating branch would make every
 # build of this workspace depend on whatever landed upstream that hour, which is precisely the kind
 # of moving target this repo has been bitten by before. Bump the rev deliberately, in its own PR.
@@ -49,7 +49,7 @@ lci-config = { path = "../config" }
 # This is a git dependency because the crate is not published yet. Once `lci-codegraph` is released
 # to crates.io, replace this whole entry with a plain `lci-codegraph = "<version>"` — no other change
 # is needed, the import path and API are identical.
-lci-codegraph = { git = "https://github.com/vymalo/codegraph", rev = "03aa2b4bb573896ef62e5f5330bb4b39e090b0b5" }
+lci-codegraph = { git = "https://github.com/vymalo/lci-codegraph", rev = "287d590e143656fcf52116fc0b6655904c764b4d" }
 # Shared tracing/OTel bootstrap (ticket #246): JSON logs (as before) + optional OTLP→Tempo export, plus
 # the crypto-provider pin this binary needs but never had (see lci-observability's doc comment).
 lci-observability = { path = "../observability" }
