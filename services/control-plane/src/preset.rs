@@ -33,6 +33,7 @@ pub enum EntryPoint {
     PrSync,
     Mention,
     A2a,
+    Mcp,
 }
 
 impl EntryPoint {
@@ -44,6 +45,7 @@ impl EntryPoint {
             EntryPoint::PrSync => "pr_sync",
             EntryPoint::Mention => "mention",
             EntryPoint::A2a => "a2a",
+            EntryPoint::Mcp => "mcp",
         }
     }
 
@@ -59,7 +61,7 @@ impl EntryPoint {
             // (the PR-wide dedup landed in #570 already prevents most of the re-review noise `deep`'s
             // thoroughness would otherwise exist to catch).
             EntryPoint::PrOpen | EntryPoint::PrSync => "fast",
-            EntryPoint::Mention | EntryPoint::A2a => "deep",
+            EntryPoint::Mention | EntryPoint::A2a | EntryPoint::Mcp => "deep",
         }
     }
 }
@@ -181,6 +183,7 @@ mod tests {
         assert_eq!(resolve_from_config(None, EntryPoint::PrOpen), "fast");
         assert_eq!(resolve_from_config(None, EntryPoint::Mention), "deep");
         assert_eq!(resolve_from_config(None, EntryPoint::A2a), "deep");
+        assert_eq!(resolve_from_config(None, EntryPoint::Mcp), "deep");
     }
 
     #[test]

@@ -28,6 +28,7 @@
 mod a2a;
 mod http;
 mod integrations;
+mod mcp;
 mod queue;
 
 // Foundational modules the groups above build on.
@@ -640,8 +641,10 @@ async fn main() -> anyhow::Result<()> {
         "notifier" => run_notifier(state).await,
         // The durable-replay store lifecycle owner (ADR-0087): TTL-sweeps the `durable_step` journal.
         "replay" => run_replay(state).await,
+        // The MCP server role for external clients.
+        "mcp" => mcp::run(state).await,
         other => anyhow::bail!(
-            "unknown role {other:?} (expected: serve | dispatcher | reconciler | a2a | notifier | replay | mint-runner-token [| poller])"
+            "unknown role {other:?} (expected: serve | dispatcher | reconciler | a2a | notifier | replay | mcp | mint-runner-token [| poller])"
         ),
     };
     // Flush any still-batched spans before exit — covers every role's graceful (SIGTERM-triggered)
