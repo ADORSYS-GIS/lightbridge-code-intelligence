@@ -1,5 +1,60 @@
 # Changelog
 
+## [0.8.0](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/compare/v0.7.0...v0.8.0) (2026-08-08)
+
+
+### ⚠ BREAKING CHANGES
+
+* **codegraph:** consume lci-codegraph from its own repository ([#595](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/595))
+
+### Features
+
+* **auth:** implement OIDC refresh-token flow for silent session renewal ([#592](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/592)) ([e90806b](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/commit/e90806b6dc8eba5df085adc79a2b352b432e6f71))
+* **control-plane:** add GET read endpoints for model overrides (ADR-0110) ([#580](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/580)) ([2bfd44f](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/commit/2bfd44f7e655d8db3ed1129f372250612d784db1))
+* **control-plane:** describe the run in the check summary and link the review ([#565](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/565)) ([6e105d9](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/commit/6e105d9d3fb8950f8922ad967841d4603c4f415f))
+* **control-plane:** implement supersede + debounce push-storm strategies ([#574](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/574)) ([51598d4](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/commit/51598d4a17f3aa95f8603a7cff5c39c3fd836deb))
+* **control-plane:** let a repo turn off the automatic on-open review ([#569](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/569)) ([18fada4](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/commit/18fada474fce9128d7f62c4b42f4de84d4a759d3)), closes [#566](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/566)
+* **control-plane:** per-repo settings store + configurable check-run reporting ([#567](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/567)) ([77d4e57](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/commit/77d4e57d4c8b5cdb955a7161a210da5da5d89958))
+* **control-plane:** real server-side pagination + filtering on GET /tasks ([#587](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/587)) ([8a7ccaa](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/commit/8a7ccaa925e8bfc7f32e655db54ca4f797b4ae0b))
+* **control-plane:** report review-runner status as a check run/commit status ([#559](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/559)) ([33f9f7c](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/commit/33f9f7c3bf03402d90716044ba75891a0d59d929)), closes [#558](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/558)
+* **control-plane:** review on new commits pushed to an open PR ([#573](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/573)) ([ff321a1](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/commit/ff321a1a2565c64212256f4d2e5cda0fb59557ad)), closes [#566](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/566)
+* **control-plane:** suppress re-review findings across the whole PR ([#570](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/570)) ([e2f5ff8](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/commit/e2f5ff8fa362a4039d16f02bcebfdcb5b8d19356)), closes [#566](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/566)
+* **observability:** add Prompt Budget dashboard for max_diff_chars sizing ([#599](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/599)) ([3d667aa](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/commit/3d667aacb495cf4ac892b066e5b24830a30cf4a9))
+* **review-agent:** log per-run prompt-budget byte accounting ([#598](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/598)) ([33623c8](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/commit/33623c8aaf85e6586d51541ff7bab0391aeb69fb))
+* **web:** add getRepoSettings/setRepoSettingsOverride API client ([#581](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/581)) ([082d1f5](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/commit/082d1f518d5d2fff4e0562c4b003e3970581c3b0))
+* **web:** add the 6-field per-repo settings block (epic [#566](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/566)) ([#583](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/583)) ([66dd3b5](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/commit/66dd3b56f6b17ee1f39e2332e3ec41e649ab768f))
+* **web:** add Toggle, Select, SourceBadge components ([#579](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/579)) ([dcf49d5](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/commit/dcf49d586ccc0ff25a56e3e1ddf8169c4bb84893))
+* **web:** inline approve/deny on the per-repo detail page ([#514](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/514)) ([#593](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/593)) ([08284c0](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/commit/08284c0bf26485f4069338c143e97e4ab6ce2b2f))
+* **web:** model-override section + read-only approval status (ADR-0110) ([#584](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/584)) ([a27423b](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/commit/a27423b52063561db7f8bc55bfa14f5f6fc83e52))
+* **web:** show an override-present indicator on the repositories list (epic [#566](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/566)) ([#585](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/585)) ([5ab0352](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/commit/5ab035211d3e285744f626826291014616ad232e))
+* **web:** swap RunList's raw &lt;select&gt; for the shared Select component (epic [#566](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/566)) ([#586](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/586)) ([84484c3](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/commit/84484c3c559b7b44cef08c5787924774e53f9c2f))
+* **web:** upgrade the repo preset control from free text to a dropdown ([#582](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/582)) ([4ae574d](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/commit/4ae574df19bdd96662578502900aa8d0f3e8a313))
+* **web:** wire the Runs page to real server-side pagination + filtering ([#588](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/588)) ([4e3a5fe](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/commit/4e3a5fe232e96bb731280472a57b7750aeb4568b))
+
+
+### Bug Fixes
+
+* **ci:** preserve SARIF severity so the quality gate stops failing on warnings ([#568](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/568)) ([b30a426](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/commit/b30a4263f4e5f5e13bc088bd8aba1482f81feb85))
+* **ci:** use non-deprecated -fail-level=error for reviewdog quality gate ([#562](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/562)) ([e03eda8](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/commit/e03eda8f4c0be30a6ab3107579c647b2bf279fa4))
+* **ci:** use non-deprecated -fail-level=error for reviewdog quality gate ([#576](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/576)) ([5f58a4b](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/commit/5f58a4b5dfe61f9670b24e5fef016b0d48066232))
+* **codegraph:** bump the lci-codegraph pin to pick up both extraction fixes ([#596](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/596)) ([1a0f676](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/commit/1a0f6764bd83dd94530be3fadaa0f80b92970391))
+* **codegraph:** bump the lci-codegraph pin to roughly double call-graph recall ([#601](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/601)) ([145703e](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/commit/145703e5d54e3ed4a9c7dd78405f776db0855110))
+* **control-plane:** omit details_url instead of sending null on check runs ([#564](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/564)) ([95dac01](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/commit/95dac01a038eaf50d603277d6d2fd3f987610497)), closes [#563](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/563)
+* **control-plane:** restore compilation after [#572](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/572)/[#573](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/573) merge-order gap ([#575](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/575)) ([9bf0458](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/commit/9bf04585362617f2ba9d0d4c0b89135fdfb298cf))
+* **control-plane:** stop a stale review run's check-run resolve from clobbering a newer one ([#572](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/572)) ([ca70575](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/commit/ca7057510ae0d50780c4396c057cb5ede409e0d6))
+* **web:** stop the Settings permissions chip list wrapping into a staircase ([#590](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/590)) ([33c2915](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/commit/33c2915ef6260a08c793708e0a06814b607db8c2))
+
+
+### Documentation
+
+* **adr:** ADR-0111 for epic [#566](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/566) (per-repo review settings + review on push) ([#577](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/577)) ([fc0b39a](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/commit/fc0b39adb5b9c948a0060ff6860967f3ae6cc76c))
+* **adr:** ADR-0112 reverses apps/web retirement plan (supersedes ADR-0063) ([#578](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/578)) ([f7bf049](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/commit/f7bf0496634ced027b45584d95d59872cb306282))
+
+
+### Refactors
+
+* **codegraph:** consume lci-codegraph from its own repository ([#595](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/595)) ([1c7546f](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/commit/1c7546f55d71a019277d72f84c6ecabcd6e8291a))
+
 ## [0.7.0](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/compare/v0.6.0...v0.7.0) (2026-08-01)
 
 
