@@ -60,22 +60,97 @@ noise) down to exactly the lines this dashboard needs, before spending cycles on
 
 --- Grouping ---
 
-Every aggregation below groups explicitly ``by (fields_preset)`` (the Loki-documented native
-grouping clause for unwrapped range aggregations, e.g. ``quantile_over_time(0.99, <expr> [5m]) by
-(host)`` in the Loki docs) rather than computing per-pod-stream numbers and combining them
-afterwards. This matters specifically for the percentile queries: computing a percentile per pod
-(each review run gets its own ephemeral pod, ``lightbridge-agent-<task-id>-*``) and then averaging
-or maxing those per-pod percentiles together would NOT equal the true percentile over the merged
-raw samples (percentile-of-percentiles is not a percentile) — the native ``by`` clause avoids that
-fallacy by computing one true quantile per preset group directly from the underlying values.
+Every aggregation below groups by ``fields_preset``, rather than computing per-pod-stream numbers
+and combining them afterwards — this matters specifically for the percentile queries: computing a
+percentile per pod (each review run gets its own ephemeral pod, ``lightbridge-agent-<task-id>-*``)
+and then averaging or maxing those per-pod percentiles together would NOT equal the true percentile
+over the merged raw samples (percentile-of-percentiles is not a percentile).
 
---- Honesty / verification status ---
+**How that grouping is spelled depends on which aggregation it is — this is NOT uniform, and getting
+it wrong is a LogQL *parse error*, not a silently-wrong or empty result.** Confirmed against a real
+Loki instance (grafana/loki 3.1.1 and 3.5.7, see "Verification status" below) and against the
+Grafana docs: *"Except for `sum_over_time`, `absent_over_time`, `rate` and `rate_counter`, unwrapped
+range aggregations support grouping."*
 
-⚠️ These queries are written against the documented CRI + ``fields_`` shape above, reasoned through
-by hand — this repo has NO live Loki access from the environment that generated this dashboard, so
-NONE of the LogQL below has been run against real data. Treat every panel as unverified until an
-operator confirms at least the headline percentile panel renders real numbers. An empty panel here
-is the expected failure mode to check for, not a sign everything is fine.
+- ``quantile_over_time`` / ``avg_over_time`` (``_quantile`` / ``_avg`` below) DO support a native
+  trailing ``by (fields_preset)`` clause directly on the range aggregation, e.g.
+  ``quantile_over_time(0.99, <expr> [5m]) by (fields_preset)``.
+- ``sum_over_time`` (``_sum`` below) does NOT, despite being on the same "unwrapped range
+  aggregation" list as the two above — it's the docs' explicit exception. ``count_over_time``
+  (``_count`` below) is a *plain* log range aggregation (no ``unwrap``), and none of that family
+  (``count_over_time``, ``bytes_over_time``, ``rate``, ``bytes_rate``) support grouping at all.
+  Both instead use a Prometheus-style vector-aggregation wrapper — ``sum by (fields_preset)
+  (sum_over_time(...))`` / ``sum by (fields_preset) (count_over_time(...))`` — which computes the
+  same per-preset total (there's exactly one series per distinct label set already, so the outer
+  ``sum by`` doesn't combine multiple values, it just regroups) and is legal LogQL.
+
+--- The mechanism behind the diff-less exclusion (Question 1) ---
+
+``fields_diff_files_total != ""`` in ``_ALL_DIFF_RUNS`` below relies on a non-obvious fact about
+how ``log_prompt_metrics`` serializes: every diff field is passed as ``diff.map(|d| d.field)`` —
+an ``Option<T>``. ``tracing``'s ``Value`` impl for ``Option<T>`` **omits the key entirely** when the
+value is ``None`` — it does NOT emit ``"diff_source_bytes":null``. So a diff-less (``ask``) run's
+JSON literally has no ``diff_*`` keys at all, e.g. ``{"fields":{"message":"...","preset":"fast"}}``.
+``| json`` then never creates a ``fields_diff_files_total`` label on that line. Confirmed against
+real Loki: a pipeline label filter (post-``json``, as opposed to a stream-selector matcher) against
+a label that was never extracted drops the line under **both** `!=` and a `=~ ".+"` variant — LogQL
+does not fall back to "absent label compares equal to empty string" here (that convention is a
+Prometheus/LogQL *stream selector* behaviour, not a post-parse pipeline label filter). Do not "fix"
+this filter to `=~ ".+"` later thinking it closes a gap — both forms behave identically for this
+purpose, and the risk is someone assuming the current `!=` form is broken when it isn't.
+
+--- ``avg_over_time`` silently divides by the wrong count ---
+
+A second, more dangerous bug (dangerous because it's silent, not a parse error) was found the same
+way as the grouping issue: pushing TWO diff-bearing "fast" runs with different `diff_budget_bytes`
+(60 000 and 20 000 — true average 40 000) into the same preset group alongside a diff-less "fast" run
+(no `diff_budget_bytes` field at all). The dashboard's original unwrap pattern —
+``| unwrap fields_diff_budget_bytes | __error__=""`` — returned **26 666.67** (== 80 000 / 3), not
+40 000 (== 80 000 / 2). Confirmed against real Loki: ``avg_over_time`` divides its sum by the count
+of ALL log lines it attempted to `unwrap` over the range — including ones the *post*-unwrap
+``__error__=""`` filter later drops from the sum for having no value to unwrap — not the count of
+lines that actually contributed a value. Any preset group mixing diff-bearing and diff-less runs (or
+runs with/without a given static-context block), which is the everyday case in production, silently
+understated every ``avg_over_time`` panel by exactly that ratio. ``sum_over_time`` and
+``quantile_over_time`` were confirmed NOT to share this bug on the same mixed data (a sum doesn't
+divide by a count at all; a percentile reads off the sorted list of actual values, unaffected by how
+many other lines existed). Fix, applied in ``_unwrap`` below: filter for the field's presence
+(``| {field} != ""``) BEFORE ``unwrap``, not only after — this makes the line never reach `unwrap` in
+the first place rather than reach it and get discounted post hoc, and the denominator becomes
+correct. Re-verified after the fix: the same mixed data now returns exactly 40 000.
+
+--- Verification status ---
+
+✅ Empirically verified, in two rounds, against a real, local Loki (grafana/loki 3.1.1 and 3.5.7 —
+every cross-checked behaviour was confirmed identical on both) using genuine
+``tracing_subscriber::fmt::layer().json()`` output captured from a real call to
+``lci_review_agent::prompt::build_messages`` (not hand-written JSON). Round 1 found the grouping
+parse errors above (4 panels) and a bot-claimed absent-label issue that turned out to be a false
+positive; round 2, after fixing the grouping, found and fixed the ``avg_over_time`` denominator bug
+above (5 panels: the effective-budget-avg panel and all four static-context-block avg panels) using a
+second, deliberately multi-sample dataset designed to make averaging bugs visible (a single sample
+per group, as round 1 used, cannot distinguish a correct average from a broken one).
+
+- The CRI-unwrap chain (``| pattern`` + ``| line_format`` + ``| json``) correctly strips the
+  ``<ts> stdout F `` prefix and parses the remainder even though the embedded JSON itself contains
+  spaces (the ``<content>`` capture takes everything after the third field, not up to the next
+  space).
+- Nested ``fields`` flattens to ``fields_<name>`` labels as documented in "Gotcha #2".
+- ``|= "prompt budget usage"`` cleanly disambiguates from the sibling
+  ``"prompt budgets: window-proportional caps active (ADR-0070)"`` event — zero lines matched both.
+- The diff-less exclusion (``!= ""`` on an absent label) behaves as documented above.
+- Every panel's query, taken from the generated dashboard JSON (not retyped from this source) after
+  BOTH fixes, parses without error and returns the numbers expected from known synthetic input on
+  real Loki — including the average panels, re-checked against a multi-sample dataset specifically
+  chosen so a wrong denominator would produce a visibly wrong number, not a coincidentally-right one.
+
+⚠️ Residual, honestly-unclosed gap: this was verified against **synthetic data pushed directly to a
+local Loki**, not against the real production stream. The stream *labels* used
+(``namespace="lightbridge-agents"``, ``pod=~"lightbridge-agent-.*"``) match what ``task_runs.py``
+already established works against prod, but that specific claim was not re-verified here, and
+real-world data volume/cardinality (many concurrent pods, long time ranges, Alloy's actual JSON
+serialization of any fields not covered by this event) is untested. Confirm the p95 panel renders
+plausible numbers on the first real deploy before trusting a sizing decision off this dashboard.
 
 Edit this generator, then ``python tools/dashboard-gen/generate.py`` and commit the regenerated
 ``deploy/observability/dashboards/prompt-budget.json`` (CI diffs it).
@@ -114,9 +189,24 @@ _STREAM = f'{_CRI_JSON} | fields_preset =~ "^$preset$"'
 
 
 def _unwrap(field: str) -> str:
-    """A range-vector unwrapping `field` off the parsed prompt-budget event stream, dropping
-    unwrap-time conversion errors (a line where the field was absent or non-numeric)."""
-    return f'{_STREAM} | unwrap {field} | __error__=""'
+    """A range-vector unwrapping `field` off the parsed prompt-budget event stream.
+
+    `{field} != ""` filters out lines where the field was never extracted (absent from the JSON —
+    e.g. a diff-less `ask` run has no `diff_*` fields at all) BEFORE `unwrap`, not just via the
+    post-unwrap `__error__=""` that used to be the only guard here. This is load-bearing, not
+    belt-and-suspenders duplication — confirmed against a real Loki instance (see the module
+    docstring's "avg_over_time silently divides by the wrong count" section): `avg_over_time`
+    divides its sum by the count of ALL log lines Loki attempted to unwrap over the range, including
+    ones the post-unwrap `__error__=""` filter later drops from the sum — not the count of lines that
+    actually contributed a value. Any preset group mixing diff-bearing and diff-less runs (the
+    everyday case) silently understated every average until this pre-filter was added.
+    `sum_over_time`/`quantile_over_time` were confirmed NOT to have this bug (summing doesn't divide;
+    a percentile is read off the actual sorted value list, not a raw line count) — the pre-filter is
+    applied uniformly anyway since this is the one place all three functions share it, and it's
+    strictly correct either way. The post-unwrap `__error__=""` stays as a defensive backstop for a
+    genuinely-non-numeric value, which `!= ""` alone would not catch.
+    """
+    return f'{_STREAM} | {field} != "" | unwrap {field} | __error__=""'
 
 
 def _quantile(q: float, field: str, rng: str = "$__range") -> str:
@@ -127,15 +217,29 @@ def _quantile(q: float, field: str, rng: str = "$__range") -> str:
 
 
 def _sum(field: str, rng: str = "$__range") -> str:
-    return f"sum_over_time({_unwrap(field)} [{rng}]) by (fields_preset)"
+    """`sum_over_time` does NOT support a native `by (...)` grouping clause — confirmed against a
+    real Loki instance (see the module docstring's "Grouping" section) and against the Grafana docs:
+    "Except for `sum_over_time`, `absent_over_time`, `rate` and `rate_counter`, unwrapped range
+    aggregations support grouping." `sum_over_time(...) by (fields_preset)` is a LogQL parse error
+    ("grouping not allowed for sum_over_time aggregation"), not an empty/degenerate result — so the
+    fix is a Prometheus-style vector-aggregation wrapper (`sum by (...) (...)`) around the range
+    aggregation instead of a grouping clause on the range aggregation itself.
+    """
+    return f"sum by (fields_preset) (sum_over_time({_unwrap(field)} [{rng}]))"
 
 
 def _avg(field: str, rng: str = "$__range") -> str:
+    """`avg_over_time` IS one of the unwrapped range aggregations that supports native `by (...)`
+    grouping (confirmed against real Loki — see the module docstring), unlike `_sum`/`_count` above."""
     return f"avg_over_time({_unwrap(field)} [{rng}]) by (fields_preset)"
 
 
 def _count(expr: str, rng: str = "$__range") -> str:
-    return f"count_over_time({expr} [{rng}]) by (fields_preset)"
+    """`count_over_time` is a plain (non-`unwrap`) log range aggregation, and none of those
+    (`count_over_time`, `bytes_over_time`, `rate`, `bytes_rate`) support a native `by (...)` clause
+    at all — confirmed against real Loki the same way as `_sum` above. Same vector-aggregation-wrapper
+    fix."""
+    return f"sum by (fields_preset) (count_over_time({expr} [{rng}]))"
 
 
 # Coverage-loss ratio: what share of diff-bearing runs lost whole-file coverage (`diff_files_omitted
@@ -174,11 +278,12 @@ everything a bigger cap could plausibly let through.
    instructions, and repo config all compete for the same context window budget as the diff; a
    bigger diff share shrinks theirs.
 
-⚠️ **Unverified.** These LogQL queries are written against the documented CRI-wrapped +
-`fields_`-nested log shape (see this dashboard's generator, `tools/dashboard-gen/lci_dashboards/\
-prompt_budget.py`) but have not been run against live Loki. Confirm the p95 panel actually renders
-numbers before making a sizing decision off this dashboard — an empty panel here means the query is
-wrong, not that there's no data.
+✅ **Empirically verified** (CRI-unwrap chain, `fields_` flattening, event disambiguation, the
+diff-less exclusion, and every panel's grouping syntax) against a real local Loki using genuine
+`tracing`-emitted log output — see "Verification status" in this dashboard's generator,
+`tools/dashboard-gen/lci_dashboards/prompt_budget.py`, for the full method and versions tested.
+⚠️ Not yet re-verified against the real production stream — confirm the p95 panel renders plausible
+numbers on the first real deploy before trusting a sizing decision off this dashboard.
 """
 
 
