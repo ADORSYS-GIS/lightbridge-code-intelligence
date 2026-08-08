@@ -25,3 +25,12 @@ advancing, a blocker cleared — move that item to its new section (or add it) i
 PR**, with the merge/issue reference and date. It is not the source of truth (decisions live in
 `docs/adr/`, tracked work in GitHub issues), so keep entries short and link out rather than duplicating
 detail. If a change touches nothing on the roadmap, leave it alone — don't churn the file for its own sake.
+
+## Identifier format
+
+Every identifier this repo mints is a **CUID2** (24 chars, lowercase `a-z0-9`, starts with a letter) —
+never add a new `Uuid::new_v4()`-style call site. This bans *minting*, not *storing*: ids owned by
+systems we don't control stay as they arrive. Ids are opaque (no shape validation), unordered (sort by
+`created_at`, not id), stored as `TEXT`, and minted through one chokepoint.
+
+Source of truth: [ADR 0039](https://github.com/ADORSYS-GIS/webank-context/blob/master/decisions/0039-cuid2-is-the-house-id-format.md).
