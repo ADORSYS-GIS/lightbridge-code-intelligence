@@ -154,6 +154,13 @@ def dashboard_builder() -> dashboard.Dashboard:
     # across all matching gateway calls in range.
     tokens_total = (
         stat.Panel()
+        # explicit id pinned so the apps/web d-solo embed URL is deterministic
+        # (repo-analytics-embed.tsx), mirroring task_runs.py's run_logs panel. This is the ONLY
+        # panel on this dashboard picked for the per-repo embed: it's Loki-sourced and genuinely
+        # scoped by $repo (see module docstring) — the Postgres findings/reactions panels below
+        # are NOT scoped by $repo and would silently show every repo's data if embedded the same
+        # way, so they're intentionally left out of the embed rather than guessed at.
+        .id(100)
         .title("Tokens (range)")
         .datasource(LOKI)
         .with_target(logql(_TOKENS_RANGE))

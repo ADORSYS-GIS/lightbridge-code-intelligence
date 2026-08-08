@@ -124,6 +124,7 @@
         "x": 18,
         "y": 0
       },
+      "id": 100,
       "options": null,
       "repeatDirection": "h",
       "targets": [
