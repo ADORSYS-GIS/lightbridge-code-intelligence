@@ -49,7 +49,7 @@ lci-config = { path = "../config" }
 # This is a git dependency because the crate is not published yet. Once `lci-codegraph` is released
 # to crates.io, replace this whole entry with a plain `lci-codegraph = "<version>"` — no other change
 # is needed, the import path and API are identical.
-lci-codegraph = { git = "https://github.com/vymalo/lci-codegraph", rev = "287d590e143656fcf52116fc0b6655904c764b4d" }
+lci-codegraph = { git = "https://github.com/vymalo/lci-codegraph", rev = "de5c1c4bba15e392ef04201fa106284f1ca35f3f" }
 # Shared tracing/OTel bootstrap (ticket #246): JSON logs (as before) + optional OTLP→Tempo export, plus
 # the crypto-provider pin this binary needs but never had (see lci-observability's doc comment).
 lci-observability = { path = "../observability" }
