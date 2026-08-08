@@ -21,6 +21,13 @@ pub struct PromptConfig {
     /// Model context window in tokens (ADR-0045). `Some(n)` activates the window-proportional block caps
     /// (ADR-0070); `None` = the absolute ceilings apply unchanged (legacy behaviour).
     pub context_window: Option<usize>,
+    /// The resolved review preset name (`"fast"`/`"deep"`/`"ultra"`, or an operator-defined one,
+    /// ADR-0103). Carries NO prompt-shaping behaviour of its own — every preset already reaches this
+    /// struct pre-resolved into `max_diff_chars`/`context_window`/etc. Its only job is as the `preset`
+    /// field on the prompt-budget log event ([`log_prompt_metrics`]): without it, the per-run byte
+    /// accounting can't distinguish the 120k `fast` tier from the 300k `deep` tier, which is the whole
+    /// point of collecting this data (deciding what to raise the cap TO, per tier).
+    pub preset: String,
 }
 
 /// The PR change set as prompt assembly sees it: the unified diff + the changed-file list. Borrowed
@@ -151,6 +158,82 @@ fn truncate_on_boundary(s: &str, max: usize) -> &str {
     &s[..end]
 }
 
+// ─── Prompt-budget accounting ───────────────────────────────────────────────────────────────────
+//
+// The operator wants to raise `review.max_diff_chars` (120k on `fast`, 300k on `deep` in prod) but
+// needs evidence of how many bytes are actually being thrown away, not just how often the cap binds
+// — "raise it to what?" needs a distribution, not a boolean. [`log_prompt_metrics`] below is that
+// evidence: it emits one structured log event per run with the full byte/file breakdown, and the
+// runner's stdout already reaches Loki, so querying and percentile-bucketing across runs is a log
+// query away. (An earlier version of this also recorded OTel histograms; that path was removed once
+// it was confirmed the production Grafana Alloy collector drops delta-temporality metrics and the
+// fix — `otelcol.processor.deltatocumulative` — is an experimental component the cluster's sole
+// collector can't be lowered to run. The log event was always the primary sink for the high-
+// cardinality per-run detail, so nothing here changed shape, only the now-dead second sink went away.)
+
+/// Per-run diff byte/file accounting handed to [`log_prompt_metrics`] — a straight relabelling of
+/// [`diff::RenderedDiff`]'s fields plus the budget it was packed against, computed once in
+/// [`build_messages`] where the raw diff and [`PromptBudgets`] are both in scope.
+struct DiffMetrics {
+    source_bytes: usize,
+    rendered_bytes: usize,
+    budget_bytes: usize,
+    omitted_bytes: usize,
+    total_files: usize,
+    rendered_files: usize,
+    omitted_files: usize,
+    low_signal_files: usize,
+}
+
+/// Per-run byte accounting for one of the four static context blocks (priors/memory/instructions/
+/// repo_config), recorded only when that block was actually present on this run (`None` blocks record
+/// nothing — an absent block isn't a zero-byte data point, it's not a data point).
+struct BlockMetrics {
+    /// The generic-block field value: `"priors"`, `"memory"`, `"instructions"`, or `"repo_config"`.
+    block: &'static str,
+    input_bytes: usize,
+    rendered_bytes: usize,
+    budget_bytes: usize,
+}
+
+/// Emit one run's prompt-budget byte/file accounting as a structured log event. `preset` distinguishes
+/// tiers; the runner's stdout already reaches Loki, so this event is queryable per-run (sliceable by
+/// repo/PR via the surrounding span) immediately — the sole sink for this data (see the "Prompt-budget
+/// accounting" section above). Matches the style of the existing ADR-0070 "window-proportional caps
+/// active" log below.
+fn log_prompt_metrics(preset: &str, diff: Option<&DiffMetrics>, blocks: &[BlockMetrics]) {
+    let block = |name: &str| blocks.iter().find(|b| b.block == name);
+    let priors = block("priors");
+    let memory = block("memory");
+    let instructions = block("instructions");
+    let repo_config = block("repo_config");
+
+    tracing::info!(
+        preset,
+        diff_source_bytes = diff.map(|d| d.source_bytes),
+        diff_rendered_bytes = diff.map(|d| d.rendered_bytes),
+        diff_budget_bytes = diff.map(|d| d.budget_bytes),
+        diff_omitted_bytes = diff.map(|d| d.omitted_bytes),
+        diff_files_total = diff.map(|d| d.total_files),
+        diff_files_rendered = diff.map(|d| d.rendered_files),
+        diff_files_omitted = diff.map(|d| d.omitted_files),
+        diff_files_low_signal = diff.map(|d| d.low_signal_files),
+        priors_input_bytes = priors.map(|b| b.input_bytes),
+        priors_rendered_bytes = priors.map(|b| b.rendered_bytes),
+        priors_budget_bytes = priors.map(|b| b.budget_bytes),
+        memory_input_bytes = memory.map(|b| b.input_bytes),
+        memory_rendered_bytes = memory.map(|b| b.rendered_bytes),
+        memory_budget_bytes = memory.map(|b| b.budget_bytes),
+        instructions_input_bytes = instructions.map(|b| b.input_bytes),
+        instructions_rendered_bytes = instructions.map(|b| b.rendered_bytes),
+        instructions_budget_bytes = instructions.map(|b| b.budget_bytes),
+        repo_config_input_bytes = repo_config.map(|b| b.input_bytes),
+        repo_config_rendered_bytes = repo_config.map(|b| b.rendered_bytes),
+        repo_config_budget_bytes = repo_config.map(|b| b.budget_bytes),
+        "prompt budget usage: per-block byte accounting (informs max_diff_chars sizing)"
+    );
+}
+
 /// Assemble the system (operator prompt + tool-protocol) and user (request + diff + static context)
 /// messages for one review run. The system prompt is the **required** operator-owned guidance
 /// (ADR-0037 — no built-in default); the tool-protocol is appended last so it's the final instruction
@@ -191,6 +274,13 @@ pub fn build_messages(
         );
     }
 
+    // Byte accounting for the prompt-budget log event emitted at the end of this function (below), once
+    // every number is in scope. `diff_metrics` stays `None` on a diff-less (`ask`) run — nothing to
+    // measure. `block_metrics` collects one entry per STATIC block actually present on this run; an
+    // absent block records nothing (it isn't a zero-byte data point, it's not a data point).
+    let mut diff_metrics: Option<DiffMetrics> = None;
+    let mut block_metrics: Vec<BlockMetrics> = Vec::new();
+
     let mut user = format!("The maintainer's request: {command}");
     match diff {
         Some(pr) => {
@@ -229,6 +319,20 @@ pub fn build_messages(
                     rendered.omitted_for_budget.join(", ")
                 ));
             }
+            // "Source diff bytes" — the real demand — is the raw diff minus whatever was set aside as
+            // low-signal (`rendered.low_signal_bytes`, which is `0` in the lockfile-only-PR edge case,
+            // since then the low-signal files ARE the source). This is the number that answers "raise
+            // max_diff_chars to what": everything a bigger cap could plausibly let through.
+            diff_metrics = Some(DiffMetrics {
+                source_bytes: pr.diff.len() - rendered.low_signal_bytes,
+                rendered_bytes: rendered.text.len(),
+                budget_bytes: budgets.diff,
+                omitted_bytes: rendered.omitted_for_budget_bytes,
+                total_files: rendered.total_files,
+                rendered_files: rendered.rendered_files,
+                omitted_files: rendered.omitted_for_budget_files,
+                low_signal_files: rendered.low_signal_files,
+            });
         }
         None => user.push_str(
             "\n\nNo diff is available for this run; answer or review against the working tree and \
@@ -245,11 +349,14 @@ pub fn build_messages(
     // authoritative. `None` on a first review, so a fresh PR reads exactly as before.
     if let Some(prior) = prior_reviews {
         user.push_str("\n\n");
-        user.push_str(&cap_prompt_block(
-            prior,
-            budgets.priors,
-            "prior-reviews context",
-        ));
+        let rendered = cap_prompt_block(prior, budgets.priors, "prior-reviews context");
+        block_metrics.push(BlockMetrics {
+            block: "priors",
+            input_bytes: prior.len(),
+            rendered_bytes: rendered.len(),
+            budget_bytes: budgets.priors,
+        });
+        user.push_str(&rendered);
     }
 
     // Per-repo feedback memory (M1, ADR-0044): findings rejected (👎) here before — untrusted context,
@@ -257,11 +364,14 @@ pub fn build_messages(
     // reading exactly as before.
     if let Some(memory) = repo_memory {
         user.push_str("\n\n");
-        user.push_str(&cap_prompt_block(
-            memory,
-            budgets.memory,
-            "repo feedback memory",
-        ));
+        let rendered = cap_prompt_block(memory, budgets.memory, "repo feedback memory");
+        block_metrics.push(BlockMetrics {
+            block: "memory",
+            input_bytes: memory.len(),
+            rendered_bytes: rendered.len(),
+            budget_bytes: budgets.memory,
+        });
+        user.push_str(&rendered);
     }
 
     // The repo's OWN explicit review config (`.lightbridge-code-review.jsonc`, ADR-0030): conventions/
@@ -271,23 +381,41 @@ pub fn build_messages(
     // no such header. Placed before `repo_instructions` (config first, ambient convention prose second).
     if let Some(repo_config) = repo_config_context {
         user.push_str("\n\n");
-        user.push_str(&cap_prompt_block(
+        let rendered = cap_prompt_block(
             repo_config,
             budgets.repo_config,
             "repository review configuration",
-        ));
+        );
+        block_metrics.push(BlockMetrics {
+            block: "repo_config",
+            input_bytes: repo_config.len(),
+            rendered_bytes: rendered.len(),
+            budget_bytes: budgets.repo_config,
+        });
+        user.push_str(&rendered);
     }
 
     // Repo-native agent instructions (ADR-0036), kept in the user message as untrusted context (it is
     // already labelled and the tool-protocol/mission in the system message stays authoritative).
     if let Some(instructions) = repo_instructions {
         user.push_str("\n\n");
-        user.push_str(&cap_prompt_block(
+        let rendered = cap_prompt_block(
             instructions,
             budgets.instructions,
             "repository agent instructions",
-        ));
+        );
+        block_metrics.push(BlockMetrics {
+            block: "instructions",
+            input_bytes: instructions.len(),
+            rendered_bytes: rendered.len(),
+            budget_bytes: budgets.instructions,
+        });
+        user.push_str(&rendered);
     }
+
+    // Prompt-budget structured log (see the "Prompt-budget accounting" section above): every number is
+    // in scope here, at the end of assembly, after every block has made its capping decision.
+    log_prompt_metrics(&config.preset, diff_metrics.as_ref(), &block_metrics);
 
     vec![ChatMessage::system(system), ChatMessage::user(user)]
 }
@@ -301,6 +429,7 @@ mod tests {
             system_prompt: "You are a reviewer.".to_string(),
             max_diff_chars: 60_000,
             context_window: None,
+            preset: "fast".to_string(),
         }
     }
 

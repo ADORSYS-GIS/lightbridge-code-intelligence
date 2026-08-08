@@ -517,6 +517,7 @@ async fn perform_review(
     };
     let outcome = review::opencode::run_opencode_agent(
         review,
+        &context.preset,
         &context.command,
         diff.as_ref(),
         repo_instructions.as_deref(),

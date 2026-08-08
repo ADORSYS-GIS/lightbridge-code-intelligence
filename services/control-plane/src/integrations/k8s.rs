@@ -479,6 +479,27 @@ fn job_manifest(name: &str, cfg: JobConfig, task: &ClaimedTask) -> Value {
     if let Some(traceparent) = lci_observability::current_traceparent() {
         env.push(json!({ "name": "TRACEPARENT", "value": traceparent }));
     }
+    // TRACEPARENT (above) is a trace context with nowhere to go unless the runner can also export it.
+    // `services/observability/src/lib.rs::init_tracing` only installs its OTLP export layer when
+    // `OTEL_EXPORTER_OTLP_ENDPOINT` is present in *its own* process env — and the agent-runner Job is
+    // not a Helm-templated pod (unlike control-plane/dispatcher, which get this from chart values), so
+    // without forwarding it here every runner Job would carry a TRACEPARENT it is structurally unable
+    // to export against, and emit no OTel data at all. Forward both the endpoint and (if set) the
+    // trace sampler ratio verbatim from the dispatcher's own env — same shape as the `INDEX_*`
+    // passthrough loop below (`if let Ok(value) = std::env::var(key)`), just placed next to
+    // TRACEPARENT since the two are one mechanism. Unlike that loop, this is deliberately OUTSIDE the
+    // `is_open` gate: the gate exists to keep index/embeddings *credentials* off the hardened `open`
+    // surface (ADR-0088), but a collector URL is not a credential — it's the same non-secret endpoint
+    // already present in the dispatcher's own pod spec — and `open` tasks (untrusted repo + generated
+    // code) are exactly the ones whose telemetry matters most. Absent (no collector configured) leaves
+    // the Job exactly as it was before this: fmt-only, no OTel layer installed, matching today's
+    // behaviour for any deployment that hasn't configured a collector.
+    if let Ok(endpoint) = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT") {
+        env.push(json!({ "name": "OTEL_EXPORTER_OTLP_ENDPOINT", "value": endpoint }));
+    }
+    if let Ok(sampler_arg) = std::env::var("OTEL_TRACES_SAMPLER_ARG") {
+        env.push(json!({ "name": "OTEL_TRACES_SAMPLER_ARG", "value": sampler_arg }));
+    }
     if !is_open {
         // Embeddings config (ADR-0018): required for index/review — a misconfigured Job fails loud
         // rather than silently embedding with the wrong model. `open` never gets these: it does not
@@ -882,6 +903,105 @@ mod tests {
             cfg_vol.config_map.as_ref().map(|c| c.name.as_str()),
             Some("lightbridge-agent-config")
         );
+    }
+
+    // Ticket #246 (extended): the runner's `init_tracing` (services/observability) only installs its
+    // OTLP export layer when `OTEL_EXPORTER_OTLP_ENDPOINT` is present in *its own* env — so the
+    // TRACEPARENT handoff above is inert unless job_manifest also forwards the dispatcher's OTel
+    // config into the Job. All three scenarios live in one #[test] (rather than three) because
+    // `OTEL_EXPORTER_OTLP_ENDPOINT`/`OTEL_TRACES_SAMPLER_ARG` are real process-env vars, and this file
+    // has no `serial_test`-style guard against `cargo test`'s default parallel execution: two
+    // #[test] fns racing to set/unset the SAME env var key would be flaky by construction. Doing the
+    // set → assert → unset → assert sequence within a single, sole owner of these two keys (grepped:
+    // no other test in this crate touches them) keeps it deterministic regardless of run order or
+    // thread interleaving with unrelated tests.
+    #[test]
+    fn otel_env_is_forwarded_from_the_dispatchers_own_process_env() {
+        // Guard against ever leaking a real value from the host running `cargo test` into the
+        // "unset" assertion below.
+        unsafe {
+            std::env::remove_var("OTEL_EXPORTER_OTLP_ENDPOINT");
+            std::env::remove_var("OTEL_TRACES_SAMPLER_ARG");
+        }
+
+        let env_of = |value: Value| -> Vec<(String, Option<String>)> {
+            let job: Job = serde_json::from_value(value).expect("valid Job manifest");
+            job.spec.unwrap().template.spec.unwrap().containers[0]
+                .env
+                .clone()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|e| (e.name, e.value))
+                .collect()
+        };
+        let has = |env: &[(String, Option<String>)], name: &str| {
+            env.iter().find(|(n, _)| n == name).map(|(_, v)| v.clone())
+        };
+
+        let base_config = || JobConfig {
+            image: "img:tag",
+            service_account: "sa",
+            control_plane_url: "http://cp:8080",
+            runner_token: "runner-secret",
+            ca_secret: None,
+            active_deadline_seconds: 1800,
+            review_system_prompt: None,
+            agent_config_map: None,
+            resources: None,
+            owner_reference: None,
+        };
+
+        // (b) Absent in the dispatcher's env → absent in the Job (today's behaviour, unchanged: a
+        // deployment with no collector configured stays fmt-only).
+        let review_task = sample_task(); // command_text == "review"
+        let value = job_manifest(&job_name(&review_task), base_config(), &review_task);
+        let env = env_of(value);
+        assert!(
+            has(&env, "OTEL_EXPORTER_OTLP_ENDPOINT").is_none(),
+            "no collector configured → endpoint must not appear"
+        );
+        assert!(
+            has(&env, "OTEL_TRACES_SAMPLER_ARG").is_none(),
+            "no collector configured → sampler arg must not appear"
+        );
+
+        // (a) Present in the dispatcher's env → forwarded verbatim into a review Job.
+        unsafe {
+            std::env::set_var("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4317");
+            std::env::set_var("OTEL_TRACES_SAMPLER_ARG", "0.1");
+        }
+        let value = job_manifest(&job_name(&review_task), base_config(), &review_task);
+        let env = env_of(value);
+        assert_eq!(
+            has(&env, "OTEL_EXPORTER_OTLP_ENDPOINT"),
+            Some(Some("http://otel-collector:4317".to_string()))
+        );
+        assert_eq!(
+            has(&env, "OTEL_TRACES_SAMPLER_ARG"),
+            Some(Some("0.1".to_string()))
+        );
+
+        // (c) Still forwarded for an `open`-kind task: a collector URL is not a credential, so it must
+        // NOT be caught by the `is_open` gate that keeps index/embeddings secrets off that hardened,
+        // untrusted-code surface (ADR-0088) — see the comment beside the TRACEPARENT push.
+        let mut open_task = sample_task();
+        open_task.command_text = "open".to_string();
+        let value = job_manifest(&job_name(&open_task), base_config(), &open_task);
+        let env = env_of(value);
+        assert_eq!(
+            has(&env, "OTEL_EXPORTER_OTLP_ENDPOINT"),
+            Some(Some("http://otel-collector:4317".to_string())),
+            "open tasks are exactly the ones whose telemetry matters most (ADR-0088 rationale)"
+        );
+        assert_eq!(
+            has(&env, "OTEL_TRACES_SAMPLER_ARG"),
+            Some(Some("0.1".to_string()))
+        );
+
+        unsafe {
+            std::env::remove_var("OTEL_EXPORTER_OTLP_ENDPOINT");
+            std::env::remove_var("OTEL_TRACES_SAMPLER_ARG");
+        }
     }
 
     // ADR-0088 merge bar: the `open` Job manifest satisfies every sandbox hard requirement (non-root,
