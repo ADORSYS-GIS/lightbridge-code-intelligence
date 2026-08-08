@@ -82,6 +82,7 @@ async fn drive(scenario: GoldenScenario) -> (LegacyTrace, Vec<String>) {
         system_prompt: "You are a reviewer.".to_string(),
         max_diff_chars: 60_000,
         context_window: settings.context_window,
+        preset: "fast".to_string(),
     };
     let messages = prompt::build_messages(&config, "review", diff, None, None, None, None);
     let initial_names = tool_defs()

@@ -122,6 +122,12 @@ pub struct McpEnv<'a> {
 #[allow(clippy::too_many_arguments)]
 pub async fn run_opencode_agent(
     review: &ReviewConfig,
+    // Resolved review preset name (`"fast"`/`"deep"`/`"ultra"`, or an operator-defined one, ADR-0103—
+    // `context.preset` at the caller). `ReviewConfig` itself doesn't carry it (a preset resolves INTO a
+    // `ReviewConfig`, it isn't stored alongside one), so it's threaded through as its own parameter
+    // purely to label the prompt-budget metrics (`lci.review.prompt.*`) — without it a histogram of
+    // `max_diff_chars` usage can't tell the 120k `fast` tier apart from the 300k `deep` tier.
+    preset: &str,
     command: &str,
     diff: Option<&PrDiff>,
     repo_instructions: Option<&str>,
@@ -144,6 +150,7 @@ pub async fn run_opencode_agent(
         system_prompt: review.system_prompt.clone(),
         max_diff_chars: review.max_diff_chars,
         context_window: review.context_window,
+        preset: preset.to_string(),
     };
     let diff_ref = diff.map(|pr| PrDiffRef {
         diff: &pr.diff,

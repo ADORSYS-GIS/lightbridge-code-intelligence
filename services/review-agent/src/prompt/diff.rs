@@ -36,6 +36,19 @@ struct FileSection<'a> {
 
 /// The outcome of packing a PR diff into the prompt budget, file-boundary aware. Paths borrow from the
 /// diff (`'a`) — the caller stringifies them into the prompt immediately, so no ownership is needed.
+///
+/// Byte accounting (added alongside the path lists to answer "raise `max_diff_chars` to what?", not
+/// just "which files got dropped"): every count below is a straight sum of the relevant per-file
+/// [`FileSection`] text lengths, never an estimate, and the following always reconciles against the
+/// original `diff` byte length passed to [`render_diff_for_prompt`]:
+///
+/// `text.len() + omitted_for_budget_bytes + low_signal_bytes == diff.len()`
+///
+/// (this holds in both the normal case — source sections packed, low-signal sections set aside — and
+/// the lockfile-only-PR edge case — everything is "low-signal" but gets rendered anyway, so
+/// `low_signal_bytes` is `0` and every byte flows through `text`/`omitted_for_budget_bytes` instead).
+/// Likewise `total_files == rendered_files + omitted_for_budget_files + low_signal_files`. Both
+/// invariants are asserted directly in this module's tests.
 pub struct RenderedDiff<'a> {
     /// The diff text to paste into the prompt: whole per-file sections, source first, within budget.
     pub text: String,
@@ -46,6 +59,31 @@ pub struct RenderedDiff<'a> {
     /// Files set aside as low-signal generated/lock noise and listed rather than rendered (unless the PR
     /// changed nothing else). Repo-relative paths, in diff order.
     pub low_signal: Vec<&'a str>,
+    /// Every per-file section found in the diff, source and low-signal alike, before any packing
+    /// decision. The denominator for the file-count reconciliation above.
+    pub total_files: usize,
+    /// Sections whose FULL text made it into `text`. Deliberately distinct from "not counted as
+    /// omitted": the one-oversized-file-boundary-truncation case (a single section larger than the
+    /// whole budget) still shows a byte-limited *prefix* of that file, but the file itself is NOT fully
+    /// shown, so it counts toward `omitted_for_budget_files`/`omitted_for_budget_bytes` below, not here.
+    pub rendered_files: usize,
+    /// How many source sections didn't fit the budget and were dropped — the same count as
+    /// `omitted_for_budget.len()`, but tracked as its own counter (not derived from the Vec) so file-
+    /// count reconciliation never depends on `Vec::dedup`'s same-path-collapsing behaviour.
+    pub omitted_for_budget_files: usize,
+    /// How many sections were set aside as low-signal and listed rather than rendered — `0` in the
+    /// lockfile-only-PR edge case, where those sections ARE the rendered diff. Same rationale as
+    /// `omitted_for_budget_files` for tracking this independent of the Vec.
+    pub low_signal_files: usize,
+    /// Bytes NOT shown because they didn't fit the budget: the full length of every fully-dropped
+    /// section, plus (for the single-oversized-file case) the truncated-away tail of the one section
+    /// that got a partial prefix rendered. This is the direct "how many bytes did the cap throw away"
+    /// number — the raw material for deciding what to raise `max_diff_chars` to.
+    pub omitted_for_budget_bytes: usize,
+    /// Bytes of the sections set aside as low-signal noise (lockfiles, generated code, …) and NOT
+    /// rendered. `0` when there's no source at all (the lockfile-only-PR fallback renders them instead
+    /// of setting them aside) — mirrors `low_signal_files`/`low_signal`.
+    pub low_signal_bytes: usize,
 }
 
 /// Whether a path carries little-to-no review signal per byte, so it's deprioritised out of the
@@ -152,6 +190,7 @@ fn truncate_on_boundary(s: &str, max: usize) -> &str {
 /// huge file can't blank the diff; it's still flagged as omitted so the model knows it's partial.
 pub fn render_diff_for_prompt(diff: &str, max: usize) -> RenderedDiff<'_> {
     let sections = split_sections(diff);
+    let total_files = sections.len();
 
     let (source, low_signal): (Vec<&FileSection>, Vec<&FileSection>) =
         sections.iter().partition(|s| !s.low_signal);
@@ -168,24 +207,46 @@ pub fn render_diff_for_prompt(diff: &str, max: usize) -> RenderedDiff<'_> {
     } else {
         low_signal.iter().map(|s| s.path).collect()
     };
+    // Byte/file totals for the set-aside sections mirror the disclosure-list branch above exactly: `0`
+    // when they're rendered instead (lockfile-only-PR fallback), else the full sum (never an estimate).
+    let (low_signal_files, low_signal_bytes) = if source.is_empty() {
+        (0, 0)
+    } else {
+        (
+            low_signal.len(),
+            low_signal.iter().map(|s| s.text.len()).sum(),
+        )
+    };
 
     let mut text = String::new();
     let mut omitted_for_budget: Vec<&str> = Vec::new();
+    let mut rendered_files = 0usize;
+    let mut omitted_for_budget_files = 0usize;
+    let mut omitted_for_budget_bytes = 0usize;
     for sec in &render_order {
         // `<=`: a section exactly filling the remaining budget still fits.
         if text.len() + sec.text.len() <= max {
             text.push_str(sec.text);
+            rendered_files += 1;
         } else if text.is_empty() {
             // Nothing rendered yet and even this first section overflows: show as much of it as the
             // budget allows (boundary-safe) rather than emitting an empty diff, and flag it as partial.
-            text.push_str(truncate_on_boundary(sec.text, max));
+            let partial = truncate_on_boundary(sec.text, max);
+            // Only the truncated-away tail is "omitted" — the prefix DID reach the model, so it must not
+            // be double-counted (see the reconciliation invariant on `RenderedDiff`).
+            omitted_for_budget_bytes += sec.text.len() - partial.len();
+            text.push_str(partial);
             omitted_for_budget.push(sec.path);
+            omitted_for_budget_files += 1;
         } else {
+            omitted_for_budget_bytes += sec.text.len();
             omitted_for_budget.push(sec.path);
+            omitted_for_budget_files += 1;
         }
     }
 
-    // Stable, de-duplicated disclosure lists in diff order.
+    // Stable, de-duplicated disclosure lists in diff order. (The byte/file counters above are tallied
+    // during the loop itself, independent of this dedup, so reconciliation never depends on it.)
     low_signal_listed.dedup();
     omitted_for_budget.dedup();
 
@@ -193,6 +254,12 @@ pub fn render_diff_for_prompt(diff: &str, max: usize) -> RenderedDiff<'_> {
         text,
         omitted_for_budget,
         low_signal: low_signal_listed,
+        total_files,
+        rendered_files,
+        omitted_for_budget_files,
+        low_signal_files,
+        omitted_for_budget_bytes,
+        low_signal_bytes,
     }
 }
 
@@ -357,5 +424,114 @@ mod tests {
         assert_eq!(out.text, a);
         assert!(out.omitted_for_budget.is_empty());
         assert!(out.low_signal.is_empty());
+    }
+
+    /// Every [`RenderedDiff`] must satisfy both reconciliation invariants documented on the struct,
+    /// regardless of scenario — shared by the byte-accounting tests below so a mistake in one of them
+    /// can't silently pass just because the other happens to still add up.
+    fn assert_reconciles(diff: &str, out: &RenderedDiff<'_>) {
+        assert_eq!(
+            out.text.len() + out.omitted_for_budget_bytes + out.low_signal_bytes,
+            diff.len(),
+            "rendered + omitted-for-budget + low-signal bytes must reconstruct the original diff length"
+        );
+        assert_eq!(
+            out.total_files,
+            out.rendered_files + out.omitted_for_budget_files + out.low_signal_files,
+            "file counts must reconcile the same way"
+        );
+    }
+
+    // Byte accounting, case 1: a diff that overflows the budget. Exercises both the "fully dropped"
+    // section (src/c.rs) and confirms the dropped bytes are counted exactly (not estimated) — the
+    // number this whole feature exists to produce ("raise max_diff_chars to what?").
+    #[test]
+    fn byte_accounting_reconciles_when_the_budget_overflows() {
+        let a = section("src/a.rs", 3);
+        let b = section("src/b.rs", 3);
+        let c = section("src/c.rs", 3);
+        let diff = format!("{a}{b}{c}");
+        let max = a.len() + b.len() + 1; // fits a + b whole, not c.
+        let out = render_diff_for_prompt(&diff, max);
+
+        assert_eq!(out.text.len(), a.len() + b.len(), "a and b render whole");
+        assert_eq!(
+            out.omitted_for_budget_bytes,
+            c.len(),
+            "c is dropped whole, so its exact byte length is the omitted total"
+        );
+        assert_eq!(out.low_signal_bytes, 0);
+        assert_eq!(out.total_files, 3);
+        assert_eq!(out.rendered_files, 2);
+        assert_eq!(out.omitted_for_budget_files, 1);
+        assert_eq!(out.low_signal_files, 0);
+        assert_reconciles(&diff, &out);
+    }
+
+    // Byte accounting, case 2: a diff with low-signal files set aside (not budget-constrained). The
+    // low-signal byte total must equal the lockfile's exact length, and the reconciliation invariant
+    // must hold even though nothing was dropped for budget.
+    #[test]
+    fn byte_accounting_reconciles_with_low_signal_files_set_aside() {
+        let lock = section("Cargo.lock", 200);
+        let src = section("src/auth/store.rs", 5);
+        let diff = format!("{lock}{src}");
+        let max = src.len() + 50; // fits the source but never the lockfile.
+        let out = render_diff_for_prompt(&diff, max);
+
+        assert_eq!(out.text.len(), src.len(), "only the source file renders");
+        assert_eq!(
+            out.omitted_for_budget_bytes, 0,
+            "nothing was budget-dropped"
+        );
+        assert_eq!(
+            out.low_signal_bytes,
+            lock.len(),
+            "the lockfile's exact byte length is set aside, not estimated"
+        );
+        assert_eq!(out.total_files, 2);
+        assert_eq!(out.rendered_files, 1);
+        assert_eq!(out.omitted_for_budget_files, 0);
+        assert_eq!(out.low_signal_files, 1);
+        assert_reconciles(&diff, &out);
+    }
+
+    // Byte accounting, case 3: a diff that fits entirely within budget. Every byte is "rendered", and
+    // both omitted/low-signal totals are exactly zero — the trivial but load-bearing base case.
+    #[test]
+    fn byte_accounting_reconciles_when_everything_fits() {
+        let a = section("src/a.rs", 2);
+        let b = section("src/b.rs", 2);
+        let diff = format!("{a}{b}");
+        let out = render_diff_for_prompt(&diff, diff.len() + 1000);
+
+        assert_eq!(out.text.len(), diff.len());
+        assert_eq!(out.omitted_for_budget_bytes, 0);
+        assert_eq!(out.low_signal_bytes, 0);
+        assert_eq!(out.total_files, 2);
+        assert_eq!(out.rendered_files, 2);
+        assert_eq!(out.omitted_for_budget_files, 0);
+        assert_eq!(out.low_signal_files, 0);
+        assert_reconciles(&diff, &out);
+    }
+
+    // Byte accounting, case 4: the single-oversized-file boundary truncation — the one case where a
+    // section is PARTIALLY rendered. The truncated-away tail (not the whole section) must be what's
+    // counted as omitted, or the reconciliation invariant breaks (this is the subtle case the plain
+    // "flag the path" bookkeeping could get wrong).
+    #[test]
+    fn byte_accounting_reconciles_on_a_single_oversized_file() {
+        let big = section("src/huge.rs", 100);
+        let max = big.len() / 2;
+        let out = render_diff_for_prompt(&big, max);
+
+        assert_eq!(
+            out.omitted_for_budget_bytes,
+            big.len() - out.text.len(),
+            "omitted bytes must be exactly the truncated-away tail, not the whole section"
+        );
+        assert_eq!(out.rendered_files, 0, "no file was shown IN FULL");
+        assert_eq!(out.omitted_for_budget_files, 1);
+        assert_reconciles(&big, &out);
     }
 }

@@ -120,6 +120,10 @@ impl TranscriptSink for JobSink {
 #[allow(clippy::too_many_arguments)]
 pub async fn run_native_agent(
     review: &ReviewConfig,
+    // Resolved review preset name (ADR-0103) — see the identical parameter on the sibling
+    // `opencode::run_opencode_agent` for why this is threaded as its own parameter rather than a
+    // `ReviewConfig` field: it only exists to label the prompt-budget metrics.
+    preset: &str,
     command: &str,
     diff: Option<&PrDiff>,
     // Repo-native agent instructions (ADR-0036), prior reviews (A, #137), and per-repo feedback memory
@@ -165,6 +169,7 @@ pub async fn run_native_agent(
         system_prompt: review.system_prompt.clone(),
         max_diff_chars: review.max_diff_chars,
         context_window: review.context_window,
+        preset: preset.to_string(),
     };
     let diff_ref = diff.map(|pr| PrDiffRef {
         diff: &pr.diff,

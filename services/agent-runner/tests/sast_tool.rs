@@ -213,6 +213,7 @@ async fn opengrep_never_runs_when_the_agent_never_calls_run_sast() {
     };
     let outcome = run_native_agent(
         &review,
+        "fast",
         "review",
         Some(&diff),
         None,
@@ -282,6 +283,7 @@ async fn opengrep_runs_and_surfaces_findings_when_the_agent_calls_run_sast() {
     };
     let outcome = run_native_agent(
         &review,
+        "fast",
         "review",
         Some(&diff),
         None,
