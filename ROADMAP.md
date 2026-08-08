@@ -9,7 +9,7 @@ open a PR to fix this file.
 > **Keeping this current is part of "done."** When a PR meaningfully ships, unblocks, or retires an item
 > here, update its status in the **same PR** (see [AGENTS.md](AGENTS.md)).
 
-_Last updated: 2026-08-07._
+_Last updated: 2026-08-08._
 
 ## Recently shipped
 
@@ -28,8 +28,23 @@ _Last updated: 2026-08-07._
   *or* semantic search; [lci-codegraph#2](https://github.com/vymalo/lci-codegraph/issues/2) — the
   binary/NUL guard was bypassed on the graph path, the one path production runs, letting raw NUL bytes
   into chunk content that PostgreSQL's `text` type rejects outright). Adversarial review of that fix
-  then found the same declaration-vs-implementation ambiguity in the Java tags path, still open
-  upstream as [lci-codegraph#5](https://github.com/vymalo/lci-codegraph/issues/5).
+  then found the same declaration-vs-implementation ambiguity in the Java/TypeScript tags path
+  ([lci-codegraph#5](https://github.com/vymalo/lci-codegraph/issues/5)) — also fixed and consumed.
+
+- **Call-graph recall on Java, TypeScript and Python roughly doubled** — an instance call through a
+  variable receiver (`accountService.findById(id)`, the most common call shape in idiomatic code)
+  resolved to **nothing** on every tags-driven language. The qualifier was captured as the receiver
+  *variable* name and compared textually against the callable's declaring *type*, so the resolver's
+  single-candidate branch rejected the one correct answer — not the documented "ambiguous, so drop"
+  policy, but a correct candidate being actively discarded. Measured on pinned real-world
+  repositories: JSON-java 700 → 1014 `calls` edges (+45%), itsdangerous 68 → 77; Rust unaffected
+  (different code path, already correct). ([lci-codegraph#8](https://github.com/vymalo/lci-codegraph/issues/8))
+
+  Found independently and from opposite directions by an adversarial review and a Spring-support
+  design spike. The reason it survived so long is worth recording: every call site in the upstream
+  fixtures was type-qualified, `this`-qualified, or bare — not one was an instance call through a
+  variable — and the real-world container test asserted *at least one* `calls` edge, which cannot
+  distinguish "resolved most calls" from "resolved the easy third".
 
 - **Per-repo review settings + review on new commits** (Epic #566) — check-run reporting, the
   automatic on-PR-open review, and a new review-on-new-commits trigger are now individually
