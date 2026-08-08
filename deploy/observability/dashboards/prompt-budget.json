@@ -1,0 +1,512 @@
+{
+  "annotations": {},
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "panels": [
+    {
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "options": {
+        "content": "### How to read this dashboard\n\n**The number that answers \"raise `review.max_diff_chars` to what?\" is the p95 (or p99) of\n`diff_source_bytes`, by preset** \u2014 the two bar-gauge panels below. `diff_source_bytes` is the real\ndiff demand *after* low-signal files (lockfiles, generated code) are already dropped: it is\neverything a bigger cap could plausibly let through.\n\n1. **Pick a percentile you're comfortable never truncating below.** p95 is a reasonable default;\n   use p99 if losing whole-file coverage on the long tail matters more than a modestly bigger\n   prompt.\n2. **Read it off the preset you're sizing**, not a blended number \u2014 `fast` (120000 in prod) and\n   `deep` (300000) have different models and context windows, so they must be sized independently.\n   Use the `preset` variable to isolate one, or leave \"All\" to compare both side by side.\n3. **Cross-check \"Coverage loss \u2014 runs with omitted files\".** If a meaningful share of runs on a\n   preset already have `diff_files_omitted > 0`, the current cap isn't just trimming a hunk, it's\n   dropping whole files the reviewer never saw \u2014 that's a stronger signal to raise the cap than the\n   percentile alone.\n4. **Cross-check \"Effective diff budget avg\" against the configured `max_diff_chars`.**\n   `diff_budget_bytes` is the *effective* per-run budget after the ADR-0070 window-proportional\n   share (`min(max_diff_chars, 0.25 \u00d7 context_window \u00d7 4)`). If it sits well below the configured\n   cap, the window share \u2014 not `max_diff_chars` \u2014 is the actual binding constraint, and raising the\n   operator config alone won't move anything.\n5. **Check the static-context-block panels before enlarging the diff share.** Priors, repo memory,\n   instructions, and repo config all compete for the same context window budget as the diff; a\n   bigger diff share shrinks theirs.\n\n\u26a0\ufe0f **Unverified.** These LogQL queries are written against the documented CRI-wrapped +\n`fields_`-nested log shape (see this dashboard's generator, `tools/dashboard-gen/lci_dashboards/prompt_budget.py`) but have not been run against live Loki. Confirm the p95 panel actually renders\nnumbers before making a sizing decision off this dashboard \u2014 an empty panel here means the query is\nwrong, not that there's no data.\n",
+        "mode": "markdown"
+      },
+      "repeatDirection": "h",
+      "title": "How to read this dashboard",
+      "transformations": [],
+      "transparent": false,
+      "type": "text"
+    },
+    {
+      "datasource": {
+        "type": "loki",
+        "uid": "${DS_LOKI}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 9
+      },
+      "options": null,
+      "repeatDirection": "h",
+      "targets": [
+        {
+          "datasource": {
+            "type": "loki",
+            "uid": "${DS_LOKI}"
+          },
+          "expr": "quantile_over_time(0.95, {namespace=\"lightbridge-agents\", pod=~\"lightbridge-agent-.*\"} |= \"prompt budget usage\" | pattern `<_> <_> <_> <content>` | line_format `{{.content}}` | json | __error__=\"\" | fields_preset =~ \"^$preset$\" | unwrap fields_diff_source_bytes | __error__=\"\" [$__range]) by (fields_preset)",
+          "queryType": "range",
+          "refId": "A"
+        }
+      ],
+      "title": "Diff demand p95 (diff_source_bytes) \u2014 size the cap around this",
+      "transformations": [],
+      "transparent": false,
+      "type": "bargauge"
+    },
+    {
+      "datasource": {
+        "type": "loki",
+        "uid": "${DS_LOKI}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 9
+      },
+      "options": null,
+      "repeatDirection": "h",
+      "targets": [
+        {
+          "datasource": {
+            "type": "loki",
+            "uid": "${DS_LOKI}"
+          },
+          "expr": "quantile_over_time(0.99, {namespace=\"lightbridge-agents\", pod=~\"lightbridge-agent-.*\"} |= \"prompt budget usage\" | pattern `<_> <_> <_> <content>` | line_format `{{.content}}` | json | __error__=\"\" | fields_preset =~ \"^$preset$\" | unwrap fields_diff_source_bytes | __error__=\"\" [$__range]) by (fields_preset)",
+          "queryType": "range",
+          "refId": "A"
+        }
+      ],
+      "title": "Diff demand p99 (diff_source_bytes) \u2014 near-zero-truncation margin",
+      "transformations": [],
+      "transparent": false,
+      "type": "bargauge"
+    },
+    {
+      "datasource": {
+        "type": "loki",
+        "uid": "${DS_LOKI}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 17
+      },
+      "options": null,
+      "repeatDirection": "h",
+      "targets": [
+        {
+          "datasource": {
+            "type": "loki",
+            "uid": "${DS_LOKI}"
+          },
+          "expr": "quantile_over_time(0.95, {namespace=\"lightbridge-agents\", pod=~\"lightbridge-agent-.*\"} |= \"prompt budget usage\" | pattern `<_> <_> <_> <content>` | line_format `{{.content}}` | json | __error__=\"\" | fields_preset =~ \"^$preset$\" | unwrap fields_diff_source_bytes | __error__=\"\" [$__interval]) by (fields_preset)",
+          "queryType": "range",
+          "refId": "A"
+        }
+      ],
+      "title": "Diff demand p95 (diff_source_bytes) over time, by preset",
+      "transformations": [],
+      "transparent": false,
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "loki",
+        "uid": "${DS_LOKI}"
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 0,
+        "y": 25
+      },
+      "options": null,
+      "repeatDirection": "h",
+      "targets": [
+        {
+          "datasource": {
+            "type": "loki",
+            "uid": "${DS_LOKI}"
+          },
+          "expr": "count_over_time({namespace=\"lightbridge-agents\", pod=~\"lightbridge-agent-.*\"} |= \"prompt budget usage\" | pattern `<_> <_> <_> <content>` | line_format `{{.content}}` | json | __error__=\"\" | fields_preset =~ \"^$preset$\" [$__range]) by (fields_preset)",
+          "queryType": "range",
+          "refId": "A"
+        }
+      ],
+      "title": "Runs sampled (range)",
+      "transformations": [],
+      "transparent": false,
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "loki",
+        "uid": "${DS_LOKI}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 6,
+        "y": 25
+      },
+      "options": null,
+      "repeatDirection": "h",
+      "targets": [
+        {
+          "datasource": {
+            "type": "loki",
+            "uid": "${DS_LOKI}"
+          },
+          "expr": "quantile_over_time(0.5, {namespace=\"lightbridge-agents\", pod=~\"lightbridge-agent-.*\"} |= \"prompt budget usage\" | pattern `<_> <_> <_> <content>` | line_format `{{.content}}` | json | __error__=\"\" | fields_preset =~ \"^$preset$\" | unwrap fields_diff_source_bytes | __error__=\"\" [$__range]) by (fields_preset)",
+          "queryType": "range",
+          "refId": "A"
+        }
+      ],
+      "title": "Diff demand p50 (diff_source_bytes)",
+      "transformations": [],
+      "transparent": false,
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "loki",
+        "uid": "${DS_LOKI}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 12,
+        "y": 25
+      },
+      "options": null,
+      "repeatDirection": "h",
+      "targets": [
+        {
+          "datasource": {
+            "type": "loki",
+            "uid": "${DS_LOKI}"
+          },
+          "expr": "avg_over_time({namespace=\"lightbridge-agents\", pod=~\"lightbridge-agent-.*\"} |= \"prompt budget usage\" | pattern `<_> <_> <_> <content>` | line_format `{{.content}}` | json | __error__=\"\" | fields_preset =~ \"^$preset$\" | unwrap fields_diff_budget_bytes | __error__=\"\" [$__range]) by (fields_preset)",
+          "queryType": "range",
+          "refId": "A"
+        }
+      ],
+      "title": "Effective diff budget avg (post ADR-0070 window share)",
+      "transformations": [],
+      "transparent": false,
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "loki",
+        "uid": "${DS_LOKI}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 18,
+        "y": 25
+      },
+      "options": null,
+      "repeatDirection": "h",
+      "targets": [
+        {
+          "datasource": {
+            "type": "loki",
+            "uid": "${DS_LOKI}"
+          },
+          "expr": "100 * (count_over_time({namespace=\"lightbridge-agents\", pod=~\"lightbridge-agent-.*\"} |= \"prompt budget usage\" | pattern `<_> <_> <_> <content>` | line_format `{{.content}}` | json | __error__=\"\" | fields_preset =~ \"^$preset$\" | fields_diff_files_omitted > 0 [$__range]) by (fields_preset)) / (count_over_time({namespace=\"lightbridge-agents\", pod=~\"lightbridge-agent-.*\"} |= \"prompt budget usage\" | pattern `<_> <_> <_> <content>` | line_format `{{.content}}` | json | __error__=\"\" | fields_preset =~ \"^$preset$\" | fields_diff_files_total != \"\" [$__range]) by (fields_preset))",
+          "queryType": "range",
+          "refId": "A"
+        }
+      ],
+      "title": "Coverage loss \u2014 runs with omitted files",
+      "transformations": [],
+      "transparent": false,
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "loki",
+        "uid": "${DS_LOKI}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 29
+      },
+      "options": null,
+      "repeatDirection": "h",
+      "targets": [
+        {
+          "datasource": {
+            "type": "loki",
+            "uid": "${DS_LOKI}"
+          },
+          "expr": "sum_over_time({namespace=\"lightbridge-agents\", pod=~\"lightbridge-agent-.*\"} |= \"prompt budget usage\" | pattern `<_> <_> <_> <content>` | line_format `{{.content}}` | json | __error__=\"\" | fields_preset =~ \"^$preset$\" | unwrap fields_diff_omitted_bytes | __error__=\"\" [$__interval]) by (fields_preset)",
+          "queryType": "range",
+          "refId": "A"
+        }
+      ],
+      "title": "Bytes discarded per interval (diff_omitted_bytes), by preset",
+      "transformations": [],
+      "transparent": false,
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "loki",
+        "uid": "${DS_LOKI}"
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 29
+      },
+      "options": null,
+      "repeatDirection": "h",
+      "targets": [
+        {
+          "datasource": {
+            "type": "loki",
+            "uid": "${DS_LOKI}"
+          },
+          "expr": "sum_over_time({namespace=\"lightbridge-agents\", pod=~\"lightbridge-agent-.*\"} |= \"prompt budget usage\" | pattern `<_> <_> <_> <content>` | line_format `{{.content}}` | json | __error__=\"\" | fields_preset =~ \"^$preset$\" | unwrap fields_diff_files_omitted | __error__=\"\" [$__range]) by (fields_preset)",
+          "queryType": "range",
+          "refId": "A"
+        }
+      ],
+      "title": "Files omitted, total (range), by preset",
+      "transformations": [],
+      "transparent": false,
+      "type": "bargauge"
+    },
+    {
+      "datasource": {
+        "type": "loki",
+        "uid": "${DS_LOKI}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 0,
+        "y": 37
+      },
+      "options": null,
+      "repeatDirection": "h",
+      "targets": [
+        {
+          "datasource": {
+            "type": "loki",
+            "uid": "${DS_LOKI}"
+          },
+          "expr": "avg_over_time({namespace=\"lightbridge-agents\", pod=~\"lightbridge-agent-.*\"} |= \"prompt budget usage\" | pattern `<_> <_> <_> <content>` | line_format `{{.content}}` | json | __error__=\"\" | fields_preset =~ \"^$preset$\" | unwrap fields_priors_rendered_bytes | __error__=\"\" [$__range]) by (fields_preset)",
+          "queryType": "range",
+          "refId": "A"
+        }
+      ],
+      "title": "Priors block avg rendered bytes (range)",
+      "transformations": [],
+      "transparent": false,
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "loki",
+        "uid": "${DS_LOKI}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 6,
+        "y": 37
+      },
+      "options": null,
+      "repeatDirection": "h",
+      "targets": [
+        {
+          "datasource": {
+            "type": "loki",
+            "uid": "${DS_LOKI}"
+          },
+          "expr": "avg_over_time({namespace=\"lightbridge-agents\", pod=~\"lightbridge-agent-.*\"} |= \"prompt budget usage\" | pattern `<_> <_> <_> <content>` | line_format `{{.content}}` | json | __error__=\"\" | fields_preset =~ \"^$preset$\" | unwrap fields_memory_rendered_bytes | __error__=\"\" [$__range]) by (fields_preset)",
+          "queryType": "range",
+          "refId": "A"
+        }
+      ],
+      "title": "Repo memory block avg rendered bytes (range)",
+      "transformations": [],
+      "transparent": false,
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "loki",
+        "uid": "${DS_LOKI}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 12,
+        "y": 37
+      },
+      "options": null,
+      "repeatDirection": "h",
+      "targets": [
+        {
+          "datasource": {
+            "type": "loki",
+            "uid": "${DS_LOKI}"
+          },
+          "expr": "avg_over_time({namespace=\"lightbridge-agents\", pod=~\"lightbridge-agent-.*\"} |= \"prompt budget usage\" | pattern `<_> <_> <_> <content>` | line_format `{{.content}}` | json | __error__=\"\" | fields_preset =~ \"^$preset$\" | unwrap fields_instructions_rendered_bytes | __error__=\"\" [$__range]) by (fields_preset)",
+          "queryType": "range",
+          "refId": "A"
+        }
+      ],
+      "title": "Instructions block avg rendered bytes (range)",
+      "transformations": [],
+      "transparent": false,
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "loki",
+        "uid": "${DS_LOKI}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 18,
+        "y": 37
+      },
+      "options": null,
+      "repeatDirection": "h",
+      "targets": [
+        {
+          "datasource": {
+            "type": "loki",
+            "uid": "${DS_LOKI}"
+          },
+          "expr": "avg_over_time({namespace=\"lightbridge-agents\", pod=~\"lightbridge-agent-.*\"} |= \"prompt budget usage\" | pattern `<_> <_> <_> <content>` | line_format `{{.content}}` | json | __error__=\"\" | fields_preset =~ \"^$preset$\" | unwrap fields_repo_config_rendered_bytes | __error__=\"\" [$__range]) by (fields_preset)",
+          "queryType": "range",
+          "refId": "A"
+        }
+      ],
+      "title": "Repo config block avg rendered bytes (range)",
+      "transformations": [],
+      "transparent": false,
+      "type": "stat"
+    }
+  ],
+  "refresh": "5m",
+  "schemaVersion": 36,
+  "style": "dark",
+  "tags": [
+    "lightbridge",
+    "generated"
+  ],
+  "templating": {
+    "list": [
+      {
+        "auto": false,
+        "auto_count": 30,
+        "auto_min": "10s",
+        "hide": 0,
+        "id": "00000000-0000-0000-0000-000000000000",
+        "includeAll": false,
+        "label": "Preset",
+        "multi": false,
+        "name": "preset",
+        "query": "All : .+,fast,deep,ultra",
+        "skipUrlSync": false,
+        "type": "custom"
+      }
+    ]
+  },
+  "time": {
+    "from": "now-7d",
+    "to": "now"
+  },
+  "timezone": "browser",
+  "title": "Lightbridge \u2014 Prompt Budget",
+  "uid": "lci-prompt-budget"
+}
