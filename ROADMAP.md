@@ -126,6 +126,21 @@ _Last updated: 2026-08-08._
   Sliced per-page, in progress.
 - **A2A per-finding review streaming** — stream findings as they are confirmed at finalize.
   ([ADR-0098](https://github.com/vymalo/lightbridge-code-intelligence/pull/458), #458 — open)
+- **A dedicated OTel Collector for LCI telemetry**
+  ([ADR-0113](docs/adr/0113-dedicated-otel-collector-for-lci-telemetry.md) — proposed) — the
+  agent-runner is a one-shot Job, so it must *push* and its metrics must be delta-temporality; the
+  shared Alloy collector drops delta, and the processor that would fix it is experimental and would
+  have to be enabled on the cluster's sole collector. A private collector isolates that decision and,
+  because Loki is on 3.x with native OTLP ingest, also removes the CRI-unwrap tax that every dashboard
+  query currently pays. Prerequisite for prompt-budget *metrics*; the log-based evidence (below) already
+  works without it. Migration hazard called out in the ADR: switching log transport changes the stream
+  labels and will render the Prompt Budget dashboard **empty rather than broken** unless its queries
+  land in the same arc.
+- **Raise `review.max_diff_chars` on evidence** (#597 — instrumentation shipped, decision open) — the
+  cap binds on both presets (120k `fast` / 300k `deep`), confirmed live: effective budget reads ~117 KiB
+  against a configured 120 000. As of 2026-08-08 the first 13 runs show p99 demand at 80.1 KiB with
+  **zero** files omitted, so the data does not yet justify a raise. Revisit once `deep` has runs and the
+  sample is more than a couple of hours old.
 
 ## Planned — open epics
 
