@@ -48,8 +48,11 @@ export async function GET(req: NextRequest) {
   res.cookies.set(SESSION_COOKIE, tokens.access_token, cookieOptions(maxAge));
 
   if (tokens.refresh_token) {
+    // Only a positive value is a usable lifetime; anything else uses the default below.
     const refreshMaxAge =
-      typeof tokens.refresh_expires_in === "number" ? tokens.refresh_expires_in : 30 * 24 * 60 * 60;
+      typeof tokens.refresh_expires_in === "number" && tokens.refresh_expires_in > 0
+        ? tokens.refresh_expires_in
+        : 30 * 24 * 60 * 60;
     res.cookies.set(REFRESH_COOKIE, tokens.refresh_token, cookieOptions(refreshMaxAge));
   }
 

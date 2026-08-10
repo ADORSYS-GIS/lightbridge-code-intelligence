@@ -14,10 +14,10 @@ export interface OidcClientConfig {
   redirectUri: string;
   postLogoutRedirectUri: string;
   /**
-   * Space-delimited scopes; defaults to `openid profile email offline_access`.
-   * Note: The `offline_access` scope is required for the refresh token feature to work.
-   * If overriding `OIDC_SCOPE` in production, ensure `offline_access` is included, otherwise
-   * the background session renewal will silently no-op.
+   * Space-delimited scopes; defaults to `openid profile email`.
+   *
+   * Silent renewal (`middleware.ts`) runs on a session-bound refresh token, whose
+   * `refresh_expires_in` tracks the realm's SSO Session Idle and resets on every refresh.
    */
   scope: string;
 }
@@ -36,7 +36,7 @@ export function oidcClientConfigFromEnv(): OidcClientConfig {
     clientSecret: process.env.OIDC_CLIENT_SECRET || undefined,
     redirectUri: process.env.OIDC_REDIRECT_URI ?? "http://localhost:3000/api/auth/callback",
     postLogoutRedirectUri: process.env.OIDC_POST_LOGOUT_REDIRECT_URI ?? "http://localhost:3000",
-    scope: process.env.OIDC_SCOPE ?? "openid profile email offline_access",
+    scope: process.env.OIDC_SCOPE ?? "openid profile email",
   };
 }
 
