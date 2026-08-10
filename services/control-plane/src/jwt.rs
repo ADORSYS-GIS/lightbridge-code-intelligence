@@ -148,6 +148,14 @@ impl JwtValidator {
         }
     }
 
+    /// The issuer this validator trusts. Read by the `mcp` role to advertise the authorization
+    /// server in its RFC 9728 protected-resource metadata, so clients are pointed at the SAME
+    /// issuer tokens are actually validated against rather than a second, driftable read of
+    /// `OIDC_ISSUER`.
+    pub fn issuer(&self) -> &str {
+        &self.config.issuer
+    }
+
     fn keys_from_jwks(jwks: &JwkSet) -> HashMap<String, DecodingKey> {
         let mut map = HashMap::new();
         for jwk in &jwks.keys {
@@ -239,6 +247,7 @@ impl FromRequestParts<AppState> for Claims {
 /// Extractor that authenticates a request AND carries the caller's **permissions** (ADR-0023), read
 /// from the configured claim (`state.permissions_claim`, from `PERMISSIONS_CLAIM`, default
 /// `permissions`). Handlers call [`Caller::require`] to authorize a specific capability.
+#[derive(Clone)]
 pub struct Caller {
     pub claims: Claims,
     pub permissions: std::collections::HashSet<String>,

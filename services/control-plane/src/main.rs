@@ -28,6 +28,7 @@
 mod a2a;
 mod http;
 mod integrations;
+mod mcp;
 mod queue;
 
 // Foundational modules the groups above build on.
@@ -132,6 +133,13 @@ pub struct AppState {
     /// section. Empty when unconfigured — every repo/org model-override write is then rejected
     /// (fail-closed), not silently unvalidated.
     pub model_allowlist: Arc<Vec<String>>,
+    /// Externally reachable base URL of the `mcp` surface, from `MCP_PUBLIC_URL` (e.g.
+    /// `https://code-intelligence-api.…/mcp`). The pod cannot infer this — Traefik strips the `/mcp`
+    /// prefix before the request lands — so it is deployment-specific, exactly like `A2A_BASE_URL`.
+    /// `None` when unset: the RFC 9728 protected-resource metadata is then not served (a document
+    /// with a guessed `resource` is worse than none) and the 401 carries no `resource_metadata`
+    /// challenge, i.e. the pre-discovery behaviour. Only the `mcp` role reads it.
+    pub mcp_public_url: Option<Arc<String>>,
 }
 
 impl AppState {
@@ -280,6 +288,10 @@ impl AppState {
                     .unwrap_or_else(|| "permissions".to_string()),
             ),
             model_allowlist: Arc::new(model_allowlist),
+            mcp_public_url: std::env::var("MCP_PUBLIC_URL")
+                .ok()
+                .filter(|u| !u.trim().is_empty())
+                .map(|u| Arc::new(u.trim().to_string())),
         })
     }
 }
@@ -640,8 +652,10 @@ async fn main() -> anyhow::Result<()> {
         "notifier" => run_notifier(state).await,
         // The durable-replay store lifecycle owner (ADR-0087): TTL-sweeps the `durable_step` journal.
         "replay" => run_replay(state).await,
+        // The MCP server role for external clients.
+        "mcp" => mcp::run(state).await,
         other => anyhow::bail!(
-            "unknown role {other:?} (expected: serve | dispatcher | reconciler | a2a | notifier | replay | mint-runner-token [| poller])"
+            "unknown role {other:?} (expected: serve | dispatcher | reconciler | a2a | notifier | replay | mcp | mint-runner-token [| poller])"
         ),
     };
     // Flush any still-batched spans before exit — covers every role's graceful (SIGTERM-triggered)
