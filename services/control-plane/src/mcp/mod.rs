@@ -1,9 +1,11 @@
 pub mod auth;
 pub mod handler;
+pub mod metadata;
 pub mod tools;
 
 use crate::AppState;
 use axum::Router;
+use axum::routing::get;
 use rmcp::transport::streamable_http_server::{
     StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
 };
@@ -78,12 +80,23 @@ pub async fn run(state: AppState) -> anyhow::Result<()> {
     // Provide the service on the root path since Traefik strips the /mcp prefix. axum 0.8 no longer
     // allows `nest_service("/", ...)` (panics: "Nesting at the root is no longer supported") —
     // `fallback_service` is the documented replacement for mounting a service at the root.
+    //
+    // The RFC 9728 discovery document is merged OUTSIDE that auth layer — it must be readable without
+    // credentials or it cannot serve its purpose, the same reason `a2a` mounts its agent card outside
+    // `a2a_auth`. It is the role's only unauthenticated route; everything else stays gated.
+    let protected =
+        Router::new()
+            .fallback_service(service)
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                auth::mcp_auth,
+            ));
     let router = Router::new()
-        .fallback_service(service)
-        .layer(axum::middleware::from_fn_with_state(
-            state.clone(),
-            auth::mcp_auth,
-        ))
+        .route(
+            metadata::METADATA_PATH,
+            get(metadata::protected_resource_metadata),
+        )
+        .merge(protected)
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;

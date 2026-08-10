@@ -9,6 +9,30 @@ use axum::{
     response::{IntoResponse, Response},
 };
 
+/// A 401 carrying the RFC 9728 §5.1 `WWW-Authenticate` challenge. Without the `resource_metadata`
+/// pointer a bare 401 is a dead end for an MCP client — nothing tells it which authorization server
+/// to go to — so this is what makes the discovery document reachable in practice. Falls back to a
+/// plain 401 when `MCP_PUBLIC_URL` is unset (no metadata document is served in that case either).
+fn unauthorized(state: &AppState, detail: &'static str) -> Response {
+    let challenge = state.mcp_public_url.as_deref().and_then(|base| {
+        HeaderValue::from_str(&format!(
+            r#"Bearer resource_metadata="{}{}""#,
+            base.trim_end_matches('/'),
+            super::metadata::METADATA_PATH
+        ))
+        .ok()
+    });
+    match challenge {
+        Some(value) => (
+            StatusCode::UNAUTHORIZED,
+            [(header::WWW_AUTHENTICATE, value)],
+            detail,
+        )
+            .into_response(),
+        None => (StatusCode::UNAUTHORIZED, detail).into_response(),
+    }
+}
+
 /// OIDC auth middleware for MCP.
 pub async fn mcp_auth(
     State(state): State<AppState>,
@@ -23,7 +47,7 @@ pub async fn mcp_auth(
 
     let token = match token {
         Some(t) => t,
-        None => return (StatusCode::UNAUTHORIZED, "Missing Bearer token").into_response(),
+        None => return unauthorized(&state, "Missing Bearer token"),
     };
 
     let jwt = match state.jwt.as_ref() {
@@ -36,7 +60,7 @@ pub async fn mcp_auth(
     let claims = match jwt.validate(token).await {
         Ok(c) => c,
         Err(err @ AuthError::JwksUnavailable) => return err.into_response(),
-        Err(_) => return (StatusCode::UNAUTHORIZED, "invalid token").into_response(),
+        Err(_) => return unauthorized(&state, "invalid token"),
     };
 
     let permissions = claims.permissions(&state.permissions_claim);
@@ -88,6 +112,15 @@ mod tests {
             app_handle: std::sync::Arc::new("lightbridge-assistant".to_string()),
             permissions_claim: std::sync::Arc::new("permissions".to_string()),
             model_allowlist: std::sync::Arc::new(Vec::new()),
+            mcp_public_url: None,
+        }
+    }
+
+    /// `test_state` plus the public URL, so the RFC 9728 `WWW-Authenticate` challenge is emitted.
+    fn test_state_with_public_url(jwt: Option<Arc<JwtValidator>>, url: &str) -> AppState {
+        AppState {
+            mcp_public_url: Some(Arc::new(url.to_string())),
+            ..test_state(jwt)
         }
     }
 
@@ -132,6 +165,43 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        // No MCP_PUBLIC_URL configured -> no discovery document is served, so the challenge would
+        // point at a 404. Better to stay silent than to advertise a dead pointer.
+        assert!(resp.headers().get(header::WWW_AUTHENTICATE).is_none());
+    }
+
+    /// RFC 9728 §5.1: the 401 is what tells a client where to look. Without this header the metadata
+    /// document may as well not exist — nothing references it.
+    #[tokio::test]
+    async fn rejection_advertises_the_resource_metadata_when_public_url_is_set() {
+        let (addr, client) = spawn(test_state_with_public_url(
+            Some(Arc::new(crate::jwt::test_support::validator())),
+            // Trailing slash on purpose: it must not double up in the advertised URL.
+            "https://api.example/mcp/",
+        ))
+        .await;
+
+        for (case, req) in [
+            ("missing token", client.get(format!("http://{addr}/probe"))),
+            (
+                "invalid token",
+                client
+                    .get(format!("http://{addr}/probe"))
+                    .header(header::AUTHORIZATION, "Bearer nope"),
+            ),
+        ] {
+            let resp = req.send().await.unwrap();
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{case}");
+            assert_eq!(
+                resp.headers()
+                    .get(header::WWW_AUTHENTICATE)
+                    .and_then(|v| v.to_str().ok()),
+                Some(
+                    r#"Bearer resource_metadata="https://api.example/mcp/.well-known/oauth-protected-resource""#
+                ),
+                "{case}"
+            );
+        }
     }
 
     #[tokio::test]

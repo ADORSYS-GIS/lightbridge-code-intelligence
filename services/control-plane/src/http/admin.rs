@@ -883,6 +883,7 @@ mod tests {
             app_handle: std::sync::Arc::new("lightbridge-assistant".to_string()),
             permissions_claim: std::sync::Arc::new("permissions".to_string()),
             model_allowlist: std::sync::Arc::new(Vec::new()),
+            mcp_public_url: None,
         }
     }
 
@@ -1510,6 +1511,7 @@ mod tests {
             app_handle: std::sync::Arc::new("lightbridge-assistant".to_string()),
             permissions_claim: std::sync::Arc::new("permissions".to_string()),
             model_allowlist: std::sync::Arc::new(allowlist),
+            mcp_public_url: None,
         }
     }
 
