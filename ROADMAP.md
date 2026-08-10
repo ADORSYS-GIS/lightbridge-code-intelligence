@@ -13,6 +13,35 @@ _Last updated: 2026-08-08._
 
 ## Recently shipped
 
+- **One service, one domain, path-routed** (Epic #492) — `/a2a`, `/mcp` and `/api/v2` (including
+  `/api/v2/webhook/{github,gitlab,bitbucket}`) are now served under
+  `code-intelligence-api.ai.camer.digital`, replacing a flat unversioned route tree, a legacy
+  `/github/webhook` alias, and the since-abandoned plan to give A2A its own separate domain. Four
+  slices, all live in prod:
+  - **`/api/v2` versioning** — every route moved under the prefix and the legacy `/github/webhook`
+    alias removed in the same change (hard cutover, no dual-path window).
+    ([ADR-0109](docs/adr/0109-api-v2-route-versioning.md), #506/#534)
+  - **Per-forge webhook paths** — `/api/v2/webhook/{github,gitlab,bitbucket}`, plus GitLab
+    `installation_id` validation. ([ADR-0110](docs/adr/0110-path-scoped-webhook-routes.md), #507/#547)
+  - **`/mcp` exposed externally** — the control-plane's `mcp` role serves its tool surface over MCP
+    Streamable HTTP for third-party clients (Claude Desktop, Cursor), OIDC-gated end-to-end: the auth
+    layer wraps the whole transport and the role refuses to start without `OIDC_ISSUER`. Five tools,
+    each with a declared `outputSchema`; `start_review` additionally requires a dedicated
+    `review:trigger` permission and an atomic per-identity quota. Clients discover the realm via
+    RFC 9728 protected-resource metadata at `/mcp/.well-known/oauth-protected-resource`, advertised
+    from the 401 `WWW-Authenticate` challenge — MCP has no standard in-client OAuth flow, so without
+    that a 401 is a dead end. (#508/#591)
+  - **`/a2a` on the shared host** — A2A moved onto the unified domain, dropping the separate-domain
+    plan from the closed #295. Note the topology is one control-plane *image*, role-selected into
+    separate Deployments (`serve`/`a2a`/`mcp`) that Traefik path-routes behind one host — not a single
+    process serving all three. (#509)
+
+  Ingress/DNS/TLS for the domain landed in the companion repos (ADORSYS-GIS/ai-helm#922,
+  ADORSYS-GIS/ai-helm-values#185 and #219; story #510). Still open: the `mcp` role sets
+  `disable_allowed_hosts()` on its `0.0.0.0` listener with no NetworkPolicy restricting ingress to
+  Traefik — the same posture `a2a` already has, worth closing before these surfaces carry heavy
+  external traffic.
+
 - **`lci-codegraph` extracted to its own repository** — the structural-graph engine now lives at
   [vymalo/lci-codegraph](https://github.com/vymalo/lci-codegraph) instead of `services/codegraph/`, and
   `agent-runner` consumes it as a git dependency pinned by exact commit (a plain crates.io version
