@@ -125,7 +125,7 @@ _Last updated: 2026-08-08._
   (ADR-0110), followed by a lower-priority consistency pass across Repositories/Runs/Overview/Settings.
   Sliced per-page, in progress.
 - **A2A per-finding review streaming** — stream findings as they are confirmed at finalize.
-  ([ADR-0098](https://github.com/vymalo/lightbridge-code-intelligence/pull/458), #458 — open)
+  ([PR #458](https://github.com/vymalo/lightbridge-code-intelligence/pull/458) — open; no ADR yet)
 
 ## Planned — open epics
 
