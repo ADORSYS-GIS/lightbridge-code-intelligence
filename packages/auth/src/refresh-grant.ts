@@ -62,10 +62,7 @@ export async function performRefreshGrant(
         accessToken: data.access_token,
         refreshToken: data.refresh_token,
         expiresIn: typeof data.expires_in === "number" ? data.expires_in : 1800,
-        // A non-positive `refresh_expires_in` is normalised to "not provided" so the caller's
-        // fallback applies: Keycloak sends 0 to mean "never expires", but 0 written into a cookie
-        // becomes `Max-Age=0` — the HTTP instruction to DELETE it — so the browser would discard
-        // the refresh token the instant it arrived.
+        // Only a positive value is a usable lifetime; anything else defers to the caller's default.
         refreshExpiresIn:
           typeof data.refresh_expires_in === "number" && data.refresh_expires_in > 0
             ? data.refresh_expires_in

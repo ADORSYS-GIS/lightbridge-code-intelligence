@@ -48,10 +48,7 @@ export async function GET(req: NextRequest) {
   res.cookies.set(SESSION_COOKIE, tokens.access_token, cookieOptions(maxAge));
 
   if (tokens.refresh_token) {
-    // A non-positive `refresh_expires_in` falls back rather than being trusted as a literal
-    // lifetime: Keycloak sends 0 to mean "never expires", but 0 reaches the browser as
-    // `Max-Age=0` — the instruction to DELETE the cookie — so the refresh token would be
-    // discarded the instant it arrived.
+    // Only a positive value is a usable lifetime; anything else uses the default below.
     const refreshMaxAge =
       typeof tokens.refresh_expires_in === "number" && tokens.refresh_expires_in > 0
         ? tokens.refresh_expires_in
