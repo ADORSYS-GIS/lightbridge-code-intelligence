@@ -33,26 +33,21 @@ _CONTROL_PLANE_SELECTOR = '{namespace="converse", service_name="lightbridge-ci",
 
 # The CRI unwrap is the fix for #483: Alloy tails pod logs with `loki.source.file` and its pipeline
 # has NO `stage.cri`, so every line reaches Loki as `<ts> stdout F {...json...}` and a bare `| json`
-# dies with `JSONParserErr`. `| cri` is not a LogQL stage on any Loki version. Same three-stage
-# `pattern`/`line_format`/`json` chain `prompt_budget.py` already runs against the agent pods — see
-# its "Gotcha #1" for the empirical verification of that chain against a real Loki.
+# dies with `JSONParserErr`. `| cri` is an ingest-pipeline stage, not a LogQL parser. Same chain
+# `prompt_budget.py`'s `_CRI_JSON` already runs against the agent pods — see its "Gotcha #1".
 #
-# `|= "${task_id}"` runs before any parser: it is the cheap narrowing pass over a large mixed stream,
-# and it keeps non-JSON pods sharing this `service_name` (neo4j) from ever reaching `| json`.
-# `fields_task_id` — not `task_id` — because the subscriber is built with `.json()` and no
-# `.flatten_event(true)`, so `tracing`'s fields nest under `fields` and `| json` flattens them with
-# an underscore (prompt_budget.py's "Gotcha #2"). On 24h of real control-plane logs every line
-# containing a given task id also carried that id in `fields.task_id`, so the equality drops nothing
-# the line filter keeps.
+# `|= "${task_id}"` runs before any parser: cheap narrowing, and it keeps the non-JSON pods sharing
+# this `service_name` (neo4j) from ever reaching `| json`. `fields_task_id` — not `task_id` —
+# because the subscriber is `.json()` with no `.flatten_event(true)`, so fields nest under `fields`
+# and `| json` flattens with an underscore (prompt_budget.py's "Gotcha #2").
 #
-# `| fields_task_id != ""` before that equality is load-bearing, NOT redundant — same presence-guard
-# shape as prompt_budget.py's `_unwrap`. `$task_id` defaults to empty (an operator opening the
-# dashboard directly rather than via the run-detail embed), and on an EMPTY value `|= ""` matches
-# every line while `fields_task_id = ""` also matches every line whose `fields_task_id` was never
-# extracted — LogQL treats an absent label as equal to the empty string under `=`. Without this
-# guard the panel firehoses the entire control-plane stream under the title "Logs for ". Confirmed
-# against the production Loki: empty `$task_id` returns 500+ lines without the guard and 0 with it,
-# while a real task id returns the same 103 lines either way.
+# `| fields_task_id != ""` is load-bearing, NOT redundant — same presence-guard shape as
+# prompt_budget.py's `_unwrap`. `$task_id` defaults to empty when an operator opens the dashboard
+# directly instead of via the run-detail embed, and on an empty value `|= ""` matches everything
+# while `fields_task_id = ""` ALSO matches every line whose `fields_task_id` was never extracted —
+# LogQL treats an absent label as equal to "" under `=`. Without the guard the panel firehoses the
+# whole control-plane stream under the title "Logs for ". Measured against prod: empty `$task_id`
+# returns 500+ lines without it and 0 with it; a real task id returns the same 103 either way.
 _CONTROL_PLANE_LOGS = (
     f"{_CONTROL_PLANE_SELECTOR} "
     '|= "${task_id}" '
