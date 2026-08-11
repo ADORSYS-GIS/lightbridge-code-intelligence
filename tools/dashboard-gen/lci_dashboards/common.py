@@ -60,13 +60,25 @@ def sql(raw_sql: str, ref_id: str = "A", fmt: str = "table") -> RawTarget:
 # pipeline that tails `/var/log/pods` has no `stage.cri` (ai-helm-values,
 # `environments/prod/values/alloy.yaml`). A bare `| json` fails with `JSONParserErr` on that prefix,
 # and `| cri` is an ingest-pipeline stage, not a LogQL parser. These two stages strip the envelope so
-# a following `| json` sees clean input: `<_>` discards the three CRI fields, and `content` takes
-# everything after them (not up to the next space), so spaces inside the payload are safe.
+# a following `| json` sees clean input: `content` takes everything after the three CRI fields (not
+# up to the next space), so spaces inside the payload are safe.
+#
+# The CRI prefix is matched by an OPTIONAL group, which is the whole point of this shape. When
+# ai-helm-values adds `stage.cri` to the Alloy pipeline, newly-ingested lines arrive already
+# unwrapped while everything older stays wrapped for the full 90d retention — so both shapes are
+# live in Loki at once. A `| pattern`-based unwrap does not survive that: applied to an
+# already-unwrapped line it yields garbage, `| json` then errors, and the `| __error__=""` every
+# call site pairs it with drops the line SILENTLY — zero rows, no error surfaced. Measured against
+# prod on an OTLP stream (already envelope-free, i.e. a preview of post-`stage.cri` lines):
+# `| pattern` returned 0 of 50 lines, this form returned all of them, and on today's CRI-wrapped
+# control-plane stream both return the same 103.
 #
 # Every Loki-backed dashboard that parses a pod's structured logs goes through here — keep it single
-# so the eventual `stage.cri` rollout in ai-helm-values is a one-line change on this side, not a
-# hunt through every generator.
-CRI_UNWRAP = "| pattern `<_> <_> <_> <content>` | line_format `{{.content}}`"
+# so the `stage.cri` rollout is a one-line change on this side, not a hunt through every generator.
+CRI_UNWRAP = (
+    r"| regexp `^(?:\S+ std(?:out|err) [FP] )?(?P<content>.*)$` "
+    "| line_format `{{.content}}`"
+)
 
 
 def logql(expr: str, ref_id: str = "A") -> RawTarget:
