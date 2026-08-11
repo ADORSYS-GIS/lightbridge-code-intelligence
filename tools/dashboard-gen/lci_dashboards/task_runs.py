@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from grafana_foundation_sdk.builders import dashboard, logs, table
 
-from .common import LOKI, POSTGRES, Layout, logql, sql
+from .common import CRI_UNWRAP, LOKI, POSTGRES, Layout, logql, sql
 
 UID = "lci-task-runs"
 
@@ -21,12 +21,37 @@ UID = "lci-task-runs"
 # stream selector referenced a label THIS LOKI DOES NOT HAVE and silently matched zero streams —
 # see the Loki `/loki/api/v1/labels` response for the actual label set before changing this again).
 #
-# NOT covered here: the control plane's own task_id-tagged admin lines (e.g. "review queued for
-# egress") in a SEPARATE long-lived pod, which the original `| json | task_id = ...` design targeted.
-# That approach is independently broken on THIS Loki: pod logs are stored CRI-wrapped
-# (`<ts> stdout F {...}`), and a bare `| json` can't parse past that prefix (`JSONParserErr`) —
-# `| cri` is not a valid stage on this Loki version. Needs a `| pattern`/`| regexp` unwrap stage,
-# proven working, before it can be added back. Tracked as a follow-up, not fixed here.
+# The control plane's own task_id-tagged lines ("created review task", "dispatched task to a Job")
+# live in SEPARATE long-lived pods, added as a second target below so one panel covers both the
+# dispatch side and the run's own execution logs (#483).
+#
+# Alloy maps `app.kubernetes.io/name` -> `service_name`, and every long-lived `lightbridge-ci-*` pod
+# carries that one value in a container named `main`. Selecting on it rather than on
+# `pod=~"lightbridge-ci-control-plane-.*"` is deliberate: a task's lifecycle spans several of these
+# pods, and a real run's lines came from the control plane AND the dispatcher.
+_CONTROL_PLANE_SELECTOR = '{namespace="converse", service_name="lightbridge-ci", container="main"}'
+
+# `|= "${task_id}"` runs before any parser — cheap narrowing over a large stream, and it keeps the
+# non-JSON pods sharing this `service_name` (neo4j) from ever reaching `| json`.
+#
+# `fields_task_id`, not `task_id`: the subscriber is `.json()` with no `.flatten_event(true)`, so
+# event fields nest under `fields` and `| json` flattens them with an underscore.
+#
+# Both `fields_task_id` filters are load-bearing. `$task_id` defaults to empty when an operator
+# opens the dashboard directly rather than through the run-detail embed. On an empty value `|= ""`
+# matches every line, and `fields_task_id = ""` matches every line whose `fields_task_id` was never
+# extracted, because LogQL treats an absent label as equal to "" under `=` — the equality alone
+# firehoses the whole stream under the title "Logs for ". `!= ""` keeps only lines that carry a task
+# id; the equality then finds none with an empty one. Measured: empty `$task_id` returns 500+ lines
+# with the equality alone and 0 with both, while a real task id returns the same 103 either way.
+_CONTROL_PLANE_LOGS = (
+    f"{_CONTROL_PLANE_SELECTOR} "
+    '|= "${task_id}" '
+    f"{CRI_UNWRAP} "
+    '| json | __error__="" '
+    '| fields_task_id != "" '
+    '| fields_task_id = "${task_id}"'
+)
 
 
 def dashboard_builder() -> dashboard.Dashboard:
@@ -87,6 +112,7 @@ def dashboard_builder() -> dashboard.Dashboard:
         .show_time(True)
         .wrap_log_message(True)
         .with_target(logql('{namespace="lightbridge-agents", pod=~"lightbridge-agent-${task_id}-.*"}'))
+        .with_target(logql(_CONTROL_PLANE_LOGS, ref_id="B"))
         .grid_pos(layout.place(24, 11))
     )
 

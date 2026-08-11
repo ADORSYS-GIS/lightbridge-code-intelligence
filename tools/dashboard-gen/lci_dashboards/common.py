@@ -54,6 +54,33 @@ def sql(raw_sql: str, ref_id: str = "A", fmt: str = "table") -> RawTarget:
     )
 
 
+# --- Loki line handling ---
+
+# Strips the CRI envelope from a pod log line so a following `| json` sees clean input. Every
+# Loki-backed dashboard that parses structured pod logs goes through here.
+#
+# The kubelet writes pod logs as `<ts> <stdout|stderr> <F|P> <line>`. Alloy's pipeline strips that
+# envelope with a `stage.cri` before shipping to Loki, so lines ingested since that stage rolled out
+# arrive as bare JSON and this unwrap is a no-op on them. Lines stored before it still carry the
+# prefix until they age out of the 90d retention, and `| cri` is an ingest-pipeline stage rather
+# than a LogQL parser — so those older lines can only be unwrapped here.
+#
+# That is why the prefix is an OPTIONAL group: one query has to read both shapes. A required-prefix
+# form (`| pattern`) handles only the wrapped ones — on a bare-JSON line it captures garbage,
+# `| json` then errors, and the `| __error__=""` every call site pairs it with discards the line
+# silently, which is far worse than a visible failure. Measured on both shapes: required-prefix
+# returned 0 of 50 unwrapped lines where this form returned all 50, and the two agree on wrapped
+# lines. `content` captures everything after the three CRI fields rather than up to the next space,
+# so spaces inside the payload are safe.
+#
+# Once the oldest queryable line postdates the `stage.cri` rollout, this whole helper collapses to
+# nothing and its call sites can go straight to `| json`.
+CRI_UNWRAP = (
+    r"| regexp `^(?:\S+ std(?:out|err) [FP] )?(?P<content>.*)$` "
+    "| line_format `{{.content}}`"
+)
+
+
 def logql(expr: str, ref_id: str = "A") -> RawTarget:
     return RawTarget(
         {
