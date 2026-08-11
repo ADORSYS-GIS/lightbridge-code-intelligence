@@ -59,13 +59,13 @@ def sql(raw_sql: str, ref_id: str = "A", fmt: str = "table") -> RawTarget:
 # Strips the CRI envelope from a pod log line so a following `| json` sees clean input. Every
 # Loki-backed dashboard that parses structured pod logs goes through here.
 #
-# The kubelet writes pod logs as `<ts> <stdout|stderr> <F|P> <line>`. Whether that envelope reaches
-# Loki depends on whether the Alloy pipeline tailing `/var/log/pods` applies a `stage.cri`, and a
-# query cannot assume either way: an ingest-side change takes effect only for newly-written lines,
-# while everything already stored keeps the shape it was stored with for the full 90d retention. So
-# Loki holds both shapes at once for a retention period after any such change. `| cri` is an
-# ingest-pipeline stage, not a LogQL parser, so when the envelope IS present the unwrap has to
-# happen here.
+# The kubelet writes pod logs as `<ts> <stdout|stderr> <F|P> <line>`. That envelope reaches Loki
+# intact unless the Alloy pipeline tailing `/var/log/pods` strips it with a `stage.cri`. Toggling
+# that stage does not rewrite history: it applies only to newly written lines, while everything
+# already stored keeps its shape until it ages out of the 90d retention. For a retention period
+# either side of such a change, Loki therefore holds both shapes at once and a single query spans
+# both. `| cri` is an ingest-pipeline stage, not a LogQL parser, so wherever the envelope is
+# present the unwrap has to happen here.
 #
 # Hence the OPTIONAL prefix group — it is what lets one query serve both shapes. A required-prefix
 # form (`| pattern`) handles only wrapped lines: on an unwrapped one it captures garbage, `| json`
