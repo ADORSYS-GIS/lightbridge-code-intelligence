@@ -75,6 +75,15 @@
           "expr": "{namespace=\"lightbridge-agents\", pod=~\"lightbridge-agent-${task_id}-.*\"}",
           "queryType": "range",
           "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "loki",
+            "uid": "${DS_LOKI}"
+          },
+          "expr": "{namespace=\"converse\", service_name=\"lightbridge-ci\", container=\"main\"} |= \"${task_id}\" | pattern `<_> <_> <_> <content>` | line_format `{{.content}}` | json | __error__=\"\" | fields_task_id != \"\" | fields_task_id = \"${task_id}\"",
+          "queryType": "range",
+          "refId": "B"
         }
       ],
       "title": "Logs for $task_id",

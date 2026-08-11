@@ -21,12 +21,42 @@ UID = "lci-task-runs"
 # stream selector referenced a label THIS LOKI DOES NOT HAVE and silently matched zero streams —
 # see the Loki `/loki/api/v1/labels` response for the actual label set before changing this again).
 #
-# NOT covered here: the control plane's own task_id-tagged admin lines (e.g. "review queued for
-# egress") in a SEPARATE long-lived pod, which the original `| json | task_id = ...` design targeted.
-# That approach is independently broken on THIS Loki: pod logs are stored CRI-wrapped
-# (`<ts> stdout F {...}`), and a bare `| json` can't parse past that prefix (`JSONParserErr`) —
-# `| cri` is not a valid stage on this Loki version. Needs a `| pattern`/`| regexp` unwrap stage,
-# proven working, before it can be added back. Tracked as a follow-up, not fixed here.
+# The control plane's own task_id-tagged admin lines (e.g. "review queued for egress") live in
+# SEPARATE long-lived pods and are added as a second target below, so one panel shows both the
+# dispatch/admin side and the run's own execution logs (#483/#517).
+#
+# Alloy's relabel rules map `app.kubernetes.io/name` -> `service_name`, and every long-lived
+# `lightbridge-ci-*` pod carries that one value in a container named `main` — so this selector picks
+# up the reconciler/notifier/dispatcher lines too, not just `control-plane`'s. (Verified live: the
+# `task.create` / `queue::dispatcher` halves of a single task are emitted by two different pods.)
+_CONTROL_PLANE_SELECTOR = '{namespace="converse", service_name="lightbridge-ci", container="main"}'
+
+# The CRI unwrap is the fix for #483: Alloy tails pod logs with `loki.source.file` and its pipeline
+# has NO `stage.cri`, so every line reaches Loki as `<ts> stdout F {...json...}` and a bare `| json`
+# dies with `JSONParserErr`. `| cri` is an ingest-pipeline stage, not a LogQL parser. Same chain
+# `prompt_budget.py`'s `_CRI_JSON` already runs against the agent pods — see its "Gotcha #1".
+#
+# `|= "${task_id}"` runs before any parser: cheap narrowing, and it keeps the non-JSON pods sharing
+# this `service_name` (neo4j) from ever reaching `| json`. `fields_task_id` — not `task_id` —
+# because the subscriber is `.json()` with no `.flatten_event(true)`, so fields nest under `fields`
+# and `| json` flattens with an underscore (prompt_budget.py's "Gotcha #2").
+#
+# `| fields_task_id != ""` is load-bearing, NOT redundant — same presence-guard shape as
+# prompt_budget.py's `_unwrap`. `$task_id` defaults to empty when an operator opens the dashboard
+# directly instead of via the run-detail embed, and on an empty value `|= ""` matches everything
+# while `fields_task_id = ""` ALSO matches every line whose `fields_task_id` was never extracted —
+# LogQL treats an absent label as equal to "" under `=`. Without the guard the panel firehoses the
+# whole control-plane stream under the title "Logs for ". Measured against prod: empty `$task_id`
+# returns 500+ lines without it and 0 with it; a real task id returns the same 103 either way.
+_CONTROL_PLANE_LOGS = (
+    f"{_CONTROL_PLANE_SELECTOR} "
+    '|= "${task_id}" '
+    "| pattern `<_> <_> <_> <content>` "
+    "| line_format `{{.content}}` "
+    '| json | __error__="" '
+    '| fields_task_id != "" '
+    '| fields_task_id = "${task_id}"'
+)
 
 
 def dashboard_builder() -> dashboard.Dashboard:
@@ -87,6 +117,7 @@ def dashboard_builder() -> dashboard.Dashboard:
         .show_time(True)
         .wrap_log_message(True)
         .with_target(logql('{namespace="lightbridge-agents", pod=~"lightbridge-agent-${task_id}-.*"}'))
+        .with_target(logql(_CONTROL_PLANE_LOGS, ref_id="B"))
         .grid_pos(layout.place(24, 11))
     )
 
