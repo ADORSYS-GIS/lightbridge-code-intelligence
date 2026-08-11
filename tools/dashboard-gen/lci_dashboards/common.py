@@ -54,6 +54,21 @@ def sql(raw_sql: str, ref_id: str = "A", fmt: str = "table") -> RawTarget:
     )
 
 
+# --- Loki line handling ---
+
+# Pod logs reach Loki still CRI-wrapped — `<ts> <stdout|stderr> <F|P> <line>` — because the Alloy
+# pipeline that tails `/var/log/pods` has no `stage.cri` (ai-helm-values,
+# `environments/prod/values/alloy.yaml`). A bare `| json` fails with `JSONParserErr` on that prefix,
+# and `| cri` is an ingest-pipeline stage, not a LogQL parser. These two stages strip the envelope so
+# a following `| json` sees clean input: `<_>` discards the three CRI fields, and `content` takes
+# everything after them (not up to the next space), so spaces inside the payload are safe.
+#
+# Every Loki-backed dashboard that parses a pod's structured logs goes through here — keep it single
+# so the eventual `stage.cri` rollout in ai-helm-values is a one-line change on this side, not a
+# hunt through every generator.
+CRI_UNWRAP = "| pattern `<_> <_> <_> <content>` | line_format `{{.content}}`"
+
+
 def logql(expr: str, ref_id: str = "A") -> RawTarget:
     return RawTarget(
         {
