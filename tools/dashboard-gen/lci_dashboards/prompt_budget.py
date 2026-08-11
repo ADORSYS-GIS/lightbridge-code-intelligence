@@ -161,7 +161,7 @@ from __future__ import annotations
 from grafana_foundation_sdk.builders import bargauge, dashboard, stat, text, timeseries
 from grafana_foundation_sdk.models.text import TextMode
 
-from .common import LOKI, Layout, logql
+from .common import CRI_UNWRAP, LOKI, Layout, logql
 
 UID = "lci-prompt-budget"
 
@@ -178,8 +178,7 @@ _SELECTOR = '{namespace="lightbridge-agents", pod=~"lightbridge-agent-.*"}'
 _CRI_JSON = (
     f"{_SELECTOR} "
     '|= "prompt budget usage" '
-    "| pattern `<_> <_> <_> <content>` "
-    "| line_format `{{.content}}` "
+    f"{CRI_UNWRAP} "
     '| json | __error__=""'
 )
 

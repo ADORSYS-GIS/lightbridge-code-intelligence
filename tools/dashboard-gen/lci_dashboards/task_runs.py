@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from grafana_foundation_sdk.builders import dashboard, logs, table
 
-from .common import LOKI, POSTGRES, Layout, logql, sql
+from .common import CRI_UNWRAP, LOKI, POSTGRES, Layout, logql, sql
 
 UID = "lci-task-runs"
 
@@ -51,8 +51,7 @@ _CONTROL_PLANE_SELECTOR = '{namespace="converse", service_name="lightbridge-ci",
 _CONTROL_PLANE_LOGS = (
     f"{_CONTROL_PLANE_SELECTOR} "
     '|= "${task_id}" '
-    "| pattern `<_> <_> <_> <content>` "
-    "| line_format `{{.content}}` "
+    f"{CRI_UNWRAP} "
     '| json | __error__="" '
     '| fields_task_id != "" '
     '| fields_task_id = "${task_id}"'
