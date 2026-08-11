@@ -23,22 +23,21 @@ budget after the ADR-0070 window-proportional share (``min(max_diff_chars, 0.25 
 4)``) — comparing it against the operator's configured ``max_diff_chars`` shows whether the cap
 itself or the window share is what's actually binding.
 
---- Gotcha #1: pod log lines arrive in two shapes, CRI-wrapped or not ---
+--- Gotcha #1: pod log lines older than the stage.cri rollout are CRI-wrapped ---
 
-Alloy tails these pods with ``loki.source.file`` straight off ``/var/log/pods/...``, so unless the
-pipeline applies a ``stage.cri`` the kubelet's envelope survives into Loki and a stored line looks
-like:
+Alloy tails these pods with ``loki.source.file`` straight off ``/var/log/pods/...`` and strips the
+kubelet's envelope with a ``stage.cri``, so lines ingested since that stage rolled out arrive as
+bare JSON. Lines stored before it still look like:
 
     2026-08-08T04:01:44.123Z stdout F {"timestamp":"...","level":"INFO","fields":{...},"target":"..."}
 
-A bare ``| json`` fails with ``JSONParserErr`` on that — it can't parse past the leading
-``<ts> <stream> <flag>`` prefix. ``| cri`` is an ingest-pipeline stage, not a LogQL parser, so it
-is not an option either. The fix used here is ``common.CRI_UNWRAP``: a ``| regexp`` stage whose
-CRI prefix is an OPTIONAL group, capturing the remainder into ``content``, then ``| line_format``
-to replace the log line with just that capture, THEN ``| json`` — see ``_CRI_JSON`` below. The
-prefix is optional because Loki holds both shapes at the same time — an ingest-side change applies
-only to new lines, while stored ones keep their shape until they age out of retention — so a single
-query spans both and must handle either. ``common.py`` carries the detail.
+and stay queryable until they age out of the 90d retention. A bare ``| json`` fails with
+``JSONParserErr`` on those — it can't parse past the leading ``<ts> <stream> <flag>`` prefix — and
+``| cri`` is an ingest-pipeline stage, not a LogQL parser, so it is no help at query time. The fix
+used here is ``common.CRI_UNWRAP``: a ``| regexp`` stage whose CRI prefix is an OPTIONAL group,
+capturing the remainder into ``content``, then ``| line_format`` to replace the log line with just
+that capture, THEN ``| json`` — see ``_CRI_JSON`` below. The prefix is optional so that one query
+reads both the pre- and post-rollout shape; ``common.py`` carries the detail.
 
 --- Gotcha #2: event fields are nested under `fields`, not top-level ---
 
