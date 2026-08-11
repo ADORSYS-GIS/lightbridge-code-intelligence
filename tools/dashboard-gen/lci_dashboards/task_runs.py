@@ -21,12 +21,37 @@ UID = "lci-task-runs"
 # stream selector referenced a label THIS LOKI DOES NOT HAVE and silently matched zero streams —
 # see the Loki `/loki/api/v1/labels` response for the actual label set before changing this again).
 #
-# NOT covered here: the control plane's own task_id-tagged admin lines (e.g. "review queued for
-# egress") in a SEPARATE long-lived pod, which the original `| json | task_id = ...` design targeted.
-# That approach is independently broken on THIS Loki: pod logs are stored CRI-wrapped
-# (`<ts> stdout F {...}`), and a bare `| json` can't parse past that prefix (`JSONParserErr`) —
-# `| cri` is not a valid stage on this Loki version. Needs a `| pattern`/`| regexp` unwrap stage,
-# proven working, before it can be added back. Tracked as a follow-up, not fixed here.
+# The control plane's own task_id-tagged admin lines (e.g. "review queued for egress") live in
+# SEPARATE long-lived pods and are added as a second target below, so one panel shows both the
+# dispatch/admin side and the run's own execution logs (#483/#517).
+#
+# Alloy's relabel rules map `app.kubernetes.io/name` -> `service_name`, and every long-lived
+# `lightbridge-ci-*` pod carries that one value in a container named `main` — so this selector picks
+# up the reconciler/notifier/dispatcher lines too, not just `control-plane`'s. (Verified live: the
+# `task.create` / `queue::dispatcher` halves of a single task are emitted by two different pods.)
+_CONTROL_PLANE_SELECTOR = '{namespace="converse", service_name="lightbridge-ci", container="main"}'
+
+# The CRI unwrap is the fix for #483: Alloy tails pod logs with `loki.source.file` and its pipeline
+# has NO `stage.cri`, so every line reaches Loki as `<ts> stdout F {...json...}` and a bare `| json`
+# dies with `JSONParserErr`. `| cri` is not a LogQL stage on any Loki version. Same three-stage
+# `pattern`/`line_format`/`json` chain `prompt_budget.py` already runs against the agent pods — see
+# its "Gotcha #1" for the empirical verification of that chain against a real Loki.
+#
+# `|= "${task_id}"` runs before any parser: it is the cheap narrowing pass over a large mixed stream,
+# and it keeps non-JSON pods sharing this `service_name` (neo4j) from ever reaching `| json`.
+# `fields_task_id` — not `task_id` — because the subscriber is built with `.json()` and no
+# `.flatten_event(true)`, so `tracing`'s fields nest under `fields` and `| json` flattens them with
+# an underscore (prompt_budget.py's "Gotcha #2"). It is a precision guard, not the primary filter:
+# on 24h of real control-plane logs every line containing a given task id also carried that id in
+# `fields.task_id`, so it drops nothing the line filter keeps.
+_CONTROL_PLANE_LOGS = (
+    f"{_CONTROL_PLANE_SELECTOR} "
+    '|= "${task_id}" '
+    "| pattern `<_> <_> <_> <content>` "
+    "| line_format `{{.content}}` "
+    '| json | __error__="" '
+    '| fields_task_id = "${task_id}"'
+)
 
 
 def dashboard_builder() -> dashboard.Dashboard:
@@ -87,6 +112,7 @@ def dashboard_builder() -> dashboard.Dashboard:
         .show_time(True)
         .wrap_log_message(True)
         .with_target(logql('{namespace="lightbridge-agents", pod=~"lightbridge-agent-${task_id}-.*"}'))
+        .with_target(logql(_CONTROL_PLANE_LOGS, ref_id="B"))
         .grid_pos(layout.place(24, 11))
     )
 
