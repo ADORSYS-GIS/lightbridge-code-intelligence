@@ -41,15 +41,25 @@ _CONTROL_PLANE_SELECTOR = '{namespace="converse", service_name="lightbridge-ci",
 # and it keeps non-JSON pods sharing this `service_name` (neo4j) from ever reaching `| json`.
 # `fields_task_id` — not `task_id` — because the subscriber is built with `.json()` and no
 # `.flatten_event(true)`, so `tracing`'s fields nest under `fields` and `| json` flattens them with
-# an underscore (prompt_budget.py's "Gotcha #2"). It is a precision guard, not the primary filter:
-# on 24h of real control-plane logs every line containing a given task id also carried that id in
-# `fields.task_id`, so it drops nothing the line filter keeps.
+# an underscore (prompt_budget.py's "Gotcha #2"). On 24h of real control-plane logs every line
+# containing a given task id also carried that id in `fields.task_id`, so the equality drops nothing
+# the line filter keeps.
+#
+# `| fields_task_id != ""` before that equality is load-bearing, NOT redundant — same presence-guard
+# shape as prompt_budget.py's `_unwrap`. `$task_id` defaults to empty (an operator opening the
+# dashboard directly rather than via the run-detail embed), and on an EMPTY value `|= ""` matches
+# every line while `fields_task_id = ""` also matches every line whose `fields_task_id` was never
+# extracted — LogQL treats an absent label as equal to the empty string under `=`. Without this
+# guard the panel firehoses the entire control-plane stream under the title "Logs for ". Confirmed
+# against the production Loki: empty `$task_id` returns 500+ lines without the guard and 0 with it,
+# while a real task id returns the same 103 lines either way.
 _CONTROL_PLANE_LOGS = (
     f"{_CONTROL_PLANE_SELECTOR} "
     '|= "${task_id}" '
     "| pattern `<_> <_> <_> <content>` "
     "| line_format `{{.content}}` "
     '| json | __error__="" '
+    '| fields_task_id != "" '
     '| fields_task_id = "${task_id}"'
 )
 
