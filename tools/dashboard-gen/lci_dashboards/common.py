@@ -59,19 +59,21 @@ def sql(raw_sql: str, ref_id: str = "A", fmt: str = "table") -> RawTarget:
 # Strips the CRI envelope from a pod log line so a following `| json` sees clean input. Every
 # Loki-backed dashboard that parses structured pod logs goes through here.
 #
-# The kubelet writes pod logs as `<ts> <stdout|stderr> <F|P> <line>`, and the Alloy pipeline that
-# tails `/var/log/pods` has no `stage.cri` to strip it, so the envelope reaches Loki as part of the
-# line and a bare `| json` fails with `JSONParserErr`. `| cri` is an ingest-pipeline stage, not a
-# LogQL parser, so the unwrap has to happen here. `content` captures everything after the three CRI
-# fields rather than up to the next space, so spaces inside the payload are safe.
+# The kubelet writes pod logs as `<ts> <stdout|stderr> <F|P> <line>`. Whether that envelope reaches
+# Loki depends on whether the Alloy pipeline tailing `/var/log/pods` applies a `stage.cri`, and a
+# query cannot assume either way: an ingest-side change takes effect only for newly-written lines,
+# while everything already stored keeps the shape it was stored with for the full 90d retention. So
+# Loki holds both shapes at once for a retention period after any such change. `| cri` is an
+# ingest-pipeline stage, not a LogQL parser, so when the envelope IS present the unwrap has to
+# happen here.
 #
-# The prefix is an OPTIONAL group on purpose. Once the Alloy pipeline gains `stage.cri`, only
-# newly-ingested lines arrive unwrapped — older ones keep the envelope for the full 90d retention,
-# so both shapes are live in Loki at once and one query has to serve both. A required-prefix form
-# (`| pattern`) does not: on an already-unwrapped line it captures garbage, `| json` then errors,
-# and the `| __error__=""` every call site pairs it with discards the line silently — zero rows and
-# nothing surfaced. Measured against an envelope-free stream: required-prefix returned 0 of 50
-# lines, this form returned all 50, and both return the same rows on wrapped lines.
+# Hence the OPTIONAL prefix group — it is what lets one query serve both shapes. A required-prefix
+# form (`| pattern`) handles only wrapped lines: on an unwrapped one it captures garbage, `| json`
+# then errors, and the `| __error__=""` every call site pairs it with discards the line silently —
+# zero rows, nothing surfaced, which is far worse than a visible failure. Measured on both shapes:
+# required-prefix returned 0 of 50 unwrapped lines where this form returned all 50, and the two
+# agree on wrapped lines. `content` captures everything after the three CRI fields rather than up to
+# the next space, so spaces inside the payload are safe.
 CRI_UNWRAP = (
     r"| regexp `^(?:\S+ std(?:out|err) [FP] )?(?P<content>.*)$` "
     "| line_format `{{.content}}`"
