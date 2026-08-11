@@ -21,33 +21,29 @@ UID = "lci-task-runs"
 # stream selector referenced a label THIS LOKI DOES NOT HAVE and silently matched zero streams —
 # see the Loki `/loki/api/v1/labels` response for the actual label set before changing this again).
 #
-# The control plane's own task_id-tagged admin lines (e.g. "review queued for egress") live in
-# SEPARATE long-lived pods and are added as a second target below, so one panel shows both the
-# dispatch/admin side and the run's own execution logs (#483/#517).
+# The control plane's own task_id-tagged lines ("created review task", "dispatched task to a Job")
+# live in SEPARATE long-lived pods, added as a second target below so one panel covers both the
+# dispatch side and the run's own execution logs (#483).
 #
-# Alloy's relabel rules map `app.kubernetes.io/name` -> `service_name`, and every long-lived
-# `lightbridge-ci-*` pod carries that one value in a container named `main` — so this selector picks
-# up the reconciler/notifier/dispatcher lines too, not just `control-plane`'s. (Verified live: the
-# `task.create` / `queue::dispatcher` halves of a single task are emitted by two different pods.)
+# Alloy maps `app.kubernetes.io/name` -> `service_name`, and every long-lived `lightbridge-ci-*` pod
+# carries that one value in a container named `main`. Selecting on it rather than on
+# `pod=~"lightbridge-ci-control-plane-.*"` is deliberate: a task's lifecycle spans several of these
+# pods, and a real run's lines came from the control plane AND the dispatcher.
 _CONTROL_PLANE_SELECTOR = '{namespace="converse", service_name="lightbridge-ci", container="main"}'
 
-# The CRI unwrap is the fix for #483: Alloy tails pod logs with `loki.source.file` and its pipeline
-# has NO `stage.cri`, so every line reaches Loki as `<ts> stdout F {...json...}` and a bare `| json`
-# dies with `JSONParserErr`. `| cri` is an ingest-pipeline stage, not a LogQL parser. Same chain
-# `prompt_budget.py`'s `_CRI_JSON` already runs against the agent pods — see its "Gotcha #1".
+# `|= "${task_id}"` runs before any parser — cheap narrowing over a large stream, and it keeps the
+# non-JSON pods sharing this `service_name` (neo4j) from ever reaching `| json`.
 #
-# `|= "${task_id}"` runs before any parser: cheap narrowing, and it keeps the non-JSON pods sharing
-# this `service_name` (neo4j) from ever reaching `| json`. `fields_task_id` — not `task_id` —
-# because the subscriber is `.json()` with no `.flatten_event(true)`, so fields nest under `fields`
-# and `| json` flattens with an underscore (prompt_budget.py's "Gotcha #2").
+# `fields_task_id`, not `task_id`: the subscriber is `.json()` with no `.flatten_event(true)`, so
+# event fields nest under `fields` and `| json` flattens them with an underscore.
 #
-# `| fields_task_id != ""` is load-bearing, NOT redundant — same presence-guard shape as
-# prompt_budget.py's `_unwrap`. `$task_id` defaults to empty when an operator opens the dashboard
-# directly instead of via the run-detail embed, and on an empty value `|= ""` matches everything
-# while `fields_task_id = ""` ALSO matches every line whose `fields_task_id` was never extracted —
-# LogQL treats an absent label as equal to "" under `=`. Without the guard the panel firehoses the
-# whole control-plane stream under the title "Logs for ". Measured against prod: empty `$task_id`
-# returns 500+ lines without it and 0 with it; a real task id returns the same 103 either way.
+# Both `fields_task_id` filters are load-bearing. `$task_id` defaults to empty when an operator
+# opens the dashboard directly rather than through the run-detail embed. On an empty value `|= ""`
+# matches every line, and `fields_task_id = ""` matches every line whose `fields_task_id` was never
+# extracted, because LogQL treats an absent label as equal to "" under `=` — the equality alone
+# firehoses the whole stream under the title "Logs for ". `!= ""` keeps only lines that carry a task
+# id; the equality then finds none with an empty one. Measured: empty `$task_id` returns 500+ lines
+# with the equality alone and 0 with both, while a real task id returns the same 103 either way.
 _CONTROL_PLANE_LOGS = (
     f"{_CONTROL_PLANE_SELECTOR} "
     '|= "${task_id}" '

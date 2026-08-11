@@ -31,11 +31,12 @@ pipeline has NO ``stage.cri``, so every line in Loki still looks like:
     2026-08-08T04:01:44.123Z stdout F {"timestamp":"...","level":"INFO","fields":{...},"target":"..."}
 
 A bare ``| json`` fails with ``JSONParserErr`` on this — it can't parse past the leading
-``<ts> <stream> <flag>`` prefix. ``| cri`` is not a valid stage on this Loki version either
-(``task_runs.py`` hit this first and left it as a documented follow-up). The fix used here: a
-``| pattern`` stage that captures everything after the three leading CRI fields (discarded via
-``<_>``) into a named ``content`` field, ``| line_format`` to replace the log line with just that
-capture, THEN ``| json`` — see ``_CRI_JSON`` below.
+``<ts> <stream> <flag>`` prefix. ``| cri`` is an ingest-pipeline stage, not a LogQL parser, so it
+is not an option either. The fix used here is ``common.CRI_UNWRAP``: a ``| regexp`` stage whose
+CRI prefix is an OPTIONAL group, capturing the remainder into ``content``, then ``| line_format``
+to replace the log line with just that capture, THEN ``| json`` — see ``_CRI_JSON`` below. The
+prefix is optional so one query serves both wrapped and unwrapped lines; ``common.py`` documents
+why that matters.
 
 --- Gotcha #2: event fields are nested under `fields`, not top-level ---
 
@@ -131,10 +132,11 @@ above (5 panels: the effective-budget-avg panel and all four static-context-bloc
 second, deliberately multi-sample dataset designed to make averaging bugs visible (a single sample
 per group, as round 1 used, cannot distinguish a correct average from a broken one).
 
-- The CRI-unwrap chain (``| pattern`` + ``| line_format`` + ``| json``) correctly strips the
-  ``<ts> stdout F `` prefix and parses the remainder even though the embedded JSON itself contains
-  spaces (the ``<content>`` capture takes everything after the third field, not up to the next
-  space).
+- The CRI-unwrap chain (``common.CRI_UNWRAP`` + ``| json``) correctly strips the ``<ts> stdout F ``
+  prefix and parses the remainder even though the embedded JSON itself contains spaces (the
+  ``content`` capture takes everything after the third field, not up to the next space). Verified
+  in this round against a ``| pattern`` form; the stage is now the equivalent optional-group
+  ``| regexp``, re-checked against the production stream for the same result.
 - Nested ``fields`` flattens to ``fields_<name>`` labels as documented in "Gotcha #2".
 - ``|= "prompt budget usage"`` cleanly disambiguates from the sibling
   ``"prompt budgets: window-proportional caps active (ADR-0070)"`` event — zero lines matched both.

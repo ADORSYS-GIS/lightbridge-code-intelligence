@@ -56,25 +56,22 @@ def sql(raw_sql: str, ref_id: str = "A", fmt: str = "table") -> RawTarget:
 
 # --- Loki line handling ---
 
-# Pod logs reach Loki still CRI-wrapped — `<ts> <stdout|stderr> <F|P> <line>` — because the Alloy
-# pipeline that tails `/var/log/pods` has no `stage.cri` (ai-helm-values,
-# `environments/prod/values/alloy.yaml`). A bare `| json` fails with `JSONParserErr` on that prefix,
-# and `| cri` is an ingest-pipeline stage, not a LogQL parser. These two stages strip the envelope so
-# a following `| json` sees clean input: `content` takes everything after the three CRI fields (not
-# up to the next space), so spaces inside the payload are safe.
+# Strips the CRI envelope from a pod log line so a following `| json` sees clean input. Every
+# Loki-backed dashboard that parses structured pod logs goes through here.
 #
-# The CRI prefix is matched by an OPTIONAL group, which is the whole point of this shape. When
-# ai-helm-values adds `stage.cri` to the Alloy pipeline, newly-ingested lines arrive already
-# unwrapped while everything older stays wrapped for the full 90d retention — so both shapes are
-# live in Loki at once. A `| pattern`-based unwrap does not survive that: applied to an
-# already-unwrapped line it yields garbage, `| json` then errors, and the `| __error__=""` every
-# call site pairs it with drops the line SILENTLY — zero rows, no error surfaced. Measured against
-# prod on an OTLP stream (already envelope-free, i.e. a preview of post-`stage.cri` lines):
-# `| pattern` returned 0 of 50 lines, this form returned all of them, and on today's CRI-wrapped
-# control-plane stream both return the same 103.
+# The kubelet writes pod logs as `<ts> <stdout|stderr> <F|P> <line>`, and the Alloy pipeline that
+# tails `/var/log/pods` has no `stage.cri` to strip it, so the envelope reaches Loki as part of the
+# line and a bare `| json` fails with `JSONParserErr`. `| cri` is an ingest-pipeline stage, not a
+# LogQL parser, so the unwrap has to happen here. `content` captures everything after the three CRI
+# fields rather than up to the next space, so spaces inside the payload are safe.
 #
-# Every Loki-backed dashboard that parses a pod's structured logs goes through here — keep it single
-# so the `stage.cri` rollout is a one-line change on this side, not a hunt through every generator.
+# The prefix is an OPTIONAL group on purpose. Once the Alloy pipeline gains `stage.cri`, only
+# newly-ingested lines arrive unwrapped — older ones keep the envelope for the full 90d retention,
+# so both shapes are live in Loki at once and one query has to serve both. A required-prefix form
+# (`| pattern`) does not: on an already-unwrapped line it captures garbage, `| json` then errors,
+# and the `| __error__=""` every call site pairs it with discards the line silently — zero rows and
+# nothing surfaced. Measured against an envelope-free stream: required-prefix returned 0 of 50
+# lines, this form returned all 50, and both return the same rows on wrapped lines.
 CRI_UNWRAP = (
     r"| regexp `^(?:\S+ std(?:out|err) [FP] )?(?P<content>.*)$` "
     "| line_format `{{.content}}`"
