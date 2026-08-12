@@ -381,7 +381,7 @@ export default async function RepoSettings({ params }: { params: Promise<{ id: s
 
       <Card>
         <CardHeader>
-          <CardTitle>Review analytics</CardTitle>
+          <CardTitle>Review analytics &mdash; last 30 days</CardTitle>
         </CardHeader>
         <CardBody className="flex flex-col gap-3 sm:flex-row">
           {REPO_ANALYTICS_PANELS.map((panel) => (
