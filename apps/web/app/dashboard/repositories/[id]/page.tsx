@@ -2,6 +2,7 @@ import { ArrowLeft, Check, RotateCcw, X } from "lucide-react";
 import Link from "next/link";
 import { notFound } from "next/navigation";
 import { PresetPicker } from "@/components/repos/preset-picker";
+import { REPO_ANALYTICS_PANELS, RepoAnalyticsEmbed } from "@/components/repos/repo-analytics-embed";
 import { Button } from "@/components/ui/button";
 import { Card, CardBody, CardHeader, CardTitle } from "@/components/ui/card";
 import { Select } from "@/components/ui/select";
@@ -399,6 +400,19 @@ export default async function RepoSettings({ params }: { params: Promise<{ id: s
             Overrides which model the review preset uses for this repo. Falls back to an org-wide
             override, then the preset's own configured model, when unset.
           </p>
+        </CardBody>
+      </Card>
+
+      <Card>
+        <CardHeader>
+          <CardTitle>Review analytics &mdash; last 30 days</CardTitle>
+        </CardHeader>
+        <CardBody className="flex flex-col gap-3 sm:flex-row">
+          {REPO_ANALYTICS_PANELS.map((panel) => (
+            <div key={panel.dashboardUid} className="flex-1">
+              <RepoAnalyticsEmbed repo={repoSlug(repo)} panel={panel} />
+            </div>
+          ))}
         </CardBody>
       </Card>
     </Shell>
