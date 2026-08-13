@@ -1,8 +1,16 @@
+import { redirect } from "next/navigation";
 import { buttonClass } from "@/components/ui/button";
 import { Card, CardBody } from "@/components/ui/card";
+import { currentClaims } from "@/lib/auth/session";
 
-/** Authentication is delegated to Keycloak (OIDC). This page just kicks off the redirect flow. */
-export default function SignInPage() {
+export const dynamic = "force-dynamic";
+
+/** Authentication is delegated to Keycloak (OIDC). This page just kicks off the redirect flow —
+ * and skips it entirely for someone who already has a session, so a stale bookmark or a back
+ * button lands them in the console instead of on a sign-in prompt they've already satisfied. */
+export default async function SignInPage() {
+  if (await currentClaims()) redirect("/dashboard");
+
   return (
     <main className="mx-auto flex min-h-dvh max-w-md flex-col justify-center px-6 py-16">
       <Card>
