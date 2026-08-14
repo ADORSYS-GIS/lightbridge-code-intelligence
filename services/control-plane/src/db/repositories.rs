@@ -91,9 +91,29 @@ pub async fn list_repositories(
     .await
 }
 
-/// One page of connected repositories, most-recently-active first, plus the `(last_task_at, id)`
-/// of the last row when another page follows. `after` is that pair from the previous page; `None`
-/// starts at the first page. `q` matches `owner/name`, case-insensitively.
+/// A page boundary for [`list_repositories_page`]: the `(last_task_at, id)` of the row it points
+/// at, and which direction to continue from there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepositoryCursor {
+    /// Continue forward from the bottom of a previous page.
+    After(OffsetDateTime, i64),
+    /// Continue backward from the top of a previous page.
+    Before(OffsetDateTime, i64),
+}
+
+/// One page of [`list_repositories_page`]: the rows in display order (most-recently-active first),
+/// the count of every repository matching `q` regardless of page (for a "1–12 of 357" label), and
+/// the boundary to continue in each direction — `None` at either edge of the list.
+pub struct RepositoryPage {
+    pub rows: Vec<RepositoryRow>,
+    pub total: i64,
+    pub next: Option<(OffsetDateTime, i64)>,
+    pub prev: Option<(OffsetDateTime, i64)>,
+}
+
+/// One page of connected repositories, most-recently-active first. `cursor` continues from a
+/// previous page in either direction; `None` starts at the first page. `q` matches `owner/name`,
+/// case-insensitively.
 ///
 /// The ordering is `repositories.last_task_at` (migration 0039), a stored column the keyset
 /// predicate can seek on. Never-run repositories carry the `'epoch'` sentinel so the comparison is
@@ -105,42 +125,104 @@ pub async fn list_repositories(
 pub async fn list_repositories_page(
     pool: &PgPool,
     q: Option<&str>,
-    after: Option<(OffsetDateTime, i64)>,
+    cursor: Option<RepositoryCursor>,
     page_size: i64,
-) -> Result<(Vec<RepositoryRow>, Option<(OffsetDateTime, i64)>), sqlx::Error> {
-    // One row past the page proves whether another page exists, so a full last page doesn't cost the
-    // caller a request to discover an empty tail.
-    let mut rows = sqlx::query_as::<_, RepositoryRow>(
-        "SELECT r.id, r.platform_repo_id, r.platform, r.owner, r.name, r.default_branch, r.status, \
-           (r.status = 'approved') AS active, r.approved_at, r.approved_by, \
-           c.task_count, NULLIF(r.last_task_at, 'epoch') AS last_task_at \
-         FROM repositories r \
-         LEFT JOIN LATERAL ( \
-           SELECT COUNT(*) AS task_count FROM tasks t WHERE t.repository_id = r.id \
-         ) c ON TRUE \
-         WHERE ($1::text IS NULL OR r.owner || '/' || r.name ILIKE '%' || $1 || '%') \
-           AND ($2::timestamptz IS NULL OR (r.last_task_at, r.id) < ($2, $3)) \
-         ORDER BY r.last_task_at DESC, r.id DESC \
-         LIMIT $4",
+) -> Result<RepositoryPage, sqlx::Error> {
+    // Independent of the cursor — it is the "of N" in a range label, not a page-relative count, so
+    // it does not shrink as the cursor advances.
+    let total: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM repositories r \
+         WHERE ($1::text IS NULL OR r.owner || '/' || r.name ILIKE '%' || $1 || '%')",
     )
     .bind(q)
-    .bind(after.map(|(last_task_at, _)| last_task_at))
-    .bind(after.map(|(_, id)| id))
-    .bind(page_size + 1)
-    .fetch_all(pool)
+    .fetch_one(pool)
     .await?;
 
-    let has_next = rows.len() as i64 > page_size;
+    // One row past the page, in whichever direction this query scans, so "does another page exist
+    // that way" is a fact rather than a guess from a full page.
+    let (mut rows, has_more) = if let Some(RepositoryCursor::Before(activity_at, id)) = cursor {
+        let rows = sqlx::query_as::<_, RepositoryRow>(
+            "SELECT r.id, r.platform_repo_id, r.platform, r.owner, r.name, r.default_branch, r.status, \
+               (r.status = 'approved') AS active, r.approved_at, r.approved_by, \
+               c.task_count, NULLIF(r.last_task_at, 'epoch') AS last_task_at \
+             FROM repositories r \
+             LEFT JOIN LATERAL ( \
+               SELECT COUNT(*) AS task_count FROM tasks t WHERE t.repository_id = r.id \
+             ) c ON TRUE \
+             WHERE ($1::text IS NULL OR r.owner || '/' || r.name ILIKE '%' || $1 || '%') \
+               AND (r.last_task_at, r.id) > ($2, $3) \
+             ORDER BY r.last_task_at ASC, r.id ASC \
+             LIMIT $4",
+        )
+        .bind(q)
+        .bind(activity_at)
+        .bind(id)
+        .bind(page_size + 1)
+        .fetch_all(pool)
+        .await?;
+        let has_more = rows.len() as i64 > page_size;
+        (rows, has_more)
+    } else {
+        let after = match cursor {
+            Some(RepositoryCursor::After(activity_at, id)) => Some((activity_at, id)),
+            _ => None,
+        };
+        let rows = sqlx::query_as::<_, RepositoryRow>(
+            "SELECT r.id, r.platform_repo_id, r.platform, r.owner, r.name, r.default_branch, r.status, \
+               (r.status = 'approved') AS active, r.approved_at, r.approved_by, \
+               c.task_count, NULLIF(r.last_task_at, 'epoch') AS last_task_at \
+             FROM repositories r \
+             LEFT JOIN LATERAL ( \
+               SELECT COUNT(*) AS task_count FROM tasks t WHERE t.repository_id = r.id \
+             ) c ON TRUE \
+             WHERE ($1::text IS NULL OR r.owner || '/' || r.name ILIKE '%' || $1 || '%') \
+               AND ($2::timestamptz IS NULL OR (r.last_task_at, r.id) < ($2, $3)) \
+             ORDER BY r.last_task_at DESC, r.id DESC \
+             LIMIT $4",
+        )
+        .bind(q)
+        .bind(after.map(|(activity_at, _)| activity_at))
+        .bind(after.map(|(_, id)| id))
+        .bind(page_size + 1)
+        .fetch_all(pool)
+        .await?;
+        let has_more = rows.len() as i64 > page_size;
+        (rows, has_more)
+    };
+
     rows.truncate(page_size as usize);
-    // Back to the sentinel the ordering uses, so the next page resumes inside the never-run group
-    // rather than restarting at its head.
-    let next = has_next.then(|| rows.last()).flatten().map(|last| {
+    if matches!(cursor, Some(RepositoryCursor::Before(..))) {
+        rows.reverse(); // ascending scan order back to newest-first display order
+    }
+
+    // Paging in a direction always implies a page exists on the *other* side too — the one just
+    // navigated from — so only the side actually scanned needs the extra-row probe above.
+    let (has_next, has_prev) = match cursor {
+        None => (has_more, false),
+        Some(RepositoryCursor::After(..)) => (has_more, true),
+        Some(RepositoryCursor::Before(..)) => (true, has_more),
+    };
+    // Back to the sentinel the ordering uses, so paging across the never-run group resumes inside
+    // it rather than restarting at its head.
+    let next = has_next.then(|| rows.last()).flatten().map(|row| {
         (
-            last.last_task_at.unwrap_or(OffsetDateTime::UNIX_EPOCH),
-            last.id,
+            row.last_task_at.unwrap_or(OffsetDateTime::UNIX_EPOCH),
+            row.id,
         )
     });
-    Ok((rows, next))
+    let prev = has_prev.then(|| rows.first()).flatten().map(|row| {
+        (
+            row.last_task_at.unwrap_or(OffsetDateTime::UNIX_EPOCH),
+            row.id,
+        )
+    });
+
+    Ok(RepositoryPage {
+        rows,
+        total,
+        next,
+        prev,
+    })
 }
 
 /// Register a repository seen via an `installation` / `installation_repositories` webhook as

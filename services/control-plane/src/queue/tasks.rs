@@ -192,9 +192,10 @@ pub async fn get_feedback(
     }
 }
 
-/// `GET /repositories` query params — all optional. `after_activity_at` + `after_id` are the
-/// `last_task_at` and `id` of the last row of the previous page: the keyset cursor, sent as the
-/// values it is made of so a paginated URL says what it selects.
+/// `GET /repositories` query params — all optional. `after_activity_at`/`after_id` and
+/// `before_activity_at`/`before_id` are a page boundary's `last_task_at` and `id`, sent as the
+/// values they are made of so a paginated URL says what it selects. At most one direction may be
+/// given at a time.
 #[derive(Debug, Deserialize)]
 pub struct RepositoriesQuery {
     pub page_size: Option<i64>,
@@ -202,15 +203,18 @@ pub struct RepositoriesQuery {
     #[serde(default, with = "time::serde::rfc3339::option")]
     pub after_activity_at: Option<OffsetDateTime>,
     pub after_id: Option<i64>,
+    #[serde(default, with = "time::serde::rfc3339::option")]
+    pub before_activity_at: Option<OffsetDateTime>,
+    pub before_id: Option<i64>,
 }
 
 /// Validated [`RepositoriesQuery`]. Building one is the only way into the query, so an out-of-range
-/// page size or half a cursor cannot reach SQL.
+/// page size, half a cursor, or both directions at once cannot reach SQL.
 #[derive(Debug)]
 struct RepositoriesParams {
     page_size: i64,
     q: Option<String>,
-    after: Option<(OffsetDateTime, i64)>,
+    cursor: Option<crate::db::RepositoryCursor>,
 }
 
 impl TryFrom<RepositoriesQuery> for RepositoriesParams {
@@ -239,6 +243,29 @@ impl TryFrom<RepositoriesQuery> for RepositoriesParams {
                 ));
             }
         };
+        let before = match (query.before_activity_at, query.before_id) {
+            (Some(activity_at), Some(id)) => Some((activity_at, id)),
+            (None, None) => None,
+            _ => {
+                return Err(bad_request(
+                    "before_activity_at and before_id must be given together".to_string(),
+                ));
+            }
+        };
+        let cursor = match (after, before) {
+            (Some((activity_at, id)), None) => {
+                Some(crate::db::RepositoryCursor::After(activity_at, id))
+            }
+            (None, Some((activity_at, id))) => {
+                Some(crate::db::RepositoryCursor::Before(activity_at, id))
+            }
+            (None, None) => None,
+            (Some(_), Some(_)) => {
+                return Err(bad_request(
+                    "after_* and before_* are mutually exclusive".to_string(),
+                ));
+            }
+        };
         Ok(Self {
             page_size,
             // Trimmed before it reaches the pattern: surrounding whitespace in a search box is
@@ -247,7 +274,7 @@ impl TryFrom<RepositoriesQuery> for RepositoriesParams {
                 .q
                 .map(|q| q.trim().to_string())
                 .filter(|q| !q.is_empty()),
-            after,
+            cursor,
         })
     }
 }
@@ -256,19 +283,26 @@ fn bad_request(message: String) -> (StatusCode, String) {
     (StatusCode::BAD_REQUEST, message)
 }
 
-/// Where the next page starts. Serialized under the names the client sends them back as.
+/// A page boundary on the wire: carries no direction of its own — `next` is where a follow-up
+/// request should point `?after_activity_at=`/`?after_id=`, `prev` is where it should point
+/// `?before_activity_at=`/`?before_id=`.
 #[derive(Debug, Serialize)]
 struct RepositoriesCursor {
     #[serde(with = "time::serde::rfc3339")]
-    after_activity_at: OffsetDateTime,
-    after_id: i64,
+    activity_at: OffsetDateTime,
+    id: i64,
 }
 
 #[derive(Debug, Serialize)]
 struct RepositoriesPage {
     repositories: Vec<crate::db::RepositoryRow>,
-    /// `null` on the last page.
+    /// Every repository matching `q`, independent of the current page — the "of N" in a range
+    /// label.
+    total: i64,
+    /// `null` at the end of the list.
     next: Option<RepositoriesCursor>,
+    /// `null` at the start of the list.
+    prev: Option<RepositoriesCursor>,
 }
 
 /// `GET /repositories` — connected repositories + their run activity (the Repositories view), one
@@ -292,17 +326,20 @@ pub async fn list_repositories(
     match crate::db::list_repositories_page(
         pool,
         params.q.as_deref(),
-        params.after,
+        params.cursor,
         params.page_size,
     )
     .await
     {
-        Ok((repositories, next)) => Json(RepositoriesPage {
-            repositories,
-            next: next.map(|(after_activity_at, after_id)| RepositoriesCursor {
-                after_activity_at,
-                after_id,
-            }),
+        Ok(page) => Json(RepositoriesPage {
+            repositories: page.rows,
+            total: page.total,
+            next: page
+                .next
+                .map(|(activity_at, id)| RepositoriesCursor { activity_at, id }),
+            prev: page
+                .prev
+                .map(|(activity_at, id)| RepositoriesCursor { activity_at, id }),
         })
         .into_response(),
         Err(error) => {
@@ -366,7 +403,10 @@ mod tests {
 
         assert_eq!(params.page_size, 10);
         assert_eq!(params.q.as_deref(), Some("shop"));
-        assert_eq!(params.after, Some((expected, 7)));
+        assert_eq!(
+            params.cursor,
+            Some(crate::db::RepositoryCursor::After(expected, 7))
+        );
     }
 
     fn repositories_query() -> RepositoriesQuery {
@@ -375,6 +415,8 @@ mod tests {
             q: None,
             after_activity_at: None,
             after_id: None,
+            before_activity_at: None,
+            before_id: None,
         }
     }
 
@@ -382,7 +424,7 @@ mod tests {
     fn repositories_params_default_to_the_first_page() {
         let params = RepositoriesParams::try_from(repositories_query()).expect("valid");
         assert_eq!(params.page_size, DEFAULT_REPOSITORY_PAGE_SIZE);
-        assert!(params.after.is_none());
+        assert!(params.cursor.is_none());
         assert!(params.q.is_none());
     }
 
@@ -410,19 +452,53 @@ mod tests {
                 after_id: Some(42),
                 ..repositories_query()
             },
+            RepositoriesQuery {
+                before_activity_at: Some(activity_at),
+                ..repositories_query()
+            },
+            RepositoriesQuery {
+                before_id: Some(42),
+                ..repositories_query()
+            },
         ];
         for query in halves {
             let (status, _) = RepositoriesParams::try_from(query).expect_err("rejected");
             assert_eq!(status, StatusCode::BAD_REQUEST);
         }
 
-        let both = RepositoriesQuery {
+        let after = RepositoriesQuery {
             after_activity_at: Some(activity_at),
             after_id: Some(42),
             ..repositories_query()
         };
-        let params = RepositoriesParams::try_from(both).expect("valid");
-        assert_eq!(params.after, Some((activity_at, 42)));
+        assert_eq!(
+            RepositoriesParams::try_from(after).expect("valid").cursor,
+            Some(crate::db::RepositoryCursor::After(activity_at, 42))
+        );
+
+        let before = RepositoriesQuery {
+            before_activity_at: Some(activity_at),
+            before_id: Some(42),
+            ..repositories_query()
+        };
+        assert_eq!(
+            RepositoriesParams::try_from(before).expect("valid").cursor,
+            Some(crate::db::RepositoryCursor::Before(activity_at, 42))
+        );
+    }
+
+    #[test]
+    fn repositories_params_reject_both_directions_at_once() {
+        let activity_at = OffsetDateTime::from_unix_timestamp(1_770_000_000).expect("in range");
+        let query = RepositoriesQuery {
+            after_activity_at: Some(activity_at),
+            after_id: Some(1),
+            before_activity_at: Some(activity_at),
+            before_id: Some(2),
+            ..repositories_query()
+        };
+        let (status, _) = RepositoriesParams::try_from(query).expect_err("rejected");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 
     #[test]

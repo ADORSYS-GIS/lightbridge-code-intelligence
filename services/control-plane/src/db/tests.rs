@@ -1062,22 +1062,22 @@ async fn seed_idle_repositories(pool: &PgPool, count: i64) -> sqlx::Result<Vec<i
     Ok(ids)
 }
 
-/// Page through `list_repositories_page` with the given search and page size, following each
-/// returned cursor, and return every row seen. Guards against a runaway loop so a cursor bug fails
-/// as an assertion rather than hanging the suite.
+/// Page forward through `list_repositories_page` with the given search and page size, following
+/// each returned `next`, and return every row seen. Guards against a runaway loop so a cursor bug
+/// fails as an assertion rather than hanging the suite.
 async fn drain_repository_pages(
     pool: &PgPool,
     q: Option<&str>,
     page_size: i64,
 ) -> sqlx::Result<Vec<RepositoryRow>> {
     let mut seen = Vec::new();
-    let mut after = None;
+    let mut cursor = None;
     let mut terminated = false;
     for _ in 0..100 {
-        let (rows, next) = list_repositories_page(pool, q, after, page_size).await?;
-        seen.extend(rows);
-        match next {
-            Some(next) => after = Some(next),
+        let page = list_repositories_page(pool, q, cursor, page_size).await?;
+        seen.extend(page.rows);
+        match page.next {
+            Some((activity_at, id)) => cursor = Some(RepositoryCursor::After(activity_at, id)),
             None => {
                 terminated = true;
                 break;
@@ -1134,21 +1134,29 @@ async fn list_repositories_page_walks_the_null_activity_boundary(pool: PgPool) -
     Ok(())
 }
 
-/// The last page reports no cursor, so a caller stops instead of re-requesting an empty tail. A page
-/// that exactly fills `page_size` is the case a row-count heuristic gets wrong.
+/// The last page reports no `next`, so a caller stops instead of re-requesting an empty tail. A
+/// page that exactly fills `page_size` is the case a row-count heuristic gets wrong. The first page
+/// also reports no `prev`.
 #[sqlx::test]
 async fn list_repositories_page_ends_without_a_cursor(pool: PgPool) -> sqlx::Result<()> {
     seed_idle_repositories(&pool, 2).await?;
 
-    let (rows, next) = list_repositories_page(&pool, None, None, 10).await?;
-    assert_eq!(rows.len(), 2);
-    assert!(next.is_none(), "a partial page must not hand back a cursor");
-
-    let (rows, next) = list_repositories_page(&pool, None, None, 2).await?;
-    assert_eq!(rows.len(), 2);
+    let page = list_repositories_page(&pool, None, None, 10).await?;
+    assert_eq!(page.rows.len(), 2);
     assert!(
-        next.is_none(),
-        "an exactly-full last page must not hand back a cursor either"
+        page.next.is_none(),
+        "a partial page must not hand back a next cursor"
+    );
+    assert!(
+        page.prev.is_none(),
+        "the first page must not hand back a prev cursor"
+    );
+
+    let page = list_repositories_page(&pool, None, None, 2).await?;
+    assert_eq!(page.rows.len(), 2);
+    assert!(
+        page.next.is_none(),
+        "an exactly-full last page must not hand back a next cursor either"
     );
     Ok(())
 }
@@ -1169,6 +1177,105 @@ async fn list_repositories_page_filters_by_query(pool: PgPool) -> sqlx::Result<(
         seen,
         vec![shop],
         "search matches owner/name case-insensitively and survives paging"
+    );
+    Ok(())
+}
+
+/// `total` counts every repository matching `q`, independent of where the cursor currently is — the
+/// "of N" in a range label, not a page-relative count.
+#[sqlx::test]
+async fn list_repositories_page_total_ignores_the_cursor(pool: PgPool) -> sqlx::Result<()> {
+    seed_idle_repositories(&pool, 5).await?;
+
+    let first = list_repositories_page(&pool, None, None, 2).await?;
+    assert_eq!(first.total, 5);
+
+    let cursor = first
+        .next
+        .map(|(activity_at, id)| RepositoryCursor::After(activity_at, id));
+    let second = list_repositories_page(&pool, None, cursor, 2).await?;
+    assert_eq!(
+        second.total, 5,
+        "total does not shrink as the cursor advances"
+    );
+    Ok(())
+}
+
+/// Walking backward from where a forward walk ended must reconstruct the exact same sequence of
+/// repositories, in the same order — the same no-drops/no-duplicates guarantee the forward walk
+/// has, in the other direction.
+#[sqlx::test]
+async fn list_repositories_page_walks_backward_symmetrically_to_forward(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let active =
+        upsert_repository(&pool, Platform::GitHub, 1, "vymalo", "shop", "main", None).await?;
+    let task = paged_task(active, 1, None);
+    record_delivery(
+        &pool,
+        Platform::GitHub,
+        &task.webhook_delivery_id,
+        "pull_request",
+        &json!({}),
+    )
+    .await?;
+    assert!(
+        create_task(&pool, &task).await?.is_some(),
+        "the seed task was created"
+    );
+    seed_idle_repositories(&pool, 3).await?;
+
+    // Walk forward to the tail, keeping every page's own rows plus the tail page's `prev` — the
+    // boundary a "Prev" click from the tail would send back.
+    let mut forward_ids = Vec::new();
+    let mut tail_ids = Vec::new();
+    let mut tail_prev = None;
+    let mut cursor = None;
+    for _ in 0..100 {
+        let page = list_repositories_page(&pool, None, cursor, 2).await?;
+        let page_ids: Vec<i64> = page.rows.iter().map(|r| r.id).collect();
+        forward_ids.extend(page_ids.iter().copied());
+        match page.next {
+            Some((activity_at, id)) => cursor = Some(RepositoryCursor::After(activity_at, id)),
+            None => {
+                tail_ids = page_ids;
+                tail_prev = page.prev;
+                break;
+            }
+        }
+    }
+
+    // Walk backward from that boundary, prepending each earlier page's rows.
+    let mut backward_pages: Vec<Vec<i64>> = Vec::new();
+    let mut cursor = tail_prev;
+    let mut terminated = false;
+    for _ in 0..100 {
+        let Some((activity_at, id)) = cursor else {
+            terminated = true;
+            break;
+        };
+        let page = list_repositories_page(
+            &pool,
+            None,
+            Some(RepositoryCursor::Before(activity_at, id)),
+            2,
+        )
+        .await?;
+        backward_pages.push(page.rows.iter().map(|r| r.id).collect());
+        cursor = page.prev;
+    }
+    assert!(
+        terminated,
+        "backward walk did not terminate within 100 pages"
+    );
+
+    backward_pages.reverse();
+    let mut reconstructed: Vec<i64> = backward_pages.into_iter().flatten().collect();
+    reconstructed.extend(tail_ids);
+
+    assert_eq!(
+        reconstructed, forward_ids,
+        "walking backward from the tail reconstructs the forward sequence exactly"
     );
     Ok(())
 }
