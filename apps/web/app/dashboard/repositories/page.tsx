@@ -5,10 +5,27 @@ import { ApiErrorLine, EmptyState } from "@/components/ui/states";
 import { gitlabLinkConfig } from "@/lib/domain/gitlab-links";
 import { REPOS_PAGE_SIZE } from "@/lib/domain/repos";
 import { getRepoSettings } from "@/lib/server/admin";
-import { getDeploymentConfig, listRepositoriesPage } from "@/lib/server/api";
+import {
+  getDeploymentConfig,
+  listRepositoriesPage,
+  type RepositoriesCursor,
+} from "@/lib/server/api";
 import { githubAppInstallUrl } from "@/lib/utils/config";
 
 export const dynamic = "force-dynamic";
+
+/** Reads a `{prefix}_activity_at` + `{prefix}_id` pair from `searchParams`; `undefined` unless both
+ * halves are present and `id` is a real integer. */
+function cursorFromParams(
+  sp: Record<string, string | string[] | undefined>,
+  prefix: "after" | "before",
+): RepositoriesCursor | undefined {
+  const activityAt = sp[`${prefix}_activity_at`];
+  const id = sp[`${prefix}_id`];
+  if (typeof activityAt !== "string" || typeof id !== "string") return undefined;
+  const parsedId = Number(id);
+  return Number.isInteger(parsedId) ? { activity_at: activityAt, id: parsedId } : undefined;
+}
 
 export default async function Repositories({
   searchParams,
@@ -17,16 +34,12 @@ export default async function Repositories({
 }) {
   const sp = await searchParams;
   const q = typeof sp.q === "string" && sp.q ? sp.q : undefined;
-  // Both halves or neither: the control plane rejects half a cursor rather than quietly serving the
-  // first page again.
-  const afterActivityAt = typeof sp.after_activity_at === "string" ? sp.after_activity_at : null;
-  const afterId = typeof sp.after_id === "string" ? Number(sp.after_id) : null;
-  const after =
-    afterActivityAt && afterId !== null && Number.isInteger(afterId)
-      ? { after_activity_at: afterActivityAt, after_id: afterId }
-      : undefined;
+  const after = cursorFromParams(sp, "after");
+  // `after` wins if a hand-edited URL somehow carries both — the control plane would 400 on
+  // sending both anyway, so only one is ever forwarded.
+  const before = after ? undefined : cursorFromParams(sp, "before");
 
-  const result = await listRepositoriesPage({ pageSize: REPOS_PAGE_SIZE, q, after });
+  const result = await listRepositoriesPage({ pageSize: REPOS_PAGE_SIZE, q, after, before });
   const cfg = await getDeploymentConfig();
   const gitlabLinks = gitlabLinkConfig(
     cfg.ok ? cfg.data.gitlab_base_url : null,
@@ -65,7 +78,7 @@ export default async function Repositories({
         <Card>
           <ApiErrorLine result={result} />
         </Card>
-      ) : result.data.repositories.length === 0 && !q && !after ? (
+      ) : result.data.total === 0 && !q ? (
         <EmptyState
           title="No repositories yet"
           action={
@@ -85,7 +98,9 @@ export default async function Repositories({
       ) : (
         <RepoList
           repos={result.data.repositories}
+          total={result.data.total}
           next={result.data.next}
+          prev={result.data.prev}
           now={now}
           gitlabLinks={gitlabLinks}
           overrideRepoIds={overrideRepoIds}

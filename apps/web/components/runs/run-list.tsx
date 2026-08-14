@@ -50,8 +50,8 @@ export function RunList({
   // `shallow: false` on every param here: this page's status/repo/q/page state drives a real
   // server-side fetch (`listTasksPage`, real pagination — control-plane #587), so a URL-only change
   // (nuqs' default `shallow: true`) would update the address bar without ever re-invoking the Server
-  // Component that owns the data. RepoList's search/cursor now do the same server-side fetch
-  // (`listRepositoriesPage`) and need the same `shallow: false` — see its own comment.
+  // Component that owns the data. RepoList's search and pager drive the same kind of server-side
+  // fetch (`listRepositoriesPage`) and need the same `shallow: false` — see its own comment.
   const [filter, setFilter] = useQueryState(
     "status",
     parseAsStringLiteral(FILTER_VALUES).withDefault("all").withOptions({ shallow: false }),

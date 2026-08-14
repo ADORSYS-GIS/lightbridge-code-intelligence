@@ -145,38 +145,47 @@ export async function cancelTask(id: string): Promise<ApiResult<null>> {
   }
 }
 
-/** Where the next page of `GET /repositories` starts: the `last_task_at` and `id` of the last row
- * of the current page, sent straight back as query params. */
+/** A `GET /repositories` page boundary: the `last_task_at` and `id` of the row it points at.
+ * Carries no direction of its own — `next` is where a follow-up request should send back as
+ * `after`, `prev` is where it should send back as `before`. */
 export interface RepositoriesCursor {
-  after_activity_at: string;
-  after_id: number;
+  activity_at: string;
+  id: number;
 }
 
-/** `GET /repositories`' response envelope: one page plus where the next one starts (`null` on the
- * last page). */
+/** `GET /repositories`' response envelope: one page, the count matching the current search (for a
+ * "1–12 of 357" label), and where to continue in each direction (`null` at either edge). */
 export interface RepositoriesPageResponse {
   repositories: Repository[];
+  total: number;
   next: RepositoriesCursor | null;
+  prev: RepositoriesCursor | null;
 }
 
 export interface RepositoriesPageParams {
   pageSize: number;
   /** Matches `owner/name`, case-insensitively. */
   q?: string;
-  /** The previous page's `next`; omitted for the first page. */
+  /** Continue forward from a previous page's `next`. Mutually exclusive with `before`. */
   after?: RepositoriesCursor;
+  /** Continue backward from a previous page's `prev`. Mutually exclusive with `after`. */
+  before?: RepositoriesCursor;
 }
 
-/** `GET /repositories?page_size=&q=&after_activity_at=&after_id=` — connected repositories + run
- * activity, most-recently-active first, one page at a time. */
+/** `GET /repositories?page_size=&q=&after_activity_at=&after_id=` (or `before_*`) — connected
+ * repositories + run activity, most-recently-active first, one page at a time. */
 export async function listRepositoriesPage(
   params: RepositoriesPageParams,
 ): Promise<ApiResult<RepositoriesPageResponse>> {
   const query = new URLSearchParams({ page_size: String(params.pageSize) });
   if (params.q) query.set("q", params.q);
   if (params.after) {
-    query.set("after_activity_at", params.after.after_activity_at);
-    query.set("after_id", String(params.after.after_id));
+    query.set("after_activity_at", params.after.activity_at);
+    query.set("after_id", String(params.after.id));
+  }
+  if (params.before) {
+    query.set("before_activity_at", params.before.activity_at);
+    query.set("before_id", String(params.before.id));
   }
 
   try {
