@@ -91,6 +91,58 @@ pub async fn list_repositories(
     .await
 }
 
+/// One page of connected repositories, most-recently-active first, plus the `(last_task_at, id)`
+/// of the last row when another page follows. `after` is that pair from the previous page; `None`
+/// starts at the first page. `q` matches `owner/name`, case-insensitively.
+///
+/// The ordering is `repositories.last_task_at` (migration 0039), a stored column the keyset
+/// predicate can seek on. Never-run repositories carry the `'epoch'` sentinel so the comparison is
+/// total, and the projection maps it back to NULL — the wire keeps reporting "no runs yet" as an
+/// absent timestamp.
+///
+/// The final tie-break is `id`, not [`list_repositories`]'s `owner, name`: a page boundary needs a
+/// unique key, and every never-run repository shares the same `last_task_at`.
+pub async fn list_repositories_page(
+    pool: &PgPool,
+    q: Option<&str>,
+    after: Option<(OffsetDateTime, i64)>,
+    page_size: i64,
+) -> Result<(Vec<RepositoryRow>, Option<(OffsetDateTime, i64)>), sqlx::Error> {
+    // One row past the page proves whether another page exists, so a full last page doesn't cost the
+    // caller a request to discover an empty tail.
+    let mut rows = sqlx::query_as::<_, RepositoryRow>(
+        "SELECT r.id, r.platform_repo_id, r.platform, r.owner, r.name, r.default_branch, r.status, \
+           (r.status = 'approved') AS active, r.approved_at, r.approved_by, \
+           c.task_count, NULLIF(r.last_task_at, 'epoch') AS last_task_at \
+         FROM repositories r \
+         LEFT JOIN LATERAL ( \
+           SELECT COUNT(*) AS task_count FROM tasks t WHERE t.repository_id = r.id \
+         ) c ON TRUE \
+         WHERE ($1::text IS NULL OR r.owner || '/' || r.name ILIKE '%' || $1 || '%') \
+           AND ($2::timestamptz IS NULL OR (r.last_task_at, r.id) < ($2, $3)) \
+         ORDER BY r.last_task_at DESC, r.id DESC \
+         LIMIT $4",
+    )
+    .bind(q)
+    .bind(after.map(|(last_task_at, _)| last_task_at))
+    .bind(after.map(|(_, id)| id))
+    .bind(page_size + 1)
+    .fetch_all(pool)
+    .await?;
+
+    let has_next = rows.len() as i64 > page_size;
+    rows.truncate(page_size as usize);
+    // Back to the sentinel the ordering uses, so the next page resumes inside the never-run group
+    // rather than restarting at its head.
+    let next = has_next.then(|| rows.last()).flatten().map(|last| {
+        (
+            last.last_task_at.unwrap_or(OffsetDateTime::UNIX_EPOCH),
+            last.id,
+        )
+    });
+    Ok((rows, next))
+}
+
 /// Register a repository seen via an `installation` / `installation_repositories` webhook as
 /// **pending** approval. New repo → inserted pending. A previously **disabled** repo (uninstalled
 /// then re-added) is re-opened to pending so the admin sees it in the queue again; an already

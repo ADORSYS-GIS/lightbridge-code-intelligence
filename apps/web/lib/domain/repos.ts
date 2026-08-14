@@ -6,6 +6,15 @@
 import { type GitlabLinkConfig, gitlabBaseUrlForProject } from "@/lib/domain/gitlab-links";
 import type { StatusVariant } from "@/lib/domain/tasks";
 
+/** Repositories per page. Shared by the Server Component that fetches the page and the client
+ * `RepoList` that renders it — the same reason `RUNS_PAGE_SIZE` lives beside its view rather than
+ * inside it (a `"use client"` module cannot export plain values to a Server Component). */
+export const REPOS_PAGE_SIZE = 12;
+
+/** Repositories offered in the Runs page's repository filter. One page is the whole dropdown: a
+ * `<select>` longer than this is unusable anyway, and it keeps the filter to a single request. */
+export const REPO_FILTER_LIMIT = 100;
+
 /** A connected repository plus its run-activity summary. */
 export interface Repository {
   id: number;

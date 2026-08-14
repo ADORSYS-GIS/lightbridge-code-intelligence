@@ -2,8 +2,9 @@ import { RunList } from "@/components/runs/run-list";
 import { buttonClass } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { ApiErrorLine, EmptyState } from "@/components/ui/states";
+import { REPO_FILTER_LIMIT } from "@/lib/domain/repos";
 import { RUNS_PAGE_SIZE } from "@/lib/domain/tasks";
-import { listRepositories, listTasksPage, type TasksStatusFilter } from "@/lib/server/api";
+import { listRepositoriesPage, listTasksPage, type TasksStatusFilter } from "@/lib/server/api";
 import { githubAppInstallUrl } from "@/lib/utils/config";
 
 export const dynamic = "force-dynamic";
@@ -38,10 +39,10 @@ export default async function Runs({
   // narrowed to one repo would otherwise make every other repo disappear from its own dropdown).
   const [result, reposResult] = await Promise.all([
     listTasksPage({ page, pageSize: RUNS_PAGE_SIZE, status, repositoryId, q }),
-    listRepositories(),
+    listRepositoriesPage({ pageSize: REPO_FILTER_LIMIT }),
   ]);
   const now = Date.now();
-  const repoOptions = reposResult.ok ? reposResult.data : [];
+  const repoOptions = reposResult.ok ? reposResult.data.repositories : [];
 
   return (
     <div className="flex flex-col gap-6">

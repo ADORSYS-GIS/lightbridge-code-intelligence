@@ -145,13 +145,45 @@ export async function cancelTask(id: string): Promise<ApiResult<null>> {
   }
 }
 
-/** `GET /repositories` — connected repositories + run activity. */
-export async function listRepositories(): Promise<ApiResult<Repository[]>> {
+/** Where the next page of `GET /repositories` starts: the `last_task_at` and `id` of the last row
+ * of the current page, sent straight back as query params. */
+export interface RepositoriesCursor {
+  after_activity_at: string;
+  after_id: number;
+}
+
+/** `GET /repositories`' response envelope: one page plus where the next one starts (`null` on the
+ * last page). */
+export interface RepositoriesPageResponse {
+  repositories: Repository[];
+  next: RepositoriesCursor | null;
+}
+
+export interface RepositoriesPageParams {
+  pageSize: number;
+  /** Matches `owner/name`, case-insensitively. */
+  q?: string;
+  /** The previous page's `next`; omitted for the first page. */
+  after?: RepositoriesCursor;
+}
+
+/** `GET /repositories?page_size=&q=&after_activity_at=&after_id=` — connected repositories + run
+ * activity, most-recently-active first, one page at a time. */
+export async function listRepositoriesPage(
+  params: RepositoriesPageParams,
+): Promise<ApiResult<RepositoriesPageResponse>> {
+  const query = new URLSearchParams({ page_size: String(params.pageSize) });
+  if (params.q) query.set("q", params.q);
+  if (params.after) {
+    query.set("after_activity_at", params.after.after_activity_at);
+    query.set("after_id", String(params.after.after_id));
+  }
+
   try {
-    const res = await authedFetch("/repositories");
+    const res = await authedFetch(`/repositories?${query.toString()}`);
     if (!res) return { ok: false, reason: "unauthenticated" };
     if (!res.ok) return { ok: false, reason: classify(res.status), status: res.status };
-    return { ok: true, data: (await res.json()) as Repository[] };
+    return { ok: true, data: (await res.json()) as RepositoriesPageResponse };
   } catch {
     return { ok: false, reason: "unavailable" };
   }

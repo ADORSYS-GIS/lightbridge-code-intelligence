@@ -1041,6 +1041,138 @@ async fn list_repositories_summarises_activity(pool: PgPool) {
     assert!(idle_row.last_task_at.is_none());
 }
 
+/// Seed `count` repositories that have never run a task (so their `last_task_at` is NULL on the
+/// wire), named `vymalo/idle-<n>`. Returns their ids in creation order.
+async fn seed_idle_repositories(pool: &PgPool, count: i64) -> sqlx::Result<Vec<i64>> {
+    let mut ids = Vec::new();
+    for n in 0..count {
+        ids.push(
+            upsert_repository(
+                pool,
+                Platform::GitHub,
+                1_000 + n,
+                "vymalo",
+                &format!("idle-{n}"),
+                "main",
+                None,
+            )
+            .await?,
+        );
+    }
+    Ok(ids)
+}
+
+/// Page through `list_repositories_page` with the given search and page size, following each
+/// returned cursor, and return every row seen. Guards against a runaway loop so a cursor bug fails
+/// as an assertion rather than hanging the suite.
+async fn drain_repository_pages(
+    pool: &PgPool,
+    q: Option<&str>,
+    page_size: i64,
+) -> sqlx::Result<Vec<RepositoryRow>> {
+    let mut seen = Vec::new();
+    let mut after = None;
+    let mut terminated = false;
+    for _ in 0..100 {
+        let (rows, next) = list_repositories_page(pool, q, after, page_size).await?;
+        seen.extend(rows);
+        match next {
+            Some(next) => after = Some(next),
+            None => {
+                terminated = true;
+                break;
+            }
+        }
+    }
+    assert!(terminated, "pagination did not terminate within 100 pages");
+    Ok(seen)
+}
+
+/// The keyset page walk must visit every repository exactly once — no drops, no duplicates — even
+/// when the page boundary falls between repos that HAVE run tasks and repos that never have.
+///
+/// The never-run group is where a keyset is easiest to get wrong: those rows share one sort key, so
+/// the walk depends on the `id` tie-break, and on the `'epoch'` sentinel keeping the comparison
+/// total (`NULL < $ts` is UNKNOWN in SQL, which would drop them from every page after the first).
+#[sqlx::test]
+async fn list_repositories_page_walks_the_null_activity_boundary(pool: PgPool) -> sqlx::Result<()> {
+    let active =
+        upsert_repository(&pool, Platform::GitHub, 1, "vymalo", "shop", "main", None).await?;
+    // tasks.webhook_delivery_id FKs webhook_deliveries, so the delivery must exist first — and
+    // under the exact id `paged_task` derives from (repository_id, target_id).
+    let task = paged_task(active, 1, None);
+    record_delivery(
+        &pool,
+        Platform::GitHub,
+        &task.webhook_delivery_id,
+        "pull_request",
+        &json!({}),
+    )
+    .await?;
+    assert!(
+        create_task(&pool, &task).await?.is_some(),
+        "the seed task was created"
+    );
+    let idle = seed_idle_repositories(&pool, 3).await?;
+
+    // Page size 2 over 4 repos puts the boundary inside the never-run group, and again between the
+    // active repo and the first never-run one.
+    let seen = drain_repository_pages(&pool, None, 2).await?;
+
+    let mut seen_ids: Vec<i64> = seen.iter().map(|r| r.id).collect();
+    let mut expected: Vec<i64> = std::iter::once(active).chain(idle).collect();
+    seen_ids.sort_unstable();
+    expected.sort_unstable();
+    assert_eq!(
+        seen_ids, expected,
+        "every repository must appear exactly once across the paged walk"
+    );
+    assert_eq!(
+        seen[0].id, active,
+        "the repo with activity sorts ahead of the never-run ones"
+    );
+    Ok(())
+}
+
+/// The last page reports no cursor, so a caller stops instead of re-requesting an empty tail. A page
+/// that exactly fills `page_size` is the case a row-count heuristic gets wrong.
+#[sqlx::test]
+async fn list_repositories_page_ends_without_a_cursor(pool: PgPool) -> sqlx::Result<()> {
+    seed_idle_repositories(&pool, 2).await?;
+
+    let (rows, next) = list_repositories_page(&pool, None, None, 10).await?;
+    assert_eq!(rows.len(), 2);
+    assert!(next.is_none(), "a partial page must not hand back a cursor");
+
+    let (rows, next) = list_repositories_page(&pool, None, None, 2).await?;
+    assert_eq!(rows.len(), 2);
+    assert!(
+        next.is_none(),
+        "an exactly-full last page must not hand back a cursor either"
+    );
+    Ok(())
+}
+
+/// The search filter composes with the cursor rather than being dropped once paging starts.
+#[sqlx::test]
+async fn list_repositories_page_filters_by_query(pool: PgPool) -> sqlx::Result<()> {
+    seed_idle_repositories(&pool, 2).await?;
+    let shop =
+        upsert_repository(&pool, Platform::GitHub, 1, "vymalo", "shop", "main", None).await?;
+
+    let seen: Vec<i64> = drain_repository_pages(&pool, Some("SHOP"), 1)
+        .await?
+        .iter()
+        .map(|r| r.id)
+        .collect();
+    assert_eq!(
+        seen,
+        vec![shop],
+        "search matches owner/name case-insensitively and survives paging"
+    );
+    Ok(())
+}
+
 /// `list_tasks_page` is the dashboard run list and must return most-recent-first. `tasks.id` is a
 /// random UUIDv4, so ordering by it is effectively random — this guards against regressing to an
 /// id-based ORDER BY (which hid recent runs entirely once older rows crowded the LIMIT window).
