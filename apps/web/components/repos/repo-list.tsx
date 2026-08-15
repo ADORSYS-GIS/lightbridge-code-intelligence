@@ -2,7 +2,7 @@
 
 import { ExternalLink, GitBranch, Settings } from "lucide-react";
 import Link from "next/link";
-import { parseAsInteger, useQueryStates } from "nuqs";
+import { useQueryState } from "nuqs";
 import { useMemo } from "react";
 import { Card } from "@/components/ui/card";
 import { Pagination } from "@/components/ui/pagination";
@@ -17,18 +17,13 @@ import {
   repoUrl,
 } from "@/lib/domain/repos";
 import { relativeTime } from "@/lib/domain/tasks";
+import { useCursorPagination } from "@/lib/hooks/use-cursor-pagination";
 import type { RepositoriesCursor } from "@/lib/server/api";
 
 /** Connected repositories as cards with a search box + pagination (ADR-0024, daisyUI in ADR-0027).
  * `repos`/`total`/`next`/`prev` are exactly what the control plane returned for the current URL
  * (`listRepositoriesPage`, cursor-paginated) — this component does no client-side filtering or
- * slicing of its own.
- *
- * `page` is a display-only counter: Prev/Next move it by one for the "N / M" label, but the request
- * that actually moves between pages is driven by `next`/`prev`, the keyset boundary the server just
- * returned — `page` itself is never sent to the control plane. That split keeps paging correct
- * under concurrent inserts (the boundary is a row, not a position) while still reading like
- * ordinary numbered pages.
+ * slicing of its own; paging itself is `useCursorPagination`'s job.
  *
  * `now` is server-passed so relative times don't drift on hydration.
  * `gitlabLinks` is passed from the Server Component for self-hosted GitLab links. */
@@ -54,66 +49,29 @@ export function RepoList({
   overrideRepoIds: number[];
 }) {
   const overrideSet = useMemo(() => new Set(overrideRepoIds), [overrideRepoIds]);
-  // `shallow: false` on every param: search and paging drive a real server-side fetch
-  // (`listRepositoriesPage`), so a URL-only change (nuqs' default `shallow: true`) would update the
-  // address bar without ever re-invoking the Server Component that owns the data.
-  const [{ q, page }, setParams] = useQueryStates({
-    q: { defaultValue: "", parse: String, clearOnDefault: true, shallow: false },
-    page: parseAsInteger.withDefault(0).withOptions({ shallow: false }),
-    after_activity_at: { defaultValue: "", parse: String, clearOnDefault: true, shallow: false },
-    after_id: { defaultValue: "", parse: String, clearOnDefault: true, shallow: false },
-    before_activity_at: { defaultValue: "", parse: String, clearOnDefault: true, shallow: false },
-    before_id: { defaultValue: "", parse: String, clearOnDefault: true, shallow: false },
+  // `shallow: false`: search drives a real server-side fetch (`listRepositoriesPage`), so a
+  // URL-only change would update the address bar without ever re-invoking the Server Component
+  // that owns the data — same reason the pager below needs it.
+  const [q, setQuery] = useQueryState("q", {
+    defaultValue: "",
+    clearOnDefault: true,
+    shallow: false,
   });
-
-  const pageCount = Math.max(1, Math.ceil(total / REPOS_PAGE_SIZE));
-  const current = Math.min(Math.max(0, page), pageCount - 1);
-  const start = current * REPOS_PAGE_SIZE;
-  const rangeLabel =
-    total === 0
-      ? "No results"
-      : `${start + 1}–${Math.min(start + REPOS_PAGE_SIZE, total)} of ${total}`;
-
-  // `Pagination` only ever calls this with `current - 1` (or `null`, at page 0) or `current + 1`, so
-  // the sign of the move says which cursor to send. `next` and `prev` are null exactly when the
-  // corresponding button is disabled — both come from the same response as `total` — so a move
-  // landing here always has the cursor it needs; the `&& next`/`&& prev` guards are a graceful
-  // no-op for the rare case a concurrent change makes that momentarily untrue.
-  function goToPage(target: number | null) {
-    const nextPage = target ?? 0;
-    if (nextPage > current && next) {
-      setParams({
-        page: target,
-        after_activity_at: next.activity_at,
-        after_id: String(next.id),
-        before_activity_at: null,
-        before_id: null,
-      });
-    } else if (nextPage < current && prev) {
-      setParams({
-        page: target,
-        before_activity_at: prev.activity_at,
-        before_id: String(prev.id),
-        after_activity_at: null,
-        after_id: null,
-      });
-    }
-  }
+  const { current, pageCount, rangeLabel, goToPage, reset } = useCursorPagination({
+    total,
+    pageSize: REPOS_PAGE_SIZE,
+    next,
+    prev,
+  });
 
   return (
     <div className="flex flex-col gap-3">
       <SearchInput
         value={q}
-        onChange={(e) =>
-          setParams({
-            q: e.target.value,
-            page: null,
-            after_activity_at: null,
-            after_id: null,
-            before_activity_at: null,
-            before_id: null,
-          })
-        }
+        onChange={(e) => {
+          setQuery(e.target.value);
+          reset();
+        }}
         placeholder="Search repositories"
         aria-label="Search repositories"
         className="w-full sm:w-72"
