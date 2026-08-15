@@ -34,9 +34,11 @@ export default async function Runs({
   const page = typeof sp.page === "string" ? Math.max(0, Number(sp.page) || 0) : 0;
   const hasFilters = status !== undefined || repositoryId !== undefined || q !== undefined;
 
-  // Two independent fetches: the page's own filtered/paginated window, and the full repo universe
-  // for the filter dropdown (deliberately NOT derived from the current page's tasks — a filter
-  // narrowed to one repo would otherwise make every other repo disappear from its own dropdown).
+  // Two independent fetches: the page's own filtered/paginated window, and the 100
+  // most-recently-active repositories for the filter dropdown (deliberately NOT derived from the
+  // current page's tasks — a filter narrowed to one repo would otherwise make every other repo on
+  // that page disappear from its own dropdown). A repo outside that top 100 by activity isn't
+  // offered until it runs again.
   const [result, reposResult] = await Promise.all([
     listTasksPage({ page, pageSize: RUNS_PAGE_SIZE, status, repositoryId, q }),
     listRepositoriesPage({ pageSize: REPO_FILTER_LIMIT }),

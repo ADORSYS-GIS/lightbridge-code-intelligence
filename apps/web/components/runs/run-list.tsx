@@ -34,8 +34,9 @@ const isView = (value: string): value is View => (VIEW_VALUES as readonly string
  * control-plane #587), so `tasks`/`total` arriving as props are already the correct window; this
  * component does no client-side filtering or slicing itself. The view toggle is a personal
  * preference, so it persists to localStorage instead of the URL. `now` is server-passed so relative
- * times don't drift on hydration. `repoOptions` is the full repo universe (not derived from `tasks`)
- * so narrowing the filter to one repo doesn't make every other repo vanish from its own dropdown. */
+ * times don't drift on hydration. `repoOptions` is the 100 most-recently-active repositories (not
+ * derived from `tasks`) so narrowing the filter to one repo doesn't make every other repo on the
+ * current page vanish from its own dropdown. */
 export function RunList({
   tasks,
   total,
