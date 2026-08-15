@@ -2,8 +2,9 @@ import { RunList } from "@/components/runs/run-list";
 import { buttonClass } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { ApiErrorLine, EmptyState } from "@/components/ui/states";
+import { REPO_FILTER_LIMIT } from "@/lib/domain/repos";
 import { RUNS_PAGE_SIZE } from "@/lib/domain/tasks";
-import { listRepositories, listTasksPage, type TasksStatusFilter } from "@/lib/server/api";
+import { listRepositoriesPage, listTasksPage, type TasksStatusFilter } from "@/lib/server/api";
 import { githubAppInstallUrl } from "@/lib/utils/config";
 
 export const dynamic = "force-dynamic";
@@ -33,15 +34,17 @@ export default async function Runs({
   const page = typeof sp.page === "string" ? Math.max(0, Number(sp.page) || 0) : 0;
   const hasFilters = status !== undefined || repositoryId !== undefined || q !== undefined;
 
-  // Two independent fetches: the page's own filtered/paginated window, and the full repo universe
-  // for the filter dropdown (deliberately NOT derived from the current page's tasks — a filter
-  // narrowed to one repo would otherwise make every other repo disappear from its own dropdown).
+  // Two independent fetches: the page's own filtered/paginated window, and the 100
+  // most-recently-active repositories for the filter dropdown (deliberately NOT derived from the
+  // current page's tasks — a filter narrowed to one repo would otherwise make every other repo on
+  // that page disappear from its own dropdown). A repo outside that top 100 by activity isn't
+  // offered until it runs again.
   const [result, reposResult] = await Promise.all([
     listTasksPage({ page, pageSize: RUNS_PAGE_SIZE, status, repositoryId, q }),
-    listRepositories(),
+    listRepositoriesPage({ pageSize: REPO_FILTER_LIMIT }),
   ]);
   const now = Date.now();
-  const repoOptions = reposResult.ok ? reposResult.data : [];
+  const repoOptions = reposResult.ok ? reposResult.data.repositories : [];
 
   return (
     <div className="flex flex-col gap-6">

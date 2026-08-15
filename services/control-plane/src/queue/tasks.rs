@@ -6,6 +6,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
+use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::AppState;
@@ -13,6 +14,10 @@ use crate::db::TasksPageFilter;
 use crate::jwt::Caller;
 
 const TASK_LIST_LIMIT: i64 = 100;
+/// `GET /repositories` page size when the caller does not ask for one, and the largest it may ask
+/// for. A list view renders a screenful; the ceiling bounds the response for everything else.
+const DEFAULT_REPOSITORY_PAGE_SIZE: i64 = 25;
+const MAX_REPOSITORY_PAGE_SIZE: i64 = 100;
 
 /// `GET /tasks` query params — all optional, so a bare `GET /tasks` (the Overview page's insights
 /// fetch) keeps returning exactly the old "most recent 100, unfiltered" behavior. `status` is one of
@@ -187,16 +192,156 @@ pub async fn get_feedback(
     }
 }
 
-/// `GET /repositories` — connected repositories + their run activity (the Repositories view).
-pub async fn list_repositories(caller: Caller, State(state): State<AppState>) -> Response {
+/// `GET /repositories` query params — all optional. `after_activity_at`/`after_id` and
+/// `before_activity_at`/`before_id` are a page boundary's `last_task_at` and `id`, sent as the
+/// values they are made of so a paginated URL says what it selects. At most one direction may be
+/// given at a time.
+#[derive(Debug, Deserialize)]
+pub struct RepositoriesQuery {
+    pub page_size: Option<i64>,
+    pub q: Option<String>,
+    #[serde(default, with = "time::serde::rfc3339::option")]
+    pub after_activity_at: Option<OffsetDateTime>,
+    pub after_id: Option<i64>,
+    #[serde(default, with = "time::serde::rfc3339::option")]
+    pub before_activity_at: Option<OffsetDateTime>,
+    pub before_id: Option<i64>,
+}
+
+/// Validated [`RepositoriesQuery`]. Building one is the only way into the query, so an out-of-range
+/// page size, half a cursor, or both directions at once cannot reach SQL.
+#[derive(Debug)]
+struct RepositoriesParams {
+    page_size: i64,
+    q: Option<String>,
+    cursor: Option<crate::db::RepositoryCursor>,
+}
+
+impl TryFrom<RepositoriesQuery> for RepositoriesParams {
+    type Error = (StatusCode, String);
+
+    fn try_from(query: RepositoriesQuery) -> Result<Self, Self::Error> {
+        // Rejected rather than clamped: a client asking for 500 and quietly receiving 100 has no way
+        // to notice it is paging against a size it did not choose.
+        let page_size = match query.page_size {
+            None => DEFAULT_REPOSITORY_PAGE_SIZE,
+            Some(size) if (1..=MAX_REPOSITORY_PAGE_SIZE).contains(&size) => size,
+            Some(_) => {
+                return Err(bad_request(format!(
+                    "page_size must be between 1 and {MAX_REPOSITORY_PAGE_SIZE}"
+                )));
+            }
+        };
+        // Half a cursor is a client bug, not a first page — ignoring the given half would serve page
+        // one forever.
+        let after = match (query.after_activity_at, query.after_id) {
+            (Some(activity_at), Some(id)) => Some((activity_at, id)),
+            (None, None) => None,
+            _ => {
+                return Err(bad_request(
+                    "after_activity_at and after_id must be given together".to_string(),
+                ));
+            }
+        };
+        let before = match (query.before_activity_at, query.before_id) {
+            (Some(activity_at), Some(id)) => Some((activity_at, id)),
+            (None, None) => None,
+            _ => {
+                return Err(bad_request(
+                    "before_activity_at and before_id must be given together".to_string(),
+                ));
+            }
+        };
+        let cursor = match (after, before) {
+            (Some((activity_at, id)), None) => {
+                Some(crate::db::RepositoryCursor::After(activity_at, id))
+            }
+            (None, Some((activity_at, id))) => {
+                Some(crate::db::RepositoryCursor::Before(activity_at, id))
+            }
+            (None, None) => None,
+            (Some(_), Some(_)) => {
+                return Err(bad_request(
+                    "after_* and before_* are mutually exclusive".to_string(),
+                ));
+            }
+        };
+        Ok(Self {
+            page_size,
+            // Trimmed before it reaches the pattern: surrounding whitespace in a search box is
+            // typing, not a term, and `ILIKE '% shop %'` would match nothing.
+            q: query
+                .q
+                .map(|q| q.trim().to_string())
+                .filter(|q| !q.is_empty()),
+            cursor,
+        })
+    }
+}
+
+fn bad_request(message: String) -> (StatusCode, String) {
+    (StatusCode::BAD_REQUEST, message)
+}
+
+/// A page boundary on the wire: carries no direction of its own — `next` is where a follow-up
+/// request should point `?after_activity_at=`/`?after_id=`, `prev` is where it should point
+/// `?before_activity_at=`/`?before_id=`.
+#[derive(Debug, Serialize)]
+struct RepositoriesCursor {
+    #[serde(with = "time::serde::rfc3339")]
+    activity_at: OffsetDateTime,
+    id: i64,
+}
+
+#[derive(Debug, Serialize)]
+struct RepositoriesPage {
+    repositories: Vec<crate::db::RepositoryRow>,
+    /// Every repository matching `q`, independent of the current page — the "of N" in a range
+    /// label.
+    total: i64,
+    /// `null` at the end of the list.
+    next: Option<RepositoriesCursor>,
+    /// `null` at the start of the list.
+    prev: Option<RepositoriesCursor>,
+}
+
+/// `GET /repositories` — connected repositories + their run activity (the Repositories view), one
+/// keyset page at a time, most-recently-active first.
+pub async fn list_repositories(
+    caller: Caller,
+    State(state): State<AppState>,
+    Query(query): Query<RepositoriesQuery>,
+) -> Response {
     if let Err(e) = caller.require("repo:read") {
         return e.into_response();
     }
     let Some(pool) = state.db.as_ref() else {
         return (StatusCode::SERVICE_UNAVAILABLE, "no database").into_response();
     };
-    match crate::db::list_repositories(pool, None).await {
-        Ok(repos) => Json(repos).into_response(),
+    let params = match RepositoriesParams::try_from(query) {
+        Ok(params) => params,
+        Err(rejection) => return rejection.into_response(),
+    };
+
+    match crate::db::list_repositories_page(
+        pool,
+        params.q.as_deref(),
+        params.cursor,
+        params.page_size,
+    )
+    .await
+    {
+        Ok(page) => Json(RepositoriesPage {
+            repositories: page.rows,
+            total: page.total,
+            next: page
+                .next
+                .map(|(activity_at, id)| RepositoriesCursor { activity_at, id }),
+            prev: page
+                .prev
+                .map(|(activity_at, id)| RepositoriesCursor { activity_at, id }),
+        })
+        .into_response(),
         Err(error) => {
             tracing::error!(%error, "list repositories failed");
             (StatusCode::INTERNAL_SERVER_ERROR, "query error").into_response()
@@ -237,5 +382,143 @@ mod tests {
         assert_eq!(status_variant_to_raw("all"), None);
         assert_eq!(status_variant_to_raw("bogus"), None);
         assert_eq!(status_variant_to_raw(""), None);
+    }
+
+    /// The cursor travels as query-string text, so the timestamp's wire format is part of the
+    /// contract: parse a real URL rather than only hand-built structs.
+    #[test]
+    fn repositories_query_parses_a_cursor_from_the_url() {
+        let uri: axum::http::Uri =
+            "/repositories?page_size=10&q=shop&after_activity_at=2026-02-01T09:14:02Z&after_id=7"
+                .parse()
+                .expect("valid uri");
+        let Query(query) = Query::<RepositoriesQuery>::try_from_uri(&uri).expect("parses");
+        let params = RepositoriesParams::try_from(query).expect("valid");
+
+        let expected = OffsetDateTime::parse(
+            "2026-02-01T09:14:02Z",
+            &time::format_description::well_known::Rfc3339,
+        )
+        .expect("valid timestamp");
+
+        assert_eq!(params.page_size, 10);
+        assert_eq!(params.q.as_deref(), Some("shop"));
+        assert_eq!(
+            params.cursor,
+            Some(crate::db::RepositoryCursor::After(expected, 7))
+        );
+    }
+
+    fn repositories_query() -> RepositoriesQuery {
+        RepositoriesQuery {
+            page_size: None,
+            q: None,
+            after_activity_at: None,
+            after_id: None,
+            before_activity_at: None,
+            before_id: None,
+        }
+    }
+
+    #[test]
+    fn repositories_params_default_to_the_first_page() {
+        let params = RepositoriesParams::try_from(repositories_query()).expect("valid");
+        assert_eq!(params.page_size, DEFAULT_REPOSITORY_PAGE_SIZE);
+        assert!(params.cursor.is_none());
+        assert!(params.q.is_none());
+    }
+
+    #[test]
+    fn repositories_params_reject_an_out_of_range_page_size() {
+        for size in [0, -1, MAX_REPOSITORY_PAGE_SIZE + 1] {
+            let query = RepositoriesQuery {
+                page_size: Some(size),
+                ..repositories_query()
+            };
+            let (status, _) = RepositoriesParams::try_from(query).expect_err("rejected");
+            assert_eq!(status, StatusCode::BAD_REQUEST, "page_size {size}");
+        }
+    }
+
+    #[test]
+    fn repositories_params_reject_half_a_cursor() {
+        let activity_at = OffsetDateTime::from_unix_timestamp(1_770_000_000).expect("in range");
+        let halves = [
+            RepositoriesQuery {
+                after_activity_at: Some(activity_at),
+                ..repositories_query()
+            },
+            RepositoriesQuery {
+                after_id: Some(42),
+                ..repositories_query()
+            },
+            RepositoriesQuery {
+                before_activity_at: Some(activity_at),
+                ..repositories_query()
+            },
+            RepositoriesQuery {
+                before_id: Some(42),
+                ..repositories_query()
+            },
+        ];
+        for query in halves {
+            let (status, _) = RepositoriesParams::try_from(query).expect_err("rejected");
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+        }
+
+        let after = RepositoriesQuery {
+            after_activity_at: Some(activity_at),
+            after_id: Some(42),
+            ..repositories_query()
+        };
+        assert_eq!(
+            RepositoriesParams::try_from(after).expect("valid").cursor,
+            Some(crate::db::RepositoryCursor::After(activity_at, 42))
+        );
+
+        let before = RepositoriesQuery {
+            before_activity_at: Some(activity_at),
+            before_id: Some(42),
+            ..repositories_query()
+        };
+        assert_eq!(
+            RepositoriesParams::try_from(before).expect("valid").cursor,
+            Some(crate::db::RepositoryCursor::Before(activity_at, 42))
+        );
+    }
+
+    #[test]
+    fn repositories_params_reject_both_directions_at_once() {
+        let activity_at = OffsetDateTime::from_unix_timestamp(1_770_000_000).expect("in range");
+        let query = RepositoriesQuery {
+            after_activity_at: Some(activity_at),
+            after_id: Some(1),
+            before_activity_at: Some(activity_at),
+            before_id: Some(2),
+            ..repositories_query()
+        };
+        let (status, _) = RepositoriesParams::try_from(query).expect_err("rejected");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn repositories_params_trim_the_search_and_drop_a_blank_one() {
+        let blank = RepositoriesQuery {
+            q: Some("   ".to_string()),
+            ..repositories_query()
+        };
+        assert!(
+            RepositoriesParams::try_from(blank)
+                .expect("valid")
+                .q
+                .is_none()
+        );
+
+        let padded = RepositoriesQuery {
+            q: Some("  shop  ".to_string()),
+            ..repositories_query()
+        };
+        let params = RepositoriesParams::try_from(padded).expect("valid");
+        assert_eq!(params.q.as_deref(), Some("shop"));
     }
 }

@@ -2,64 +2,88 @@
 
 import { ExternalLink, GitBranch, Settings } from "lucide-react";
 import Link from "next/link";
-import { parseAsInteger, useQueryState } from "nuqs";
+import { useQueryState } from "nuqs";
 import { useMemo } from "react";
 import { Card } from "@/components/ui/card";
 import { Pagination } from "@/components/ui/pagination";
 import { SearchInput } from "@/components/ui/search-input";
 import { Pill } from "@/components/ui/status-pill";
 import type { GitlabLinkConfig } from "@/lib/domain/gitlab-links";
-import { approvalVisual, type Repository, repoSlug, repoUrl } from "@/lib/domain/repos";
+import {
+  approvalVisual,
+  REPOS_PAGE_SIZE,
+  type Repository,
+  repoSlug,
+  repoUrl,
+} from "@/lib/domain/repos";
 import { relativeTime } from "@/lib/domain/tasks";
-import { usePagination } from "@/lib/hooks/use-pagination";
-
-const PAGE_SIZE = 12;
+import { useCursorPagination } from "@/lib/hooks/use-cursor-pagination";
+import type { RepositoriesCursor } from "@/lib/server/api";
 
 /** Connected repositories as cards with a search box + pagination (ADR-0024, daisyUI in ADR-0027).
- * Search + page live in the URL via nuqs; filtering/paging is client-side over the fetched list.
+ * `repos`/`total`/`next`/`prev` are exactly what the control plane returned for the current URL
+ * (`listRepositoriesPage`, cursor-paginated) — this component does no client-side filtering or
+ * slicing of its own; paging itself is `useCursorPagination`'s job.
+ *
  * `now` is server-passed so relative times don't drift on hydration.
  * `gitlabLinks` is passed from the Server Component for self-hosted GitLab links. */
 export function RepoList({
   repos,
+  total,
+  next,
+  prev,
   now,
   gitlabLinks,
   overrideRepoIds,
 }: {
   repos: Repository[];
+  /** Repositories matching the current search, independent of the current page. */
+  total: number;
+  /** Where a "Next" request should continue from, or null at the end of the list. */
+  next: RepositoriesCursor | null;
+  /** Where a "Prev" request should continue from, or null at the start of the list. */
+  prev: RepositoriesCursor | null;
   now: number;
   gitlabLinks: GitlabLinkConfig;
   /** Repos with at least one ADR-0111 setting resolved from a DB admin override (epic #566). */
   overrideRepoIds: number[];
 }) {
   const overrideSet = useMemo(() => new Set(overrideRepoIds), [overrideRepoIds]);
-  const [query, setQuery] = useQueryState("q", { defaultValue: "", clearOnDefault: true });
-  const [page, setPage] = useQueryState("page", parseAsInteger.withDefault(0));
-
-  const filtered = useMemo(() => {
-    const q = query.trim().toLowerCase();
-    return q ? repos.filter((r) => repoSlug(r).toLowerCase().includes(q)) : repos;
-  }, [repos, query]);
-
-  const { rows, pageCount, current, rangeLabel } = usePagination(filtered, PAGE_SIZE, page);
+  // `shallow: false`: search drives a real server-side fetch (`listRepositoriesPage`), so a
+  // URL-only change would update the address bar without ever re-invoking the Server Component
+  // that owns the data — same reason the pager below needs it.
+  const [q, setQuery] = useQueryState("q", {
+    defaultValue: "",
+    clearOnDefault: true,
+    shallow: false,
+  });
+  const { current, pageCount, rangeLabel, goToPage, reset } = useCursorPagination({
+    total,
+    pageSize: REPOS_PAGE_SIZE,
+    next,
+    prev,
+  });
 
   return (
     <div className="flex flex-col gap-3">
       <SearchInput
-        value={query}
+        value={q}
         onChange={(e) => {
           setQuery(e.target.value);
-          setPage(null);
+          reset();
         }}
         placeholder="Search repositories"
         aria-label="Search repositories"
         className="w-full sm:w-72"
       />
 
-      {rows.length === 0 ? (
-        <p className="px-1 py-6 text-sm text-base-content/60">No repositories match “{query}”.</p>
+      {repos.length === 0 ? (
+        <p className="px-1 py-6 text-sm text-base-content/60">
+          {q ? `No repositories match “${q}”.` : "No repositories."}
+        </p>
       ) : (
         <div className="grid gap-3 sm:grid-cols-2">
-          {rows.map((repo) => (
+          {repos.map((repo) => (
             <RepoCard
               key={repo.id}
               repo={repo}
@@ -71,12 +95,12 @@ export function RepoList({
         </div>
       )}
 
-      {filtered.length > PAGE_SIZE && (
+      {total > REPOS_PAGE_SIZE && (
         <Pagination
           current={current}
           pageCount={pageCount}
           rangeLabel={rangeLabel}
-          onPageChange={setPage}
+          onPageChange={goToPage}
           className="flex items-center justify-between gap-3 text-xs text-base-content/60"
         />
       )}

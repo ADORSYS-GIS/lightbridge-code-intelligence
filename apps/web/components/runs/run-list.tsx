@@ -34,8 +34,9 @@ const isView = (value: string): value is View => (VIEW_VALUES as readonly string
  * control-plane #587), so `tasks`/`total` arriving as props are already the correct window; this
  * component does no client-side filtering or slicing itself. The view toggle is a personal
  * preference, so it persists to localStorage instead of the URL. `now` is server-passed so relative
- * times don't drift on hydration. `repoOptions` is the full repo universe (not derived from `tasks`)
- * so narrowing the filter to one repo doesn't make every other repo vanish from its own dropdown. */
+ * times don't drift on hydration. `repoOptions` is the 100 most-recently-active repositories (not
+ * derived from `tasks`) so narrowing the filter to one repo doesn't make every other repo on the
+ * current page vanish from its own dropdown. */
 export function RunList({
   tasks,
   total,
@@ -50,8 +51,8 @@ export function RunList({
   // `shallow: false` on every param here: this page's status/repo/q/page state drives a real
   // server-side fetch (`listTasksPage`, real pagination — control-plane #587), so a URL-only change
   // (nuqs' default `shallow: true`) would update the address bar without ever re-invoking the Server
-  // Component that owns the data. RepoList's nuqs state stays shallow (default) since that page's
-  // filtering/paging is deliberately client-side over an already-fetched list.
+  // Component that owns the data. RepoList's search and pager drive the same kind of server-side
+  // fetch (`listRepositoriesPage`) and need the same `shallow: false` — see its own comment.
   const [filter, setFilter] = useQueryState(
     "status",
     parseAsStringLiteral(FILTER_VALUES).withDefault("all").withOptions({ shallow: false }),
