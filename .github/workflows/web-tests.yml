@@ -1,0 +1,37 @@
+# Component tests for apps/web, run against jsdom via Vitest. This covers rendered output and
+# props/env-driven branching, not routing, data fetching, or the Next.js server runtime.
+name: web tests
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "apps/web/**"
+      - "packages/**"
+      - "pnpm-lock.yaml"
+      - ".github/workflows/web-tests.yml"
+  pull_request:
+    paths:
+      - "apps/web/**"
+      - "packages/**"
+      - "pnpm-lock.yaml"
+      - ".github/workflows/web-tests.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: web-tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: corepack enable
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm turbo run test --filter=@lightbridge/web
