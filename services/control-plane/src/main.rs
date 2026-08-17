@@ -372,6 +372,8 @@ fn api_v2_router() -> Router<AppState> {
             "/admin/repositories/{id}/preset",
             get(admin::get_preset).post(admin::set_preset),
         )
+        // Native code-graph view (ADR-0113 / #615) — a bounded neighborhood, not the whole graph.
+        .route("/admin/repositories/{id}/graph", get(admin::graph))
         // Per-identity model selection + ACL (ADR-0110, story #501).
         .route("/admin/models", get(admin::list_model_allowlist))
         .route(

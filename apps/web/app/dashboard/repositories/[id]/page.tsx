@@ -3,6 +3,7 @@ import Link from "next/link";
 import { notFound } from "next/navigation";
 import { PresetPicker } from "@/components/repos/preset-picker";
 import { REPO_ANALYTICS_PANELS, RepoAnalyticsEmbed } from "@/components/repos/repo-analytics-embed";
+import { RepoGraphView } from "@/components/repos/repo-graph-view";
 import { Button } from "@/components/ui/button";
 import { Card, CardBody, CardHeader, CardTitle } from "@/components/ui/card";
 import { Select } from "@/components/ui/select";
@@ -22,6 +23,7 @@ import {
   listAdminRepos,
   type RepoSettingsPatch,
 } from "@/lib/server/admin";
+import { getRepoGraph } from "@/lib/server/api";
 import {
   approveRepoAction,
   clearRepoSettingAction,
@@ -50,15 +52,23 @@ export default async function RepoSettings({ params }: { params: Promise<{ id: s
   // No single-repo GET endpoint exists control-plane-side — the list is small (an admin console, not
   // a customer-facing catalog), so finding the repo in the already-existing list call is the
   // pragmatic choice over adding a new endpoint for one field (owner/name) this page needs.
-  const [reposResult, presetResult, settingsResult, modelResult, allowlistResult, claims] =
-    await Promise.all([
-      listAdminRepos(),
-      getRepoPreset(id),
-      getRepoSettings(id),
-      getRepoModel(id),
-      getModelAllowlist(),
-      currentClaims(),
-    ]);
+  const [
+    reposResult,
+    presetResult,
+    settingsResult,
+    modelResult,
+    allowlistResult,
+    graphResult,
+    claims,
+  ] = await Promise.all([
+    listAdminRepos(),
+    getRepoPreset(id),
+    getRepoSettings(id),
+    getRepoModel(id),
+    getModelAllowlist(),
+    getRepoGraph(id),
+    currentClaims(),
+  ]);
   const canConfigure = hasPermission(claims, "repo:configure");
   const canConfigureModel = hasPermission(claims, "model:configure");
   const canApprove = hasPermission(claims, "repo:approve");
@@ -400,6 +410,21 @@ export default async function RepoSettings({ params }: { params: Promise<{ id: s
             Overrides which model the review preset uses for this repo. Falls back to an org-wide
             override, then the preset's own configured model, when unset.
           </p>
+        </CardBody>
+      </Card>
+
+      <Card>
+        <CardHeader>
+          <CardTitle>Code graph</CardTitle>
+        </CardHeader>
+        <CardBody>
+          {!graphResult.ok ? (
+            <ApiErrorLine result={graphResult} />
+          ) : !graphResult.data ? (
+            <StatusLine>Not indexed yet — the graph appears after the first index run.</StatusLine>
+          ) : (
+            <RepoGraphView graph={graphResult.data} />
+          )}
         </CardBody>
       </Card>
 

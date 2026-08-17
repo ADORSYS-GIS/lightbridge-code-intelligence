@@ -12,7 +12,10 @@
       { "name": "repo:read", "description": "Read repositories (ADR-0023)", "composite": false, "clientRole": false },
       { "name": "repo:approve", "description": "Approve a repository (ADR-0023)", "composite": false, "clientRole": false },
       { "name": "repo:deny", "description": "Deny a repository (ADR-0023)", "composite": false, "clientRole": false },
-      { "name": "review:read", "description": "Read a run's review (ADR-0023)", "composite": false, "clientRole": false }
+      { "name": "review:read", "description": "Read a run's review (ADR-0023)", "composite": false, "clientRole": false },
+      { "name": "repo:configure", "description": "Change a repository's preset/settings (ADR-0023, ADR-0109/0111)", "composite": false, "clientRole": false },
+      { "name": "model:configure", "description": "Change a repository/org model override (ADR-0023, ADR-0110)", "composite": false, "clientRole": false },
+      { "name": "review:trigger", "description": "Trigger a review via the MCP surface (ADR-0023)", "composite": false, "clientRole": false }
     ]
   },
   "clients": [
@@ -121,7 +124,10 @@
         "repo:read",
         "repo:approve",
         "repo:deny",
-        "review:read"
+        "review:read",
+        "repo:configure",
+        "model:configure",
+        "review:trigger"
       ]
     }
   ]

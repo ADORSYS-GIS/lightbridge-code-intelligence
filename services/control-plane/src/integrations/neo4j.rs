@@ -254,6 +254,108 @@ pub async fn get_callers(
     Ok(hits)
 }
 
+/// One edge returned by a graph-view query (ADR-0113 / #615).
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct RelHit {
+    pub source: String,
+    pub target: String,
+    pub relation: String,
+}
+
+/// Any one symbol's `node_id` for a repo snapshot, used as the default seed when the caller doesn't
+/// pick one (ADR-0113 / #615 — symbol picking is a later UI decision, not blocking a first render).
+/// Deterministic (`ORDER BY node_id`), not "most interesting" — good enough to prove the view works.
+pub async fn any_symbol_id(
+    graph: &Graph,
+    repository_id: i64,
+    commit_sha: &str,
+) -> anyhow::Result<Option<String>> {
+    use anyhow::Context;
+    let mut rows = graph
+        .execute(
+            query(
+                "MATCH (s:Symbol {repo_id: $repo, commit: $commit}) \
+                 RETURN s.node_id AS node_id ORDER BY s.node_id LIMIT 1",
+            )
+            .param("repo", repository_id)
+            .param("commit", commit_sha),
+        )
+        .await
+        .context("any_symbol_id query")?;
+    match rows.next().await.context("any_symbol_id row")? {
+        Some(row) => Ok(row.get("node_id").ok()),
+        None => Ok(None),
+    }
+}
+
+/// Neighborhood around `seed_id`, up to `hops` `REL` traversals in either direction, within one repo
+/// snapshot (ADR-0113 / #615 — the reduction strategy for a repo too large to render whole; #515's
+/// spike measured real repos at a p90 of ~9,126 nodes, far past what a raw full-graph render can
+/// carry). Bounded by `limit` on the edge count, not the node count — the caller (the HTTP handler)
+/// picks the ceiling.
+///
+/// `hops` is interpolated into the query text rather than bound as a parameter: Cypher's
+/// variable-length path syntax (`*1..N`) takes a literal bound, not a parameter, in stock Neo4j.
+/// Safe here because `hops` is clamped by the caller to a small integer range before this is ever
+/// called — never raw user input reaching the query string.
+pub async fn graph_neighborhood(
+    graph: &Graph,
+    repository_id: i64,
+    commit_sha: &str,
+    seed_id: &str,
+    hops: i64,
+    limit: i64,
+) -> anyhow::Result<(Vec<SymbolHit>, Vec<RelHit>)> {
+    use anyhow::Context;
+    let cypher = format!(
+        "MATCH (seed:Symbol {{repo_id: $repo, commit: $commit, node_id: $id}}) \
+         MATCH path = (seed)-[:REL*1..{hops}]-(neighbor:Symbol {{repo_id: $repo, commit: $commit}}) \
+         UNWIND relationships(path) AS r \
+         WITH DISTINCT startNode(r) AS a, endNode(r) AS b, r.relation AS relation \
+         RETURN a.node_id AS src_id, a.label AS src_label, a.source_file AS src_file, a.start_line AS src_line, \
+                b.node_id AS dst_id, b.label AS dst_label, b.source_file AS dst_file, b.start_line AS dst_line, \
+                relation \
+         LIMIT $limit"
+    );
+    let mut rows = graph
+        .execute(
+            query(&cypher)
+                .param("repo", repository_id)
+                .param("commit", commit_sha)
+                .param("id", seed_id)
+                .param("limit", limit),
+        )
+        .await
+        .context("graph_neighborhood query")?;
+
+    let mut nodes: std::collections::HashMap<String, SymbolHit> = std::collections::HashMap::new();
+    let mut edges = Vec::new();
+    while let Some(row) = rows.next().await.context("graph_neighborhood row")? {
+        for (id_col, label_col, file_col, line_col) in [
+            ("src_id", "src_label", "src_file", "src_line"),
+            ("dst_id", "dst_label", "dst_file", "dst_line"),
+        ] {
+            let node_id: String = row.get(id_col).context("graph_neighborhood node id")?;
+            nodes.entry(node_id.clone()).or_insert_with(|| SymbolHit {
+                node_id,
+                label: row.get(label_col).unwrap_or_default(),
+                source_file: row.get(file_col).unwrap_or_default(),
+                start_line: row.get(line_col).unwrap_or(0),
+            });
+        }
+        edges.push(RelHit {
+            source: row
+                .get("src_id")
+                .context("graph_neighborhood edge source")?,
+            target: row
+                .get("dst_id")
+                .context("graph_neighborhood edge target")?,
+            relation: row.get("relation").unwrap_or_default(),
+        });
+    }
+    Ok((nodes.into_values().collect(), edges))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

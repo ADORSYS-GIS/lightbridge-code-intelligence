@@ -198,6 +198,48 @@ export async function listRepositoriesPage(
   }
 }
 
+/** One symbol node in a `GET /admin/repositories/{id}/graph` response. */
+export interface GraphNode {
+  node_id: string;
+  label: string;
+  source_file: string;
+  start_line: number;
+}
+
+/** One `REL` edge in a `GET /admin/repositories/{id}/graph` response. */
+export interface GraphEdge {
+  source: string;
+  target: string;
+  relation: string;
+}
+
+export interface RepoGraph {
+  commit: string;
+  nodes: GraphNode[];
+  edges: GraphEdge[];
+}
+
+/** `GET /admin/repositories/{id}/graph[?seed=&hops=]` — a bounded neighborhood of the repo's code
+ * graph (ADR-0113 / #615). Omit `seed` for a deterministic default. `data: null` on 404, which
+ * covers both "not yet indexed" and "empty graph" — the caller doesn't need to distinguish them. */
+export async function getRepoGraph(
+  id: number,
+  seed?: string,
+  hops = 2,
+): Promise<ApiResult<RepoGraph | null>> {
+  const query = new URLSearchParams({ hops: String(hops) });
+  if (seed) query.set("seed", seed);
+  try {
+    const res = await authedFetch(`/admin/repositories/${id}/graph?${query.toString()}`);
+    if (!res) return { ok: false, reason: "unauthenticated" };
+    if (res.status === 404) return { ok: true, data: null };
+    if (!res.ok) return { ok: false, reason: classify(res.status), status: res.status };
+    return { ok: true, data: (await res.json()) as RepoGraph };
+  } catch {
+    return { ok: false, reason: "unavailable" };
+  }
+}
+
 /** Non-sensitive deployment settings for the console (GitLab web base URL, etc.). */
 export interface DeploymentConfig {
   gitlab_base_url: string;

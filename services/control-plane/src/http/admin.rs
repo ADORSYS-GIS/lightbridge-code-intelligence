@@ -9,7 +9,7 @@ use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::AppState;
 use crate::jwt::Caller;
@@ -46,6 +46,92 @@ pub async fn list_repositories(
         Err(error) => {
             tracing::error!(%error, "admin list repositories failed");
             (StatusCode::INTERNAL_SERVER_ERROR, "query error").into_response()
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct GraphQuery {
+    /// Seed symbol's `node_id` to center the neighborhood on. Omit to get a deterministic default
+    /// (ADR-0113 — symbol picking is a later UI decision).
+    pub seed: Option<String>,
+    #[serde(default = "default_graph_hops")]
+    pub hops: i64,
+}
+fn default_graph_hops() -> i64 {
+    2
+}
+
+/// Keeps the response well inside the browser's practical render budget — #515's spike found
+/// Grafana's node-graph panel hiding most nodes past a few hundred; this endpoint stays bounded from
+/// the start rather than relying on the frontend to truncate a huge payload.
+const GRAPH_EDGE_LIMIT: i64 = 500;
+
+#[derive(Debug, Serialize)]
+pub struct GraphResponse {
+    pub commit: String,
+    pub nodes: Vec<crate::integrations::neo4j::SymbolHit>,
+    pub edges: Vec<crate::integrations::neo4j::RelHit>,
+}
+
+/// `GET /admin/repositories/{id}/graph[?seed=<node_id>&hops=2]` — a bounded neighborhood of the
+/// repo's code graph at its latest indexed commit (ADR-0113 / #615). Requires `repo:read`.
+pub async fn graph(
+    caller: Caller,
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Query(q): Query<GraphQuery>,
+) -> Response {
+    if let Err(e) = caller.require("repo:read") {
+        return e.into_response();
+    }
+    let Some(pool) = state.db.as_ref() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "no database").into_response();
+    };
+    let Some(neo4j) = state.neo4j.as_ref() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "neo4j not configured").into_response();
+    };
+    let commit = match crate::db::latest_indexed_commit(pool, id).await {
+        Ok(Some(c)) => c,
+        Ok(None) => return (StatusCode::NOT_FOUND, "repository not yet indexed").into_response(),
+        Err(error) => {
+            tracing::error!(%error, repository_id = id, "graph: latest_indexed_commit failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "query error").into_response();
+        }
+    };
+    let seed = match q.seed {
+        Some(s) => s,
+        None => match crate::integrations::neo4j::any_symbol_id(neo4j, id, &commit).await {
+            Ok(Some(s)) => s,
+            Ok(None) => {
+                return (StatusCode::NOT_FOUND, "repository graph is empty").into_response();
+            }
+            Err(error) => {
+                tracing::error!(%error, repository_id = id, "graph: any_symbol_id failed");
+                return (StatusCode::INTERNAL_SERVER_ERROR, "query error").into_response();
+            }
+        },
+    };
+    let hops = q.hops.clamp(1, 3);
+    match crate::integrations::neo4j::graph_neighborhood(
+        neo4j,
+        id,
+        &commit,
+        &seed,
+        hops,
+        GRAPH_EDGE_LIMIT,
+    )
+    .await
+    {
+        Ok((nodes, edges)) => Json(GraphResponse {
+            commit,
+            nodes,
+            edges,
+        })
+        .into_response(),
+        Err(error) => {
+            tracing::error!(%error, repository_id = id, "graph: neo4j query failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "graph query error").into_response()
         }
     }
 }
