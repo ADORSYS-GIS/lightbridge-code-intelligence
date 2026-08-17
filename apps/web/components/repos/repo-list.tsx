@@ -1,6 +1,6 @@
 "use client";
 
-import { ExternalLink, GitBranch, Settings } from "lucide-react";
+import { ExternalLink, GitBranch } from "lucide-react";
 import Link from "next/link";
 import { useQueryState } from "nuqs";
 import { useMemo } from "react";
@@ -123,10 +123,18 @@ function RepoCard({
   const approval = approvalVisual(repo);
   const viewLabel = repo.platform === "gitlab" ? "View on GitLab" : "View on GitHub";
   return (
-    <Card>
+    // The card's own overlay anchor is what makes the whole surface clickable. Wrapping the card in
+    // a link instead would nest it around the external link below — invalid markup that browsers
+    // resolve by silently dropping one of the two.
+    <Card className="relative">
       <div className="flex items-start justify-between gap-3 px-4 py-3">
         <div className="min-w-0">
-          <div className="truncate text-sm font-medium">{repoSlug(repo)}</div>
+          <Link
+            href={`/dashboard/repositories/${repo.id}`}
+            className="block truncate text-sm font-medium after:absolute after:inset-0 hover:underline"
+          >
+            {repoSlug(repo)}
+          </Link>
           <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-0.5 text-xs text-base-content/60">
             <span className="inline-flex items-center gap-1">
               <GitBranch className="size-3" />
@@ -138,34 +146,34 @@ function RepoCard({
             {repo.last_task_at && <span>last {relativeTime(repo.last_task_at, now)}</span>}
           </div>
         </div>
-        <Pill variant={approval.variant} label={approval.label} className="shrink-0" />
+        <div className="flex shrink-0 items-center gap-1.5">
+          {/* Carried by a label rather than a marker on an icon: a repository whose review settings
+              have been overridden away from its own config file is worth saying outright, and it is
+              the kind of thing a reader only learns from a dot if they already knew to look. */}
+          {hasOverride && (
+            <span
+              className="badge badge-xs badge-accent badge-soft"
+              title="A review setting is overridden for this repository"
+            >
+              Override
+            </span>
+          )}
+          <Pill variant={approval.variant} label={approval.label} />
+        </div>
       </div>
       <div className="flex items-center justify-between gap-3 border-t border-base-content/15 px-4 py-2 text-xs">
         {/* Index health (graph + vector freshness, ADR-0016) lands with the indexer — honest for now. */}
         <span className="text-base-content/60">Not indexed yet</span>
-        <div className="flex items-center gap-3">
-          <Link
-            href={`/dashboard/repositories/${repo.id}`}
-            className="relative inline-flex items-center gap-1 text-base-content/60 transition-colors hover:text-base-content"
-            title={
-              hasOverride ? "Review settings (has an admin override)" : "Review preset settings"
-            }
-          >
-            <Settings className="size-3 shrink-0" />
-            {hasOverride && (
-              <span className="absolute -top-0.5 -right-0.5 size-1.5 rounded-full bg-accent" />
-            )}
-          </Link>
-          <a
-            href={repoUrl(repo, gitlabLinks)}
-            target="_blank"
-            rel="noopener noreferrer"
-            className="inline-flex items-center gap-1 text-primary transition-colors hover:underline"
-          >
-            {viewLabel}
-            <ExternalLink className="size-3 shrink-0" />
-          </a>
-        </div>
+        {/* Stacked above the card's overlay anchor so it stays independently clickable. */}
+        <a
+          href={repoUrl(repo, gitlabLinks)}
+          target="_blank"
+          rel="noopener noreferrer"
+          className="relative inline-flex items-center gap-1 text-primary transition-colors hover:underline"
+        >
+          {viewLabel}
+          <ExternalLink className="size-3 shrink-0" />
+        </a>
       </div>
     </Card>
   );

@@ -1,7 +1,21 @@
 import Link from "next/link";
+import { redirect } from "next/navigation";
 import { buttonClass } from "@/components/ui/button";
+import { currentClaims } from "@/lib/auth/session";
 
-export default function Home() {
+export const dynamic = "force-dynamic";
+
+/**
+ * The root route is a signpost, not a destination: someone who already has a session belongs in the
+ * console, so send them there rather than asking them to click through a page that tells them
+ * nothing they don't know. What remains is the one thing an anonymous visitor needs — what this is,
+ * and a single way in. There is no second entry point, because the console redirects to the identity
+ * provider on its own; offering "open" alongside "sign in" only ever presented two doors onto the
+ * same room.
+ */
+export default async function Home() {
+  if (await currentClaims()) redirect("/dashboard");
+
   return (
     <main className="mx-auto flex min-h-dvh max-w-xl flex-col justify-center gap-5 px-6 py-16">
       <div className="flex items-center gap-2.5">
@@ -15,10 +29,7 @@ export default function Home() {
         pull requests. Sign in to see task runs across your repositories.
       </p>
       <div className="flex gap-3">
-        <Link href="/dashboard" className={buttonClass("primary", "md")}>
-          Open console
-        </Link>
-        <Link href="/sign-in" className={buttonClass("neutral", "md")}>
+        <Link href="/sign-in" className={buttonClass("primary", "md")}>
           Sign in
         </Link>
       </div>

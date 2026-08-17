@@ -1,5 +1,6 @@
 import { SESSION_COOKIE, type SessionClaims } from "@lightbridge/auth";
 import { cookies } from "next/headers";
+import { cache } from "react";
 import type { SettingsSource } from "@/components/ui/source-badge";
 import type { Repository } from "@/lib/domain/repos";
 import type { ApiResult } from "@/lib/server/api";
@@ -75,6 +76,22 @@ export async function listAdminRepos(status?: string): Promise<ApiResult<Reposit
     return { ok: false, reason: "unavailable" };
   }
 }
+
+/**
+ * One repository by id, or `null` data when no repository carries that id. There is no single-repo
+ * GET endpoint control-plane-side, so this narrows the list call — the list is small (an admin
+ * console, not a customer-facing catalog), which makes finding the row locally the pragmatic choice
+ * over adding an endpoint for the one or two fields a detail view needs.
+ *
+ * Wrapped in React's `cache` because a repository's own segment resolves it more than once per
+ * request — the surrounding chrome needs its name and approval state, the view inside needs it
+ * again. Every fetch here is `no-store`, so nothing else would collapse those into one call.
+ */
+export const getAdminRepo = cache(async (id: number): Promise<ApiResult<Repository | null>> => {
+  const result = await listAdminRepos();
+  if (!result.ok) return result;
+  return { ok: true, data: result.data.find((repo) => repo.id === id) ?? null };
+});
 
 /** `POST /admin/repositories/{id}/{approve|deny}` — returns whether it succeeded. */
 export async function setRepoStatus(id: number, action: "approve" | "deny"): Promise<boolean> {
