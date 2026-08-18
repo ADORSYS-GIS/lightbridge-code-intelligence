@@ -66,8 +66,14 @@ fn cap_chunk_bytes(chunk: Chunk, tuning: super::IndexTuning) -> Vec<Chunk> {
         // Always take at least one line, so a single line longer than the cap still terminates.
         let mut end = start + 1;
         let mut size = lines[start].len();
-        while end < lines.len() && size + lines[end].len() < tuning.max_chunk_bytes {
-            size += lines[end].len();
+        while end < lines.len() {
+            // +1 accounts for the "\n" the join() below inserts between lines — omitting it
+            // undercounts by one byte per line, so the emitted content can exceed the cap.
+            let with_next = size + 1 + lines[end].len();
+            if with_next > tuning.max_chunk_bytes {
+                break;
+            }
+            size = with_next;
             end += 1;
         }
         out.push(Chunk {
@@ -368,5 +374,31 @@ fn sub(a: i32, b: i32) -> i32 { a - b }
             "a single oversized line is still one chunk, not split mid-line"
         );
         assert_eq!(out[0].content.len(), 100);
+    }
+
+    // Regression: the byte accumulator must count the `\n` that `join("\n")` inserts between
+    // lines, not just line lengths — otherwise many short lines can pack into one chunk whose
+    // real length exceeds the cap (worst case ~2x, per lightbridge-assistant's PR #619 review).
+    #[test]
+    fn cap_accounts_for_join_separator_bytes_not_just_line_lengths() {
+        let tuning = IndexTuning {
+            max_chunk_bytes: 100,
+            ..IndexTuning::default()
+        };
+        let chunk = Chunk {
+            file_path: "f.txt".to_string(),
+            language: "text".to_string(),
+            chunk_type: "window".to_string(),
+            symbol_name: None,
+            start_line: 0,
+            end_line: 0,
+            content: vec!["x"; 99].join("\n"), // 99 + 98 separators = 197 bytes
+        };
+        let out = cap_chunk_bytes(chunk, tuning);
+        assert!(
+            out.iter()
+                .all(|c| c.content.len() <= tuning.max_chunk_bytes),
+            "every split chunk must respect the cap once join() separators are counted"
+        );
     }
 }
