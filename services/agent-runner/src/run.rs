@@ -166,7 +166,10 @@ async fn run_once_body(mode: Option<Mode>) -> std::process::ExitCode {
             std::process::ExitCode::SUCCESS
         }
         RunOnceOutcome::Ran(Err(error)) => {
-            let detail = error.to_string();
+            // `{error:#}` (not `{error}`/`.to_string()`) so the full anyhow chain survives — e.g.
+            // "embedding batch 27" alone hides the actual HTTP status/body an embeddings-client
+            // failure carries one level down. Mirrors the review-failure path's `{error:#}` below.
+            let detail = format!("{error:#}");
             tracing::error!(task_id = %config.task_id, error = %detail, "task failed");
             report(&client, &config, "failed", Some(&detail)).await;
             std::process::ExitCode::FAILURE
