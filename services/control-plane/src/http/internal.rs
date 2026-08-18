@@ -1627,6 +1627,28 @@ pub async fn finalize_review(
         let summary =
             effective_summary(real_summary, deduped_n, all_deduped, deduped_across_commits);
 
+        // A2A per-finding streaming (ADR-0098): for any A2A task fronting this run, stream each
+        // confirmed, deduped finding as its own artifact-update chunk, then the conclusion (summary +
+        // context) as the last `review` artifact — the terminal COMPLETED status-update closes the
+        // stream. This is the confirmed set that gets persisted/posted, so streaming and polling
+        // (`GetTask`) agree on content. Best-effort and ADDITIONAL to the PR review: a stream-append
+        // failure must never fail the finalize (the posted review is the primary product). A non-A2A
+        // (webhook) run has no fronting `a2a_tasks` row → this no-ops. `review_url` is null here (the
+        // review has not posted yet); the caller reads the permalink from `GetTask` after posting.
+        let review_ctx = crate::a2a::mapping::ReviewContext {
+            repo: Some(format!("{}/{}", context.owner, context.name)),
+            pr: Some(context.target_id),
+            base_sha: context.base_sha.clone(),
+            head_sha: context.head_sha.clone(),
+            review_url: None,
+        };
+        if let Err(error) =
+            crate::a2a::events::append_review_stream(pool, id, &findings, &summary, &review_ctx)
+                .await
+        {
+            tracing::warn!(%error, task_id = %id, "A2A review stream append failed (non-fatal)");
+        }
+
         // The PR-diff fetch is a READ done at produce time (ADR-0059: shaping is the producer's job).
         // Platform-aware (ADR-0072): the trait's `list_changed_files` dispatches to GitHub or GitLab
         // and encapsulates auth internally — no token minting here.
