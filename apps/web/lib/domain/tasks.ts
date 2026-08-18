@@ -77,7 +77,7 @@ export interface Review {
 /** The small visual set statuses collapse to (ADR-0015/0016 tokens). */
 export type StatusVariant = "pending" | "active" | "success" | "error" | "muted";
 
-/** A bare index task never attempts a review, so its failure banner shouldn't say "Review did not post". */
+/** Failure-banner label, matched to what the task actually attempted: indexing vs. review. */
 export function failureNoticePrefix(task: Task): string {
   return task.target_type === "repository" ? "Indexing failed" : "Review did not post";
 }

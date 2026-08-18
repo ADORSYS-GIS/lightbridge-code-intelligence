@@ -166,7 +166,7 @@ async fn run_once_body(mode: Option<Mode>) -> std::process::ExitCode {
             std::process::ExitCode::SUCCESS
         }
         RunOnceOutcome::Ran(Err(error)) => {
-            // `{error:#}` preserves the full anyhow chain; `.to_string()` drops everything but the outermost context.
+            // Alternate formatting keeps the full causal chain, which operators need to diagnose the failure.
             let detail = format!("{error:#}");
             tracing::error!(task_id = %config.task_id, error = %detail, "task failed");
             report(&client, &config, "failed", Some(&detail)).await;
