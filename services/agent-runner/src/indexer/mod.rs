@@ -35,6 +35,9 @@ pub struct IndexTuning {
     /// Windowed-fallback step, in lines (overlap = `window_size - window_step`). `INDEX_WINDOW_STEP`
     /// (default 50).
     pub window_step: usize,
+    /// Ceiling on a single chunk's content length, in bytes, applied after chunking regardless of
+    /// strategy. `INDEX_MAX_CHUNK_BYTES` (default 16_000).
+    pub max_chunk_bytes: usize,
 }
 
 impl Default for IndexTuning {
@@ -44,6 +47,7 @@ impl Default for IndexTuning {
             max_chunk_lines: 150,
             window_size: 100,
             window_step: 50,
+            max_chunk_bytes: 16_000,
         }
     }
 }
@@ -58,6 +62,7 @@ impl IndexTuning {
             max_chunk_lines: env_usize("INDEX_MAX_CHUNK_LINES", defaults.max_chunk_lines),
             window_size: env_usize("INDEX_WINDOW_SIZE", defaults.window_size),
             window_step: env_usize("INDEX_WINDOW_STEP", defaults.window_step),
+            max_chunk_bytes: env_usize("INDEX_MAX_CHUNK_BYTES", defaults.max_chunk_bytes),
         }
     }
 }
@@ -236,6 +241,7 @@ mod tests {
         assert_eq!(tuning.max_chunk_lines, 150);
         assert_eq!(tuning.window_size, 100);
         assert_eq!(tuning.window_step, 50);
+        assert_eq!(tuning.max_chunk_bytes, 16_000);
     }
 
     #[test]

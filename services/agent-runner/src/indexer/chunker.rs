@@ -35,14 +35,53 @@ pub fn chunk_file(
         return Vec::new();
     }
 
-    if super::language::has_grammar(language)
+    let chunks = if super::language::has_grammar(language)
         && let Some(chunks) = try_treesitter(file_path, source, language, tuning)
         && !chunks.is_empty()
     {
-        return chunks;
+        chunks
+    } else {
+        // Fallback: text files and languages without a grammar get windowed chunking.
+        window_chunks(file_path, source, language, tuning)
+    };
+
+    // Neither strategy above bounds a chunk's byte size on its own (a tree-sitter symbol with no
+    // splittable children, or a windowed slice of long unwrapped lines, can both come out huge) —
+    // this pass is the single place that guarantees every chunk fits an embedding model's input.
+    chunks
+        .into_iter()
+        .flat_map(|c| cap_chunk_bytes(c, tuning))
+        .collect()
+}
+
+/// Split a chunk whose content exceeds `tuning.max_chunk_bytes` into smaller line-windowed pieces.
+fn cap_chunk_bytes(chunk: Chunk, tuning: super::IndexTuning) -> Vec<Chunk> {
+    if chunk.content.len() <= tuning.max_chunk_bytes {
+        return vec![chunk];
     }
-    // Fallback: text files and languages without a grammar get windowed chunking.
-    window_chunks(file_path, source, language, tuning)
+    let lines: Vec<&str> = chunk.content.lines().collect();
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    while start < lines.len() {
+        // Always take at least one line, so a single line longer than the cap still terminates.
+        let mut end = start + 1;
+        let mut size = lines[start].len();
+        while end < lines.len() && size + lines[end].len() < tuning.max_chunk_bytes {
+            size += lines[end].len();
+            end += 1;
+        }
+        out.push(Chunk {
+            file_path: chunk.file_path.clone(),
+            language: chunk.language.clone(),
+            chunk_type: chunk.chunk_type.clone(),
+            symbol_name: chunk.symbol_name.clone(),
+            start_line: chunk.start_line + start as i32,
+            end_line: chunk.start_line + end as i32 - 1,
+            content: lines[start..end].join("\n"),
+        });
+        start = end;
+    }
+    out
 }
 
 fn ts_language(lang: &str) -> Option<Language> {
@@ -129,8 +168,8 @@ fn collect_items(
                 collect_items(&child, bytes, file_path, source, language, tuning, out);
                 if out.len() == before {
                     // No interesting sub-nodes (e.g. a 200-line function with no nested fns).
-                    // Emit it as a single chunk rather than silently dropping it; the embedding
-                    // API will truncate if the content exceeds the model's context window.
+                    // Emit it as one chunk rather than silently dropping the symbol —
+                    // `chunk_file`'s cap_chunk_bytes pass splits it further if it's oversized.
                     out.push(Chunk {
                         file_path: file_path.to_string(),
                         language: language.to_string(),
@@ -261,5 +300,73 @@ fn sub(a: i32, b: i32) -> i32 { a - b }
         let chunks = window_chunks("f.txt", src, "text", IndexTuning::default());
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].start_line, 0);
+    }
+
+    #[test]
+    fn chunk_under_the_cap_passes_through_unchanged() {
+        let tuning = IndexTuning {
+            max_chunk_bytes: 1_000,
+            ..IndexTuning::default()
+        };
+        let chunk = Chunk {
+            file_path: "f.txt".to_string(),
+            language: "text".to_string(),
+            chunk_type: "window".to_string(),
+            symbol_name: None,
+            start_line: 0,
+            end_line: 2,
+            content: "small".to_string(),
+        };
+        let out = cap_chunk_bytes(chunk, tuning);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].content, "small");
+    }
+
+    // Mirrors a real failure: a markdown changelog whose entries are each one very long unwrapped
+    // line, chunked by `window_chunks` (100 lines/window by default) — a window of such lines can
+    // vastly exceed an embedding model's input limit despite easily fitting the line-count cap.
+    #[test]
+    fn oversized_windowed_chunk_from_long_unwrapped_lines_is_split_under_the_cap() {
+        let tuning = IndexTuning {
+            max_chunk_bytes: 2_000,
+            ..IndexTuning::default()
+        };
+        let long_line = "x".repeat(500);
+        let src = vec![long_line; 50].join("\n");
+        let chunks = chunk_file("CHANGELOG.md", &src, "text", tuning);
+        assert!(
+            chunks.len() > 1,
+            "one 25KB window must split into several chunks"
+        );
+        assert!(
+            chunks
+                .iter()
+                .all(|c| c.content.len() <= tuning.max_chunk_bytes),
+            "no output chunk may exceed max_chunk_bytes"
+        );
+    }
+
+    #[test]
+    fn a_single_line_longer_than_the_cap_still_terminates_as_its_own_chunk() {
+        let tuning = IndexTuning {
+            max_chunk_bytes: 10,
+            ..IndexTuning::default()
+        };
+        let chunk = Chunk {
+            file_path: "f.txt".to_string(),
+            language: "text".to_string(),
+            chunk_type: "window".to_string(),
+            symbol_name: None,
+            start_line: 0,
+            end_line: 0,
+            content: "a".repeat(100),
+        };
+        let out = cap_chunk_bytes(chunk, tuning);
+        assert_eq!(
+            out.len(),
+            1,
+            "a single oversized line is still one chunk, not split mid-line"
+        );
+        assert_eq!(out[0].content.len(), 100);
     }
 }
