@@ -13,6 +13,7 @@ import { gitlabLinkConfig } from "@/lib/domain/gitlab-links";
 import {
   absoluteTime,
   duration,
+  failureNoticePrefix,
   repoLabel,
   repoUrl,
   shortSha,
@@ -97,7 +98,7 @@ export default async function RunDetail({ params }: { params: Promise<{ id: stri
           <CardBody>
             <StatusLine tone="error">
               {task.error_detail
-                ? `Review did not post: ${task.error_detail}`
+                ? `${failureNoticePrefix(task)}: ${task.error_detail}`
                 : `This run ended in a ${statusVisual(
                     task.status,
                   ).label.toLowerCase()} state. No reason was reported by the agent runner.`}
@@ -109,7 +110,9 @@ export default async function RunDetail({ params }: { params: Promise<{ id: stri
       {silentNoOp && (
         <Card className="border-warning">
           <CardBody>
-            <StatusLine tone="error">Review did not post: {task.error_detail}</StatusLine>
+            <StatusLine tone="error">
+              {failureNoticePrefix(task)}: {task.error_detail}
+            </StatusLine>
           </CardBody>
         </Card>
       )}
