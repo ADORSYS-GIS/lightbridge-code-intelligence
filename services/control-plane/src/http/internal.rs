@@ -717,6 +717,10 @@ pub struct GraphNodeInput {
     pub label: String,
     pub source_file: String,
     pub start_line: i64,
+    /// Embedding of the symbol's definition text (ADR-0114). `None` when the runner found no
+    /// correlated chunk to embed for this node.
+    #[serde(default)]
+    pub embedding: Option<Vec<f32>>,
 }
 
 /// One directed edge (`contains` / `method` / `calls` / …).
@@ -781,6 +785,7 @@ pub async fn ingest_graph(
             label: n.label,
             source_file: n.source_file,
             start_line: n.start_line,
+            embedding: n.embedding,
         })
         .collect();
     let edges: Vec<crate::integrations::neo4j::GraphEdge> = batch
@@ -893,12 +898,16 @@ pub async fn search(
 /// Body for `POST /internal/tasks/{id}/graph/query` — a small fixed op set over the Neo4j graph.
 #[derive(Debug, Deserialize)]
 pub struct GraphQueryRequest {
-    /// `find_symbol` (needs `term`) or `get_callers` (needs `node_id`).
+    /// `find_symbol` (needs `term`), `get_callers` (needs `node_id`), or `hybrid_search` (ADR-0114,
+    /// needs `term` + `embedding`).
     pub op: String,
     #[serde(default)]
     pub term: Option<String>,
     #[serde(default)]
     pub node_id: Option<String>,
+    /// Pre-computed query embedding for `hybrid_search`. `None` for the other two ops.
+    #[serde(default)]
+    pub embedding: Option<Vec<f32>>,
     #[serde(default)]
     pub limit: Option<i64>,
 }
@@ -942,10 +951,32 @@ pub async fn graph_query(
             crate::integrations::neo4j::get_callers(neo4j, repository_id, &commit, node_id, limit)
                 .await
         }
+        "hybrid_search" => {
+            let (Some(term), Some(embedding)) = (req.term.as_deref(), req.embedding.as_ref())
+            else {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    "hybrid_search requires `term` and `embedding`",
+                )
+                    .into_response();
+            };
+            crate::integrations::neo4j::hybrid_symbol_search(
+                neo4j,
+                repository_id,
+                &commit,
+                term,
+                embedding,
+                limit.max(20),
+                limit,
+            )
+            .await
+        }
         other => {
             return (
                 StatusCode::BAD_REQUEST,
-                format!("unsupported op {other:?} (expected: find_symbol | get_callers)"),
+                format!(
+                    "unsupported op {other:?} (expected: find_symbol | get_callers | hybrid_search)"
+                ),
             )
                 .into_response();
         }

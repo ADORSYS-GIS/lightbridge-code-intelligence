@@ -27,7 +27,7 @@ pub mod write_file;
 
 pub use edit_file::EDIT_FILE;
 pub use finish::{ABORT, FINISH, REPORT_PROGRESS};
-pub use graph::{GRAPH_FIND_SYMBOL, GRAPH_GET_CALLERS};
+pub use graph::{GRAPH_FIND_SYMBOL, GRAPH_GET_CALLERS, GRAPH_SEMANTIC_SEARCH};
 pub use list_directory::LIST_DIRECTORY;
 pub use mcp::MCP_TOOL_PREFIX;
 pub use read_file::READ_FILE;
@@ -97,6 +97,7 @@ pub fn known_tool_names() -> Vec<&'static str> {
         VECTOR_SEMANTIC_SEARCH,
         GRAPH_FIND_SYMBOL,
         GRAPH_GET_CALLERS,
+        GRAPH_SEMANTIC_SEARCH,
         READ_FILE,
         ADD_REVIEW_COMMENT,
         RETRACT_FINDING,
@@ -274,9 +275,9 @@ fn render_refusal(refusal: DispatchRefusal) -> ToolOutcome {
         )),
         DispatchRefusal::NotOffered { tool_name } => ToolOutcome::Continue(format!(
             "error: unknown tool {tool_name:?}. Available tools: {VECTOR_SEMANTIC_SEARCH}, \
-             {GRAPH_FIND_SYMBOL}, {GRAPH_GET_CALLERS}, {READ_FILE}, {ADD_REVIEW_COMMENT}, \
-             {ADD_COMMENT}, {FINISH}, {REPORT_PROGRESS}, {ABORT}, {RUN_SAST}, plus any discovered \
-             {MCP_TOOL_PREFIX}<server>__<tool>."
+             {GRAPH_FIND_SYMBOL}, {GRAPH_GET_CALLERS}, {GRAPH_SEMANTIC_SEARCH}, {READ_FILE}, \
+             {ADD_REVIEW_COMMENT}, {ADD_COMMENT}, {FINISH}, {REPORT_PROGRESS}, {ABORT}, {RUN_SAST}, \
+             plus any discovered {MCP_TOOL_PREFIX}<server>__<tool>."
         )),
     }
 }
@@ -487,6 +488,11 @@ mod tests {
             ("v", VECTOR_SEMANTIC_SEARCH, r#"{"query":"auth"}"#),
             ("g1", GRAPH_FIND_SYMBOL, r#"{"term":"main"}"#),
             ("g2", GRAPH_GET_CALLERS, r#"{"node_id":"n"}"#),
+            (
+                "g3",
+                GRAPH_SEMANTIC_SEARCH,
+                r#"{"query":"auth retry logic"}"#,
+            ),
         ] {
             assert_eq!(
                 tools.dispatch(&call(id, name, args)).await,

@@ -180,6 +180,7 @@ async fn submit_graph_posts_nodes_and_edges_with_bearer() {
                     label: "add()".to_string(),
                     source_file: "src/math.rs".to_string(),
                     start_line: 2,
+                    embedding: None,
                 }],
                 edges: vec![GraphEdgePayload {
                     source: "src_math_calc_bump".to_string(),

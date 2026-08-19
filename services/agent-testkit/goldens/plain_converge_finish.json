@@ -4,7 +4,7 @@
     {
       "messages": [
         {
-          "content": "You are a reviewer.\n\n# How to act\nInvestigate with the search/graph tools before making any claim — never speculate about code you have not looked up. If `run_sast` is available and this is a real review (not just answering a question), call it EARLY — before you finish investigating — so its findings are recorded up front; do not re-report what it returns as your own finding, but you may investigate one of its leads further (confirm exploitability, trace a tainted input, note a false positive) if it's worth your budget. As you find issues, record each one with `add_review_comment` (one call per finding, on a line this diff adds or changes). Only set `start_line` when the finding's evidence genuinely spans multiple contiguous lines — a multi-line problem, not a multi-line explanation of a one-line problem — and if the finding also carries a `suggestion`, make it cover the full start_line..line range. Use `add_comment` for a plain reply that isn't pinned to a diff line (e.g. answering a question). Nothing you record is posted until you call `finish` with your overall verdict — call `finish` exactly once when you are done, even if you found nothing. If you genuinely cannot produce anything useful, call `abort` with a reason — that reason is posted verbatim as the public review note on the PR, so write one honest sentence for the PR author, never an internal note or scratch reasoning. You may not edit files or run commands.",
+          "content": "You are a reviewer.\n\n# How to act\nInvestigate with the search/graph tools before making any claim \u2014 never speculate about code you have not looked up. If `run_sast` is available and this is a real review (not just answering a question), call it EARLY \u2014 before you finish investigating \u2014 so its findings are recorded up front; do not re-report what it returns as your own finding, but you may investigate one of its leads further (confirm exploitability, trace a tainted input, note a false positive) if it's worth your budget. As you find issues, record each one with `add_review_comment` (one call per finding, on a line this diff adds or changes). Only set `start_line` when the finding's evidence genuinely spans multiple contiguous lines \u2014 a multi-line problem, not a multi-line explanation of a one-line problem \u2014 and if the finding also carries a `suggestion`, make it cover the full start_line..line range. Use `add_comment` for a plain reply that isn't pinned to a diff line (e.g. answering a question). Nothing you record is posted until you call `finish` with your overall verdict \u2014 call `finish` exactly once when you are done, even if you found nothing. If you genuinely cannot produce anything useful, call `abort` with a reason \u2014 that reason is posted verbatim as the public review note on the PR, so write one honest sentence for the PR author, never an internal note or scratch reasoning. You may not edit files or run commands.",
           "role": "system"
         },
         {
@@ -85,6 +85,29 @@
           "type": "function"
         },
         {
+          "type": "function",
+          "function": {
+            "name": "lightbridge_graph_semantic_search",
+            "description": "Find symbols by meaning, not just name \u2014 combines exact-name and semantic-similarity matching (ADR-0114). Use when you know what the code should DO but not what it's called.",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "query": {
+                  "type": "string",
+                  "description": "Natural-language description of the code you're looking for."
+                },
+                "limit": {
+                  "type": "integer",
+                  "description": "Maximum number of results (default 10, max 100)."
+                }
+              },
+              "required": [
+                "query"
+              ]
+            }
+          }
+        },
+        {
           "function": {
             "description": "Read a UTF-8 text file from the checked-out repository (the working tree under review). Path is relative to the repo root; absolute paths and `..` traversal are rejected. Returns up to 64 KiB; pass `start_line`/`end_line` (1-based, inclusive) to read a slice. Use this to look at the actual source when the search/graph tools come up empty.",
             "name": "read_file",
@@ -133,7 +156,7 @@
                   "type": "string"
                 },
                 "evidence": {
-                  "description": "REQUIRED: the concrete proof — the exact lines / symbol this finding rests on, so it can be verified. If you can't cite it, don't record the finding.",
+                  "description": "REQUIRED: the concrete proof \u2014 the exact lines / symbol this finding rests on, so it can be verified. If you can't cite it, don't record the finding.",
                   "type": "string"
                 },
                 "file": {
@@ -141,11 +164,11 @@
                   "type": "string"
                 },
                 "line": {
-                  "description": "The line this finding anchors to — a line the diff adds or changes. When `start_line` is also given, this is the LAST line of the multi-line range.",
+                  "description": "The line this finding anchors to \u2014 a line the diff adds or changes. When `start_line` is also given, this is the LAST line of the multi-line range.",
                   "type": "integer"
                 },
                 "priority": {
-                  "description": "P0 = blocking — security/data-loss: exploitable without special access, or causes data/state loss on a realistic path. P1 = blocking — a real defect: demonstrably wrong on a realistic input or precondition, even if that precondition is rare; decide by IMPACT IF REAL, not by how confident you feel. P2 = non-blocking: cosmetic, needs an already-broken precondition, or a claim you cannot verify from the diff alone. Never downgrade a defect you can prove to P2 to dodge scrutiny — a wrong severity costs more trust than a missed one.",
+                  "description": "P0 = blocking \u2014 security/data-loss: exploitable without special access, or causes data/state loss on a realistic path. P1 = blocking \u2014 a real defect: demonstrably wrong on a realistic input or precondition, even if that precondition is rare; decide by IMPACT IF REAL, not by how confident you feel. P2 = non-blocking: cosmetic, needs an already-broken precondition, or a claim you cannot verify from the diff alone. Never downgrade a defect you can prove to P2 to dodge scrutiny \u2014 a wrong severity costs more trust than a missed one.",
                   "enum": [
                     "P0",
                     "P1",
@@ -162,7 +185,7 @@
                   "type": "string"
                 },
                 "title": {
-                  "description": "Short (≤ ~8 words).",
+                  "description": "Short (\u2264 ~8 words).",
                   "type": "string"
                 }
               },
@@ -181,7 +204,7 @@
         },
         {
           "function": {
-            "description": "Drop a finding you previously recorded that did NOT survive verification (its claim doesn't hold against the cited evidence). Use during your pre-finish review of your own P0/P1 findings — a wrong finding costs more trust than a missed one.",
+            "description": "Drop a finding you previously recorded that did NOT survive verification (its claim doesn't hold against the cited evidence). Use during your pre-finish review of your own P0/P1 findings \u2014 a wrong finding costs more trust than a missed one.",
             "name": "retract_finding",
             "parameters": {
               "properties": {
@@ -209,7 +232,7 @@
         },
         {
           "function": {
-            "description": "Post a plain reply on the thread (GitHub-flavored Markdown) — for answering a question or a general remark, not pinned to a diff line. Multiple calls are consolidated into one reply.",
+            "description": "Post a plain reply on the thread (GitHub-flavored Markdown) \u2014 for answering a question or a general remark, not pinned to a diff line. Multiple calls are consolidated into one reply.",
             "name": "add_comment",
             "parameters": {
               "properties": {
@@ -228,12 +251,12 @@
         },
         {
           "function": {
-            "description": "Finish the run: record your overall verdict/summary and post everything you buffered. Call exactly once when done — investigate and record findings/replies first.",
+            "description": "Finish the run: record your overall verdict/summary and post everything you buffered. Call exactly once when done \u2014 investigate and record findings/replies first.",
             "name": "finish",
             "parameters": {
               "properties": {
                 "summary": {
-                  "description": "1–3 sentence overall verdict: does the change do what it intends, and is it correct and safe?",
+                  "description": "1\u20133 sentence overall verdict: does the change do what it intends, and is it correct and safe?",
                   "type": "string"
                 }
               },
@@ -265,12 +288,12 @@
         },
         {
           "function": {
-            "description": "Abort when you cannot produce a useful result (e.g. the diff is unreadable). Recorded as a clean abort, not a crash. Any findings/replies you buffered are discarded — but `reason` itself is posted verbatim as the public review note on the PR, so it must be a plain sentence for the PR author, never an internal note or scratch reasoning.",
+            "description": "Abort when you cannot produce a useful result (e.g. the diff is unreadable). Recorded as a clean abort, not a crash. Any findings/replies you buffered are discarded \u2014 but `reason` itself is posted verbatim as the public review note on the PR, so it must be a plain sentence for the PR author, never an internal note or scratch reasoning.",
             "name": "abort",
             "parameters": {
               "properties": {
                 "reason": {
-                  "description": "One honest sentence explaining why, written for the PR author to read — this is posted publicly as the review body, not a private note.",
+                  "description": "One honest sentence explaining why, written for the PR author to read \u2014 this is posted publicly as the review body, not a private note.",
                   "type": "string"
                 }
               },
@@ -287,7 +310,7 @@
     {
       "messages": [
         {
-          "content": "You are a reviewer.\n\n# How to act\nInvestigate with the search/graph tools before making any claim — never speculate about code you have not looked up. If `run_sast` is available and this is a real review (not just answering a question), call it EARLY — before you finish investigating — so its findings are recorded up front; do not re-report what it returns as your own finding, but you may investigate one of its leads further (confirm exploitability, trace a tainted input, note a false positive) if it's worth your budget. As you find issues, record each one with `add_review_comment` (one call per finding, on a line this diff adds or changes). Only set `start_line` when the finding's evidence genuinely spans multiple contiguous lines — a multi-line problem, not a multi-line explanation of a one-line problem — and if the finding also carries a `suggestion`, make it cover the full start_line..line range. Use `add_comment` for a plain reply that isn't pinned to a diff line (e.g. answering a question). Nothing you record is posted until you call `finish` with your overall verdict — call `finish` exactly once when you are done, even if you found nothing. If you genuinely cannot produce anything useful, call `abort` with a reason — that reason is posted verbatim as the public review note on the PR, so write one honest sentence for the PR author, never an internal note or scratch reasoning. You may not edit files or run commands.",
+          "content": "You are a reviewer.\n\n# How to act\nInvestigate with the search/graph tools before making any claim \u2014 never speculate about code you have not looked up. If `run_sast` is available and this is a real review (not just answering a question), call it EARLY \u2014 before you finish investigating \u2014 so its findings are recorded up front; do not re-report what it returns as your own finding, but you may investigate one of its leads further (confirm exploitability, trace a tainted input, note a false positive) if it's worth your budget. As you find issues, record each one with `add_review_comment` (one call per finding, on a line this diff adds or changes). Only set `start_line` when the finding's evidence genuinely spans multiple contiguous lines \u2014 a multi-line problem, not a multi-line explanation of a one-line problem \u2014 and if the finding also carries a `suggestion`, make it cover the full start_line..line range. Use `add_comment` for a plain reply that isn't pinned to a diff line (e.g. answering a question). Nothing you record is posted until you call `finish` with your overall verdict \u2014 call `finish` exactly once when you are done, even if you found nothing. If you genuinely cannot produce anything useful, call `abort` with a reason \u2014 that reason is posted verbatim as the public review note on the PR, so write one honest sentence for the PR author, never an internal note or scratch reasoning. You may not edit files or run commands.",
           "role": "system"
         },
         {
@@ -318,7 +341,7 @@
           "tool_call_id": "plain-record"
         },
         {
-          "content": "You have recorded at least one finding. When your investigation is complete, call `finish` with your overall verdict to post everything you've buffered — don't keep investigating past the point of useful work.",
+          "content": "You have recorded at least one finding. When your investigation is complete, call `finish` with your overall verdict to post everything you've buffered \u2014 don't keep investigating past the point of useful work.",
           "role": "user"
         }
       ],
@@ -395,6 +418,29 @@
           "type": "function"
         },
         {
+          "type": "function",
+          "function": {
+            "name": "lightbridge_graph_semantic_search",
+            "description": "Find symbols by meaning, not just name \u2014 combines exact-name and semantic-similarity matching (ADR-0114). Use when you know what the code should DO but not what it's called.",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "query": {
+                  "type": "string",
+                  "description": "Natural-language description of the code you're looking for."
+                },
+                "limit": {
+                  "type": "integer",
+                  "description": "Maximum number of results (default 10, max 100)."
+                }
+              },
+              "required": [
+                "query"
+              ]
+            }
+          }
+        },
+        {
           "function": {
             "description": "Read a UTF-8 text file from the checked-out repository (the working tree under review). Path is relative to the repo root; absolute paths and `..` traversal are rejected. Returns up to 64 KiB; pass `start_line`/`end_line` (1-based, inclusive) to read a slice. Use this to look at the actual source when the search/graph tools come up empty.",
             "name": "read_file",
@@ -443,7 +489,7 @@
                   "type": "string"
                 },
                 "evidence": {
-                  "description": "REQUIRED: the concrete proof — the exact lines / symbol this finding rests on, so it can be verified. If you can't cite it, don't record the finding.",
+                  "description": "REQUIRED: the concrete proof \u2014 the exact lines / symbol this finding rests on, so it can be verified. If you can't cite it, don't record the finding.",
                   "type": "string"
                 },
                 "file": {
@@ -451,11 +497,11 @@
                   "type": "string"
                 },
                 "line": {
-                  "description": "The line this finding anchors to — a line the diff adds or changes. When `start_line` is also given, this is the LAST line of the multi-line range.",
+                  "description": "The line this finding anchors to \u2014 a line the diff adds or changes. When `start_line` is also given, this is the LAST line of the multi-line range.",
                   "type": "integer"
                 },
                 "priority": {
-                  "description": "P0 = blocking — security/data-loss: exploitable without special access, or causes data/state loss on a realistic path. P1 = blocking — a real defect: demonstrably wrong on a realistic input or precondition, even if that precondition is rare; decide by IMPACT IF REAL, not by how confident you feel. P2 = non-blocking: cosmetic, needs an already-broken precondition, or a claim you cannot verify from the diff alone. Never downgrade a defect you can prove to P2 to dodge scrutiny — a wrong severity costs more trust than a missed one.",
+                  "description": "P0 = blocking \u2014 security/data-loss: exploitable without special access, or causes data/state loss on a realistic path. P1 = blocking \u2014 a real defect: demonstrably wrong on a realistic input or precondition, even if that precondition is rare; decide by IMPACT IF REAL, not by how confident you feel. P2 = non-blocking: cosmetic, needs an already-broken precondition, or a claim you cannot verify from the diff alone. Never downgrade a defect you can prove to P2 to dodge scrutiny \u2014 a wrong severity costs more trust than a missed one.",
                   "enum": [
                     "P0",
                     "P1",
@@ -472,7 +518,7 @@
                   "type": "string"
                 },
                 "title": {
-                  "description": "Short (≤ ~8 words).",
+                  "description": "Short (\u2264 ~8 words).",
                   "type": "string"
                 }
               },
@@ -491,7 +537,7 @@
         },
         {
           "function": {
-            "description": "Drop a finding you previously recorded that did NOT survive verification (its claim doesn't hold against the cited evidence). Use during your pre-finish review of your own P0/P1 findings — a wrong finding costs more trust than a missed one.",
+            "description": "Drop a finding you previously recorded that did NOT survive verification (its claim doesn't hold against the cited evidence). Use during your pre-finish review of your own P0/P1 findings \u2014 a wrong finding costs more trust than a missed one.",
             "name": "retract_finding",
             "parameters": {
               "properties": {
@@ -519,7 +565,7 @@
         },
         {
           "function": {
-            "description": "Post a plain reply on the thread (GitHub-flavored Markdown) — for answering a question or a general remark, not pinned to a diff line. Multiple calls are consolidated into one reply.",
+            "description": "Post a plain reply on the thread (GitHub-flavored Markdown) \u2014 for answering a question or a general remark, not pinned to a diff line. Multiple calls are consolidated into one reply.",
             "name": "add_comment",
             "parameters": {
               "properties": {
@@ -538,12 +584,12 @@
         },
         {
           "function": {
-            "description": "Finish the run: record your overall verdict/summary and post everything you buffered. Call exactly once when done — investigate and record findings/replies first.",
+            "description": "Finish the run: record your overall verdict/summary and post everything you buffered. Call exactly once when done \u2014 investigate and record findings/replies first.",
             "name": "finish",
             "parameters": {
               "properties": {
                 "summary": {
-                  "description": "1–3 sentence overall verdict: does the change do what it intends, and is it correct and safe?",
+                  "description": "1\u20133 sentence overall verdict: does the change do what it intends, and is it correct and safe?",
                   "type": "string"
                 }
               },
@@ -575,12 +621,12 @@
         },
         {
           "function": {
-            "description": "Abort when you cannot produce a useful result (e.g. the diff is unreadable). Recorded as a clean abort, not a crash. Any findings/replies you buffered are discarded — but `reason` itself is posted verbatim as the public review note on the PR, so it must be a plain sentence for the PR author, never an internal note or scratch reasoning.",
+            "description": "Abort when you cannot produce a useful result (e.g. the diff is unreadable). Recorded as a clean abort, not a crash. Any findings/replies you buffered are discarded \u2014 but `reason` itself is posted verbatim as the public review note on the PR, so it must be a plain sentence for the PR author, never an internal note or scratch reasoning.",
             "name": "abort",
             "parameters": {
               "properties": {
                 "reason": {
-                  "description": "One honest sentence explaining why, written for the PR author to read — this is posted publicly as the review body, not a private note.",
+                  "description": "One honest sentence explaining why, written for the PR author to read \u2014 this is posted publicly as the review body, not a private note.",
                   "type": "string"
                 }
               },

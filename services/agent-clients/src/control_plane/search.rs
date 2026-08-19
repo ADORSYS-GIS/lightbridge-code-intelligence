@@ -84,6 +84,23 @@ impl ControlPlaneClient {
         .await
     }
 
+    /// `POST /internal/tasks/{id}/graph/query` with `op=hybrid_search` (ADR-0114) — lexical + semantic
+    /// symbol search, fused by weighted reciprocal rank. `embedding` must already be computed (this
+    /// client never embeds anything itself); the caller mints it from its own `EmbeddingsClient`.
+    pub async fn graph_semantic_search(
+        &self,
+        task_id: Uuid,
+        term: &str,
+        embedding: &[f32],
+        limit: i64,
+    ) -> anyhow::Result<Vec<SymbolHit>> {
+        self.graph_query(
+            task_id,
+            serde_json::json!({ "op": "hybrid_search", "term": term, "embedding": embedding, "limit": limit }),
+        )
+        .await
+    }
+
     async fn graph_query(
         &self,
         task_id: Uuid,

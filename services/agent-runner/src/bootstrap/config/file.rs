@@ -183,6 +183,8 @@ pub enum ReviewTool {
     GraphFindSymbol,
     #[serde(rename = "lightbridge_graph_get_callers")]
     GraphGetCallers,
+    #[serde(rename = "lightbridge_graph_semantic_search")]
+    GraphSemanticSearch,
     #[serde(rename = "read_file")]
     ReadFile,
     #[serde(rename = "add_review_comment")]
@@ -205,10 +207,11 @@ pub enum ReviewTool {
 
 impl ReviewTool {
     /// Every variant, in the canonical tool order — the operator-facing list of valid built-in names.
-    pub const ALL: [ReviewTool; 11] = [
+    pub const ALL: [ReviewTool; 12] = [
         ReviewTool::VectorSemanticSearch,
         ReviewTool::GraphFindSymbol,
         ReviewTool::GraphGetCallers,
+        ReviewTool::GraphSemanticSearch,
         ReviewTool::ReadFile,
         ReviewTool::AddReviewComment,
         ReviewTool::RetractFinding,
@@ -225,6 +228,7 @@ impl ReviewTool {
             ReviewTool::VectorSemanticSearch => "lightbridge_vector_semantic_search",
             ReviewTool::GraphFindSymbol => "lightbridge_graph_find_symbol",
             ReviewTool::GraphGetCallers => "lightbridge_graph_get_callers",
+            ReviewTool::GraphSemanticSearch => "lightbridge_graph_semantic_search",
             ReviewTool::ReadFile => "read_file",
             ReviewTool::AddReviewComment => "add_review_comment",
             ReviewTool::RetractFinding => "retract_finding",

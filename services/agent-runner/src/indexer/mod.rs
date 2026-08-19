@@ -77,13 +77,15 @@ fn env_usize(key: &str, default: usize) -> usize {
 }
 
 /// Index the checkout directory and submit all chunks to the control plane.
-/// Returns the total number of chunks submitted.
+/// Returns the total number of chunks submitted, plus the chunks themselves — `index_graph`
+/// (ADR-0114) correlates them against `lci-codegraph`'s symbol nodes to embed each symbol's
+/// definition text, without needing `lci-codegraph` itself to expose an end line.
 pub async fn index_checkout(
     context: &TaskContext,
     checkout: &Path,
     client: &ControlPlaneClient,
     embedder: &EmbeddingsClient,
-) -> anyhow::Result<usize> {
+) -> anyhow::Result<(usize, Vec<chunker::Chunk>)> {
     let commit_sha = context
         .head_sha
         .as_deref()
@@ -96,7 +98,7 @@ pub async fn index_checkout(
         .context("collecting chunks")?;
     if chunks.is_empty() {
         tracing::info!("no chunks produced (empty or all-binary repo)");
-        return Ok(0);
+        return Ok((0, chunks));
     }
     tracing::info!(
         chunk_count = chunks.len(),
@@ -144,7 +146,7 @@ pub async fn index_checkout(
         tracing::info!(submitted, total, "indexing progress");
     }
 
-    Ok(submitted)
+    Ok((submitted, chunks))
 }
 
 /// Walk the checkout directory and produce chunks for every indexable file.

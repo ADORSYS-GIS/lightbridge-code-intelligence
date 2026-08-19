@@ -18,6 +18,9 @@ pub struct GraphNode {
     pub source_file: String,
     /// 1-based start line (as emitted by `lci-codegraph`).
     pub start_line: i64,
+    /// Embedding of the symbol's definition text (ADR-0114), when the runner found a correlated
+    /// chunk to embed. `None` leaves any existing `s.embedding` untouched on a re-index.
+    pub embedding: Option<Vec<f32>>,
 }
 
 /// One directed edge (`contains` / `method` / `calls` / …).
@@ -63,17 +66,24 @@ pub async fn upsert_graph(
     let mut txn = graph.start_txn().await.context("begin neo4j txn")?;
 
     for n in nodes {
+        // `$embedding` is sent as an empty list when `n.embedding` is `None` — Neo4j has no first-class
+        // null-vs-empty-list parameter distinction that's simpler to thread through here, and an empty
+        // list is otherwise meaningless for a 4096-dim embedding, so it's a safe "no update" sentinel.
+        // Without this guard a re-index that only recomputed structural facts (no embedder available)
+        // would silently wipe every symbol's embedding.
         txn.run(
             query(
                 "MERGE (s:Symbol {repo_id: $repo, commit: $commit, node_id: $id}) \
-                 SET s.label = $label, s.source_file = $file, s.start_line = $line",
+                 SET s.label = $label, s.source_file = $file, s.start_line = $line, \
+                     s.embedding = CASE WHEN size($embedding) > 0 THEN $embedding ELSE s.embedding END",
             )
             .param("repo", repository_id)
             .param("commit", commit_sha)
             .param("id", n.node_id.as_str())
             .param("label", n.label.as_str())
             .param("file", n.source_file.as_str())
-            .param("line", n.start_line),
+            .param("line", n.start_line)
+            .param("embedding", n.embedding.clone().unwrap_or_default()),
         )
         .await
         .context("merge symbol node")?;
@@ -254,6 +264,123 @@ pub async fn get_callers(
     Ok(hits)
 }
 
+/// Create the vector and fulltext indexes hybrid search needs, if they don't already exist
+/// (ADR-0114). Both `CREATE ... INDEX ... IF NOT EXISTS` forms are idempotent — verified directly
+/// against a real `neo4j:5.26-community` instance — so this is safe to call on every startup,
+/// mirroring how Postgres migrations already run unconditionally on connect (`db::connect_from_env`).
+/// 4096 dims / cosine matches `qwen3-embedding-8b`, the same model `code_chunks.embedding` (pgvector)
+/// already uses.
+pub async fn ensure_indexes(graph: &Graph) -> anyhow::Result<()> {
+    create_index_idempotent(
+        graph,
+        "CREATE VECTOR INDEX symbol_embedding_idx IF NOT EXISTS \
+         FOR (s:Symbol) ON s.embedding \
+         OPTIONS { indexConfig: { \
+           `vector.dimensions`: 4096, \
+           `vector.similarity_function`: 'cosine' \
+         }}",
+        "symbol_embedding_idx",
+    )
+    .await?;
+    create_index_idempotent(
+        graph,
+        "CREATE FULLTEXT INDEX symbol_label_fulltext IF NOT EXISTS \
+         FOR (s:Symbol) ON EACH [s.label, s.source_file]",
+        "symbol_label_fulltext",
+    )
+    .await?;
+    Ok(())
+}
+
+/// `CREATE ... IF NOT EXISTS` is not race-safe under concurrent callers: this project runs
+/// `ensure_indexes` from every role that opens a Neo4j connection (control-plane and mcp both at
+/// startup, confirmed live — two callers connected two seconds apart still raced), and Neo4j's
+/// existence check + create isn't atomic across sessions. The loser of the race doesn't get a silent
+/// no-op; it gets a hard `Neo.ClientError.Schema.EquivalentSchemaRuleAlreadyExists` ("An equivalent
+/// index already exists"). The desired end state — the index exists — is reached either way, so that
+/// specific outcome is a success here, not a failure; anything else still propagates.
+async fn create_index_idempotent(graph: &Graph, ddl: &str, name: &str) -> anyhow::Result<()> {
+    use anyhow::Context;
+    match graph.run(query(ddl)).await {
+        Ok(()) => Ok(()),
+        Err(error) if error.to_string().contains("already exists") => {
+            tracing::debug!(%error, name, "index already exists (lost a startup race, not a failure)");
+            Ok(())
+        }
+        Err(error) => Err(error).with_context(|| format!("create {name}")),
+    }
+}
+
+/// Hybrid symbol search: lexical (fulltext on `label`/`source_file`) + semantic (vector on
+/// `embedding`), fused by weighted reciprocal rank (WRRF) — Neo4j's own documented hybrid-search
+/// pattern, not an ad hoc union (ADR-0114). Scoped by `(repository_id, commit_sha)` like every other
+/// query in this module. Takes an already-computed `query_embedding`; this function never embeds
+/// anything itself, which is what lets both the MCP tool (runner-embedded) and a future frontend
+/// endpoint (control-plane-embedded) share it without duplicating embedding logic here.
+///
+/// `source_k` bounds how many candidates each branch contributes before fusion; `final_k` bounds the
+/// fused result. `RRF_CONSTANT = 60.0` is Neo4j's own documented default, dampening the effect of
+/// rank position.
+///
+/// Version note: uses the `db.index.vector.queryNodes()` **procedure** form, confirmed working
+/// against this project's real `neo4j:5.26-community` — not the newer `SEARCH ... IN (VECTOR
+/// INDEX...)` clause syntax some current Neo4j docs lead with.
+pub async fn hybrid_symbol_search(
+    graph: &Graph,
+    repository_id: i64,
+    commit_sha: &str,
+    query_text: &str,
+    query_embedding: &[f32],
+    source_k: i64,
+    final_k: i64,
+) -> anyhow::Result<Vec<SymbolHit>> {
+    use anyhow::Context;
+    const RRF_CONSTANT: f64 = 60.0;
+
+    let mut rows = graph
+        .execute(
+            query(
+                "CALL () { \
+                   CALL db.index.fulltext.queryNodes('symbol_label_fulltext', $query, {limit: $sourceK}) \
+                   YIELD node AS s \
+                   WHERE s.repo_id = $repo AND s.commit = $commit \
+                   WITH collect(s) AS hits \
+                   UNWIND CASE WHEN size(hits) = 0 THEN [] ELSE range(0, size(hits) - 1) END AS rankIndex \
+                   RETURN hits[rankIndex] AS s, rankIndex + 1 AS sourceRank \
+                   UNION ALL \
+                   CALL db.index.vector.queryNodes('symbol_embedding_idx', $sourceK, $queryVector) \
+                   YIELD node AS s \
+                   WHERE s.repo_id = $repo AND s.commit = $commit \
+                   WITH collect(s) AS hits \
+                   UNWIND CASE WHEN size(hits) = 0 THEN [] ELSE range(0, size(hits) - 1) END AS rankIndex \
+                   RETURN hits[rankIndex] AS s, rankIndex + 1 AS sourceRank \
+                 } \
+                 WITH s, sum(1.0 / ($rrfConstant + sourceRank)) AS wrrf \
+                 ORDER BY wrrf DESC \
+                 LIMIT $finalK \
+                 RETURN s.node_id AS node_id, s.label AS label, s.source_file AS source_file, \
+                        s.start_line AS start_line",
+            )
+            .param("repo", repository_id)
+            .param("commit", commit_sha)
+            .param("query", query_text)
+            .param("queryVector", query_embedding.to_vec())
+            .param("sourceK", source_k)
+            .param("finalK", final_k)
+            .param("rrfConstant", RRF_CONSTANT),
+        )
+        .await
+        .context("hybrid_symbol_search query")?;
+
+    let mut hits = Vec::new();
+    while let Some(row) = rows.next().await.context("hybrid_symbol_search row")? {
+        if let Some(hit) = symbol_from_row(&row) {
+            hits.push(hit);
+        }
+    }
+    Ok(hits)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -283,12 +410,14 @@ mod tests {
                 label: "add()".into(),
                 source_file: "src/math.rs".into(),
                 start_line: 2,
+                embedding: None,
             },
             GraphNode {
                 node_id: "src_math_calc_bump".into(),
                 label: "bump()".into(),
                 source_file: "src/math.rs".into(),
                 start_line: 6,
+                embedding: None,
             },
         ];
         let edges = vec![GraphEdge {
@@ -378,6 +507,7 @@ mod tests {
             label: format!("{id}()"),
             source_file: "src/x.rs".into(),
             start_line: 1,
+            embedding: None,
         };
         let keep_sha = "graph-keep-sha";
         let stale_sha = "graph-stale-sha";
