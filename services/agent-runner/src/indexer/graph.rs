@@ -23,21 +23,12 @@ use super::{IndexTuning, chunker};
 /// Languages without a graph extractor yet contribute no structural facts.
 ///
 /// `chunks` are the same chunks `index_checkout` already collected for pgvector (ADR-0114). Each
-/// `lci-codegraph` symbol node is correlated against the chunk whose `[start_line, end_line]` range
-/// *contains* that symbol's start line, and that chunk's already-known `content` is what gets embedded
-/// for `:Symbol.embedding`. This is deliberately in-tree: `lci-codegraph` itself exposes no `end_line`
-/// to slice a symbol's text independently, and adding one there would mean carrying an
-/// embeddings-adjacent concern into a crate that otherwise has none. A node with no correlated chunk
-/// (e.g. a symbol kind the chunker doesn't produce a chunk for) simply ships without an embedding — it
-/// still gets its structural edges.
-///
-/// A range containment check, not an exact `start_line` match: `lci-codegraph` emits 1-based line
-/// numbers, but the chunker's tree-sitter walk records `child.start_position().row`, which is 0-based
-/// — confirmed live (every chunk/symbol pair for a real indexed repo was off by exactly 1), so an
-/// exact-equality match missed almost everything, even for languages with full tree-sitter chunking.
-/// Containment against the chunk's own `end_line` (already produced today, no `lci-codegraph` change
-/// needed) absorbs that off-by-one and also correctly maps a symbol nested inside a larger chunk
-/// (e.g. a method inside an `impl` block chunk) to that chunk's text.
+/// symbol node is correlated against the chunk whose `[start_line, end_line]` range contains that
+/// symbol's start line, and that chunk's text is what gets embedded for `:Symbol.embedding`. A range
+/// check rather than an exact match, since the two walks use different line-numbering conventions, and
+/// so that a symbol nested inside a larger chunk (e.g. a method inside an `impl` block) still resolves
+/// to that chunk's text. A node with no correlated chunk ships without an embedding but still gets its
+/// structural edges.
 pub async fn index_graph(
     context: &TaskContext,
     checkout: &Path,
@@ -131,8 +122,8 @@ pub async fn index_graph(
 }
 
 /// True if `chunk` is the one whose text a symbol at `symbol_start_line` in `symbol_file` should be
-/// embedded with: same file, and the symbol's (1-based, `lci-codegraph`) start line falls within the
-/// chunk's (0-based, tree-sitter) `[start_line, end_line]` range.
+/// embedded with: same file, and the symbol's start line falls within the chunk's
+/// `[start_line, end_line]` range.
 fn chunk_contains_symbol(
     chunk: &chunker::Chunk,
     symbol_file: &str,
@@ -160,12 +151,9 @@ mod tests {
     }
 
     #[test]
-    fn matches_the_off_by_one_case_seen_live_against_a_real_indexed_repo() {
-        // authix-todo, src/to_do/mod.rs: chunker chunk start_line=8 (0-based tree-sitter row),
-        // lci-codegraph symbol start_line=9 (1-based) — an exact-equality match missed this
-        // every time; containment against the chunk's own end_line catches it.
-        let c = chunk("src/to_do/mod.rs", 8, 18);
-        assert!(chunk_contains_symbol(&c, "src/to_do/mod.rs", 9));
+    fn matches_when_the_chunk_and_symbol_use_different_line_numbering() {
+        let c = chunk("src/lib.rs", 8, 18);
+        assert!(chunk_contains_symbol(&c, "src/lib.rs", 9));
     }
 
     #[test]

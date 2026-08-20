@@ -66,11 +66,9 @@ pub async fn upsert_graph(
     let mut txn = graph.start_txn().await.context("begin neo4j txn")?;
 
     for n in nodes {
-        // `$embedding` is sent as an empty list when `n.embedding` is `None` — Neo4j has no first-class
-        // null-vs-empty-list parameter distinction that's simpler to thread through here, and an empty
-        // list is otherwise meaningless for a 4096-dim embedding, so it's a safe "no update" sentinel.
-        // Without this guard a re-index that only recomputed structural facts (no embedder available)
-        // would silently wipe every symbol's embedding.
+        // `$embedding` is sent as an empty list when `n.embedding` is `None`, which is otherwise
+        // meaningless for an embedding vector — a safe "no update" sentinel so a re-index that only
+        // recomputed structural facts doesn't wipe an existing embedding.
         txn.run(
             query(
                 "MERGE (s:Symbol {repo_id: $repo, commit: $commit, node_id: $id}) \
@@ -265,18 +263,13 @@ pub async fn get_callers(
 }
 
 /// Create the vector and fulltext indexes hybrid search needs, if they don't already exist
-/// (ADR-0114). Both `CREATE ... INDEX ... IF NOT EXISTS` forms are idempotent — verified directly
-/// against a real `neo4j:5.26-community` instance — so this is safe to call on every startup,
-/// mirroring how Postgres migrations already run unconditionally on connect (`db::connect_from_env`).
+/// (ADR-0114). Idempotent, so safe to call on every startup, mirroring how Postgres migrations
+/// already run unconditionally on connect.
 ///
-/// `dimension` must match whatever the runner's `EmbeddingsClient` actually produces — 4096
-/// (`qwen3-embedding-8b`, same as `code_chunks.embedding`/pgvector) is only the *default* when no
-/// `embeddings.dimension` is configured. Neo4j's `CREATE VECTOR INDEX` has no parameter substitution
-/// (schema DDL is never parameterized in Cypher), so the value is interpolated directly — safe here
-/// since it comes from trusted server-side config, never from a request. A mismatch between this and
-/// the embeddings actually written would otherwise fail every `MERGE ... SET s.embedding` silently at
-/// the vector-index level and every `db.index.vector.queryNodes` call, exactly the failure mode
-/// `db::reconcile_embedding_dimension` already guards against for the pgvector column.
+/// `dimension` should match the configured embeddings model's output size (4096 is the default when
+/// `embeddings.dimension` is unset) — the same value `reconcile_embedding_dimension` uses for the
+/// pgvector column. Cypher schema DDL can't be parameterized, so the value is interpolated directly,
+/// which is safe here since it comes from trusted server-side config, never request input.
 pub async fn ensure_indexes(graph: &Graph, dimension: i64) -> anyhow::Result<()> {
     create_index_idempotent(
         graph,
@@ -301,13 +294,11 @@ pub async fn ensure_indexes(graph: &Graph, dimension: i64) -> anyhow::Result<()>
     Ok(())
 }
 
-/// `CREATE ... IF NOT EXISTS` is not race-safe under concurrent callers: this project runs
-/// `ensure_indexes` from every role that opens a Neo4j connection (control-plane and mcp both at
-/// startup, confirmed live — two callers connected two seconds apart still raced), and Neo4j's
-/// existence check + create isn't atomic across sessions. The loser of the race doesn't get a silent
-/// no-op; it gets a hard `Neo.ClientError.Schema.EquivalentSchemaRuleAlreadyExists` ("An equivalent
-/// index already exists"). The desired end state — the index exists — is reached either way, so that
-/// specific outcome is a success here, not a failure; anything else still propagates.
+/// `CREATE ... IF NOT EXISTS` is not atomic across concurrent callers — multiple roles can open a
+/// Neo4j connection at startup, and the losing caller gets a hard
+/// `Neo.ClientError.Schema.EquivalentSchemaRuleAlreadyExists` rather than a silent no-op. The desired
+/// end state (the index exists) is reached either way, so that specific outcome is treated as success
+/// here; anything else still propagates.
 async fn create_index_idempotent(graph: &Graph, ddl: &str, name: &str) -> anyhow::Result<()> {
     use anyhow::Context;
     match graph.run(query(ddl)).await {
@@ -321,19 +312,16 @@ async fn create_index_idempotent(graph: &Graph, ddl: &str, name: &str) -> anyhow
 }
 
 /// Hybrid symbol search: lexical (fulltext on `label`/`source_file`) + semantic (vector on
-/// `embedding`), fused by weighted reciprocal rank (WRRF) — Neo4j's own documented hybrid-search
-/// pattern, not an ad hoc union (ADR-0114). Scoped by `(repository_id, commit_sha)` like every other
-/// query in this module. Takes an already-computed `query_embedding`; this function never embeds
-/// anything itself, which is what lets both the MCP tool (runner-embedded) and a future frontend
-/// endpoint (control-plane-embedded) share it without duplicating embedding logic here.
+/// `embedding`), fused by weighted reciprocal rank (WRRF) — Neo4j's documented hybrid-search pattern,
+/// not an ad hoc union (ADR-0114). Scoped by `(repository_id, commit_sha)` like every other query in
+/// this module. Takes an already-computed `query_embedding`; never embeds anything itself, so any
+/// caller with its own embedder can reuse it.
 ///
 /// `source_k` bounds how many candidates each branch contributes before fusion; `final_k` bounds the
-/// fused result. `RRF_CONSTANT = 60.0` is Neo4j's own documented default, dampening the effect of
-/// rank position.
+/// fused result. `RRF_CONSTANT = 60.0` is Neo4j's documented default.
 ///
-/// Version note: uses the `db.index.vector.queryNodes()` **procedure** form, confirmed working
-/// against this project's real `neo4j:5.26-community` — not the newer `SEARCH ... IN (VECTOR
-/// INDEX...)` clause syntax some current Neo4j docs lead with.
+/// Uses the `db.index.vector.queryNodes()` procedure form rather than the newer
+/// `SEARCH ... IN (VECTOR INDEX...)` clause syntax.
 pub async fn hybrid_symbol_search(
     graph: &Graph,
     repository_id: i64,
@@ -391,13 +379,10 @@ pub async fn hybrid_symbol_search(
 }
 
 /// Escape Lucene query-syntax metacharacters in free text before it's sent to
-/// `db.index.fulltext.queryNodes`. The `term`/`query` argument to `lightbridge_graph_semantic_search`
-/// is a model-authored natural-language string, not a hand-written Lucene query — an unescaped `(`,
-/// `:`, unbalanced `"`, etc. throws a Lucene parse error that fails the *entire* Cypher call (not just
-/// the fulltext branch), even though the vector branch alone would have been perfectly able to answer.
-/// Escaping every occurrence of Lucene's reserved characters makes the whole string match as literal
-/// terms, which is the right semantics here anyway — these are natural-language queries, not queries a
-/// caller is deliberately writing Lucene boolean/proximity syntax into.
+/// `db.index.fulltext.queryNodes`. The query is a natural-language string, not a hand-written Lucene
+/// query — an unescaped `(`, `:`, or unbalanced `"` throws a Lucene parse error that fails the entire
+/// call, not just the fulltext branch. Escaping treats the whole string as literal terms, which is the
+/// right semantics for free text.
 fn escape_lucene_query(text: &str) -> String {
     const SPECIAL: &[char] = &[
         '\\', '+', '-', '!', '(', ')', ':', '^', '[', ']', '"', '{', '}', '~', '*', '?', '|', '&',
