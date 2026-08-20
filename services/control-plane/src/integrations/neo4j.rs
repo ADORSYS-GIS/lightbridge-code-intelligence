@@ -268,17 +268,26 @@ pub async fn get_callers(
 /// (ADR-0114). Both `CREATE ... INDEX ... IF NOT EXISTS` forms are idempotent — verified directly
 /// against a real `neo4j:5.26-community` instance — so this is safe to call on every startup,
 /// mirroring how Postgres migrations already run unconditionally on connect (`db::connect_from_env`).
-/// 4096 dims / cosine matches `qwen3-embedding-8b`, the same model `code_chunks.embedding` (pgvector)
-/// already uses.
-pub async fn ensure_indexes(graph: &Graph) -> anyhow::Result<()> {
+///
+/// `dimension` must match whatever the runner's `EmbeddingsClient` actually produces — 4096
+/// (`qwen3-embedding-8b`, same as `code_chunks.embedding`/pgvector) is only the *default* when no
+/// `embeddings.dimension` is configured. Neo4j's `CREATE VECTOR INDEX` has no parameter substitution
+/// (schema DDL is never parameterized in Cypher), so the value is interpolated directly — safe here
+/// since it comes from trusted server-side config, never from a request. A mismatch between this and
+/// the embeddings actually written would otherwise fail every `MERGE ... SET s.embedding` silently at
+/// the vector-index level and every `db.index.vector.queryNodes` call, exactly the failure mode
+/// `db::reconcile_embedding_dimension` already guards against for the pgvector column.
+pub async fn ensure_indexes(graph: &Graph, dimension: i64) -> anyhow::Result<()> {
     create_index_idempotent(
         graph,
-        "CREATE VECTOR INDEX symbol_embedding_idx IF NOT EXISTS \
-         FOR (s:Symbol) ON s.embedding \
-         OPTIONS { indexConfig: { \
-           `vector.dimensions`: 4096, \
-           `vector.similarity_function`: 'cosine' \
-         }}",
+        &format!(
+            "CREATE VECTOR INDEX symbol_embedding_idx IF NOT EXISTS \
+             FOR (s:Symbol) ON s.embedding \
+             OPTIONS {{ indexConfig: {{ \
+               `vector.dimensions`: {dimension}, \
+               `vector.similarity_function`: 'cosine' \
+             }}}}"
+        ),
         "symbol_embedding_idx",
     )
     .await?;
@@ -363,7 +372,7 @@ pub async fn hybrid_symbol_search(
             )
             .param("repo", repository_id)
             .param("commit", commit_sha)
-            .param("query", query_text)
+            .param("query", escape_lucene_query(query_text))
             .param("queryVector", query_embedding.to_vec())
             .param("sourceK", source_k)
             .param("finalK", final_k)
@@ -381,9 +390,56 @@ pub async fn hybrid_symbol_search(
     Ok(hits)
 }
 
+/// Escape Lucene query-syntax metacharacters in free text before it's sent to
+/// `db.index.fulltext.queryNodes`. The `term`/`query` argument to `lightbridge_graph_semantic_search`
+/// is a model-authored natural-language string, not a hand-written Lucene query — an unescaped `(`,
+/// `:`, unbalanced `"`, etc. throws a Lucene parse error that fails the *entire* Cypher call (not just
+/// the fulltext branch), even though the vector branch alone would have been perfectly able to answer.
+/// Escaping every occurrence of Lucene's reserved characters makes the whole string match as literal
+/// terms, which is the right semantics here anyway — these are natural-language queries, not queries a
+/// caller is deliberately writing Lucene boolean/proximity syntax into.
+fn escape_lucene_query(text: &str) -> String {
+    const SPECIAL: &[char] = &[
+        '\\', '+', '-', '!', '(', ')', ':', '^', '[', ']', '"', '{', '}', '~', '*', '?', '|', '&',
+        '/',
+    ];
+    let mut escaped = String::with_capacity(text.len());
+    for c in text.chars() {
+        if SPECIAL.contains(&c) {
+            escaped.push('\\');
+        }
+        escaped.push(c);
+    }
+    escaped
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn escapes_lucene_metacharacters_a_model_query_could_plausibly_contain() {
+        assert_eq!(
+            escape_lucene_query("retry logic (with backoff)"),
+            r"retry logic \(with backoff\)"
+        );
+        assert_eq!(
+            escape_lucene_query("how does auth: refresh work?"),
+            r"how does auth\: refresh work\?"
+        );
+        assert_eq!(
+            escape_lucene_query(r#"a "quoted" phrase"#),
+            r#"a \"quoted\" phrase"#
+        );
+    }
+
+    #[test]
+    fn leaves_plain_natural_language_untouched() {
+        assert_eq!(
+            escape_lucene_query("retry a failed payment charge with backoff"),
+            "retry a failed payment charge with backoff"
+        );
+    }
 
     /// Live round-trip against a real Neo4j (the compose service). Ignored by default — CI has no
     /// Neo4j — run with `cargo test -p control-plane --ignored` after `docker compose up -d neo4j`.

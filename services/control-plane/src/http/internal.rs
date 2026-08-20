@@ -960,13 +960,23 @@ pub async fn graph_query(
                 )
                     .into_response();
             };
+            // `source_k` (candidates per branch *before* the repo/commit filter) needs to be large:
+            // `db.index.fulltext.queryNodes`/`db.index.vector.queryNodes` rank against the entire
+            // global `:Symbol` index — every repository, every retained commit — and only truncate to
+            // `source_k` *before* `hybrid_symbol_search`'s `WHERE repo_id = $repo AND commit = $commit`
+            // filter runs (Neo4j has no pre-filtered/scoped vector search in this version). A small
+            // `source_k` in a multi-repo deployment can mean this repo's real match never survives to
+            // the filter at all, even though it's the best result once scoped. 500 is a mitigation,
+            // not a structural fix — a very large or very actively indexed install could still exceed
+            // it; the real fix (a per-repo/snapshot-scoped index, or Neo4j's newer filtered vector
+            // search once available in this deployment's version) is tracked as a follow-up.
             crate::integrations::neo4j::hybrid_symbol_search(
                 neo4j,
                 repository_id,
                 &commit,
                 term,
                 embedding,
-                limit.max(20),
+                limit.max(500),
                 limit,
             )
             .await

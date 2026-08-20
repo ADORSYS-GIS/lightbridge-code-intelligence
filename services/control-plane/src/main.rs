@@ -191,7 +191,8 @@ impl AppState {
                 // Hybrid-search index bootstrap (ADR-0114). Idempotent, but best-effort like the
                 // connection itself: a bootstrap failure disables hybrid search, not the whole
                 // control plane — structural graph reads/writes don't depend on these indexes.
-                if let Err(error) = neo4j::ensure_indexes(&graph).await {
+                let dimension = embeddings.dimension.unwrap_or(4096);
+                if let Err(error) = neo4j::ensure_indexes(&graph, dimension).await {
                     tracing::error!(
                         ?error,
                         "neo4j index bootstrap failed; hybrid search disabled"
