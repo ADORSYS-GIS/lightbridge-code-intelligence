@@ -6,7 +6,8 @@
     "dev": "next dev",
     "build": "next build",
     "start": "node .next/standalone/apps/web/server.js",
-    "lint": "biome check ."
+    "lint": "biome check .",
+    "test": "vitest run"
   },
   "dependencies": {
     "@lightbridge/auth": "workspace:*",
@@ -25,11 +26,16 @@
   "devDependencies": {
     "@lightbridge/tsconfig": "workspace:*",
     "@tailwindcss/postcss": "^4.0.0",
+    "@testing-library/dom": "^10.4.1",
+    "@testing-library/react": "^16.3.2",
     "@types/node": "^22.0.0",
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",
+    "@vitejs/plugin-react": "^6.0.5",
     "daisyui": "^5.5.23",
+    "jsdom": "^30.0.1",
     "tailwindcss": "^4.0.0",
-    "typescript": "^5.6.0"
+    "typescript": "^5.6.0",
+    "vitest": "^4.1.10"
   }
 }
