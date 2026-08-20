@@ -394,13 +394,17 @@ async fn perform_indexing(
         status.set_phase(Phase::Indexing);
     }
     // ── Semantic index: tree-sitter → pgvector (epic #5, slice 2) ────────────────────────
-    let chunks = indexer::index_checkout(context, checkout, client, embedder).await?;
+    let (chunk_count, chunks) =
+        indexer::index_checkout(context, checkout, client, embedder).await?;
     // ── Structural index: in-house lci-codegraph → Neo4j (epic #5, slice 3, ADR-0086) ─────
     // The structural graph is built in-process by the `lci-codegraph` crate (tree-sitter); it
     // replaced the retired Python Graphify CLI (ADR-0019) — no flag, no fallback.
     // Best-effort: the semantic index already landed, and the graph store may be unconfigured
     // (control plane returns 503). A graph failure is logged, not fatal — the task still succeeds.
-    let graph_result = indexer::graph::index_graph(context, checkout, client).await;
+    // `chunks` (already collected above) are reused to embed each symbol's definition text
+    // (ADR-0114) — no second file walk, no lci-codegraph change.
+    let graph_result =
+        indexer::graph::index_graph(context, checkout, client, embedder, &chunks).await;
     let graph = match graph_result {
         Ok((nodes, edges)) => format!("{nodes} nodes / {edges} edges"),
         Err(error) => {
@@ -408,7 +412,7 @@ async fn perform_indexing(
             "graph skipped".to_string()
         }
     };
-    Ok((chunks, graph))
+    Ok((chunk_count, graph))
 }
 
 /// Apply the resolved repo/org model override (ADR-0110, story #501) to a preset-resolved

@@ -11,6 +11,7 @@ use super::{ReviewServices, clamp_limit, parse, render};
 
 pub const GRAPH_FIND_SYMBOL: &str = "lightbridge_graph_find_symbol";
 pub const GRAPH_GET_CALLERS: &str = "lightbridge_graph_get_callers";
+pub const GRAPH_SEMANTIC_SEARCH: &str = "lightbridge_graph_semantic_search";
 
 #[derive(Deserialize)]
 struct FindArgs {
@@ -24,8 +25,14 @@ struct CallersArgs {
     #[serde(default)]
     limit: Option<i64>,
 }
+#[derive(Deserialize)]
+struct SemanticSearchArgs {
+    query: String,
+    #[serde(default)]
+    limit: Option<i64>,
+}
 
-pub fn specs() -> [ToolSpec; 2] {
+pub fn specs() -> [ToolSpec; 3] {
     let limit = serde_json::json!({"type":"integer","description":"Maximum number of results (default 10, max 100)."});
     [
         ToolSpec::function(
@@ -38,6 +45,11 @@ pub fn specs() -> [ToolSpec; 2] {
             "Return the symbols that call a given symbol (reverse call graph). Pass a node id from graph_find_symbol.",
             serde_json::json!({"type":"object","properties":{"node_id":{"type":"string","description":"Node id of the target symbol (from graph_find_symbol)."},"limit":limit},"required":["node_id"]}),
         ),
+        ToolSpec::function(
+            GRAPH_SEMANTIC_SEARCH,
+            "Find symbols by meaning, not just name — combines exact-name and semantic-similarity matching (ADR-0114). Use when you know what the code should DO but not what it's called.",
+            serde_json::json!({"type":"object","properties":{"query":{"type":"string","description":"Natural-language description of the code you're looking for."},"limit":limit},"required":["query"]}),
+        ),
     ]
 }
 
@@ -49,13 +61,17 @@ struct CallersTool {
     spec: ToolSpec,
     services: ReviewServices,
 }
+struct SemanticSearchTool {
+    spec: ToolSpec,
+    services: ReviewServices,
+}
 
 pub(crate) fn register(
     registry: &mut ToolRegistry,
     services: &ReviewServices,
     caps: RuntimeCaps,
 ) -> Result<(), RegistryError> {
-    let [find, callers] = specs();
+    let [find, callers, semantic_search] = specs();
     registry.register(
         Arc::new(FindTool {
             spec: find,
@@ -66,6 +82,13 @@ pub(crate) fn register(
     registry.register(
         Arc::new(CallersTool {
             spec: callers,
+            services: services.clone(),
+        }),
+        caps,
+    )?;
+    registry.register(
+        Arc::new(SemanticSearchTool {
+            spec: semantic_search,
             services: services.clone(),
         }),
         caps,
@@ -118,6 +141,48 @@ impl Tool for CallersTool {
                         .graph_get_callers(cx.task_id, &args.node_id, clamp_limit(args.limit))
                         .await,
                 )),
+                Err(error) => ToolOutcome::Continue(error.to_string()),
+            }
+        })
+    }
+}
+
+impl Tool for SemanticSearchTool {
+    fn spec(&self) -> &ToolSpec {
+        &self.spec
+    }
+    fn kind(&self) -> ToolKind {
+        ToolKind::ReadOnly(ReadKind::Retrieval)
+    }
+    fn replay(&self) -> ReplaySafety {
+        ReplaySafety::ReadOnly
+    }
+    fn call<'a>(&'a self, cx: &'a ToolCx<'a>, call: &'a ToolCallReq) -> BoxFuture<'a, ToolOutcome> {
+        Box::pin(async move {
+            match parse::<SemanticSearchArgs>(&call.function.arguments) {
+                Ok(args) => {
+                    // Embed then search, sequenced into one Result so `render` reports either
+                    // failure the same way it already reports a graph-query failure — the model
+                    // doesn't need to know embedding is a separate step.
+                    let result = async {
+                        let mut embeddings =
+                            self.services.embedder.embed(&[args.query.as_str()]).await?;
+                        let embedding = embeddings
+                            .pop()
+                            .ok_or_else(|| anyhow::anyhow!("embedder returned no vector"))?;
+                        self.services
+                            .client
+                            .graph_semantic_search(
+                                cx.task_id,
+                                &args.query,
+                                &embedding,
+                                clamp_limit(args.limit),
+                            )
+                            .await
+                    }
+                    .await;
+                    ToolOutcome::Continue(render(GRAPH_SEMANTIC_SEARCH, result))
+                }
                 Err(error) => ToolOutcome::Continue(error.to_string()),
             }
         })

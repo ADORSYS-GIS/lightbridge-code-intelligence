@@ -34,6 +34,11 @@ pub struct GraphNodePayload {
     pub label: String,
     pub source_file: String,
     pub start_line: i64,
+    /// Embedding of the symbol's definition text (ADR-0114), when a correlated chunk was found.
+    /// `None` for a symbol kind the chunker doesn't produce a chunk for — it still gets structural
+    /// edges, it just won't surface from a semantic search until a chunk-producing edit touches it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub embedding: Option<Vec<f32>>,
 }
 
 /// One directed edge (`contains` / `method` / `calls` / …).

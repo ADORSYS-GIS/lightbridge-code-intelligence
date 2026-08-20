@@ -187,7 +187,20 @@ impl AppState {
             .await?;
         }
         let neo4j = match neo4j::connect_from_env().await {
-            Ok(handle) => handle.map(Arc::new),
+            Ok(Some(graph)) => {
+                // Hybrid-search index bootstrap (ADR-0114). Idempotent, but best-effort like the
+                // connection itself: a bootstrap failure disables hybrid search, not the whole
+                // control plane — structural graph reads/writes don't depend on these indexes.
+                let dimension = embeddings.dimension.unwrap_or(4096);
+                if let Err(error) = neo4j::ensure_indexes(&graph, dimension).await {
+                    tracing::error!(
+                        ?error,
+                        "neo4j index bootstrap failed; hybrid search disabled"
+                    );
+                }
+                Some(Arc::new(graph))
+            }
+            Ok(None) => None,
             // A graph store outage shouldn't stop the control plane from serving everything else;
             // the graph-ingest route fails closed (503) when this is None.
             Err(error) => {

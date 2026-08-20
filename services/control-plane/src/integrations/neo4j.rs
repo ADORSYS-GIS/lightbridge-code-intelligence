@@ -18,6 +18,9 @@ pub struct GraphNode {
     pub source_file: String,
     /// 1-based start line (as emitted by `lci-codegraph`).
     pub start_line: i64,
+    /// Embedding of the symbol's definition text (ADR-0114), when the runner found a correlated
+    /// chunk to embed. `None` leaves any existing `s.embedding` untouched on a re-index.
+    pub embedding: Option<Vec<f32>>,
 }
 
 /// One directed edge (`contains` / `method` / `calls` / …).
@@ -63,17 +66,22 @@ pub async fn upsert_graph(
     let mut txn = graph.start_txn().await.context("begin neo4j txn")?;
 
     for n in nodes {
+        // `$embedding` is sent as an empty list when `n.embedding` is `None`, which is otherwise
+        // meaningless for an embedding vector — a safe "no update" sentinel so a re-index that only
+        // recomputed structural facts doesn't wipe an existing embedding.
         txn.run(
             query(
                 "MERGE (s:Symbol {repo_id: $repo, commit: $commit, node_id: $id}) \
-                 SET s.label = $label, s.source_file = $file, s.start_line = $line",
+                 SET s.label = $label, s.source_file = $file, s.start_line = $line, \
+                     s.embedding = CASE WHEN size($embedding) > 0 THEN $embedding ELSE s.embedding END",
             )
             .param("repo", repository_id)
             .param("commit", commit_sha)
             .param("id", n.node_id.as_str())
             .param("label", n.label.as_str())
             .param("file", n.source_file.as_str())
-            .param("line", n.start_line),
+            .param("line", n.start_line)
+            .param("embedding", n.embedding.clone().unwrap_or_default()),
         )
         .await
         .context("merge symbol node")?;
@@ -254,9 +262,169 @@ pub async fn get_callers(
     Ok(hits)
 }
 
+/// Create the vector and fulltext indexes hybrid search needs, if they don't already exist
+/// (ADR-0114). Idempotent, so safe to call on every startup, mirroring how Postgres migrations
+/// already run unconditionally on connect.
+///
+/// `dimension` should match the configured embeddings model's output size (4096 is the default when
+/// `embeddings.dimension` is unset) — the same value `reconcile_embedding_dimension` uses for the
+/// pgvector column. Cypher schema DDL can't be parameterized, so the value is interpolated directly,
+/// which is safe here since it comes from trusted server-side config, never request input.
+pub async fn ensure_indexes(graph: &Graph, dimension: i64) -> anyhow::Result<()> {
+    create_index_idempotent(
+        graph,
+        &format!(
+            "CREATE VECTOR INDEX symbol_embedding_idx IF NOT EXISTS \
+             FOR (s:Symbol) ON s.embedding \
+             OPTIONS {{ indexConfig: {{ \
+               `vector.dimensions`: {dimension}, \
+               `vector.similarity_function`: 'cosine' \
+             }}}}"
+        ),
+        "symbol_embedding_idx",
+    )
+    .await?;
+    create_index_idempotent(
+        graph,
+        "CREATE FULLTEXT INDEX symbol_label_fulltext IF NOT EXISTS \
+         FOR (s:Symbol) ON EACH [s.label, s.source_file]",
+        "symbol_label_fulltext",
+    )
+    .await?;
+    Ok(())
+}
+
+/// `CREATE ... IF NOT EXISTS` is not atomic across concurrent callers — multiple roles can open a
+/// Neo4j connection at startup, and the losing caller gets a hard
+/// `Neo.ClientError.Schema.EquivalentSchemaRuleAlreadyExists` rather than a silent no-op. The desired
+/// end state (the index exists) is reached either way, so that specific outcome is treated as success
+/// here; anything else still propagates.
+async fn create_index_idempotent(graph: &Graph, ddl: &str, name: &str) -> anyhow::Result<()> {
+    use anyhow::Context;
+    match graph.run(query(ddl)).await {
+        Ok(()) => Ok(()),
+        Err(error) if error.to_string().contains("already exists") => {
+            tracing::debug!(%error, name, "index already exists (lost a startup race, not a failure)");
+            Ok(())
+        }
+        Err(error) => Err(error).with_context(|| format!("create {name}")),
+    }
+}
+
+/// Hybrid symbol search: lexical (fulltext on `label`/`source_file`) + semantic (vector on
+/// `embedding`), fused by weighted reciprocal rank (WRRF) — Neo4j's documented hybrid-search pattern,
+/// not an ad hoc union (ADR-0114). Scoped by `(repository_id, commit_sha)` like every other query in
+/// this module. Takes an already-computed `query_embedding`; never embeds anything itself, so any
+/// caller with its own embedder can reuse it.
+///
+/// `source_k` bounds how many candidates each branch contributes before fusion; `final_k` bounds the
+/// fused result. `RRF_CONSTANT = 60.0` is Neo4j's documented default.
+///
+/// Uses the `db.index.vector.queryNodes()` procedure form rather than the newer
+/// `SEARCH ... IN (VECTOR INDEX...)` clause syntax.
+pub async fn hybrid_symbol_search(
+    graph: &Graph,
+    repository_id: i64,
+    commit_sha: &str,
+    query_text: &str,
+    query_embedding: &[f32],
+    source_k: i64,
+    final_k: i64,
+) -> anyhow::Result<Vec<SymbolHit>> {
+    use anyhow::Context;
+    const RRF_CONSTANT: f64 = 60.0;
+
+    let mut rows = graph
+        .execute(
+            query(
+                "CALL () { \
+                   CALL db.index.fulltext.queryNodes('symbol_label_fulltext', $query, {limit: $sourceK}) \
+                   YIELD node AS s \
+                   WHERE s.repo_id = $repo AND s.commit = $commit \
+                   WITH collect(s) AS hits \
+                   UNWIND CASE WHEN size(hits) = 0 THEN [] ELSE range(0, size(hits) - 1) END AS rankIndex \
+                   RETURN hits[rankIndex] AS s, rankIndex + 1 AS sourceRank \
+                   UNION ALL \
+                   CALL db.index.vector.queryNodes('symbol_embedding_idx', $sourceK, $queryVector) \
+                   YIELD node AS s \
+                   WHERE s.repo_id = $repo AND s.commit = $commit \
+                   WITH collect(s) AS hits \
+                   UNWIND CASE WHEN size(hits) = 0 THEN [] ELSE range(0, size(hits) - 1) END AS rankIndex \
+                   RETURN hits[rankIndex] AS s, rankIndex + 1 AS sourceRank \
+                 } \
+                 WITH s, sum(1.0 / ($rrfConstant + sourceRank)) AS wrrf \
+                 ORDER BY wrrf DESC \
+                 LIMIT $finalK \
+                 RETURN s.node_id AS node_id, s.label AS label, s.source_file AS source_file, \
+                        s.start_line AS start_line",
+            )
+            .param("repo", repository_id)
+            .param("commit", commit_sha)
+            .param("query", escape_lucene_query(query_text))
+            .param("queryVector", query_embedding.to_vec())
+            .param("sourceK", source_k)
+            .param("finalK", final_k)
+            .param("rrfConstant", RRF_CONSTANT),
+        )
+        .await
+        .context("hybrid_symbol_search query")?;
+
+    let mut hits = Vec::new();
+    while let Some(row) = rows.next().await.context("hybrid_symbol_search row")? {
+        if let Some(hit) = symbol_from_row(&row) {
+            hits.push(hit);
+        }
+    }
+    Ok(hits)
+}
+
+/// Escape Lucene query-syntax metacharacters in free text before it's sent to
+/// `db.index.fulltext.queryNodes`. The query is a natural-language string, not a hand-written Lucene
+/// query — an unescaped `(`, `:`, or unbalanced `"` throws a Lucene parse error that fails the entire
+/// call, not just the fulltext branch. Escaping treats the whole string as literal terms, which is the
+/// right semantics for free text.
+fn escape_lucene_query(text: &str) -> String {
+    const SPECIAL: &[char] = &[
+        '\\', '+', '-', '!', '(', ')', ':', '^', '[', ']', '"', '{', '}', '~', '*', '?', '|', '&',
+        '/',
+    ];
+    let mut escaped = String::with_capacity(text.len());
+    for c in text.chars() {
+        if SPECIAL.contains(&c) {
+            escaped.push('\\');
+        }
+        escaped.push(c);
+    }
+    escaped
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn escapes_lucene_metacharacters_a_model_query_could_plausibly_contain() {
+        assert_eq!(
+            escape_lucene_query("retry logic (with backoff)"),
+            r"retry logic \(with backoff\)"
+        );
+        assert_eq!(
+            escape_lucene_query("how does auth: refresh work?"),
+            r"how does auth\: refresh work\?"
+        );
+        assert_eq!(
+            escape_lucene_query(r#"a "quoted" phrase"#),
+            r#"a \"quoted\" phrase"#
+        );
+    }
+
+    #[test]
+    fn leaves_plain_natural_language_untouched() {
+        assert_eq!(
+            escape_lucene_query("retry a failed payment charge with backoff"),
+            "retry a failed payment charge with backoff"
+        );
+    }
 
     /// Live round-trip against a real Neo4j (the compose service). Ignored by default — CI has no
     /// Neo4j — run with `cargo test -p control-plane --ignored` after `docker compose up -d neo4j`.
@@ -283,12 +451,14 @@ mod tests {
                 label: "add()".into(),
                 source_file: "src/math.rs".into(),
                 start_line: 2,
+                embedding: None,
             },
             GraphNode {
                 node_id: "src_math_calc_bump".into(),
                 label: "bump()".into(),
                 source_file: "src/math.rs".into(),
                 start_line: 6,
+                embedding: None,
             },
         ];
         let edges = vec![GraphEdge {
@@ -378,6 +548,7 @@ mod tests {
             label: format!("{id}()"),
             source_file: "src/x.rs".into(),
             start_line: 1,
+            embedding: None,
         };
         let keep_sha = "graph-keep-sha";
         let stale_sha = "graph-stale-sha";
