@@ -92,7 +92,7 @@ future decision once this half has shipped and been used, not committed to here.
 
 - **Attach embeddings inline, in the same batch that creates the `:Symbol` nodes (chosen).**
   `agent-runner`'s indexer correlates each `lci-codegraph`-produced symbol against the chunker's
-  already-embedded chunks by `(file_path, start_line)`, then sends one combined upsert (structure +
+  already-embedded chunks by range containment (see §1), then sends one combined upsert (structure +
   embedding) to control-plane. Simple: one write, no separate re-runnable step to operate.
 - **A separate, re-runnable backfill pass** (`MATCH (s:Symbol) WHERE s.embedding IS NULL ...`, embed,
   patch back) — the pattern a [reviewed external write-up](https://www.linkedin.com/pulse/vector-indexing-plus-knowledge-graphs-neo4j-jeff-tallman-ayxve/)
@@ -112,7 +112,8 @@ future decision once this half has shipped and been used, not committed to here.
 ### 1. Two new Neo4j indexes, no change to the existing schema
 
 ```cypher
--- Semantic signal. Verified working on this cluster's real neo4j:5.26-community.
+-- Semantic signal. `vector.dimensions` matches the configured embeddings model's output size
+-- (4096 by default, same value pgvector's chunk column reconciles against).
 CREATE VECTOR INDEX symbol_embedding_idx IF NOT EXISTS
 FOR (s:Symbol) ON s.embedding
 OPTIONS { indexConfig: {
@@ -131,11 +132,21 @@ new, optional property — nodes indexed before this ships simply lack it until 
 are created idempotently at control-plane startup (`neo4j::ensure_indexes`, called once the Neo4j
 connection is established in `main.rs`), so a fresh cluster gets them without a manual migration step.
 
+**Idempotent under concurrent startup, not just repeated calls.** More than one role opens a Neo4j
+connection at startup (control-plane and the standalone MCP server both do), so `ensure_indexes` can run
+concurrently from two processes at once. `CREATE ... IF NOT EXISTS` is not atomic across sessions — the
+losing caller doesn't get a silent no-op, it gets a hard schema-conflict error even though the index it
+wanted now exists. `ensure_indexes` treats that specific outcome as success rather than propagating it,
+so a multi-role startup race converges on the same end state (the index exists) instead of one role
+logging a spurious failure.
+
 **Who writes it:** `agent-runner`'s indexer (`services/agent-runner/src/indexer/graph.rs`), reusing the
 same `EmbeddingsClient` already injected for chunk embedding — not `lci-codegraph`, which stays a pure
 structural walker (see Decision Drivers). Symbol text for embedding is correlated in-tree against the
-chunker's already-collected chunks by `(file_path, start_line)`, rather than requiring an upstream
-change to `lci-codegraph` to expose `end_line`.
+chunker's already-collected chunks by range containment — a symbol's start line falling inside a
+chunk's `[start_line, end_line]` span, rather than an exact line match — since the two walks number
+lines by different conventions and a symbol nested inside a larger chunk (e.g. a method inside an
+`impl` block) should still resolve to that chunk's text.
 
 ### 2. Hybrid search via Weighted Reciprocal Rank Fusion (WRRF)
 
@@ -143,33 +154,45 @@ Neo4j's documented hybrid-search pattern scores each source by *rank*, not raw s
 contributions for a result that appears in multiple sources:
 
 ```cypher
-CALL (query, queryVector) {
-  CALL db.index.fulltext.queryNodes('symbol_label_fulltext', query, {limit: $sourceK})
-  YIELD node AS s, score
+CALL () {
+  CALL db.index.fulltext.queryNodes('symbol_label_fulltext', $query, {limit: $sourceK})
+  YIELD node AS s
+  WHERE s.repo_id = $repo AND s.commit = $commit
   WITH collect(s) AS hits
   UNWIND CASE WHEN size(hits) = 0 THEN [] ELSE range(0, size(hits) - 1) END AS rankIndex
-  RETURN hits[rankIndex] AS s, 'lexical' AS source, rankIndex + 1 AS sourceRank
+  RETURN hits[rankIndex] AS s, rankIndex + 1 AS sourceRank
 
   UNION ALL
 
-  CALL db.index.vector.queryNodes('symbol_embedding_idx', $sourceK, queryVector)
-  YIELD node AS s, score
+  CALL db.index.vector.queryNodes('symbol_embedding_idx', $sourceK, $queryVector)
+  YIELD node AS s
+  WHERE s.repo_id = $repo AND s.commit = $commit
   WITH collect(s) AS hits
   UNWIND CASE WHEN size(hits) = 0 THEN [] ELSE range(0, size(hits) - 1) END AS rankIndex
-  RETURN hits[rankIndex] AS s, 'semantic' AS source, rankIndex + 1 AS sourceRank
+  RETURN hits[rankIndex] AS s, rankIndex + 1 AS sourceRank
 }
-WITH s, source, sourceRank, coalesce($sourceWeights[source], 1.0) AS weight
-WITH s, sum(weight / ($rrfConstant + sourceRank)) AS wrrf
+WITH s, sum(1.0 / ($rrfConstant + sourceRank)) AS wrrf
 ORDER BY wrrf DESC
 LIMIT $finalK
 RETURN s.node_id AS node_id, s.label AS label, s.source_file AS source_file,
-       s.start_line AS start_line, wrrf;
+       s.start_line AS start_line;
 ```
 
-**Version note, confirmed against this deployment:** Neo4j's docs show two syntaxes — a newer
-`SEARCH ... IN (VECTOR INDEX ...) SCORE AS score` clause, and the `db.index.vector.queryNodes()`
-procedure form. This project's own live test against `neo4j:5.26-community` used the **procedure
-form** successfully; that's what the query above uses, not the newer clause syntax.
+Uses the `db.index.vector.queryNodes()` procedure form rather than the newer
+`SEARCH ... IN (VECTOR INDEX ...)` clause syntax.
+
+`$query` is passed through a Lucene-metacharacter escape first — the query text is model-authored
+natural language, not hand-written Lucene syntax, and an unescaped `(`, `:`, or unbalanced `"` would
+otherwise throw a parse error that fails the whole call, not just the fulltext branch.
+
+**A real scoping limitation, disclosed rather than hidden:** both index procedures rank across the
+entire `:Symbol` index — every repository, every retained commit — and only truncate to `sourceK`
+*before* the `WHERE repo_id/commit` filter runs; Neo4j has no pre-filtered vector search in this
+version to push the filter earlier. In a multi-repo, multi-commit deployment, a small `sourceK` can
+mean a repository's real match never survives to the filter. `sourceK` is kept deliberately large (500)
+as a mitigation, not a structural fix — a per-repo/snapshot-scoped index, or Neo4j's filtered vector
+search once available in this deployment's version, is the real fix and is tracked as a follow-up
+rather than attempted here.
 
 **Structural signal, deliberately simplified:** the documented pattern's third source is a GDS FastRP
 node-embedding index — real, but it needs the separate Graph Data Science plugin and is heavier than
@@ -204,10 +227,12 @@ pub async fn hybrid_symbol_search(
 additive entry in the per-tier tool allowlist ([ADR-0062](0062-two-tier-review-fast-auto-deep-on-demand.md)),
 next to — not instead of — `lightbridge_graph_find_symbol` and `lightbridge_graph_get_callers`, which
 keep their exact current code and registration. The runner embeds the query with its existing per-task
-credential and calls a new `POST /internal/tasks/{id}/graph/hybrid_search`, which wraps
-`hybrid_symbol_search`. `mcp/tools.rs`'s existing `graph_search` function (today: `find_symbol` /
-`get_callers` only) is left alone — the new tool is new code, not a third branch bolted onto that
-dispatcher's exhaustive match.
+credential, then calls the existing `POST /internal/tasks/{id}/graph/query` endpoint with a new
+`op: "hybrid_search"` — no new route, just a new branch in that endpoint's existing op dispatch, which
+wraps `hybrid_symbol_search`. This is a different surface from control-plane's own standalone external
+MCP server (`mcp/tools.rs`, for third-party clients like Claude Desktop); that server's `graph_search`
+function still only offers `find_symbol`/`get_callers` and is untouched — exposing the new tool there
+is a separate, later decision, not part of this ADR.
 
 ## Consequences
 
@@ -220,12 +245,16 @@ dispatcher's exhaustive match.
 - **Good:** closes a real, concrete gap (see "What this closes for the review agent" above) rather than
   adding a tool speculatively — the review agent previously had no reliable path from "semantically
   similar" to "a graph node it can traverse."
-- **Bad:** real new engineering — two indexes, a fused-ranking query, a new internal endpoint, a new MCP
-  tool, and index-time embedding added to the runner's indexer. ADR-0089's own accepted cost line still
-  applies: roughly double the embedding-API calls at index time (symbols ≈ chunks in count).
+- **Bad:** real new engineering — two indexes, a fused-ranking query, a new op on an existing internal
+  endpoint, a new MCP tool, and index-time embedding added to the runner's indexer. ADR-0089's own
+  accepted cost line still applies: roughly double the embedding-API calls at index time (symbols ≈
+  chunks in count).
 - **Bad:** the structural signal is a deliberate simplification (hop-distance follow-up, not a true
   FastRP-ranked third source) — a real, disclosed scope reduction from Neo4j's full documented pattern,
   not the whole thing.
+- **Bad:** the index scan ranks globally, ahead of the repo/commit filter — a real, disclosed scoping
+  limitation (see §2 above), mitigated by a large `sourceK` rather than structurally fixed. A very large
+  or very actively indexed deployment could still exceed it.
 - **Neutral:** the frontend-facing half (search endpoint, standing control-plane embeddings credential,
   graph-rendering library) is deferred — see [Scope](#scope) — and will need its own decision, informed
   by how this half performs in practice, before it's built.
