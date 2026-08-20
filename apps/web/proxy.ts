@@ -10,10 +10,11 @@ import {
 } from "@lightbridge/auth";
 import { type NextRequest, NextResponse } from "next/server";
 
-// Protect the dashboard (and anything under it). Runs on the Edge runtime — uses `jose` only.
+// Protect the dashboard (and anything under it). Next.js 16 Proxy defaults to the Node.js
+// runtime; this file only uses Edge-safe `jose` and `fetch`, so it works in either.
 export const config = { matcher: ["/dashboard", "/dashboard/:path*"] };
 
-export async function middleware(req: NextRequest) {
+export async function proxy(req: NextRequest) {
   const token = req.cookies.get(SESSION_COOKIE)?.value;
   const claims = token ? await verifyAccessToken(token, verifyConfigFromEnv()) : null;
 

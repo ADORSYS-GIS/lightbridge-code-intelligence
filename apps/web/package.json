@@ -6,6 +6,7 @@
     "dev": "next dev",
     "build": "next build",
     "start": "node .next/standalone/apps/web/server.js",
+    "typecheck": "tsc --noEmit",
     "lint": "biome check ."
   },
   "dependencies": {
@@ -13,23 +14,23 @@
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
     "cmdk": "^1.1.1",
-    "jose": "^5.9.6",
-    "lucide-react": "^0.468.0",
-    "next": "^15.0.0",
-    "nuqs": "^2.8.9",
-    "openid-client": "^6.1.7",
-    "react": "^19.0.0",
-    "react-dom": "^19.0.0",
-    "tailwind-merge": "^2.5.5"
+    "jose": "^6.2.9",
+    "lucide-react": "^1.33.0",
+    "next": "^16.3.1",
+    "nuqs": "^2.9.6",
+    "openid-client": "^6.8.6",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8",
+    "tailwind-merge": "^3.6.0"
   },
   "devDependencies": {
     "@lightbridge/tsconfig": "workspace:*",
-    "@tailwindcss/postcss": "^4.0.0",
-    "@types/node": "^22.0.0",
-    "@types/react": "^19.0.0",
-    "@types/react-dom": "^19.0.0",
-    "daisyui": "^5.5.23",
-    "tailwindcss": "^4.0.0",
-    "typescript": "^5.6.0"
+    "@tailwindcss/postcss": "^4.3.3",
+    "@types/node": "^26.2.0",
+    "@types/react": "^19.2.18",
+    "@types/react-dom": "^19.2.4",
+    "daisyui": "^5.7.19",
+    "tailwindcss": "^4.3.3",
+    "typescript": "^7.0.2"
   }
 }
