@@ -1,5 +1,12 @@
 # Pin the Rust toolchain for the whole workspace (cargo/rustup read this from the project root,
 # including when builds are invoked under turbo). The default `stable` (1.91.0) is too old for
 # sqlx@0.9.0, which requires rustc >= 1.94.0 — see the sqlx "rust-version" MSRV.
+#
+# `components` matters as much as `channel`: CI runners provision with rustup's `minimal` profile
+# (rustc+cargo only) and only get rustfmt/clippy because those happened to already be baked into
+# the image's pre-existing default toolchain. Pinning a channel that image doesn't already have
+# makes rustup fetch it fresh under that same minimal profile -- silently dropping rustfmt/clippy
+# unless this file asks for them itself.
 [toolchain]
 channel = "1.95.0"
+components = ["rustfmt", "clippy"]
