@@ -8,7 +8,7 @@ OIDC against Keycloak (Authorization Code + PKCE,
 [ADR-0014](../../docs/adr/0014-keycloak-oidc-resource-server.md)); the app stores no credentials.
 Authorization is **permission-based** ([ADR-0023](../../docs/adr/0023-db-backed-rbac.md)): the token
 carries a `permissions` list under a configurable claim, and both the control plane and the UI gate on
-capabilities (`task:read/cancel`, `repo:read/approve/deny`, `review:read`, …). `middleware.ts` guards
+capabilities (`task:read/cancel`, `repo:read/approve/deny`, `review:read`, …). `proxy.ts` guards
 `/dashboard/*`.
 
 ## Surfaces
@@ -42,7 +42,7 @@ lib/
   server/            server-side API clients (control-plane calls, admin)
   utils/             cross-cutting helpers (cn, config)
   hooks/             shared client hooks
-middleware.ts        permission gate for /dashboard/*
+proxy.ts             permission gate for /dashboard/*
 ```
 
 ## Design system

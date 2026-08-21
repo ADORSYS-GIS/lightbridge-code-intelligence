@@ -14,3 +14,7 @@ allowBuilds:
 minimumReleaseAgeExclude:
   - '@opencode-ai/plugin@1.18.2'
   - '@opencode-ai/sdk@1.18.2'
+  - '@turbo/linux-64@2.10.11'
+  - daisyui@5.7.19
+  - turbo@2.10.11
+  - lucide-react@1.33.0
