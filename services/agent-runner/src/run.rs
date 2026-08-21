@@ -408,7 +408,9 @@ async fn perform_indexing(
     let graph = match graph_result {
         Ok((nodes, edges)) => format!("{nodes} nodes / {edges} edges"),
         Err(error) => {
-            tracing::warn!(%error, "structural graph indexing failed (non-fatal)");
+            // Alternate formatting keeps the full causal chain, which operators need to diagnose the failure.
+            let detail = format!("{error:#}");
+            tracing::warn!(error = %detail, "structural graph indexing failed (non-fatal)");
             "graph skipped".to_string()
         }
     };
