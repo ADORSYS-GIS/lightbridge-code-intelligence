@@ -246,7 +246,7 @@ A pnpm + Turborepo monorepo with a Cargo workspace and an `xtask` for Rust autom
 | `xtask` | Rust | Cargo `xtask` workspace automation — the Rust side of `just` (`cargo xtask ci\|fmt\|lint\|test\|build`) |
 | `tools/dashboard-gen` | Python | Generates the Grafana dashboards-as-code into the Helm chart. [README](tools/dashboard-gen/README.md) |
 | `docs/` | — | Documentation set, ADRs, RFCs, ways of working |
-| `deploy/` | — | Observability dashboards/chart + Keycloak realm export for the `ai-helm` deployment. Production image tags live in [`adorsys-gis/ai-helm-values`](https://github.com/adorsys-gis/ai-helm-values) (promoted by argocd-image-updater, GitOps). See [docs/kubernetes-deployment.md](docs/kubernetes-deployment.md). |
+| `deploy/` | — | Observability dashboards/chart + Keycloak realm export for the `ai-helm` deployment, plus the central [environment variable reference](deploy/config-reference.md). Production image tags live in [`adorsys-gis/ai-helm-values`](https://github.com/adorsys-gis/ai-helm-values) (promoted by argocd-image-updater, GitOps). See [docs/kubernetes-deployment.md](docs/kubernetes-deployment.md). |
 
 ### Kubernetes layout
 
@@ -315,6 +315,7 @@ framework (Definition of Ready/Done, AI usage declarations). See
 - [Documentation index](docs/INDEX.md)
 - [Architecture Decision Records](docs/adr/README.md)
 - [RFCs](docs/rfc/README.md)
+- [Environment variable & configuration reference](deploy/config-reference.md)
 - [Contributing](CONTRIBUTING.md)
 
 ## Development status

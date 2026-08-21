@@ -34,6 +34,7 @@ repo as `converse-ui`). ai-helm's Application reads that file as its ArgoCD `$va
   before promoting an image.
 
 This repo's `deploy/` now holds only the **observability** dashboards/chart
-(`deploy/observability/`) and the **Keycloak realm** export (`deploy/keycloak/`). The chart
-itself tracks `ai-helm` `main`; only the image tags flow continuously, now from
-`ai-helm-values`.
+(`deploy/observability/`), the **Keycloak realm** export (`deploy/keycloak/`), and the
+[**configuration & environment variable reference**](config-reference.md) — a single documentation
+page, not something ArgoCD reads. The chart itself tracks `ai-helm` `main`; only the image tags flow
+continuously, now from `ai-helm-values`.
