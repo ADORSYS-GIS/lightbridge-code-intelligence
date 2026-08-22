@@ -812,9 +812,7 @@ pub async fn ingest_graph(
             StatusCode::NO_CONTENT.into_response()
         }
         Err(error) => {
-            // Alternate formatting keeps the full causal chain, which operators need to diagnose the failure.
-            let detail = format!("{error:#}");
-            tracing::error!(error = %detail, task_id = %id, "graph upsert failed");
+            tracing::error!(%error, task_id = %id, "graph upsert failed");
             (StatusCode::INTERNAL_SERVER_ERROR, "upsert error").into_response()
         }
     }
