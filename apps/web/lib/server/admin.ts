@@ -362,6 +362,20 @@ export type GraphApiResult<T> =
       detail?: string;
     };
 
+/** `get_graph`/`get_similar`'s `404` body shape (`GraphNotFound` in `admin.rs`) — both endpoints can
+ * 404 for more than one reason (repository not found vs., for `similar` only, no stored embedding),
+ * so the backend says which via `reason` instead of the frontend guessing from the status code alone
+ * (guessing is exactly the bug this replaced: every `similar` 404 used to be shown as "no stored
+ * embedding," even a repository-not-found one). Falls back to `"not_found"` if the body isn't the
+ * expected shape — the safer of the two misreads, since it's the reason both endpoints can produce. */
+async function parseGraphNotFound(
+  res: Response,
+): Promise<Extract<GraphApiResult<never>, { ok: false }>> {
+  const body = (await res.json().catch(() => null)) as { reason?: string; message?: string } | null;
+  const reason = body?.reason === "no_embedding" ? "no_embedding" : "not_found";
+  return { ok: false, reason, status: 404, detail: body?.message };
+}
+
 /** `GET /admin/repositories/{id}/graph[?node=&hops=&limit=]` — structural neighborhood browse.
  * `node` omitted returns an unseeded overview slice so the graph view is never empty on first load.
  * Needs `repo:read`. */
@@ -381,14 +395,7 @@ export async function getRepoGraph(
       headers: { authorization: `Bearer ${t}`, accept: "application/json" },
       cache: "no-store",
     });
-    if (res.status === 404) {
-      return {
-        ok: false,
-        reason: "not_found",
-        status: 404,
-        detail: await res.text().catch(() => undefined),
-      };
-    }
+    if (res.status === 404) return parseGraphNotFound(res);
     if (!res.ok) return { ok: false, reason: classify(res.status), status: res.status };
     return { ok: true, data: (await res.json()) as GraphResponse };
   } catch {
@@ -398,9 +405,9 @@ export async function getRepoGraph(
 
 /** `GET /admin/repositories/{id}/symbols/{nodeId}/similar[?limit=]` — symbols found by meaning,
  * using `nodeId`'s own already-stored embedding as the query vector (no text is ever embedded at
- * request time). `404` when the symbol has no stored embedding (ADR-0114's coverage is not 100%) —
- * control-plane's own response body says so in plain text; `detail` forwards it verbatim.
- * Needs `repo:read`. */
+ * request time). `404` when the symbol has no stored embedding (ADR-0114's coverage is not 100%), or
+ * when the repository itself doesn't exist — `parseGraphNotFound` tells the two apart via the
+ * backend's own `reason`. Needs `repo:read`. */
 export async function getSimilarSymbols(
   id: number,
   nodeId: string,
@@ -417,14 +424,7 @@ export async function getSimilarSymbols(
         cache: "no-store",
       },
     );
-    if (res.status === 404) {
-      return {
-        ok: false,
-        reason: "no_embedding",
-        status: 404,
-        detail: await res.text().catch(() => undefined),
-      };
-    }
+    if (res.status === 404) return parseGraphNotFound(res);
     if (!res.ok) return { ok: false, reason: classify(res.status), status: res.status };
     return { ok: true, data: (await res.json()) as GraphResponse };
   } catch {

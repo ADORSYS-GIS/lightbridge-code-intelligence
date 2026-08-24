@@ -15,7 +15,11 @@ export async function GET(
   const url = new URL(request.url);
   const limit = url.searchParams.get("limit");
 
-  const result = await getSimilarSymbols(id, decodeURIComponent(nodeId), {
+  // `nodeId` is already decoded by Next.js's own dynamic-route-segment handling — re-decoding it
+  // here double-decoded anything the client had percent-escaped (e.g. `%2523` -> `%23` -> `#`
+  // instead of `#`), which could throw URIError on a malformed sequence or silently resolve the
+  // wrong node for an id containing a literal `%`.
+  const result = await getSimilarSymbols(id, nodeId, {
     limit: limit ? Number(limit) : undefined,
   });
 

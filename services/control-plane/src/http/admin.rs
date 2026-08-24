@@ -833,6 +833,18 @@ struct GraphResponse {
     edges: Vec<crate::integrations::neo4j::RelHit>,
 }
 
+/// A `404` body for `get_graph`/`get_similar` specifically. Both can 404 for more than one reason
+/// (repository not found vs., for `get_similar` only, the symbol having no stored embedding) — a
+/// bare status code can't tell those apart, and the frontend used to guess wrong (every `similar`
+/// 404 was shown as "no stored embedding," even a repository-not-found one). `reason` is the
+/// frontend's dispatch key; `message` is human copy for the case that doesn't get its own written
+/// copy client-side.
+#[derive(serde::Serialize)]
+struct GraphNotFound {
+    reason: &'static str,
+    message: &'static str,
+}
+
 /// The commit scope to query the graph at, for a repository as a whole (not a specific task/PR).
 /// `agent-runner`'s base-index write uses the repo's default branch name as the graph's `commit`
 /// property when there's no specific head SHA (see `indexer::graph::index_graph`) — this mirrors that
@@ -883,7 +895,16 @@ pub async fn get_graph(
     };
     let repo = match crate::db::get_repository_by_id(pool, id).await {
         Ok(Some(repo)) => repo,
-        Ok(None) => return (StatusCode::NOT_FOUND, "repository not found").into_response(),
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(GraphNotFound {
+                    reason: "not_found",
+                    message: "repository not found",
+                }),
+            )
+                .into_response();
+        }
         Err(error) => {
             tracing::error!(%error, repo_id = id, "graph endpoint: repository lookup failed");
             return (StatusCode::INTERNAL_SERVER_ERROR, "query error").into_response();
@@ -953,7 +974,16 @@ pub async fn get_similar(
     };
     let repo = match crate::db::get_repository_by_id(pool, id).await {
         Ok(Some(repo)) => repo,
-        Ok(None) => return (StatusCode::NOT_FOUND, "repository not found").into_response(),
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(GraphNotFound {
+                    reason: "not_found",
+                    message: "repository not found",
+                }),
+            )
+                .into_response();
+        }
         Err(error) => {
             tracing::error!(%error, repo_id = id, "similar endpoint: repository lookup failed");
             return (StatusCode::INTERNAL_SERVER_ERROR, "query error").into_response();
@@ -970,10 +1000,13 @@ pub async fn get_similar(
         Ok(Some(pair)) => pair,
         Ok(None) => {
             return (
-                    StatusCode::NOT_FOUND,
-                    "symbol has no stored embedding (not indexed, or no correlated chunk at index time)",
-                )
-                    .into_response();
+                StatusCode::NOT_FOUND,
+                Json(GraphNotFound {
+                    reason: "no_embedding",
+                    message: "symbol has no stored embedding (not indexed, or no correlated chunk at index time)",
+                }),
+            )
+                .into_response();
         }
         Err(error) => {
             tracing::error!(%error, repo_id = id, %node_id, "similar endpoint: embedding lookup failed");

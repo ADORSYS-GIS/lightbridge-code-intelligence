@@ -16,6 +16,15 @@ import { RELATION_STYLE, relationKind, SYMBOL_KIND_STYLE, symbolKind } from "@/l
 import type { GraphResponse } from "@/lib/server/admin";
 import { GRAPH_NODE_WIDTH, layoutGraph } from "./layout";
 
+/** Recomputes just a node's border color for the current selection — the only per-node thing that
+ * needs to change when `selectedNodeId` changes, so this is the only thing selection is allowed to
+ * touch (never position, which layout owns exclusively). */
+function withSelectionBorder(node: Node, selectedNodeId: string | undefined): Node["style"] {
+  const kindToken = (node.data as { kindToken?: string }).kindToken ?? "primary";
+  const borderToken = node.id === selectedNodeId ? "warning" : kindToken;
+  return { ...node.style, border: `2px solid var(--color-${borderToken})` };
+}
+
 /** The `@xyflow/react` canvas: turns a `GraphResponse` into a dagre-laid-out, kind-styled,
  * relation-styled diagram. Purely a renderer — all data fetching and interaction state (which node is
  * selected, browse vs. similar mode) lives in the parent panel; this component only calls back on a
@@ -29,12 +38,13 @@ export function CodeGraphCanvas({
   selectedNodeId?: string;
   onNodeSelect: (nodeId: string) => void;
 }) {
+  // Deliberately keyed on `data` alone, not `selectedNodeId`: dagre layout is expensive-ish and,
+  // more importantly, re-running it on every click would blow away wherever the user just dragged a
+  // node to. Selection highlighting is applied afterward, as a style patch (below), not baked in here.
   const { flowNodes, flowEdges } = useMemo(() => {
     const rawNodes: Node[] = data.nodes.map((n) => {
       const kind = symbolKind(n.label);
       const style = SYMBOL_KIND_STYLE[kind];
-      const selected = n.node_id === selectedNodeId;
-      const borderToken = selected ? "warning" : style.token;
       return {
         id: n.node_id,
         // `kindToken` rides along on `data` purely for the MiniMap's `nodeColor` callback below — the
@@ -50,11 +60,12 @@ export function CodeGraphCanvas({
         // (`base-100`) instead of a flat opacity, so the text color (also a daisyUI token) reads
         // correctly against it in both light and dark themes — a plain `<color>/15` alpha cut had near-
         // white text landing on a near-white background in dark mode, which is what made every label
-        // unreadable before this fix.
+        // unreadable before this fix. Border starts unselected; `withSelectionBorder` (below) patches
+        // it per the currently-selected node without touching layout.
         style: {
           width: GRAPH_NODE_WIDTH,
           borderRadius: 8,
-          border: `2px solid var(--color-${borderToken})`,
+          border: `2px solid var(--color-${style.token})`,
           background: `color-mix(in oklch, var(--color-${style.token}) 18%, var(--color-base-100))`,
           color: "var(--color-base-content)",
           fontSize: 12,
@@ -89,15 +100,29 @@ export function CodeGraphCanvas({
     });
 
     return { flowNodes: layoutGraph(rawNodes, rawEdges), flowEdges: rawEdges };
-  }, [data, selectedNodeId]);
+  }, [data]);
 
   const [nodes, setNodes, onNodesChange] = useNodesState(flowNodes);
   const [edges, setEdges, onEdgesChange] = useEdgesState(flowEdges);
 
+  // A real data change (new fetch) — the one case a full position reset is actually wanted.
+  // `selectedNodeId` is read here (so a refresh while a node is selected doesn't visually lose the
+  // highlight) but intentionally left out of the dependency array: this effect should fire on a new
+  // graph, not on every selection — the effect below handles selection changes without resetting
+  // positions.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: selectedNodeId read intentionally, not depended on — see comment above.
   useEffect(() => {
-    setNodes(flowNodes);
+    setNodes(flowNodes.map((n) => ({ ...n, style: withSelectionBorder(n, selectedNodeId) })));
     setEdges(flowEdges);
   }, [flowNodes, flowEdges, setNodes, setEdges]);
+
+  useEffect(() => {
+    // Selection-only change: patch the border on whatever's currently rendered — including any
+    // position the user just dragged a node to — instead of resetting from `flowNodes`.
+    setNodes((current) =>
+      current.map((n) => ({ ...n, style: withSelectionBorder(n, selectedNodeId) })),
+    );
+  }, [selectedNodeId, setNodes]);
 
   return (
     <div className="h-[600px] w-full overflow-hidden rounded-lg border border-base-content/15">
