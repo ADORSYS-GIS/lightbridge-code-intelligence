@@ -27,7 +27,7 @@ export async function GET(request: Request, { params }: { params: Promise<{ id: 
 
   if (!result.ok) {
     const status = result.status ?? (result.reason === "unauthenticated" ? 401 : 502);
-    return NextResponse.json({ error: result.reason }, { status });
+    return NextResponse.json({ code: result.reason, detail: result.detail }, { status });
   }
   return NextResponse.json(result.data);
 }

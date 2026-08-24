@@ -3,18 +3,29 @@
 import { Button } from "@/components/ui/button";
 import type { GraphSymbol } from "@/lib/server/admin";
 
-/** Side panel for the currently-selected symbol: identity, and the two actions that move the graph
- * view — expand its structural neighborhood, or find symbols like it by meaning. */
+/** A query against the selected node (e.g. "find similar") came back with a reason rather than a
+ * result — rendered as one short line right in this box, not by blanking the graph. */
+export interface InspectorNotice {
+  tone: "muted" | "error";
+  message: string;
+}
+
+/** Side panel for the currently-selected symbol: identity, the two actions that move the graph
+ * view — expand its structural neighborhood, or find symbols like it by meaning — and, if the last
+ * action didn't produce a result, one brief line saying why, right here instead of replacing the
+ * whole graph view. */
 export function NodeInspector({
   node,
   onExpand,
   onFindSimilar,
   similarActive,
+  notice,
 }: {
   node: GraphSymbol | null;
   onExpand: () => void;
   onFindSimilar: () => void;
   similarActive: boolean;
+  notice?: InspectorNotice | null;
 }) {
   if (!node) {
     return (
@@ -40,6 +51,11 @@ export function NodeInspector({
           Find similar (by meaning)
         </Button>
       </div>
+      {notice && (
+        <p className={`text-xs ${notice.tone === "error" ? "text-error" : "text-base-content/60"}`}>
+          {notice.message}
+        </p>
+      )}
     </div>
   );
 }

@@ -7,10 +7,38 @@ export type GraphMode =
   | { kind: "browse"; nodeId?: string; hops: number }
   | { kind: "similar"; nodeId: string };
 
+/** Mirrors `GraphApiResult`'s `reason` (`lib/server/admin.ts`) plus a catch-all for a fetch that
+ * never reached a JSON body at all (network error, non-JSON response) — kept distinct from the
+ * proxy's own `code` values so a caller can always tell "the server answered with a reason" apart
+ * from "nothing usable came back." */
+export type GraphErrorCode =
+  | "unauthenticated"
+  | "unavailable"
+  | "not_found"
+  | "no_embedding"
+  | "error";
+
+export interface GraphError {
+  code: GraphErrorCode;
+  detail?: string;
+}
+
 interface State {
   data: GraphResponse | null;
   loading: boolean;
-  error: string | null;
+  error: GraphError | null;
+}
+
+const GRAPH_ERROR_CODES: readonly GraphErrorCode[] = [
+  "unauthenticated",
+  "unavailable",
+  "not_found",
+  "no_embedding",
+  "error",
+];
+
+function isGraphErrorCode(value: unknown): value is GraphErrorCode {
+  return typeof value === "string" && (GRAPH_ERROR_CODES as readonly string[]).includes(value);
 }
 
 /** Drives the code-graph canvas: fetches either a structural neighborhood/overview (Tier 1, "browse")
@@ -33,18 +61,29 @@ export function useCodeGraph(repoId: number, mode: GraphMode) {
             })();
       const res = await fetch(url);
       if (!res.ok) {
-        const body = (await res.json().catch(() => null)) as { error?: string } | null;
-        setState({
-          data: null,
+        // The proxy route sends `{ code, detail }` for every ApiResult failure (see
+        // `GraphApiResult` in `lib/server/admin.ts`); its own `{ error: "invalid repository id" }`
+        // shape is the one case that isn't a `code` at all — treated as the generic fallback.
+        const body = (await res.json().catch(() => null)) as {
+          code?: string;
+          detail?: string;
+          error?: string;
+        } | null;
+        const code: GraphErrorCode = isGraphErrorCode(body?.code) ? body.code : "error";
+        // Keep the last successfully-rendered graph on screen (`s.data`) rather than blanking the
+        // canvas — a failed "find similar" (e.g. this node has no stored embedding) is an answer
+        // about *that query*, not a reason to throw away what was already showing.
+        setState((s) => ({
+          data: s.data,
           loading: false,
-          error: body?.error ?? `request failed (${res.status})`,
-        });
+          error: { code, detail: body?.detail ?? body?.error },
+        }));
         return;
       }
       const data = (await res.json()) as GraphResponse;
       setState({ data, loading: false, error: null });
     } catch {
-      setState({ data: null, loading: false, error: "network error" });
+      setState((s) => ({ data: s.data, loading: false, error: { code: "unavailable" } }));
     }
   }, [repoId, mode]);
 

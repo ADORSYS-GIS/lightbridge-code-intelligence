@@ -345,13 +345,30 @@ export interface GraphResponse {
   edges: GraphRel[];
 }
 
+/**
+ * `ApiResult`, but the two graph endpoints below need two more reasons `classify()`'s generic
+ * bucket doesn't have: a `404` from either one is a real, meaningful answer ("this repository/symbol
+ * doesn't have what you asked for"), not an infrastructure failure — collapsing it into the shared
+ * `"error"` bucket is what previously made a disclosed, expected case (a symbol with no stored
+ * embedding, ADR-0114's coverage is not 100%) indistinguishable from an actual 500. `detail` carries
+ * control-plane's own plain-text body so the UI can show real copy instead of a bare reason code.
+ */
+export type GraphApiResult<T> =
+  | { ok: true; data: T }
+  | {
+      ok: false;
+      reason: "unauthenticated" | "unavailable" | "error" | "not_found" | "no_embedding";
+      status?: number;
+      detail?: string;
+    };
+
 /** `GET /admin/repositories/{id}/graph[?node=&hops=&limit=]` — structural neighborhood browse.
  * `node` omitted returns an unseeded overview slice so the graph view is never empty on first load.
  * Needs `repo:read`. */
 export async function getRepoGraph(
   id: number,
   opts?: { node?: string; hops?: number; limit?: number },
-): Promise<ApiResult<GraphResponse>> {
+): Promise<GraphApiResult<GraphResponse>> {
   try {
     const t = await token();
     if (!t) return { ok: false, reason: "unauthenticated" };
@@ -364,6 +381,14 @@ export async function getRepoGraph(
       headers: { authorization: `Bearer ${t}`, accept: "application/json" },
       cache: "no-store",
     });
+    if (res.status === 404) {
+      return {
+        ok: false,
+        reason: "not_found",
+        status: 404,
+        detail: await res.text().catch(() => undefined),
+      };
+    }
     if (!res.ok) return { ok: false, reason: classify(res.status), status: res.status };
     return { ok: true, data: (await res.json()) as GraphResponse };
   } catch {
@@ -373,13 +398,14 @@ export async function getRepoGraph(
 
 /** `GET /admin/repositories/{id}/symbols/{nodeId}/similar[?limit=]` — symbols found by meaning,
  * using `nodeId`'s own already-stored embedding as the query vector (no text is ever embedded at
- * request time). `404` when the symbol has no stored embedding (ADR-0114's coverage is not 100%).
+ * request time). `404` when the symbol has no stored embedding (ADR-0114's coverage is not 100%) —
+ * control-plane's own response body says so in plain text; `detail` forwards it verbatim.
  * Needs `repo:read`. */
 export async function getSimilarSymbols(
   id: number,
   nodeId: string,
   opts?: { limit?: number },
-): Promise<ApiResult<GraphResponse>> {
+): Promise<GraphApiResult<GraphResponse>> {
   try {
     const t = await token();
     if (!t) return { ok: false, reason: "unauthenticated" };
@@ -391,6 +417,14 @@ export async function getSimilarSymbols(
         cache: "no-store",
       },
     );
+    if (res.status === 404) {
+      return {
+        ok: false,
+        reason: "no_embedding",
+        status: 404,
+        detail: await res.text().catch(() => undefined),
+      };
+    }
     if (!res.ok) return { ok: false, reason: classify(res.status), status: res.status };
     return { ok: true, data: (await res.json()) as GraphResponse };
   } catch {
