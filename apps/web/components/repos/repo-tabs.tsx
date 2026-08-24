@@ -18,6 +18,7 @@ export function RepoTabs({ id }: { id: number }) {
   const base = `/dashboard/repositories/${id}`;
   const tabs = [
     { href: base, label: "Overview" },
+    { href: `${base}/graph`, label: "Graph" },
     { href: `${base}/settings`, label: "Settings" },
   ];
 

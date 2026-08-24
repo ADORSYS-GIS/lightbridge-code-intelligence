@@ -322,3 +322,111 @@ export async function setRepoModel(id: number, model: string | null): Promise<bo
     return false;
   }
 }
+
+/** One graph node, as returned by every code-graph endpoint below. */
+export interface GraphSymbol {
+  node_id: string;
+  label: string;
+  source_file: string;
+  start_line: number;
+}
+
+/** One directed structural edge between two [`GraphSymbol`]s. */
+export interface GraphRel {
+  source: string;
+  target: string;
+  relation: string;
+}
+
+/** Shared response shape for every code-graph endpoint (mirrors control-plane's `GraphResponse`). */
+export interface GraphResponse {
+  commit: string;
+  nodes: GraphSymbol[];
+  edges: GraphRel[];
+}
+
+/**
+ * `ApiResult`, but the two graph endpoints below need two more reasons `classify()`'s generic
+ * bucket doesn't have: a `404` from either one is a real, meaningful answer ("this repository/symbol
+ * doesn't have what you asked for"), not an infrastructure failure, and deserves to stay
+ * distinguishable from an actual 500 rather than collapsing into the shared `"error"` bucket.
+ * `detail` carries control-plane's own message so the UI can show real copy instead of a bare
+ * reason code.
+ */
+export type GraphApiResult<T> =
+  | { ok: true; data: T }
+  | {
+      ok: false;
+      reason: "unauthenticated" | "unavailable" | "error" | "not_found" | "no_embedding";
+      status?: number;
+      detail?: string;
+    };
+
+/** `get_graph`/`get_similar`'s `404` body shape (`GraphNotFound` in `admin.rs`) — both endpoints can
+ * 404 for more than one reason (repository not found vs., for `similar` only, no stored embedding),
+ * so the backend states which via `reason` rather than the frontend inferring it from the status
+ * code alone. Falls back to `"not_found"` if the body isn't the expected shape — the safer of the
+ * two misreads, since it's the reason both endpoints can produce. */
+async function parseGraphNotFound(
+  res: Response,
+): Promise<Extract<GraphApiResult<never>, { ok: false }>> {
+  const body = (await res.json().catch(() => null)) as { reason?: string; message?: string } | null;
+  const reason = body?.reason === "no_embedding" ? "no_embedding" : "not_found";
+  return { ok: false, reason, status: 404, detail: body?.message };
+}
+
+/** `GET /admin/repositories/{id}/graph[?node=&hops=&limit=]` — structural neighborhood browse.
+ * `node` omitted returns an unseeded overview slice so the graph view is never empty on first load.
+ * Needs `repo:read`. */
+export async function getRepoGraph(
+  id: number,
+  opts?: { node?: string; hops?: number; limit?: number },
+): Promise<GraphApiResult<GraphResponse>> {
+  try {
+    const t = await token();
+    if (!t) return { ok: false, reason: "unauthenticated" };
+    const qs = new URLSearchParams();
+    if (opts?.node) qs.set("node", opts.node);
+    if (opts?.hops) qs.set("hops", String(opts.hops));
+    if (opts?.limit) qs.set("limit", String(opts.limit));
+    const suffix = qs.size > 0 ? `?${qs.toString()}` : "";
+    const res = await fetch(`${controlPlaneUrl()}/admin/repositories/${id}/graph${suffix}`, {
+      headers: { authorization: `Bearer ${t}`, accept: "application/json" },
+      cache: "no-store",
+    });
+    if (res.status === 404) return parseGraphNotFound(res);
+    if (!res.ok) return { ok: false, reason: classify(res.status), status: res.status };
+    return { ok: true, data: (await res.json()) as GraphResponse };
+  } catch {
+    return { ok: false, reason: "unavailable" };
+  }
+}
+
+/** `GET /admin/repositories/{id}/symbols/{nodeId}/similar[?limit=]` — symbols found by meaning,
+ * using `nodeId`'s own already-stored embedding as the query vector (no text is ever embedded at
+ * request time). `404` when the symbol has no stored embedding (ADR-0114's coverage is not 100%), or
+ * when the repository itself doesn't exist — `parseGraphNotFound` tells the two apart via the
+ * backend's own `reason`. Needs `repo:read`. */
+export async function getSimilarSymbols(
+  id: number,
+  nodeId: string,
+  opts?: { limit?: number },
+): Promise<GraphApiResult<GraphResponse>> {
+  try {
+    const t = await token();
+    if (!t) return { ok: false, reason: "unauthenticated" };
+    const qs = opts?.limit ? `?limit=${opts.limit}` : "";
+    const res = await fetch(
+      `${controlPlaneUrl()}/admin/repositories/${id}/symbols/${encodeURIComponent(nodeId)}/similar${qs}`,
+      {
+        headers: { authorization: `Bearer ${t}`, accept: "application/json" },
+        cache: "no-store",
+      },
+    );
+    if (res.status === 404) return parseGraphNotFound(res);
+    if (!res.ok) return { ok: false, reason: classify(res.status), status: res.status };
+    return { ok: true, data: (await res.json()) as GraphResponse };
+  } catch {
+    return { ok: false, reason: "unavailable" };
+  }
+}

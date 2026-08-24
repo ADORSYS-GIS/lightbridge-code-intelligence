@@ -817,6 +817,230 @@ pub async fn set_settings_override(
     }
 }
 
+// ── Code graph ───────────────────────────────────────────────────────────────────────────────
+//
+// Two read-only views over the same Neo4j graph the review agent's `lightbridge_graph_semantic_search`
+// tool queries, sharing one response shape (`GraphResponse`) so a single frontend renderer serves
+// both. Neither endpoint embeds any user-typed text: `similar` reuses a symbol's own already-stored
+// embedding as the query vector, so the same node always produces the same result with no new
+// embeddings credential and nothing that can fail on unusual input.
+
+/// Shared response shape for every graph-browsing endpoint below.
+#[derive(serde::Serialize)]
+struct GraphResponse {
+    commit: String,
+    nodes: Vec<crate::integrations::neo4j::SymbolHit>,
+    edges: Vec<crate::integrations::neo4j::RelHit>,
+}
+
+/// A `404` body for `get_graph`/`get_similar`. Both can 404 for more than one reason — repository
+/// not found, or, for `get_similar` only, the symbol having no stored embedding — and a bare status
+/// code can't tell those apart. `reason` is the frontend's dispatch key; `message` is human copy for
+/// the case that doesn't get its own written copy client-side.
+#[derive(serde::Serialize)]
+struct GraphNotFound {
+    reason: &'static str,
+    message: &'static str,
+}
+
+/// The commit scope to query the graph at, for a repository as a whole (not a specific task/PR).
+/// `agent-runner`'s base-index write uses the repo's default branch name as the graph's `commit`
+/// property when there's no specific head SHA (see `indexer::graph::index_graph`) — this mirrors that
+/// exactly, rather than assuming a `latest_indexed_commit` column that doesn't exist.
+fn repo_commit_scope(repo: &crate::db::RepositoryRow) -> &str {
+    &repo.default_branch
+}
+
+/// Query params shared by the neighborhood/overview endpoint.
+#[derive(Debug, Deserialize)]
+pub struct GraphQuery {
+    /// Seed symbol to center the view on. Omitted on first load — falls back to an unseeded slice of
+    /// the graph so the canvas is never empty.
+    node: Option<String>,
+    /// Hops out from `node`, clamped to 1..=3 server-side regardless of what's requested.
+    hops: Option<i64>,
+    limit: Option<i64>,
+}
+
+const GRAPH_NODE_LIMIT_DEFAULT: i64 = 60;
+const GRAPH_NODE_LIMIT_MAX: i64 = 200;
+/// Smaller default specifically for the unseeded overview — see `get_graph`'s `None` arm.
+const GRAPH_OVERVIEW_LIMIT_DEFAULT: i64 = 25;
+
+fn clamp_graph_limit(limit: Option<i64>) -> i64 {
+    limit
+        .unwrap_or(GRAPH_NODE_LIMIT_DEFAULT)
+        .clamp(1, GRAPH_NODE_LIMIT_MAX)
+}
+
+/// `GET /admin/repositories/{id}/graph?node=&hops=&limit=` — structural neighborhood browse.
+/// `node` omitted returns an unseeded overview slice instead of an error, so the graph tab always has
+/// something to render on first load.
+pub async fn get_graph(
+    caller: Caller,
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Query(q): Query<GraphQuery>,
+) -> Response {
+    if let Err(e) = caller.require("repo:read") {
+        return e.into_response();
+    }
+    let Some(pool) = state.db.as_ref() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "no database").into_response();
+    };
+    let Some(neo4j) = state.neo4j.as_ref() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "neo4j not configured").into_response();
+    };
+    let repo = match crate::db::get_repository_by_id(pool, id).await {
+        Ok(Some(repo)) => repo,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(GraphNotFound {
+                    reason: "not_found",
+                    message: "repository not found",
+                }),
+            )
+                .into_response();
+        }
+        Err(error) => {
+            tracing::error!(%error, repo_id = id, "graph endpoint: repository lookup failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "query error").into_response();
+        }
+    };
+    let commit = repo_commit_scope(&repo).to_string();
+
+    let result = match q.node.as_deref() {
+        Some(node_id) => {
+            crate::integrations::neo4j::graph_neighborhood(
+                neo4j,
+                id,
+                &commit,
+                node_id,
+                q.hops.unwrap_or(1),
+                clamp_graph_limit(q.limit),
+            )
+            .await
+        }
+        // The unseeded overview has no natural grouping (just "the first N symbols in file order"),
+        // so a flat cap that reads fine for a focused neighborhood renders as an illegible hairball
+        // here — a smaller default specifically for this case keeps the first render readable.
+        None => {
+            let overview_limit = q
+                .limit
+                .unwrap_or(GRAPH_OVERVIEW_LIMIT_DEFAULT)
+                .clamp(1, GRAPH_NODE_LIMIT_MAX);
+            crate::integrations::neo4j::graph_overview(neo4j, id, &commit, overview_limit).await
+        }
+    };
+    match result {
+        Ok((nodes, edges)) => Json(GraphResponse {
+            commit,
+            nodes,
+            edges,
+        })
+        .into_response(),
+        Err(error) => {
+            tracing::error!(%error, repo_id = id, "graph endpoint: query failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "query error").into_response()
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SimilarQuery {
+    limit: Option<i64>,
+}
+
+/// `GET /admin/repositories/{id}/symbols/{node_id}/similar` — symbols found by meaning. The query
+/// vector is the symbol's own already-stored embedding, never text embedded at request time: the same
+/// node always returns the same result, and this needs no new embeddings credential on control-plane.
+pub async fn get_similar(
+    caller: Caller,
+    State(state): State<AppState>,
+    Path((id, node_id)): Path<(i64, String)>,
+    Query(q): Query<SimilarQuery>,
+) -> Response {
+    if let Err(e) = caller.require("repo:read") {
+        return e.into_response();
+    }
+    let Some(pool) = state.db.as_ref() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "no database").into_response();
+    };
+    let Some(neo4j) = state.neo4j.as_ref() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "neo4j not configured").into_response();
+    };
+    let repo = match crate::db::get_repository_by_id(pool, id).await {
+        Ok(Some(repo)) => repo,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(GraphNotFound {
+                    reason: "not_found",
+                    message: "repository not found",
+                }),
+            )
+                .into_response();
+        }
+        Err(error) => {
+            tracing::error!(%error, repo_id = id, "similar endpoint: repository lookup failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "query error").into_response();
+        }
+    };
+    let commit = repo_commit_scope(&repo).to_string();
+    let limit = clamp_graph_limit(q.limit);
+
+    let (label, embedding) = match crate::integrations::neo4j::symbol_embedding(
+        neo4j, id, &commit, &node_id,
+    )
+    .await
+    {
+        Ok(Some(pair)) => pair,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(GraphNotFound {
+                    reason: "no_embedding",
+                    message: "symbol has no stored embedding (not indexed, or no correlated chunk at index time)",
+                }),
+            )
+                .into_response();
+        }
+        Err(error) => {
+            tracing::error!(%error, repo_id = id, %node_id, "similar endpoint: embedding lookup failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "query error").into_response();
+        }
+    };
+
+    match crate::integrations::neo4j::hybrid_symbol_search(
+        neo4j,
+        id,
+        &commit,
+        &label,
+        &embedding,
+        limit.max(20),
+        limit,
+    )
+    .await
+    {
+        Ok(nodes) => {
+            let edge_result =
+                crate::integrations::neo4j::edges_among(neo4j, id, &commit, &nodes).await;
+            let edges = edge_result.unwrap_or_default();
+            Json(GraphResponse {
+                commit,
+                nodes,
+                edges,
+            })
+            .into_response()
+        }
+        Err(error) => {
+            tracing::error!(%error, repo_id = id, %node_id, "similar endpoint: search failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "query error").into_response()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use axum::body::to_bytes;
