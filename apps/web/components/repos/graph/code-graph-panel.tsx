@@ -87,7 +87,10 @@ export function CodeGraphPanel({ repoId }: { repoId: number }) {
             <div className="rounded-lg border border-base-content/15 bg-base-100">
               <NodeInspector
                 node={selectedNode}
-                similarActive={mode.kind === "similar"}
+                // Requesting similar mode isn't the same as *showing* it: a failed "find similar"
+                // keeps the previous browse-mode graph on screen (see `use-code-graph.ts`), so the
+                // button shouldn't read as pressed/active for a result that isn't actually visible.
+                similarActive={mode.kind === "similar" && !error}
                 notice={error ? ERROR_COPY[error.code] : null}
                 onExpand={() => {
                   if (!selectedNodeId) return;
