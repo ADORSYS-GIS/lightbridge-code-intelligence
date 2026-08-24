@@ -186,11 +186,45 @@ impl ControlPlaneClient {
             http: reqwest::Client::new(),
         }
     }
+
+    /// Apply a request timeout, rebuilding the transport with it set.
+    pub fn with_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.http = reqwest::Client::builder()
+            .timeout(timeout)
+            .build()
+            .expect("building the control-plane HTTP client with a timeout cannot fail");
+        self
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
     use super::*;
+
+    #[tokio::test]
+    async fn with_timeout_aborts_a_request_that_outlives_it() {
+        let server = MockServer::start().await;
+        let task_id = Uuid::nil();
+        Mock::given(method("GET"))
+            .and(path(format!("/internal/tasks/{task_id}/status")))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(2)))
+            .mount(&server)
+            .await;
+
+        let client = ControlPlaneClient::new(server.uri(), "test-tok")
+            .with_timeout(Duration::from_millis(100));
+
+        let err = client
+            .task_status(task_id)
+            .await
+            .expect_err("a request slower than the configured timeout must fail");
+        assert!(err.to_string().contains("requesting task status"));
+    }
 
     fn context(clone_url: &str, token: &str) -> TaskContext {
         TaskContext {

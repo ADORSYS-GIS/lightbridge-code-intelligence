@@ -76,7 +76,8 @@ async fn run_once_body(mode: Option<Mode>) -> std::process::ExitCode {
             return std::process::ExitCode::FAILURE;
         }
     };
-    let client = ControlPlaneClient::new(&config.control_plane_url, &config.runner_token);
+    let client = ControlPlaneClient::new(&config.control_plane_url, &config.runner_token)
+        .with_timeout(std::time::Duration::from_secs(config.request_timeout_secs));
 
     // Optional JSON config file (ConfigMap-mounted); when absent, each config falls back to env. A
     // malformed file is a misconfiguration we surface as a failed task rather than silently ignore.
