@@ -385,6 +385,12 @@ fn api_v2_router() -> Router<AppState> {
             "/admin/repositories/{id}/preset",
             get(admin::get_preset).post(admin::set_preset),
         )
+        // Code graph browse (frontend, ADR-0114 follow-up).
+        .route("/admin/repositories/{id}/graph", get(admin::get_graph))
+        .route(
+            "/admin/repositories/{id}/symbols/{node_id}/similar",
+            get(admin::get_similar),
+        )
         // Per-identity model selection + ACL (ADR-0110, story #501).
         .route("/admin/models", get(admin::list_model_allowlist))
         .route(

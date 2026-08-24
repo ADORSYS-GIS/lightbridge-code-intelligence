@@ -398,6 +398,180 @@ fn escape_lucene_query(text: &str) -> String {
     escaped
 }
 
+/// One directed edge between two symbols already known to a caller, as returned to an admin API
+/// consumer (the frontend code graph view). Mirrors [`SymbolHit`]'s role for nodes.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct RelHit {
+    pub source: String,
+    pub target: String,
+    pub relation: String,
+}
+
+/// A symbol's own stored embedding, if it has one (ADR-0114's coverage is not 100% — a symbol with
+/// no correlated chunk at index time has none). Used to power "find similar to this" without ever
+/// embedding new text: the query vector is a value already sitting in the graph, not something
+/// computed at request time, so the same node always produces the same search.
+pub async fn symbol_embedding(
+    graph: &Graph,
+    repository_id: i64,
+    commit_sha: &str,
+    node_id: &str,
+) -> anyhow::Result<Option<(String, Vec<f32>)>> {
+    use anyhow::Context;
+    let mut rows = graph
+        .execute(
+            query(
+                "MATCH (s:Symbol {repo_id: $repo, commit: $commit, node_id: $node}) \
+                 WHERE s.embedding IS NOT NULL \
+                 RETURN s.label AS label, s.embedding AS embedding",
+            )
+            .param("repo", repository_id)
+            .param("commit", commit_sha)
+            .param("node", node_id),
+        )
+        .await
+        .context("symbol_embedding query")?;
+    match rows.next().await.context("symbol_embedding row")? {
+        Some(row) => {
+            let label: String = row.get("label").unwrap_or_default();
+            let embedding: Vec<f32> = row.get("embedding").unwrap_or_default();
+            Ok(Some((label, embedding)))
+        }
+        None => Ok(None),
+    }
+}
+
+/// A symbol's immediate structural neighborhood: itself, up to `hops` steps out along `REL` edges
+/// (either direction), and the edges among the resulting node set. Two queries rather than one —
+/// Neo4j's `*min..max` relationship range can't be parameterized, so `hops` (clamped to 1..=3 by the
+/// caller) is interpolated directly into the first query; it's a small, server-controlled integer,
+/// never request text. The second query finds only the edges *induced* by the first query's node set,
+/// so the result is a well-formed subgraph, not a node list with edges pointing outside it.
+pub async fn graph_neighborhood(
+    graph: &Graph,
+    repository_id: i64,
+    commit_sha: &str,
+    node_id: &str,
+    hops: i64,
+    limit: i64,
+) -> anyhow::Result<(Vec<SymbolHit>, Vec<RelHit>)> {
+    use anyhow::Context;
+    let hops = hops.clamp(1, 3);
+
+    let mut node_rows = graph
+        .execute(
+            query(&format!(
+                "MATCH (seed:Symbol {{repo_id: $repo, commit: $commit, node_id: $node}}) \
+                 OPTIONAL MATCH (seed)-[:REL*1..{hops}]-(other:Symbol {{repo_id: $repo, commit: $commit}}) \
+                 WITH seed, collect(DISTINCT other)[0..$limit] AS others \
+                 UNWIND [seed] + others AS n \
+                 RETURN DISTINCT n.node_id AS node_id, n.label AS label, n.source_file AS source_file, \
+                        n.start_line AS start_line"
+            ))
+            .param("repo", repository_id)
+            .param("commit", commit_sha)
+            .param("node", node_id)
+            .param("limit", limit),
+        )
+        .await
+        .context("graph_neighborhood nodes query")?;
+
+    let mut nodes = Vec::new();
+    while let Some(row) = node_rows
+        .next()
+        .await
+        .context("graph_neighborhood node row")?
+    {
+        if let Some(hit) = symbol_from_row(&row) {
+            nodes.push(hit);
+        }
+    }
+    let edges = edges_among(graph, repository_id, commit_sha, &nodes).await?;
+    Ok((nodes, edges))
+}
+
+/// An unseeded slice of a repository's graph — the first `limit` symbols in file order, plus the
+/// edges among them. Used when the frontend has no node selected yet (first load of the graph tab),
+/// so there's always something to render instead of an empty canvas.
+pub async fn graph_overview(
+    graph: &Graph,
+    repository_id: i64,
+    commit_sha: &str,
+    limit: i64,
+) -> anyhow::Result<(Vec<SymbolHit>, Vec<RelHit>)> {
+    use anyhow::Context;
+    // Ranked by structural degree (most-connected first), not file order: a repo's most-referenced
+    // symbols are a far more representative "first look" than whatever sorts first alphabetically —
+    // confirmed live that file-order surfaced a vendored, minified JS bundle's single-letter internals
+    // ahead of any of the repo's own application code, since its path happened to sort first.
+    let mut rows = graph
+        .execute(
+            query(
+                "MATCH (s:Symbol {repo_id: $repo, commit: $commit}) \
+                 OPTIONAL MATCH (s)-[r:REL]-() \
+                 WITH s, count(r) AS degree \
+                 ORDER BY degree DESC, s.source_file, s.start_line \
+                 LIMIT $limit \
+                 RETURN s.node_id AS node_id, s.label AS label, s.source_file AS source_file, \
+                        s.start_line AS start_line",
+            )
+            .param("repo", repository_id)
+            .param("commit", commit_sha)
+            .param("limit", limit),
+        )
+        .await
+        .context("graph_overview query")?;
+
+    let mut nodes = Vec::new();
+    while let Some(row) = rows.next().await.context("graph_overview row")? {
+        if let Some(hit) = symbol_from_row(&row) {
+            nodes.push(hit);
+        }
+    }
+    let edges = edges_among(graph, repository_id, commit_sha, &nodes).await?;
+    Ok((nodes, edges))
+}
+
+/// The `REL` edges whose both endpoints are in `nodes` — the induced subgraph on an already-known
+/// node set. Shared by [`graph_neighborhood`], [`graph_overview`], and semantic-search results, so a
+/// search result set that happens to be structurally connected shows that connection instead of
+/// rendering as isolated dots.
+pub async fn edges_among(
+    graph: &Graph,
+    repository_id: i64,
+    commit_sha: &str,
+    nodes: &[SymbolHit],
+) -> anyhow::Result<Vec<RelHit>> {
+    use anyhow::Context;
+    if nodes.is_empty() {
+        return Ok(Vec::new());
+    }
+    let ids: Vec<&str> = nodes.iter().map(|n| n.node_id.as_str()).collect();
+    let mut rows = graph
+        .execute(
+            query(
+                "MATCH (a:Symbol {repo_id: $repo, commit: $commit})-[r:REL]->(b:Symbol {repo_id: $repo, commit: $commit}) \
+                 WHERE a.node_id IN $ids AND b.node_id IN $ids \
+                 RETURN a.node_id AS source, b.node_id AS target, r.relation AS relation",
+            )
+            .param("repo", repository_id)
+            .param("commit", commit_sha)
+            .param("ids", ids),
+        )
+        .await
+        .context("edges_among query")?;
+
+    let mut edges = Vec::new();
+    while let Some(row) = rows.next().await.context("edges_among row")? {
+        edges.push(RelHit {
+            source: row.get("source").unwrap_or_default(),
+            target: row.get("target").unwrap_or_default(),
+            relation: row.get("relation").unwrap_or_default(),
+        });
+    }
+    Ok(edges)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
