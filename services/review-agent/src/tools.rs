@@ -652,6 +652,7 @@ mod tests {
     async fn with_offer_gates_specs_and_dispatch_to_the_allowlist() {
         let (_cp, client) = mock_offered_surface_cp().await;
         let embedder = EmbeddingsClient::new("http://unused", "key", "model");
+        // nosemgrep: rust-unwrap-unchecked — test fixture; the allowlist build must succeed or the test is broken
         let tools = Tools::with_offer(
             &client,
             &embedder,
@@ -695,6 +696,7 @@ mod tests {
     async fn with_offer_full_surface_when_the_allowlist_is_unset() {
         let (_cp, client) = mock_offered_surface_cp().await;
         let embedder = EmbeddingsClient::new("http://unused", "key", "model");
+        // nosemgrep: rust-unwrap-unchecked — test fixture; the allowlist build must succeed or the test is broken
         let tools = Tools::with_offer(
             &client,
             &embedder,
@@ -731,6 +733,7 @@ mod tests {
         // at all" — that would strand every review. Treat it like the unset case.
         let (_cp, client) = mock_offered_surface_cp().await;
         let embedder = EmbeddingsClient::new("http://unused", "key", "model");
+        // nosemgrep: rust-unwrap-unchecked — test fixture; the allowlist build must succeed or the test is broken
         let tools = Tools::with_offer(
             &client,
             &embedder,

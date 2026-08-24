@@ -534,6 +534,7 @@ mod tests {
     async fn handles_tools_list_is_offer_filtered() {
         let (_cp, client) = offered_tools_client().await;
         let embedder = EmbeddingsClient::new("http://unused", "key", "model");
+        // nosemgrep: rust-unwrap-unchecked — test fixture; the allowlist build must succeed or the test is broken
         let tools = Tools::with_offer(
             &client,
             &embedder,
@@ -550,9 +551,11 @@ mod tests {
         )
         .unwrap();
         let name_map =
+            // nosemgrep: rust-unwrap-unchecked — test fixture; no name collisions or parse errors are expected
             advertised_to_canonical(tools.specs().into_iter().map(|spec| spec.function.name))
                 .unwrap();
 
+        // nosemgrep: rust-unwrap-unchecked — test fixture; the mocked JSON-RPC call must succeed
         let resp = handle(
             &tools,
             &name_map,
@@ -560,10 +563,12 @@ mod tests {
         )
         .await
         .unwrap();
+        // nosemgrep: rust-unwrap-unchecked — test fixture; the mocked result is a tools/list payload
         let advertised: Vec<String> = resp["result"]["tools"]
             .as_array()
             .unwrap()
             .iter()
+            // nosemgrep: rust-unwrap-unchecked — test fixture; tool names in the mocked list are strings
             .map(|t| t["name"].as_str().unwrap().to_string())
             .collect();
         assert_eq!(
@@ -580,6 +585,7 @@ mod tests {
     async fn handles_tools_call_under_offer_filter() {
         let (_cp, client) = offered_tools_client().await;
         let embedder = EmbeddingsClient::new("http://unused", "key", "model");
+        // nosemgrep: rust-unwrap-unchecked — test fixture; the allowlist build must succeed or the test is broken
         let tools = Tools::with_offer(
             &client,
             &embedder,
@@ -596,10 +602,12 @@ mod tests {
         )
         .unwrap();
         let name_map =
+            // nosemgrep: rust-unwrap-unchecked — test fixture; no name collisions or parse errors are expected
             advertised_to_canonical(tools.specs().into_iter().map(|spec| spec.function.name))
                 .unwrap();
 
         // A call under the advertised name for a retrieval tool that is NOT offered: refused.
+        // nosemgrep: rust-unwrap-unchecked — test fixture; the mocked JSON-RPC call must succeed
         let resp = handle(
             &tools,
             &name_map,
@@ -610,6 +618,7 @@ mod tests {
         )
         .await
         .unwrap();
+        // nosemgrep: rust-unwrap-unchecked — test fixture; the mocked result carries a text content
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
         assert!(
             text.contains("unknown tool"),
@@ -617,6 +626,7 @@ mod tests {
         );
 
         // `add_review_comment` IS offered, so its call dispatches through to a clean recording.
+        // nosemgrep: rust-unwrap-unchecked — test fixture; the mocked JSON-RPC call must succeed
         let resp = handle(
             &tools,
             &name_map,
@@ -630,6 +640,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(resp["result"]["isError"], false);
+        // nosemgrep: rust-unwrap-unchecked — test fixture; the mocked result carries a text content
         assert!(
             resp["result"]["content"][0]["text"]
                 .as_str()
@@ -640,6 +651,7 @@ mod tests {
         );
         // And a call to a tool under another name (e.g. the un-offered vector search) is refused
         // rather than dispatched.
+        // nosemgrep: rust-unwrap-unchecked — test fixture; the mocked JSON-RPC call must succeed
         let resp = handle(
             &tools,
             &name_map,
@@ -650,6 +662,7 @@ mod tests {
         )
         .await
         .unwrap();
+        // nosemgrep: rust-unwrap-unchecked — test fixture; the mocked result carries a text content
         assert!(
             resp["result"]["content"][0]["text"]
                 .as_str()
