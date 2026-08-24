@@ -6,7 +6,9 @@
 //! holds them (trust boundary, ADR-0002) — the same reason chunk ingestion routes through the control
 //! plane rather than direct DB access.
 
-use neo4rs::{Graph, query};
+use std::collections::HashMap;
+
+use neo4rs::{BoltType, Graph, query};
 use rmcp::schemars;
 use serde::Serialize;
 
@@ -53,8 +55,9 @@ pub async fn connect_from_env() -> anyhow::Result<Option<Graph>> {
 /// transaction; returns `(nodes_written, edges_written)`.
 ///
 /// Nodes are a generic `:Symbol` and edges a generic `[:REL {relation}]` — Cypher can't parameterize
-/// labels/relationship types, and a property keeps the write a single prepared statement. Per-row
-/// MERGE in a transaction is correct and simple; batching via `UNWIND` is a later optimization.
+/// labels/relationship types, and a property keeps the write a single prepared statement. Each side
+/// is one `UNWIND`-driven statement over the whole batch, not one Bolt round trip per element, so the
+/// write stays fast as the structural graph grows into the thousands of nodes/edges.
 pub async fn upsert_graph(
     graph: &Graph,
     repository_id: i64,
@@ -65,43 +68,64 @@ pub async fn upsert_graph(
     use anyhow::Context;
     let mut txn = graph.start_txn().await.context("begin neo4j txn")?;
 
-    for n in nodes {
-        // `$embedding` is sent as an empty list when `n.embedding` is `None`, which is otherwise
+    if !nodes.is_empty() {
+        // Each row's `embedding` is an empty list when the node has none, which is otherwise
         // meaningless for an embedding vector — a safe "no update" sentinel so a re-index that only
         // recomputed structural facts doesn't wipe an existing embedding.
+        let rows: Vec<HashMap<String, BoltType>> = nodes
+            .iter()
+            .map(|n| {
+                HashMap::from([
+                    ("id".to_string(), n.node_id.as_str().into()),
+                    ("label".to_string(), n.label.as_str().into()),
+                    ("file".to_string(), n.source_file.as_str().into()),
+                    ("line".to_string(), n.start_line.into()),
+                    (
+                        "embedding".to_string(),
+                        n.embedding.clone().unwrap_or_default().into(),
+                    ),
+                ])
+            })
+            .collect();
         txn.run(
             query(
-                "MERGE (s:Symbol {repo_id: $repo, commit: $commit, node_id: $id}) \
-                 SET s.label = $label, s.source_file = $file, s.start_line = $line, \
-                     s.embedding = CASE WHEN size($embedding) > 0 THEN $embedding ELSE s.embedding END",
+                "UNWIND $nodes AS n \
+                 MERGE (s:Symbol {repo_id: $repo, commit: $commit, node_id: n.id}) \
+                 SET s.label = n.label, s.source_file = n.file, s.start_line = n.line, \
+                     s.embedding = CASE WHEN size(n.embedding) > 0 THEN n.embedding ELSE s.embedding END",
             )
             .param("repo", repository_id)
             .param("commit", commit_sha)
-            .param("id", n.node_id.as_str())
-            .param("label", n.label.as_str())
-            .param("file", n.source_file.as_str())
-            .param("line", n.start_line)
-            .param("embedding", n.embedding.clone().unwrap_or_default()),
+            .param("nodes", rows),
         )
         .await
-        .context("merge symbol node")?;
+        .context("merge symbol nodes")?;
     }
 
-    for e in edges {
+    if !edges.is_empty() {
+        let rows: Vec<HashMap<String, BoltType>> = edges
+            .iter()
+            .map(|e| {
+                HashMap::from([
+                    ("src".to_string(), e.source.as_str().into()),
+                    ("dst".to_string(), e.target.as_str().into()),
+                    ("rel".to_string(), e.relation.as_str().into()),
+                ])
+            })
+            .collect();
         txn.run(
             query(
-                "MATCH (a:Symbol {repo_id: $repo, commit: $commit, node_id: $src}) \
-                 MATCH (b:Symbol {repo_id: $repo, commit: $commit, node_id: $dst}) \
-                 MERGE (a)-[r:REL {relation: $rel}]->(b)",
+                "UNWIND $edges AS e \
+                 MATCH (a:Symbol {repo_id: $repo, commit: $commit, node_id: e.src}) \
+                 MATCH (b:Symbol {repo_id: $repo, commit: $commit, node_id: e.dst}) \
+                 MERGE (a)-[r:REL {relation: e.rel}]->(b)",
             )
             .param("repo", repository_id)
             .param("commit", commit_sha)
-            .param("src", e.source.as_str())
-            .param("dst", e.target.as_str())
-            .param("rel", e.relation.as_str()),
+            .param("edges", rows),
         )
         .await
-        .context("merge edge")?;
+        .context("merge edges")?;
     }
 
     txn.commit().await.context("commit neo4j txn")?;

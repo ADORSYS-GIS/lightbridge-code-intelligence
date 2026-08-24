@@ -9,9 +9,22 @@ open a PR to fix this file.
 > **Keeping this current is part of "done."** When a PR meaningfully ships, unblocks, or retires an item
 > here, update its status in the **same PR** (see [AGENTS.md](AGENTS.md)).
 
-_Last updated: 2026-08-08._
+_Last updated: 2026-08-21._
 
 ## Recently shipped
+
+- **Symbol-level semantic search for the review agent** — a new `lightbridge_graph_semantic_search`
+  MCP tool searches the Neo4j code graph by meaning, not just by name, additive alongside the existing
+  `lightbridge_graph_find_symbol`/`lightbridge_graph_get_callers` (both unchanged). Closes a real gap:
+  previously, going from "a semantically relevant chunk" (pgvector) to "its place in the call graph"
+  required the model to guess a symbol's exact name and hope it matched — the new tool returns a real,
+  traversable graph node directly, so a diff that duplicates existing logic under a different name is
+  now findable. Backed by two new Neo4j indexes on `:Symbol` (vector + fulltext), symbol embeddings
+  computed at index time from the chunker's already-embedded chunks (correlated by range containment,
+  not an exact line match — the two walks number source lines differently), and a Weighted Reciprocal
+  Rank Fusion query — Neo4j's own documented hybrid-search pattern — fusing the two signals. Index
+  bootstrap is idempotent under concurrent startup across the roles that open a Neo4j connection.
+  ([ADR-0114](docs/adr/0114-hybrid-graph-vector-symbol-search.md), #621)
 
 - **One service, one domain, path-routed** (Epic #492) — `/a2a`, `/mcp` and `/api/v2` (including
   `/api/v2/webhook/{github,gitlab,bitbucket}`) are now served under

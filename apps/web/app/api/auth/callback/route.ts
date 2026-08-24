@@ -41,7 +41,7 @@ export async function GET(req: NextRequest) {
   }
 
   // The access token is the bearer credential sent to the control plane (resource server) and the
-  // value the middleware validates. Cookie lifetime tracks the token's own expiry.
+  // value the proxy validates. Cookie lifetime tracks the token's own expiry.
   const maxAge = typeof tokens.expires_in === "number" ? tokens.expires_in : 1800;
 
   const res = NextResponse.redirect(new URL("/dashboard", appOrigin));

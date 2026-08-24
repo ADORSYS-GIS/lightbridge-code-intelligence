@@ -6,7 +6,7 @@ let cached: { config: client.Configuration; clientConfig: OidcClientConfig } | n
 /**
  * Discover the OIDC provider (Keycloak in dev) and build the openid-client Configuration.
  *
- * Node runtime ONLY — `openid-client` is not Edge-safe. Token *validation* (middleware) uses
+ * Node runtime ONLY — `openid-client` is not Edge-safe. Token *validation* (proxy) uses
  * `jose` instead; this is only for the Authorization-Code exchange in the route handlers.
  * Cached per server instance so discovery runs once.
  */

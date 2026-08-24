@@ -8,13 +8,14 @@
   },
   "scripts": {
     "build": "tsc --noEmit",
+    "typecheck": "tsc --noEmit",
     "lint": "biome check .",
     "test": "node --experimental-strip-types --test 'src/**/*.test.ts'"
   },
   "devDependencies": {
     "@lightbridge/tsconfig": "workspace:*",
     "@opencode-ai/plugin": "1.18.2",
-    "@types/node": "^22.0.0",
-    "typescript": "^5.6.0"
+    "@types/node": "^26.2.0",
+    "typescript": "^7.0.2"
   }
 }

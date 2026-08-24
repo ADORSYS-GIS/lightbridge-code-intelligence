@@ -41,6 +41,10 @@ export async function verifyAccessToken(
     const { payload } = await jwtVerify(token, remoteJwks(config), {
       issuer: config.issuer,
       audience: config.audience,
+      // Pin the expected signature algorithm. jose v6 no longer infers a default
+      // from the key type, and the access tokens issued by our Keycloak realm are
+      // RS256-signed. This prevents algorithm-confusion attacks.
+      algorithms: ["RS256"],
     });
     if (typeof payload.sub !== "string") return null;
     return payload as unknown as SessionClaims;

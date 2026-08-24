@@ -8,15 +8,16 @@
   },
   "scripts": {
     "build": "tsc --noEmit",
+    "typecheck": "tsc --noEmit",
     "lint": "biome check .",
     "test": "echo \"@lightbridge/auth: no tests yet\""
   },
   "dependencies": {
-    "jose": "^5.9.6"
+    "jose": "^6.2.9"
   },
   "devDependencies": {
     "@lightbridge/tsconfig": "workspace:*",
-    "@types/node": "^22.0.0",
-    "typescript": "^5.6.0"
+    "@types/node": "^26.2.0",
+    "typescript": "^7.0.2"
   }
 }
