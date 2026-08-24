@@ -141,8 +141,9 @@ _Last updated: 2026-08-21._
   reader (#494/#527/#528), every entry point (webhook/`@mention`/A2A) resolving its preset from repo
   config (#495/#529/#530), `ultra` joining `fast`/`deep` as the third platform-default preset name
   (#496), the full OpenCode fs-tool suite behind an explicit `fs_write` gate independent of the
-  known-unenforced tool-allowlist mechanism (#497/#537), GitHub MCP wired in opt-in per preset via the
-  App-derived installation token (#498/#538), the fatal-situation sentinel plugin
+  per-preset tool-allowlist mechanism now enforced on the live path (#497/#537 — the supervisor
+  resolves the offered surface and `lci-review-mcp` applies it), GitHub MCP wired in opt-in per preset
+  via the App-derived installation token (#498/#538), the fatal-situation sentinel plugin
   (#499/#539), the lci TUI + apps/web preset-selection UI backed by a new narrow
   `CodePlatform::update_repo_file` forge-write capability (#500/#540), and repo/org model
   selection + ACL with a fail-closed operator allowlist (#501/#541).

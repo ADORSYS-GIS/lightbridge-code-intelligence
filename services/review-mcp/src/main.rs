@@ -22,6 +22,19 @@
 //! `LCI_MCP_MIN_PRIORITY` (optional, ADR-0030): the repo's `severity.min`, when declared — a finding
 //! below this priority is acknowledged to the model but never sent to the control plane.
 //!
+//! `LCI_MCP_OFFERED_TOOLS` (optional, ADR-0062/ADR-0103): the resolved per-preset tool allowlist,
+//! newline-separated canonical registered names. ABSENT = the preset's `review.tools` is unset, so
+//! this server offers its FULL registered surface (today's behavior). PRESENT and non-empty = only
+//! the named tools are advertised (`tools/list`) or dispatchable (`tools/call`). This is what makes
+//! an operator's closed allowlist authoritative on the live OpenCode path; the supervisor computes it
+//! with the same `tool_surface::resolve_offered_tools` the native loop uses.
+//!
+//! `LCI_MCP_DISCOVERED_TOOLS` (optional, ADR-0066): path to a JSON file of the `DiscoveredTool`s the
+//! supervisor discovered and narrowed to this preset's `mcp__` selectors. Absent = nothing was
+//! discovered this run, so no external-knowledge tools are registered (the MCP server no longer
+//! performs its own discovery — the supervisor has the control-plane client and resolves the offer
+//! once, so this file IS the register set).
+//!
 //! SAST (ADR-0073) is opt-in and off unless the supervisor sets the `LCI_MCP_SAST_*` group (the
 //! [`SastConfig`] round-trip) AND `LCI_MCP_SAST_CHANGED_FILES` (the diff's file set to scope a scan to).
 //! It only sets those when `run_sast` cleared the allowlist + diff-present + enabled gate, so their mere
@@ -177,38 +190,51 @@ async fn build_tools() -> Result<Tools> {
         .ok()
         .filter(|v| !v.is_empty());
 
-    // ADR-0066 external-knowledge MCP tools: discover whatever MCP servers the control plane is
-    // configured with (owner-managed in ai-helm-values) and fold them into the registry as mediated
-    // `mcp__<server>__<tool>` tools — the same surface the native review loop offered. RFC-0009
-    // slice 1 stubbed this with `std::iter::empty()` ("wired in a later slice"); this IS that slice,
-    // so a customer's configured MCP is reachable on the OpenCode review path with zero per-customer
-    // runner code. Dispatch routes back through the control plane (`call_knowledge_tool`) inside
-    // `Tools`, so the runner never talks to an external MCP directly — mediation preserved (the
-    // deliberate boundary of ADR-0097 #6), and the results are size-capped + untrusted-framed CP-side.
-    // Discovery is best-effort: a control-plane hiccup degrades to the core review tools rather than
-    // failing the review (a customer's flaky MCP must never wedge a review).
-    let discovered = client
-        .list_knowledge_tools(task_id)
-        .await
-        .unwrap_or_else(|error| {
-            // stderr only — stdout is the JSON-RPC channel and must carry nothing else.
-            eprintln!(
-                "lci-review-mcp: ADR-0066 knowledge-tool discovery failed; continuing with core review tools only: {error:#}"
-            );
-            Vec::new()
-        });
+    // ADR-0066 external-knowledge MCP tools: the supervisor already discovered what the control plane
+    // is configured with (owner-managed in ai-helm-values), narrowed it to this preset's `mcp__`
+    // selectors, and serialized the matched specs to a file (`LCI_MCP_DISCOVERED_TOOLS`). This server
+    // just registers that file — mediation is preserved (dispatch routes back through the control
+    // plane's `call_knowledge_tool` inside `Tools`), and the offer decision now lives in ONE place (the
+    // supervisor) instead of being re-derived here, so an allowlist and the registered set can't
+    // diverge. Absent file = nothing discovered this run.
+    let discovered = match std::env::var("LCI_MCP_DISCOVERED_TOOLS") {
+        Ok(path) => {
+            let path = path.trim().to_string();
+            let raw = std::fs::read_to_string(&path).with_context(|| {
+                format!("reading the discovered-tools file at {path} (LCI_MCP_DISCOVERED_TOOLS)")
+            })?;
+            let tools: Vec<DiscoveredTool> =
+                serde_json::from_str(&raw).context("parsing the discovered-tools file")?;
+            filter_discovered(tools)
+        }
+        // No env var = the supervisor found nothing to offer (or the preset's allowlist has no `mcp__`
+        // selector, which skips discovery entirely — see `resolve_offered_tools`).
+        Err(_) => Vec::new(),
+    };
 
-    Tools::with_sast(
+    // The resolved per-preset allowlist (ADR-0062/ADR-0103), canonical registered names
+    // newline-separated. Absent or empty = full registered surface (today's behavior when a preset's
+    // `tools` is unset).
+    let offered_names: Option<Vec<String>> = std::env::var("LCI_MCP_OFFERED_TOOLS")
+        .ok()
+        .map(|raw| {
+            raw.lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .filter(|names: &Vec<String>| !names.is_empty());
+
+    Tools::with_offer(
         &client,
         &embedder,
         task_id,
         &checkout,
-        filter_discovered(discovered),
+        discovered,
         sast,
         min_priority,
-        // ADR-0104 fs-tool trio (story #497): review never gets write access — no env var offers this
-        // an opt-in today, unlike `sast`/`min_priority` above. See `tools.rs`'s `fs_write` doc comment.
-        false,
+        offered_names.as_deref(),
     )
     .map_err(|error| anyhow::anyhow!("building the review tool registry: {error}"))
 }
@@ -342,6 +368,13 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use lci_review_agent::tools::{
+        ABORT, ADD_REVIEW_COMMENT, FINISH, READ_FILE, VECTOR_SEMANTIC_SEARCH,
+    };
 
     #[test]
     fn maps_toolspec_to_mcp_shape() {
@@ -472,6 +505,157 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("boom")
+        );
+    }
+
+    async fn offered_tools_client() -> (MockServer, ControlPlaneClient) {
+        let cp = MockServer::start().await;
+        for endpoint in [
+            "review/inline",
+            "review/inline/retract",
+            "review/comment",
+            "review/summary",
+            "review/finalize",
+        ] {
+            Mock::given(method("POST"))
+                .and(path(format!("/internal/tasks/{}/{endpoint}", Uuid::nil())))
+                .respond_with(ResponseTemplate::new(204))
+                .mount(&cp)
+                .await;
+        }
+        let uri = cp.uri();
+        (cp, ControlPlaneClient::new(uri, "tok"))
+    }
+
+    // ADR-0062/ADR-0103 (#497/#537): with a closed allowlist, `tools/list` over the real `handle`
+    // only advertises the offered set — the surface the model can see is exactly the operator's
+    // `review.<preset>.tools`.
+    #[tokio::test]
+    async fn handles_tools_list_is_offer_filtered() {
+        let (_cp, client) = offered_tools_client().await;
+        let embedder = EmbeddingsClient::new("http://unused", "key", "model");
+        let tools = Tools::with_offer(
+            &client,
+            &embedder,
+            Uuid::nil(),
+            Path::new("/tmp"),
+            [],
+            None,
+            None,
+            Some(&[
+                ADD_REVIEW_COMMENT.to_string(),
+                FINISH.to_string(),
+                ABORT.to_string(),
+            ]),
+        )
+        .unwrap();
+        let name_map =
+            advertised_to_canonical(tools.specs().into_iter().map(|spec| spec.function.name))
+                .unwrap();
+
+        let resp = handle(
+            &tools,
+            &name_map,
+            &json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }),
+        )
+        .await
+        .unwrap();
+        let advertised: Vec<String> = resp["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            advertised,
+            vec![ADD_REVIEW_COMMENT, FINISH, ABORT],
+            "tools/list must advertise exactly the allowlist"
+        );
+    }
+
+    // ADR-0062/ADR-0103 (#497/#537): a `tools/call` for a tool that is NOT in the allowlist is
+    // refused-not-dispatched (the registry dispatches through the same `TurnFilter` as `tools/list`),
+    // while a listed tool's call still goes through.
+    #[tokio::test]
+    async fn handles_tools_call_under_offer_filter() {
+        let (_cp, client) = offered_tools_client().await;
+        let embedder = EmbeddingsClient::new("http://unused", "key", "model");
+        let tools = Tools::with_offer(
+            &client,
+            &embedder,
+            Uuid::nil(),
+            Path::new("/tmp"),
+            [],
+            None,
+            None,
+            Some(&[
+                ADD_REVIEW_COMMENT.to_string(),
+                FINISH.to_string(),
+                ABORT.to_string(),
+            ]),
+        )
+        .unwrap();
+        let name_map =
+            advertised_to_canonical(tools.specs().into_iter().map(|spec| spec.function.name))
+                .unwrap();
+
+        // A call under the advertised name for a retrieval tool that is NOT offered: refused.
+        let resp = handle(
+            &tools,
+            &name_map,
+            &json!({
+                "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                "params": { "name": advertised_name(READ_FILE), "arguments": json!({"path":"a.rs","start_line":1}) }
+            }),
+        )
+        .await
+        .unwrap();
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("unknown tool"),
+            "unlisted read_file must be refused, got: {text}"
+        );
+
+        // `add_review_comment` IS offered, so its call dispatches through to a clean recording.
+        let resp = handle(
+            &tools,
+            &name_map,
+            &json!({
+                "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                "params": { "name": ADD_REVIEW_COMMENT, "arguments": json!({
+                    "file":"a.rs","line":2,"title":"t","priority":"P2","category":"quality","body":"b","evidence":"line 2"
+                }) }
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp["result"]["isError"], false);
+        assert!(
+            resp["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("recorded finding"),
+            "an offered add_review_comment call must dispatch: {}",
+            resp
+        );
+        // And a call to a tool under another name (e.g. the un-offered vector search) is refused
+        // rather than dispatched.
+        let resp = handle(
+            &tools,
+            &name_map,
+            &json!({
+                "jsonrpc": "2.0", "id": 4, "method": "tools/call",
+                "params": { "name": advertised_name(VECTOR_SEMANTIC_SEARCH), "arguments": json!({"query":"auth"}) }
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(
+            resp["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("unknown tool"),
+            "an un-offered vector search call must be refused"
         );
     }
 }

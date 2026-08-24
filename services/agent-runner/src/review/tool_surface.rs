@@ -53,6 +53,66 @@ pub(crate) async fn resolve_offered_tools(
     client: &ControlPlaneClient,
     task_id: Uuid,
 ) -> (Vec<ToolSpec>, Vec<ToolSpec>) {
+    let mut offered = compute_offered_builtins(review, diff_present, sast_enabled);
+    let mut dispatch_discovered = Vec::new();
+    // External-knowledge MCP tools (ADR-0066): discovered dynamically. An UNSET allowlist offers ALL
+    // discovered; a SET allowlist offers a discovered tool iff some `mcp__` selector matches, and skips
+    // discovery entirely when it has none. A discovery failure degrades to "no external tools".
+    let mcp_selectors: Option<Vec<&McpToolPattern>> = review.tools.as_ref().map(|allow| {
+        allow
+            .iter()
+            .filter_map(|selector| match selector {
+                ReviewToolSelector::Mcp(pattern) => Some(pattern),
+                ReviewToolSelector::Builtin(_) => None,
+            })
+            .collect()
+    });
+    let discover = match &mcp_selectors {
+        None => true,
+        Some(selectors) => !selectors.is_empty(),
+    };
+    if discover {
+        match client.list_knowledge_tools(task_id).await {
+            Ok(discovered) => {
+                let matched: Vec<_> = discovered
+                    .into_iter()
+                    .filter(|tool| match &mcp_selectors {
+                        None => true,
+                        Some(selectors) => {
+                            selectors.iter().any(|pattern| pattern.is_match(&tool.name))
+                        }
+                    })
+                    .collect();
+                if !matched.is_empty() {
+                    tracing::info!(task_id = %task_id, count = matched.len(), "offering discovered external-knowledge tools");
+                    let specs: Vec<ToolSpec> = matched
+                        .into_iter()
+                        .map(|tool| {
+                            ToolSpec::function(tool.name, tool.description, tool.input_schema)
+                        })
+                        .collect();
+                    dispatch_discovered.extend(specs.iter().cloned());
+                    offered.extend(specs);
+                }
+            }
+            Err(error) => {
+                tracing::warn!(%error, task_id = %task_id, "knowledge-tool discovery failed; continuing without external-knowledge tools");
+            }
+        }
+    }
+    (offered, dispatch_discovered)
+}
+
+/// The built-in surface narrowed by the diff gate + the per-tier allowlist (ADR-0062) — the
+/// clientless, pre-discovery half of [`resolve_offered_tools`]. Shared with the live OpenCode path so
+/// its `tools/list`/`tools/call` honor the exact same allowlist the native loop does. `run_sast`
+/// follows the same opt-in rules: dropped unless explicitly allowlisted AND a diff is present AND SAST
+/// is enabled.
+pub(crate) fn compute_offered_builtins(
+    review: &ReviewConfig,
+    diff_present: bool,
+    sast_enabled: bool,
+) -> Vec<ToolSpec> {
     // Without a diff an inline finding has no line to anchor to, so `add_review_comment` isn't offered;
     // `run_sast` has nothing to scope a scan to either. `run_sast` is ALSO dropped whenever SAST itself
     // is off (ADR-0073) — otherwise an operator's allowlist naming it while `sast.enabled=false` would
@@ -84,53 +144,7 @@ pub(crate) async fn resolve_offered_tools(
             .collect();
         offered.retain(|spec| builtins.contains(spec.function.name.as_str()));
     }
-    // External-knowledge MCP tools (ADR-0066): discovered dynamically. An UNSET allowlist offers ALL
-    // discovered; a SET allowlist offers a discovered tool iff some `mcp__` selector matches, and skips
-    // discovery entirely when it has none. A discovery failure degrades to "no external tools".
-    let mcp_selectors: Option<Vec<&McpToolPattern>> = review.tools.as_ref().map(|allow| {
-        allow
-            .iter()
-            .filter_map(|selector| match selector {
-                ReviewToolSelector::Mcp(pattern) => Some(pattern),
-                ReviewToolSelector::Builtin(_) => None,
-            })
-            .collect()
-    });
-    let discover = match &mcp_selectors {
-        None => true,
-        Some(selectors) => !selectors.is_empty(),
-    };
-    let mut dispatch_discovered: Vec<ToolSpec> = Vec::new();
-    if discover {
-        match client.list_knowledge_tools(task_id).await {
-            Ok(discovered) => {
-                let matched: Vec<_> = discovered
-                    .into_iter()
-                    .filter(|tool| match &mcp_selectors {
-                        None => true,
-                        Some(selectors) => {
-                            selectors.iter().any(|pattern| pattern.is_match(&tool.name))
-                        }
-                    })
-                    .collect();
-                if !matched.is_empty() {
-                    tracing::info!(task_id = %task_id, count = matched.len(), "offering discovered external-knowledge tools");
-                    let specs: Vec<ToolSpec> = matched
-                        .into_iter()
-                        .map(|tool| {
-                            ToolSpec::function(tool.name, tool.description, tool.input_schema)
-                        })
-                        .collect();
-                    dispatch_discovered.extend(specs.iter().cloned());
-                    offered.extend(specs);
-                }
-            }
-            Err(error) => {
-                tracing::warn!(%error, task_id = %task_id, "knowledge-tool discovery failed; continuing without external-knowledge tools");
-            }
-        }
-    }
-    (offered, dispatch_discovered)
+    offered
 }
 
 #[cfg(test)]
@@ -266,6 +280,102 @@ mod tests {
         assert!(
             !offered.iter().any(|spec| spec.function.name == RUN_SAST),
             "sast disabled"
+        );
+    }
+
+    // ADR-0062/ADR-0103 (#497/#537): the live OpenCode path resolves its surface with the SAME
+    // `resolve_offered_tools` as the native loop, so a SET allowlist narrows the offered set to exactly
+    // the declared built-ins — the closed surface the operator asked for, and the exact names
+    // `LCI_MCP_OFFERED_TOOLS` must carry (they ARE the registered/canonical names).
+    #[tokio::test]
+    async fn set_allowlist_narrows_offered_to_the_declared_builtins() {
+        let cp = mock_no_knowledge_tools().await;
+        let client = ControlPlaneClient::new(cp.uri(), "tok");
+        let allow = Some(vec![
+            ReviewToolSelector::Builtin(ReviewTool::AddReviewComment),
+            ReviewToolSelector::Builtin(ReviewTool::Finish),
+            ReviewToolSelector::Builtin(ReviewTool::Abort),
+        ]);
+        let review = review_config(allow);
+        let (offered, _) = resolve_offered_tools(&review, true, false, &client, Uuid::nil()).await;
+        let names: Vec<&str> = offered
+            .iter()
+            .map(|spec| spec.function.name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["add_review_comment", "finish", "abort"],
+            "a SET allowlist narrows to exactly the declared built-ins (canonical registered names)"
+        );
+    }
+
+    // ADR-0066 (#497/#537): when the allowlist has an `mcp__` selector, Discovery runs and only a
+    // discovered tool matching the selector joins the offered surface (by its full
+    // `mcp__<server>__<tool>` registered name). Built-ins stay narrowed to the allowlist too, and a
+    // discovered tool that matches NO selector never appears.
+    #[tokio::test]
+    async fn discovered_tools_are_narrowed_by_mcp_selectors_and_registered_under_family_names() {
+        let cp = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/internal/tasks/{}/knowledge/tools",
+                Uuid::nil()
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                { "name": "mcp__context7__get_docs", "description": "docs", "input_schema": {} },
+                { "name": "mcp__brave-search__web_search", "description": "search", "input_schema": {} }
+            ])))
+            .mount(&cp)
+            .await;
+        let client = ControlPlaneClient::new(cp.uri(), "tok");
+        let allow = selectors(&["finish", "mcp__context7__.*"]);
+        let review = review_config(Some(allow));
+        let (offered, dispatch_discovered) =
+            resolve_offered_tools(&review, true, false, &client, Uuid::nil()).await;
+        let names: Vec<&str> = offered
+            .iter()
+            .map(|spec| spec.function.name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["finish", "mcp__context7__get_docs"],
+            "the offered surface = narrowed built-ins + selector-matched discovered tools"
+        );
+        // `dispatch_discovered` — what the MCP supervisor serializes to the discovered-tools file — is
+        // exactly the registered `mcp__` specs (the full family name, matching `McpToolPattern`.
+        assert_eq!(
+            dispatch_discovered
+                .iter()
+                .map(|spec| spec.function.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["mcp__context7__get_docs"]
+        );
+    }
+
+    // ADR-0062/ADR-0103 edge case: an UNSET allowlist runs discovery and offers ALL discovered tools,
+    // exactly as today's live behavior does (byte-identical) — the config absent means full surface,
+    // not a wall.
+    #[tokio::test]
+    async fn unset_allowlist_runs_discovery_and_offers_all_discovered() {
+        let cp = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/internal/tasks/{}/knowledge/tools",
+                Uuid::nil()
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                { "name": "mcp__context7__get_docs", "description": "docs", "input_schema": {} }
+            ])))
+            .mount(&cp)
+            .await;
+        let client = ControlPlaneClient::new(cp.uri(), "tok");
+        let review = review_config(None);
+        let (offered, _) = resolve_offered_tools(&review, true, false, &client, Uuid::nil()).await;
+        assert!(
+            offered
+                .iter()
+                .any(|spec| spec.function.name == "mcp__context7__get_docs"),
+            "unset allowlist must still offer discovered tools (ADR-0066 default)"
         );
     }
 }

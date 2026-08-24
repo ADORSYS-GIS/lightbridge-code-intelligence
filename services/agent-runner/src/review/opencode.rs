@@ -14,7 +14,7 @@ use anyhow::{Context, Result};
 use uuid::Uuid;
 
 use lci_acp_host::{AcpClient, PermissionPolicy};
-// use lci_agent_clients::ControlPlaneClient;  // ← Not used (coverage disclosure no longer posted)
+use lci_agent_clients::{ControlPlaneClient, DiscoveredTool};
 use lci_agent_sast::{ENV_CHANGED_FILES, SastConfig};
 use lci_review_agent::opencode::{
     REVIEW_PROMPT_FILE, RecorderEvent, ReviewDriver, ReviewGates, ReviewResolution, ReviewSession,
@@ -23,8 +23,23 @@ use lci_review_agent::opencode::{
 use lci_review_agent::prompt::{self, PrDiffRef, PromptConfig};
 
 use super::ReviewOutcome;
+use super::tool_surface;
 use crate::bootstrap::config::ReviewConfig;
 use crate::clone::PrDiff;
+
+/// Env var carrying the resolved per-preset tool allowlist to `lci-review-mcp` (ADR-0062/ADR-0103) —
+/// canonical registered tool names, newline-separated. ABSENT = the allowlist is unset, so the MCP
+/// server offers its FULL registered surface (today's behavior, the ADR-0103 default). This is the
+/// same offer-through-env pattern the supervisor already uses for SAST (`LCI_MCP_SAST_*`) and the
+/// GitHub token: resolve the gate here, encode as env, and the MCP server registers only what the env
+/// offers.
+const ENV_OFFERED_TOOLS: &str = "LCI_MCP_OFFERED_TOOLS";
+
+/// Env var pointing `lci-review-mcp` at a file of the ADR-0066 discovered external-knowledge tools
+/// that cleared this preset's `mcp__` selectors — JSON serialization would be fragile across env
+/// boundaries, so discovery happens supervisor-side (this process already has the control-plane
+/// client) and the matched specs ride a file, exactly like the SAST changed-file list.
+const ENV_DISCOVERED_TOOLS: &str = "LCI_MCP_DISCOVERED_TOOLS";
 
 /// Ceiling on how much of the recorder file to read into memory (gemini #447). The recorder logs tool
 /// RESULTS — including `read_file` output of arbitrary repo files — so a pathological repo could bloat
@@ -143,7 +158,10 @@ pub async fn run_opencode_agent(
     attribution: &[(String, String)],
     mcp_env: &McpEnv<'_>,
     task_id: Uuid,
-    // client: &ControlPlaneClient,  // ← Not used (coverage disclosure no longer posted)
+    // The control plane client, used to discover the ADR-0066 external-knowledge tools (which the
+    // native host does at run start). `lci-review-mcp` is a separate process and can't share this
+    // Rust client, so the supervisor serializes the matched specs to a file for it to register.
+    client: &ControlPlaneClient,
 ) -> Result<ReviewOutcome> {
     // ── Prompt (reuse the native builder) ───────────────────────────────────────────────────────
     let prompt_config = PromptConfig {
@@ -357,6 +375,81 @@ pub async fn run_opencode_agent(
             list_path.display().to_string(),
         ));
     }
+
+    // ── Per-preset tool allowlist + ADR-0066 discovery (the live surface) ────────────────────────
+    // `lci-review-mcp` is a separate process, so the offer decision is resolved HERE (where the
+    // control-plane client lives) and carried over as env — the same offer-through-env pattern SAST
+    // and GitHub MCP already use. This is what makes `review.<preset>.tools` authoritative on the
+    // live path; before this, the MCP server registered every built-in unconditionally (the
+    // known-unenforced allowlist, #497/#537). `resolve_offered_tools` is the exact turn-0 resolution
+    // the native loop uses (diff gate + built-in allowlist + ADR-0066 `mcp__` selector narrowing), so
+    // both paths honor the same rule by construction.
+    let sast_enabled = sast_config.is_some();
+    let (offered, dispatch_discovered) =
+        tool_surface::resolve_offered_tools(review, diff_present, sast_enabled, client, task_id)
+            .await;
+    // A SET allowlist is the authoritative offered set: `offered`'s names are the exact registered
+    // surface (built-in canonical names + matched discovered `mcp__<server>__<tool>` names), which is
+    // what `lci-review-mcp` registers and what its `TurnFilter::only_names` compares against. An
+    // UNSET allowlist leaves the var ABSENT so the MCP server offers its full registered surface —
+    // the ADR-0103 default, byte-identical to today's live behavior — so only presets where an
+    // operator actually declared a closed allowlist narrow.
+    if review.tools.is_some() {
+        let names: Vec<String> = offered
+            .iter()
+            .map(|spec| spec.function.name.clone())
+            .collect();
+        env.push((ENV_OFFERED_TOOLS.to_string(), names.join("\n")));
+        tracing::info!(
+            task_id = %task_id,
+            preset = %preset,
+            tool_count = names.len(),
+            tools = ?names,
+            "per-preset tool allowlist enforced on the OpenCode surface"
+        );
+    }
+
+    // ADR-0066 external-knowledge tools: discovered ONCE here (the same discovery the native host
+    // performs at run start) and already narrowed to this preset's `mcp__` selectors by
+    // `resolve_offered_tools`. Serialize the matched specs to a file for `lci-review-mcp` to register
+    // — the MCP server no longer performs its own discovery, so the offer decision and the registered
+    // set can't diverge (and it shed one internal-API client call). Discovery is best-effort: a
+    // control-plane hiccup degrades to core review tools rather than failing the review.
+    if !dispatch_discovered.is_empty() {
+        let discovered_path = workdir.join("discovered-tools.json");
+        let payload: Vec<DiscoveredTool> = dispatch_discovered
+            .into_iter()
+            .map(|spec| DiscoveredTool {
+                name: spec.function.name,
+                description: spec.function.description,
+                input_schema: spec.function.parameters,
+            })
+            .collect();
+        if !payload.is_empty() {
+            tokio::fs::write(&discovered_path, serde_json::to_vec(&payload)?)
+                .await
+                .context("writing the discovered-tools file for lci-review-mcp")?;
+            let mut names: Vec<&str> = payload.iter().map(|t| t.name.as_str()).collect();
+            names.sort_unstable();
+            tracing::info!(
+                task_id = %task_id,
+                discovered_count = payload.len(),
+                tools = ?names,
+                "offering discovered external-knowledge tools on the OpenCode surface"
+            );
+            env.push((
+                ENV_DISCOVERED_TOOLS.to_string(),
+                discovered_path.display().to_string(),
+            ));
+        }
+    }
+
+    // ── Run-start telemetry (ADR-0034/0062/0066): record the REAL turn-0 surface ────────────────
+    // Native-path parity — `run_native_agent` submits the same snapshot after resolving its surface
+    // (`tool_surface::resolve_offered_tools` → `telemetry::submit_run_start_telemetry`), so the live
+    // OpenCode path records what it actually offered (the Item 2 cost signal: a narrowed allowlist
+    // shows up in the recorded offered set, not as an un-measurable leak). Best-effort, non-fatal.
+    super::telemetry::submit_run_start_telemetry(client, task_id, review, &offered).await;
 
     // ── Spawn + handshake ───────────────────────────────────────────────────────────────────────
     let bin = std::env::var("OPENCODE_BIN").unwrap_or_else(|_| "opencode".to_string());
