@@ -54,14 +54,13 @@ export function CodeGraphCanvas({
         data: { label: n.label, kindToken: style.token },
         position: { x: 0, y: 0 },
         // Inline styles, not a Tailwind className: `@xyflow/react`'s own stylesheet
-        // (`react-flow__node-default`) ships a `background: white` rule that otherwise wins the
-        // cascade over a utility class regardless of specificity tricks — inline styles are the only
-        // reliable way to override it. `color-mix` tints the daisyUI token against the surface color
-        // (`base-100`) instead of a flat opacity, so the text color (also a daisyUI token) reads
-        // correctly against it in both light and dark themes — a plain `<color>/15` alpha cut had near-
-        // white text landing on a near-white background in dark mode, which is what made every label
-        // unreadable before this fix. Border starts unselected; `withSelectionBorder` (below) patches
-        // it per the currently-selected node without touching layout.
+        // (`react-flow__node-default`) ships a `background: white` rule that wins the cascade over a
+        // utility class regardless of specificity — inline styles are the only reliable override.
+        // `color-mix` tints the daisyUI token against the surface color (`base-100`) instead of a flat
+        // opacity, so the text color (also a daisyUI token) stays readable in both light and dark
+        // themes — a flat alpha cut leans light regardless of theme, which a dark-mode surface doesn't.
+        // Border starts unselected; `withSelectionBorder` (below) patches it per the currently-selected
+        // node without touching layout.
         style: {
           width: GRAPH_NODE_WIDTH,
           borderRadius: 8,

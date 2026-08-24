@@ -385,7 +385,7 @@ fn api_v2_router() -> Router<AppState> {
             "/admin/repositories/{id}/preset",
             get(admin::get_preset).post(admin::set_preset),
         )
-        // Code graph browse (frontend, ADR-0114 follow-up).
+        // Code graph browse and similarity search.
         .route("/admin/repositories/{id}/graph", get(admin::get_graph))
         .route(
             "/admin/repositories/{id}/symbols/{node_id}/similar",

@@ -514,9 +514,11 @@ pub async fn graph_neighborhood(
     Ok((nodes, edges))
 }
 
-/// An unseeded slice of a repository's graph — the first `limit` symbols in file order, plus the
-/// edges among them. Used when the frontend has no node selected yet (first load of the graph tab),
-/// so there's always something to render instead of an empty canvas.
+/// An unseeded slice of a repository's graph — the `limit` most-connected symbols by structural
+/// degree, plus the edges among them. Used when the frontend has no node selected yet (first load of
+/// the graph tab), so there's always something to render instead of an empty canvas. Ranking by
+/// degree rather than file order means the first thing shown is the repo's most-referenced symbols,
+/// not whatever happens to sort first alphabetically.
 pub async fn graph_overview(
     graph: &Graph,
     repository_id: i64,
@@ -524,10 +526,6 @@ pub async fn graph_overview(
     limit: i64,
 ) -> anyhow::Result<(Vec<SymbolHit>, Vec<RelHit>)> {
     use anyhow::Context;
-    // Ranked by structural degree (most-connected first), not file order: a repo's most-referenced
-    // symbols are a far more representative "first look" than whatever sorts first alphabetically —
-    // confirmed live that file-order surfaced a vendored, minified JS bundle's single-letter internals
-    // ahead of any of the repo's own application code, since its path happened to sort first.
     let mut rows = graph
         .execute(
             query(

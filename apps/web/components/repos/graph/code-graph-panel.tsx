@@ -10,13 +10,11 @@ import { type InspectorNotice, NodeInspector } from "./node-inspector";
 import { type GraphErrorCode, type GraphMode, useCodeGraph } from "./use-code-graph";
 
 /**
- * One short line per `GraphErrorCode`, so a reason code is never rendered as raw UI text (the bug
- * this fixes: a 404 for "this symbol has no stored embedding" — a real, disclosed answer, not a
- * failure — used to fall through a generic classifier and print the literal word "error"). Kept to
- * one line by design: once a graph is already on screen, this renders inside the node inspector's
- * own box (`notice`, below) beside the still-visible canvas, not as a full-width takeover — a long
- * explanation there reads as clutter, not help. `no_embedding` uses the muted tone, not error red:
- * it's an expected outcome (ADR-0114's embedding coverage isn't 100%), not a failure.
+ * One short line per `GraphErrorCode` — a reason code is never rendered as raw UI text. Kept to one
+ * line by design: once a graph is already on screen, this renders inside the node inspector's own
+ * box (`notice`, below) beside the still-visible canvas, not as a full-width takeover, where a long
+ * explanation would read as clutter rather than help. `no_embedding` uses the muted tone, not error
+ * red: it's an expected outcome (ADR-0114's embedding coverage isn't 100%), not a failure.
  */
 const ERROR_COPY: Record<GraphErrorCode, InspectorNotice> = {
   no_embedding: { tone: "muted", message: "No stored embedding for this symbol yet." },
@@ -27,10 +25,10 @@ const ERROR_COPY: Record<GraphErrorCode, InspectorNotice> = {
 };
 
 /** Top-level composition for the repo detail page's Graph tab: canvas + legend + node inspector,
- * wired to the two-tier query design (ADR-0114 follow-up) — structural browse and "find similar by
- * meaning" via a node's own stored embedding. No free-text search here by design: every query this
- * view can issue is either pure graph traversal or reuses a value already in the database, so nothing
- * a person types can produce an unpredictable or failing search. */
+ * wired to two query modes — structural browse and "find similar by meaning" via a node's own stored
+ * embedding. No free-text search here by design: every query this view can issue is either pure
+ * graph traversal or reuses a value already in the database, so nothing a person types can produce
+ * an unpredictable or failing search. */
 export function CodeGraphPanel({ repoId }: { repoId: number }) {
   const [mode, setMode] = useState<GraphMode>({ kind: "browse", hops: 1 });
   const [selectedNodeId, setSelectedNodeId] = useState<string | undefined>(undefined);

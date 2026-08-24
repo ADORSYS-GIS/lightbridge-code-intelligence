@@ -817,13 +817,13 @@ pub async fn set_settings_override(
     }
 }
 
-// ── Code graph (frontend), ADR-0114-follow-up ──────────────────────────────────────────────────
+// ── Code graph ───────────────────────────────────────────────────────────────────────────────
 //
-// Three read-only views over the same Neo4j graph the review agent's `lightbridge_graph_semantic_search`
-// already uses, all sharing one response shape (`GraphResponse`) so a single frontend renderer serves
-// all of them. Deliberately does not embed any user-typed text: `similar` reuses a symbol's own
-// already-stored embedding as the query vector, so the same node always produces the same result with
-// no new embeddings credential and nothing that can fail on unusual input.
+// Two read-only views over the same Neo4j graph the review agent's `lightbridge_graph_semantic_search`
+// tool queries, sharing one response shape (`GraphResponse`) so a single frontend renderer serves
+// both. Neither endpoint embeds any user-typed text: `similar` reuses a symbol's own already-stored
+// embedding as the query vector, so the same node always produces the same result with no new
+// embeddings credential and nothing that can fail on unusual input.
 
 /// Shared response shape for every graph-browsing endpoint below.
 #[derive(serde::Serialize)]
@@ -833,12 +833,10 @@ struct GraphResponse {
     edges: Vec<crate::integrations::neo4j::RelHit>,
 }
 
-/// A `404` body for `get_graph`/`get_similar` specifically. Both can 404 for more than one reason
-/// (repository not found vs., for `get_similar` only, the symbol having no stored embedding) — a
-/// bare status code can't tell those apart, and the frontend used to guess wrong (every `similar`
-/// 404 was shown as "no stored embedding," even a repository-not-found one). `reason` is the
-/// frontend's dispatch key; `message` is human copy for the case that doesn't get its own written
-/// copy client-side.
+/// A `404` body for `get_graph`/`get_similar`. Both can 404 for more than one reason — repository
+/// not found, or, for `get_similar` only, the symbol having no stored embedding — and a bare status
+/// code can't tell those apart. `reason` is the frontend's dispatch key; `message` is human copy for
+/// the case that doesn't get its own written copy client-side.
 #[derive(serde::Serialize)]
 struct GraphNotFound {
     reason: &'static str,
@@ -875,7 +873,7 @@ fn clamp_graph_limit(limit: Option<i64>) -> i64 {
         .clamp(1, GRAPH_NODE_LIMIT_MAX)
 }
 
-/// `GET /admin/repositories/{id}/graph?node=&hops=&limit=` — structural neighborhood browse (P1).
+/// `GET /admin/repositories/{id}/graph?node=&hops=&limit=` — structural neighborhood browse.
 /// `node` omitted returns an unseeded overview slice instead of an error, so the graph tab always has
 /// something to render on first load.
 pub async fn get_graph(
@@ -954,7 +952,7 @@ pub struct SimilarQuery {
     limit: Option<i64>,
 }
 
-/// `GET /admin/repositories/{id}/symbols/{node_id}/similar` — "find similar to this" (P2). The query
+/// `GET /admin/repositories/{id}/symbols/{node_id}/similar` — symbols found by meaning. The query
 /// vector is the symbol's own already-stored embedding, never text embedded at request time: the same
 /// node always returns the same result, and this needs no new embeddings credential on control-plane.
 pub async fn get_similar(

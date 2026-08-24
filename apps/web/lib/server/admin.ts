@@ -348,10 +348,10 @@ export interface GraphResponse {
 /**
  * `ApiResult`, but the two graph endpoints below need two more reasons `classify()`'s generic
  * bucket doesn't have: a `404` from either one is a real, meaningful answer ("this repository/symbol
- * doesn't have what you asked for"), not an infrastructure failure — collapsing it into the shared
- * `"error"` bucket is what previously made a disclosed, expected case (a symbol with no stored
- * embedding, ADR-0114's coverage is not 100%) indistinguishable from an actual 500. `detail` carries
- * control-plane's own plain-text body so the UI can show real copy instead of a bare reason code.
+ * doesn't have what you asked for"), not an infrastructure failure, and deserves to stay
+ * distinguishable from an actual 500 rather than collapsing into the shared `"error"` bucket.
+ * `detail` carries control-plane's own message so the UI can show real copy instead of a bare
+ * reason code.
  */
 export type GraphApiResult<T> =
   | { ok: true; data: T }
@@ -364,10 +364,9 @@ export type GraphApiResult<T> =
 
 /** `get_graph`/`get_similar`'s `404` body shape (`GraphNotFound` in `admin.rs`) — both endpoints can
  * 404 for more than one reason (repository not found vs., for `similar` only, no stored embedding),
- * so the backend says which via `reason` instead of the frontend guessing from the status code alone
- * (guessing is exactly the bug this replaced: every `similar` 404 used to be shown as "no stored
- * embedding," even a repository-not-found one). Falls back to `"not_found"` if the body isn't the
- * expected shape — the safer of the two misreads, since it's the reason both endpoints can produce. */
+ * so the backend states which via `reason` rather than the frontend inferring it from the status
+ * code alone. Falls back to `"not_found"` if the body isn't the expected shape — the safer of the
+ * two misreads, since it's the reason both endpoints can produce. */
 async function parseGraphNotFound(
   res: Response,
 ): Promise<Extract<GraphApiResult<never>, { ok: false }>> {

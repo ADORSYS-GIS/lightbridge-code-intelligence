@@ -41,9 +41,9 @@ function isGraphErrorCode(value: unknown): value is GraphErrorCode {
   return typeof value === "string" && (GRAPH_ERROR_CODES as readonly string[]).includes(value);
 }
 
-/** Drives the code-graph canvas: fetches either a structural neighborhood/overview (Tier 1, "browse")
- * or a "find similar" result set (Tier 2, "similar") from the same-origin API proxy routes, and
- * re-fetches whenever `mode` changes (clicking a node, expanding hops, choosing "find similar"). */
+/** Drives the code-graph canvas: fetches either a structural neighborhood/overview ("browse") or a
+ * "find similar" result set ("similar") from the same-origin API proxy routes, and re-fetches
+ * whenever `mode` changes (clicking a node, expanding hops, choosing "find similar"). */
 export function useCodeGraph(repoId: number, mode: GraphMode) {
   const [state, setState] = useState<State>({ data: null, loading: true, error: null });
 
