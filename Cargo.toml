@@ -132,7 +132,14 @@ neo4rs = "0.8"
 # (knowledge_tools.mcp_servers, e.g. brave-search/context7) as the review agent's dynamically
 # discovered external-knowledge tools. `reqwest` feature pulls rustls (matches the workspace TLS
 # policy above), not native-tls.
-rmcp = { version = "2.2", default-features = false, features = [
+#
+# rmcp 3.x targets the MCP 2026-07-28 protocol revision, which removes protocol-level sessions
+# (Mcp-Session-Id, initialize/initialized handshake, resources/subscribe) in favor of a
+# stateless-per-request model. The client opts into the modern lifecycle via
+# `ClientServiceExt::serve_with_lifecycle` with `ClientLifecycleMode::Auto` (probe server/discover,
+# fall back to the legacy initialize handshake for legacy servers) — see `mcp_client.rs`. The server
+# role serves 2026-07-28 requests statelessly regardless of the legacy session setting.
+rmcp = { version = "3", default-features = false, features = [
     "client",
     "reqwest",
     "transport-streamable-http-client-reqwest",
