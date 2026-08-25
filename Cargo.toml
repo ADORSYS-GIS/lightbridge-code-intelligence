@@ -45,10 +45,10 @@ anyhow = "1.0.103"
 bon = "3.9.3"
 # Flag+env parsing for the agent-plane `mode × host` entrypoint (ADR-0085). `derive` for the CLI
 # struct/value-enums; `env` so each axis is a flag OR an env var (the dispatcher can set either).
-clap = { version = "4.5.53", features = ["derive", "env"] }
+clap = { version = "4.6.6", features = ["derive", "env"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
-tokio = { version = "1.52.3", features = ["full"] }
+tokio = { version = "1.53.1", features = ["full"] }
 # Global allocator for the two long-running service binaries. We ship static-musl images (ADR-0080),
 # and musl's built-in malloc regresses badly under multithreaded allocation load; mimalloc restores
 # glibc-class throughput. Wired via #[global_allocator] in each binary's main (control-plane,
@@ -91,7 +91,7 @@ reqwest = { version = "0.13", default-features = false, features = ["json", "rus
 # can't auto-select a process-default provider and panics on the first TLS handshake; we install
 # `ring` up front in `main`. Only control-plane pulls both, so only it needs the handle.
 rustls = { version = "0.23.41", default-features = false, features = ["ring"] }
-uuid = { version = "1.23.4", features = ["v4", "serde"] }
+uuid = { version = "1.25.0", features = ["v4", "serde"] }
 # Concurrent joins for batched read-only tool dispatch (ADR-0042).
 futures = "0.3.32"
 
@@ -171,7 +171,7 @@ ignore = "0.4"
 regex = "1.13"
 # Run-config audit trail (ADR-0034/0062/0066): base64 for the redacted-config encoding; url to strip
 # userinfo/query credentials from the persisted base_url. (base64 is also used by control-plane tests.)
-base64 = "0.22.1"
+base64 = "0.23.1"
 url = "2.5"
 # Parse + containment-test the configurable extra SSRF deny-list CIDRs (ADR-0079 §2). The fixed
 # blocked ranges stay hand-rolled and auditable; ipnet only backs the operator-supplied extra list.

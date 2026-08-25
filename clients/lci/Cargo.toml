@@ -31,8 +31,8 @@ uuid.workspace = true
 futures.workspace = true
 
 # --- Crate-local (terminal UI + OS integration). Hand-rolled OAuth, so NO `oauth2` crate. ---
-ratatui = "0.29"
-crossterm = { version = "0.28", features = ["event-stream"] }
+ratatui = "0.30.2"
+crossterm = { version = "0.29.0", features = ["event-stream"] }
 directories = "6"
 open = "5"
 # Correct terminal display width for status-bar/segment truncation (matches ratatui 0.29's own dep).
