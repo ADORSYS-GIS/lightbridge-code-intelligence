@@ -250,3 +250,99 @@ async fn run_sast_lists_and_executes_over_the_real_stdio_boundary() {
 
     let _ = child.kill().await;
 }
+
+/// Wire-boundary proof for the allowlist-enforcement sentinel (comment: "allowlist resolved to nothing
+/// vs unset"): the supervisor sets `LCI_MCP_OFFERED_TOOLS_SET=1` whenever a preset DECLARED
+/// `review.tools`, even when the diff/SAST gates resolved it to zero names. Spawn the REAL
+/// `lci-review-mcp` binary with `_SET=1` and an absent/empty `LCI_MCP_OFFERED_TOOLS` and prove:
+///   1. `tools/list` advertises ONLY the always-registered loop-terminators (`finish`/`abort`) — the
+///      declared-empty allowlist stays a CLOSED surface, never widening back to the full registry,
+///   2. a `read_file` call is refused-not-dispatched under that closed surface,
+///   3. `finish` still dispatches over the wire (the loop can terminate; the summary posts to the
+///      control plane).
+#[tokio::test]
+async fn declared_empty_allowlist_is_a_closed_surface_over_stdio() {
+    let task_id = Uuid::new_v4();
+    let cp = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(wm_path(format!("/internal/tasks/{task_id}/review/summary")))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&cp)
+        .await;
+
+    // nosemgrep: rust-unwrap-unchecked — test fixture; the tempdir must exist or the test is broken
+    let checkout = tempfile::tempdir().unwrap();
+    // The `_SET` sentinel distinguishes "declared an allowlist that resolved to zero tools" from
+    // "allowlist unset" across the process boundary; the empty `LCI_MCP_OFFERED_TOOLS` alone would
+    // otherwise read as unset and grant the full surface.
+    let env = vec![
+        ("LCI_MCP_OFFERED_TOOLS_SET".to_string(), "1".to_string()),
+        ("LCI_MCP_OFFERED_TOOLS".to_string(), String::new()),
+    ];
+    let mut child = spawn_mcp(&cp.uri(), task_id, checkout.path(), &env);
+    // nosemgrep: rust-unwrap-unchecked — test fixture; the pipes must be open or the test is broken
+    let mut stdin = child.stdin.take().unwrap();
+    // nosemgrep: rust-unwrap-unchecked — test fixture; the pipes must be open or the test is broken
+    let mut reader = BufReader::new(child.stdout.take().unwrap()).lines();
+
+    let _ = rpc(
+        &mut stdin,
+        &mut reader,
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}),
+    )
+    .await;
+
+    // 1. Only the always-registered loop-terminators are offered.
+    let list = rpc(
+        &mut stdin,
+        &mut reader,
+        json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}),
+    )
+    .await;
+    let names = tool_names(&list);
+    assert_eq!(
+        names,
+        vec!["finish".to_string(), "abort".to_string()],
+        "a declared-empty allowlist must offer only the loop-terminators: {names:?}"
+    );
+
+    // 2. A retrieval tool is not advertised and not dispatchable under the closed surface.
+    let call = rpc(
+        &mut stdin,
+        &mut reader,
+        json!({"jsonrpc":"2.0","id":3,"method":"tools/call",
+               "params":{"name":"read_file","arguments":{"path":"a.rs","start_line":1}}}),
+    )
+    .await;
+    let text = call["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        text.contains("unknown tool"),
+        "a retrieval tool must be refused-not-dispatched under a closed allowlist: {call}"
+    );
+
+    // 3. `finish` dispatches over the wire; the summary posts to the (mock) control plane.
+    let call = rpc(
+        &mut stdin,
+        &mut reader,
+        json!({"jsonrpc":"2.0","id":4,"method":"tools/call",
+               "params":{"name":"finish","arguments":{"summary":"closed surface still terminates"}}}),
+    )
+    .await;
+    assert_eq!(
+        call["result"]["content"][0]["text"],
+        json!("Review finished; the host will finalize."),
+        "finish must dispatch under the closed allowlist: {call}"
+    );
+    // nosemgrep: rust-unwrap-unchecked — test fixture; the mock server must answer or the test is broken
+    let requests = cp.received_requests().await.unwrap();
+    assert!(
+        requests
+            .iter()
+            .any(|r| r.url.path().ends_with("/review/summary")),
+        "finish posts the summary to the control plane"
+    );
+
+    let _ = child.kill().await;
+}

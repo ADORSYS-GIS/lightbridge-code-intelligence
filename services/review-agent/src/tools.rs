@@ -283,12 +283,19 @@ impl Tools {
     /// Used by `lci-review-mcp`: the supervisor resolves the preset's `review.tools` allowlist and the
     /// ADR-0066 `mcp__` selectors into exactly this set, set as `LCI_MCP_OFFERED_TOOLS`, and this
     /// constructor applies it as a [`TurnFilter::only_names`] so both `specs()` (what `tools/list`
-    /// advertises) and `dispatch()` (what `tools/call` will execute) honor it. `None`/empty = the full
-    /// registered surface, preserving today's behavior when a preset's allowlist is unset (the
-    /// ADR-0062/ADR-0103 default). The allowed names are compared against REGISTERED names, so a bare
-    /// canonical like `lightbridge_vector_semantic_search` offered to OpenCode (where MCP prefixing
-    /// renders it `lightbridge_vector_semantic_search`) resolves regardless of the exact token; a name
-    /// that matches no registered tool is simply never offered (an unknown tool, refused at dispatch).
+    /// advertises) and `dispatch()` (what `tools/call` will execute) honor it.
+    ///
+    /// `None` = the allowlist is unset → the full registered surface (the ADR-0062/ADR-0103 default,
+    /// preserving today's behavior). `Some(…)`, INCLUDING an empty slice, = an operator-declared
+    /// allowlist; a resolved-empty set means the diff/SAST gates dropped every named built-in, and
+    /// only the always-registered loop-terminal `finish`/`abort` remain offered so a review can still
+    /// terminate cleanly. This closure-correctness distinction (declared-empty vs unset) is the whole
+    /// point — an empty allowlist must never widen back to the full registry.
+    ///
+    /// The allowed names are compared against REGISTERED names, so a bare canonical like
+    /// `lightbridge_vector_semantic_search` offered to OpenCode (where MCP prefixing renders it
+    /// `lightbridge_vector_semantic_search`) resolves regardless of the exact token; a name that
+    /// matches no registered tool is simply never offered (an unknown tool, refused at dispatch).
     #[allow(clippy::too_many_arguments)]
     pub fn with_offer(
         client: &ControlPlaneClient,
@@ -300,11 +307,14 @@ impl Tools {
         min_priority: Option<String>,
         allowed_names: Option<&[String]>,
     ) -> Result<Self, RegistryError> {
-        let offered = allowed_names
-            .filter(|names| !names.is_empty())
-            .map_or_else(TurnFilter::all, |names| {
-                TurnFilter::only_names(names.iter().cloned())
-            });
+        let offered = match allowed_names {
+            None => TurnFilter::all(),
+            // An operator-declared allowlist that resolved to zero built-ins is STILL a closed surface:
+            // only the always-registered loop-terminal tools remain offered, so a review can terminate
+            // cleanly instead of widening back to the full registry.
+            Some([]) => TurnFilter::only_names([FINISH.to_string(), ABORT.to_string()]),
+            Some(names) => TurnFilter::only_names(names.iter().cloned()),
+        };
         Self::with_sast_and_filter(
             client,
             embedder,
@@ -728,9 +738,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn with_offer_empty_list_is_the_full_surface_too() {
-        // An empty env value (a supervisor that serialized nothing) must not collapse to "no tools
-        // at all" — that would strand every review. Treat it like the unset case.
+    async fn with_offer_empty_declared_allowlist_is_a_closed_surface() {
+        // An operator-declared allowlist that resolved to zero built-ins (the diff/SAST gate dropped
+        // every named tool) must NOT widen to the full registry: only the always-registered
+        // loop-terminal tools remain, so a review can still terminate cleanly. The `_SET` companion
+        // env keeps this "declared-empty" case distinct from "unset" across the process boundary.
         let (_cp, client) = mock_offered_surface_cp().await;
         let embedder = EmbeddingsClient::new("http://unused", "key", "model");
         // nosemgrep: rust-unwrap-unchecked — test fixture; the allowlist build must succeed or the test is broken
@@ -745,9 +757,25 @@ mod tests {
             Some(&[]),
         )
         .unwrap();
+        let names: Vec<String> = tools.specs().iter().map(|s| s.name().to_string()).collect();
+        assert_eq!(
+            names,
+            vec![FINISH, ABORT],
+            "an EMPTY declared allowlist must offer only the always-registered loop-terminators"
+        );
+        assert_eq!(
+            tools
+                .dispatch(&call("f", FINISH, r#"{"summary":"done"}"#))
+                .await,
+            ToolOutcome::Finish
+        );
+        // A retrieval tool is refused under the closed empty allowlist.
+        let outcome = tools
+            .dispatch(&call("r", READ_FILE, r#"{"path":"a.rs","start_line":1}"#))
+            .await;
         assert!(
-            !tools.specs().is_empty(),
-            "an EMPTY allowlist must keep the full surface, not empty it"
+            matches!(outcome, ToolOutcome::Continue(ref message) if message.contains("unknown tool")),
+            "an unlisted retrieval tool must stay refused under an empty allowlist: {outcome:?}"
         );
     }
 }

@@ -32,8 +32,17 @@ use crate::clone::PrDiff;
 /// server offers its FULL registered surface (today's behavior, the ADR-0103 default). This is the
 /// same offer-through-env pattern the supervisor already uses for SAST (`LCI_MCP_SAST_*`) and the
 /// GitHub token: resolve the gate here, encode as env, and the MCP server registers only what the env
-/// offers.
+/// offers. Paired with [`ENV_OFFERED_TOOLS_SET`], which is set whenever the preset DECLARED an
+/// allowlist (even one the diff/SAST gates resolved to zero names) so an empty list stays a closed
+/// surface rather than collapsing to "unset" = full registry.
 const ENV_OFFERED_TOOLS: &str = "LCI_MCP_OFFERED_TOOLS";
+
+/// Companion to [`ENV_OFFERED_TOOLS`]: set ("1") whenever the preset DECLARED a `review.tools`
+/// allowlist, even if the diff/SAST gates resolved it to zero names. Without this, an empty
+/// `LCI_MCP_OFFERED_TOOLS` would read as "unset" downstream and grant the full surface — the
+/// opposite of an operator's explicitly closed set. The MCP server keeps only the always-registered
+/// loop-terminal tools (`finish`/`abort`) for a resolved-empty allowlist.
+const ENV_OFFERED_TOOLS_SET: &str = "LCI_MCP_OFFERED_TOOLS_SET";
 
 /// Env var pointing `lci-review-mcp` at a file of the ADR-0066 discovered external-knowledge tools
 /// that cleared this preset's `mcp__` selectors — JSON serialization would be fragile across env
@@ -391,10 +400,14 @@ pub async fn run_opencode_agent(
     // A SET allowlist is the authoritative offered set: `offered`'s names are the exact registered
     // surface (built-in canonical names + matched discovered `mcp__<server>__<tool>` names), which is
     // what `lci-review-mcp` registers and what its `TurnFilter::only_names` compares against. An
-    // UNSET allowlist leaves the var ABSENT so the MCP server offers its full registered surface —
+    // UNSET allowlist leaves both vars ABSENT so the MCP server offers its full registered surface —
     // the ADR-0103 default, byte-identical to today's live behavior — so only presets where an
     // operator actually declared a closed allowlist narrow.
     if review.tools.is_some() {
+        // Signal that the allowlist was DECLARED even when it resolved to zero tools (e.g. a
+        // `run_sast`-only allowlist with SAST off or no diff). An empty name list must stay a closed
+        // surface, never collapse to "full registry" the way an ABSENT var does.
+        env.push((ENV_OFFERED_TOOLS_SET.to_string(), "1".to_string()));
         let names: Vec<String> = offered
             .iter()
             .map(|spec| spec.function.name.clone())
@@ -425,31 +438,41 @@ pub async fn run_opencode_agent(
                 input_schema: spec.function.parameters,
             })
             .collect();
-        if !payload.is_empty() {
-            tokio::fs::write(&discovered_path, serde_json::to_vec(&payload)?)
-                .await
-                .context("writing the discovered-tools file for lci-review-mcp")?;
-            let mut names: Vec<&str> = payload.iter().map(|t| t.name.as_str()).collect();
-            names.sort_unstable();
-            tracing::info!(
-                task_id = %task_id,
-                discovered_count = payload.len(),
-                tools = ?names,
-                "offering discovered external-knowledge tools on the OpenCode surface"
-            );
-            env.push((
-                ENV_DISCOVERED_TOOLS.to_string(),
-                discovered_path.display().to_string(),
-            ));
-        }
+        tokio::fs::write(&discovered_path, serde_json::to_vec(&payload)?)
+            .await
+            .context("writing the discovered-tools file for lci-review-mcp")?;
+        let mut names: Vec<&str> = payload.iter().map(|t| t.name.as_str()).collect();
+        names.sort_unstable();
+        tracing::info!(
+            task_id = %task_id,
+            discovered_count = payload.len(),
+            tools = ?names,
+            "offering discovered external-knowledge tools on the OpenCode surface"
+        );
+        env.push((
+            ENV_DISCOVERED_TOOLS.to_string(),
+            discovered_path.display().to_string(),
+        ));
     }
 
     // ── Run-start telemetry (ADR-0034/0062/0066): record the REAL turn-0 surface ────────────────
     // Native-path parity — `run_native_agent` submits the same snapshot after resolving its surface
     // (`tool_surface::resolve_offered_tools` → `telemetry::submit_run_start_telemetry`), so the live
     // OpenCode path records what it actually offered (the Item 2 cost signal: a narrowed allowlist
-    // shows up in the recorded offered set, not as an un-measurable leak). Best-effort, non-fatal.
-    super::telemetry::submit_run_start_telemetry(client, task_id, review, &offered).await;
+    // shows up in the recorded offered set, not as an un-measurable leak). Fire-and-forget: the
+    // submission is best-effort (a failure is logged) and nothing downstream consumes its result, so
+    // awaiting it would add a control-plane RTT to every review's startup.
+    let telemetry_client = client.clone();
+    let telemetry_review = review.clone();
+    tokio::spawn(async move {
+        super::telemetry::submit_run_start_telemetry(
+            &telemetry_client,
+            task_id,
+            &telemetry_review,
+            &offered,
+        )
+        .await;
+    });
 
     // ── Spawn + handshake ───────────────────────────────────────────────────────────────────────
     let bin = std::env::var("OPENCODE_BIN").unwrap_or_else(|_| "opencode".to_string());

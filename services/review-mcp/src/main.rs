@@ -23,11 +23,17 @@
 //! below this priority is acknowledged to the model but never sent to the control plane.
 //!
 //! `LCI_MCP_OFFERED_TOOLS` (optional, ADR-0062/ADR-0103): the resolved per-preset tool allowlist,
-//! newline-separated canonical registered names. ABSENT = the preset's `review.tools` is unset, so
-//! this server offers its FULL registered surface (today's behavior). PRESENT and non-empty = only
-//! the named tools are advertised (`tools/list`) or dispatchable (`tools/call`). This is what makes
-//! an operator's closed allowlist authoritative on the live OpenCode path; the supervisor computes it
-//! with the same `tool_surface::resolve_offered_tools` the native loop uses.
+//! newline-separated canonical registered names. ABSENT (with `LCI_MCP_OFFERED_TOOLS_SET` unset) =
+//! the preset's `review.tools` is unset, so this server offers its FULL registered surface
+//! (today's behavior). PRESENT and non-empty = only the named tools are advertised (`tools/list`)
+//! or dispatchable (`tools/call`). This is what makes an operator's closed allowlist authoritative
+//! on the live OpenCode path; the supervisor computes it with the same
+//! `tool_surface::resolve_offered_tools` the native loop uses.
+//!
+//! `LCI_MCP_OFFERED_TOOLS_SET` (optional): "1" when the preset DECLARED `review.tools` even though
+//! the diff/SAST gates may have resolved it to zero names. A declared-but-empty allowlist must stay
+//! a CLOSED surface (only the always-registered loop-terminal `finish`/`abort` remain), never
+//! collapse to "full registry" the way an ABSENT var does.
 //!
 //! `LCI_MCP_DISCOVERED_TOOLS` (optional, ADR-0066): path to a JSON file of the `DiscoveredTool`s the
 //! supervisor discovered and narrowed to this preset's `mcp__` selectors. Absent = nothing was
@@ -102,6 +108,16 @@ fn env(key: &str) -> Result<String> {
         .with_context(|| format!("required env var {key} is not set"))
 }
 
+/// Trim, drop blanks, and collect a newline-separated env-var list. Shared by the SAST changed-file
+/// list and the per-preset tool allowlist so malformed values are treated identically in both.
+fn parse_newline_list(raw: &str) -> Vec<String> {
+    raw.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
 /// Map an ADR-0066 discovered MCP tool to a review `ToolSpec`. The control plane already reports it
 /// `mcp__<server>__<tool>`-prefixed, so it folds into the registry verbatim; dispatch of the result
 /// routes back through the control plane's `call_knowledge_tool` inside [`Tools`] — the runner never
@@ -139,6 +155,34 @@ fn filter_discovered(tools: Vec<DiscoveredTool>) -> Vec<ToolSpec> {
         .collect()
 }
 
+/// Read + parse the supervisor's discovered-tools file, degrading to "no external tools" on ANY
+/// failure (missing/truncated/unparsable file, disk error) instead of aborting the server — the same
+/// best-effort failure mode the old in-process discovery had. Read async (`tokio::fs`) on the tokio
+/// runtime so a blocking syscall never holds a worker thread gating the first `tools/list`.
+async fn load_discovered_tools(path: &str) -> Vec<ToolSpec> {
+    let raw = match tokio::fs::read_to_string(path).await {
+        Ok(raw) => raw,
+        Err(error) => {
+            eprintln!(
+                "lci-review-mcp: reading the discovered-tools file at {path} failed: {error}; \
+                 continuing without external-knowledge tools"
+            );
+            return Vec::new();
+        }
+    };
+    let tools: Vec<DiscoveredTool> = match serde_json::from_str(&raw) {
+        Ok(tools) => tools,
+        Err(error) => {
+            eprintln!(
+                "lci-review-mcp: parsing the discovered-tools file at {path} failed: {error}; \
+                 continuing without external-knowledge tools"
+            );
+            return Vec::new();
+        }
+    };
+    filter_discovered(tools)
+}
+
 /// Resolve the `run_sast` tool config (ADR-0073) from the SAST env group, or `None` when SAST wasn't
 /// offered this run. Returns `None` unless BOTH the [`SastConfig`] round-trip resolves ([`SastConfig::from_env`])
 /// AND the changed-file list is present — the supervisor only sets both together, past the opt-in gate.
@@ -159,12 +203,7 @@ fn resolve_sast_tool_config() -> Result<Option<SastToolConfig>> {
     };
     let raw = std::fs::read_to_string(&list_path)
         .with_context(|| format!("reading the SAST changed-file list at {list_path}"))?;
-    let changed_files: Vec<String> = raw
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(str::to_string)
-        .collect();
+    let changed_files: Vec<String> = parse_newline_list(&raw);
     let leads: SastLeadSink = Arc::new(Mutex::new(Vec::new()));
     Ok(Some(SastToolConfig {
         config,
@@ -197,34 +236,27 @@ async fn build_tools() -> Result<Tools> {
     // plane's `call_knowledge_tool` inside `Tools`), and the offer decision now lives in ONE place (the
     // supervisor) instead of being re-derived here, so an allowlist and the registered set can't
     // diverge. Absent file = nothing discovered this run.
+    // A read/parse failure DEGRADES to "no external tools" rather than aborting the whole server —
+    // the same failure mode the old in-process discovery had (it logged and returned `Vec::new()`).
+    // This is a best-effort bonus above the core surface; a supervisor write-race (the file is
+    // written by the child's parent), disk pressure, or an evicted temp dir must not strand the
+    // review before `tools/list` can ever be answered.
     let discovered = match std::env::var("LCI_MCP_DISCOVERED_TOOLS") {
-        Ok(path) => {
-            let path = path.trim().to_string();
-            let raw = std::fs::read_to_string(&path).with_context(|| {
-                format!("reading the discovered-tools file at {path} (LCI_MCP_DISCOVERED_TOOLS)")
-            })?;
-            let tools: Vec<DiscoveredTool> =
-                serde_json::from_str(&raw).context("parsing the discovered-tools file")?;
-            filter_discovered(tools)
-        }
-        // No env var = the supervisor found nothing to offer (or the preset's allowlist has no `mcp__`
-        // selector, which skips discovery entirely — see `resolve_offered_tools`).
-        Err(_) => Vec::new(),
+        Ok(path) if !path.trim().is_empty() => load_discovered_tools(path.trim()).await,
+        // No env var = the supervisor found nothing to offer (or the preset's allowlist has no
+        // `mcp__` selector, which skips discovery entirely — see `resolve_offered_tools`).
+        _ => Vec::new(),
     };
 
     // The resolved per-preset allowlist (ADR-0062/ADR-0103), canonical registered names
-    // newline-separated. Absent or empty = full registered surface (today's behavior when a preset's
-    // `tools` is unset).
-    let offered_names: Option<Vec<String>> = std::env::var("LCI_MCP_OFFERED_TOOLS")
+    // newline-separated. ABSENT + `_SET` unset = full registered surface (today's behavior when a
+    // preset's `tools` is unset). PRESENT, even when it resolves to an empty list, = a closed surface
+    // (see `Tools::with_offer` for the resolved-empty semantics).
+    let offer_declared = std::env::var("LCI_MCP_OFFERED_TOOLS_SET").is_ok_and(|v| v.trim() == "1");
+    let offered_names = std::env::var("LCI_MCP_OFFERED_TOOLS")
         .ok()
-        .map(|raw| {
-            raw.lines()
-                .map(str::trim)
-                .filter(|line| !line.is_empty())
-                .map(str::to_string)
-                .collect()
-        })
-        .filter(|names: &Vec<String>| !names.is_empty());
+        .map(|raw| parse_newline_list(&raw))
+        .or_else(|| offer_declared.then(Vec::new));
 
     Tools::with_offer(
         &client,
@@ -401,6 +433,61 @@ mod tests {
         assert_eq!(m["name"], "mcp__acme__search");
         assert_eq!(m["description"], "acme search");
         assert_eq!(m["inputSchema"]["properties"]["q"]["type"], "string");
+    }
+
+    #[test]
+    fn parse_newline_list_trims_and_drops_blanks() {
+        assert_eq!(parse_newline_list(""), Vec::<String>::new());
+        assert_eq!(parse_newline_list("  \n \n"), Vec::<String>::new());
+        assert_eq!(
+            parse_newline_list("read_file\n\n finish \n lightbridge_vector_semantic_search \n"),
+            vec![
+                "read_file".to_string(),
+                "finish".to_string(),
+                "lightbridge_vector_semantic_search".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn load_discovered_tools_degrades_on_missing_and_unparsable_files() {
+        // A read failure (missing file) must degrade to no external tools, not crash the server.
+        let out = load_discovered_tools("/definitely/not/a/real/file.json").await;
+        assert!(
+            out.is_empty(),
+            "a missing file must degrade to no external tools"
+        );
+
+        // An unparsable file must also degrade to no external tools.
+        let dir = std::env::temp_dir().join(format!("lci-mcp-test-{}", Uuid::new_v4()));
+        // nosemgrep: rust-unwrap-unchecked — test fixture; the temp dir must be created or the test is broken
+        std::fs::create_dir_all(&dir).unwrap();
+        let bad = dir.join("bad.json");
+        // nosemgrep: rust-unwrap-unchecked — test fixture; the temp write must succeed
+        std::fs::write(&bad, "not json").unwrap();
+        let out = load_discovered_tools(&bad.display().to_string()).await;
+        assert!(
+            out.is_empty(),
+            "an unparsable file must degrade to no external tools"
+        );
+
+        // A well-formed file folds in, dropping non-`mcp__`/duplicate entries.
+        let good = dir.join("good.json");
+        // nosemgrep: rust-unwrap-unchecked — test fixture; the temp write must succeed
+        std::fs::write(
+            &good,
+            serde_json::json!([
+                {"name": "mcp__acme__a", "description": "d", "input_schema": {"type": "object"}},
+                {"name": "read_file", "description": "d", "input_schema": {"type": "object"}}
+            ])
+            .to_string(),
+        )
+        .unwrap();
+        let out = load_discovered_tools(&good.display().to_string()).await;
+        let names: Vec<_> = out.iter().map(|s| s.name().to_string()).collect();
+        assert_eq!(names, vec!["mcp__acme__a"]);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
