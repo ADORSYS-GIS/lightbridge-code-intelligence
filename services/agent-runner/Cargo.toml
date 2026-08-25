@@ -91,7 +91,11 @@ tempfile.workspace = true
 # review path. Pinned EXACTLY so the harness verdict is reproducible against one known rig release.
 # The harness (`tests/rig_fidelity.rs`) checks whether rig's OpenAI-compatible provider preserves the
 # provider-quirk fields our hand-rolled transport (`lci_review_agent::model`) depends on.
-rig-core = "=0.39.0"
+rig-core = "=0.42.0"
+# The agent abstraction (AgentBuilder, the `Tool` trait) moved out of rig-core into `rig-agent` in
+# 0.42.0; the live probe (`tests/rig_live_probe.rs`) uses it to drive a multi-turn tool-call exchange.
+# Version-matched to rig-core.
+rig-agent = "=0.42.0"
 # The live probe links two rustls providers in one test binary (workspace `ring` via agent-runner's
 # reqwest, plus `aws-lc-rs` pulled by rig-core → reqwest 0.13). Install one process default up front so
 # the first TLS handshake can't hit the rustls-0.23 ambiguous-provider panic (#264 family).
