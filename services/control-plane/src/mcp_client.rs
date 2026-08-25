@@ -52,10 +52,13 @@ async fn connect(
         preferred_versions: vec![ProtocolVersion::V_2026_07_28],
         legacy_version: Some(ProtocolVersion::V_2025_11_25),
     };
-    tokio::time::timeout(timeout, client_info.serve_with_lifecycle(transport, lifecycle))
-        .await
-        .map_err(|_| anyhow::anyhow!("connecting to the MCP server timed out"))?
-        .map_err(|error| anyhow::anyhow!("connecting to the MCP server failed: {error}"))
+    tokio::time::timeout(
+        timeout,
+        client_info.serve_with_lifecycle(transport, lifecycle),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("connecting to the MCP server timed out"))?
+    .map_err(|error| anyhow::anyhow!("connecting to the MCP server failed: {error}"))
 }
 
 /// Bounded shutdown (see the comment at the call site in [`call_tool`] for why `close_with_timeout`
@@ -182,7 +185,9 @@ mod tests {
     use rmcp::transport::streamable_http_server::{
         StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
     };
-    use rmcp::{ErrorData, Json, RoleServer, ServerHandler, schemars, tool, tool_handler, tool_router};
+    use rmcp::{
+        ErrorData, Json, RoleServer, ServerHandler, schemars, tool, tool_handler, tool_router,
+    };
     use serde::{Deserialize, Serialize};
     use std::sync::Arc;
 
@@ -216,9 +221,7 @@ mod tests {
             _context: RequestContext<RoleServer>,
             Parameters(args): Parameters<EchoArgs>,
         ) -> std::result::Result<Json<EchoResult>, ErrorData> {
-            Ok(Json(EchoResult {
-                echoed: args.text,
-            }))
+            Ok(Json(EchoResult { echoed: args.text }))
         }
     }
 
