@@ -279,7 +279,7 @@ mod tests {
     }
 
     /// Bind an in-process MCP server to an ephemeral port and return its base URL.
-    async fn spawn_mcp_server() -> String {
+    async fn spawn_mcp_server() -> std::io::Result<String> {
         let service: StreamableHttpService<EchoHandler, LocalSessionManager> =
             StreamableHttpService::new(
                 || Ok(EchoHandler::new()),
@@ -287,18 +287,18 @@ mod tests {
                 StreamableHttpServerConfig::default().disable_allowed_hosts(),
             );
         let router = Router::new().fallback_service(service);
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind ephemeral port");
-        let addr = listener.local_addr().expect("local addr");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
         tokio::spawn(async move {
-            axum::serve(listener, router).await.expect("serve mcp");
+            if let Err(error) = axum::serve(listener, router).await {
+                eprintln!("mcp test server failed to serve: {error}");
+            }
         });
-        format!("http://{addr}")
+        Ok(format!("http://{addr}"))
     }
 
     /// Bind an in-process LEGACY MCP server (rejects `server/discover`) to an ephemeral port.
-    async fn spawn_legacy_mcp_server() -> String {
+    async fn spawn_legacy_mcp_server() -> std::io::Result<String> {
         let service: StreamableHttpService<LegacyEchoHandler, LocalSessionManager> =
             StreamableHttpService::new(
                 || Ok(LegacyEchoHandler::new()),
@@ -306,24 +306,22 @@ mod tests {
                 StreamableHttpServerConfig::default().disable_allowed_hosts(),
             );
         let router = Router::new().fallback_service(service);
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind ephemeral port");
-        let addr = listener.local_addr().expect("local addr");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
         tokio::spawn(async move {
-            axum::serve(listener, router).await.expect("serve mcp");
+            if let Err(error) = axum::serve(listener, router).await {
+                eprintln!("mcp test server failed to serve: {error}");
+            }
         });
-        format!("http://{addr}")
+        Ok(format!("http://{addr}"))
     }
 
     #[tokio::test]
-    async fn client_lists_and_calls_tools_over_streamable_http() {
-        let base_url = spawn_mcp_server().await;
+    async fn client_lists_and_calls_tools_over_streamable_http() -> anyhow::Result<()> {
+        let base_url = spawn_mcp_server().await?;
         let timeout = Duration::from_secs(10);
 
-        let tools = list_tools(&base_url, timeout)
-            .await
-            .expect("list_tools over the wire");
+        let tools = list_tools(&base_url, timeout).await?;
         assert!(
             tools.iter().any(|t| t.name == "echo"),
             "server should advertise the echo tool, got: {tools:?}"
@@ -335,26 +333,24 @@ mod tests {
             serde_json::json!({ "text": "hello from the client" }),
             timeout,
         )
-        .await
-        .expect("call_tool over the wire");
+        .await?;
         // The `echo` tool returns `Json<EchoResult>`, which rmcp serializes into a text content
         // block — the same shape the real control-plane tools produce, and what `collect_text`
         // extracts. Assert the JSON text round-tripped intact.
         assert_eq!(out, r#"{"echoed":"hello from the client"}"#);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn client_falls_back_to_legacy_initialize_for_legacy_server() {
+    async fn client_falls_back_to_legacy_initialize_for_legacy_server() -> anyhow::Result<()> {
         // A legacy server rejects `server/discover` with method-not-found. `ClientLifecycleMode::Auto`
         // must classify that as a legacy peer and fall back to the legacy initialize handshake, then
         // list/call tools over it. This pins the fallback half of the migration — the path production
         // depends on for in-cluster servers that may not speak 2026-07-28 yet.
-        let base_url = spawn_legacy_mcp_server().await;
+        let base_url = spawn_legacy_mcp_server().await?;
         let timeout = Duration::from_secs(10);
 
-        let tools = list_tools(&base_url, timeout)
-            .await
-            .expect("list_tools over the legacy fallback");
+        let tools = list_tools(&base_url, timeout).await?;
         assert!(
             tools.iter().any(|t| t.name == "echo"),
             "legacy server should advertise the echo tool over the fallback, got: {tools:?}"
@@ -366,8 +362,8 @@ mod tests {
             serde_json::json!({ "text": "legacy fallback works" }),
             timeout,
         )
-        .await
-        .expect("call_tool over the legacy fallback");
+        .await?;
         assert_eq!(out, r#"{"echoed":"legacy fallback works"}"#);
+        Ok(())
     }
 }
