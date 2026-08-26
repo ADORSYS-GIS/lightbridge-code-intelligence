@@ -8,10 +8,12 @@
 
 use std::time::Duration;
 
-use rmcp::model::{CallToolRequestParams, ClientCapabilities, ClientInfo, Implementation};
+use rmcp::model::{
+    CallToolRequestParams, ClientCapabilities, ClientInfo, Implementation, ProtocolVersion,
+};
 use rmcp::service::RunningService;
 use rmcp::transport::StreamableHttpClientTransport;
-use rmcp::{RoleClient, ServiceExt};
+use rmcp::{ClientLifecycleMode, ClientServiceExt, RoleClient};
 
 /// Hard ceiling on the text handed back to the agent: an upstream server is untrusted input
 /// (ADR-0066) and could return an adversarially huge payload — cap it the same way `read_file` caps
@@ -24,6 +26,7 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// A tool a discovered MCP server exposes, as returned to the agent-runner for it to fold into the
 /// live tool schema — no compile-time knowledge of any specific server's tools needed.
+#[derive(Debug)]
 pub struct McpTool {
     pub name: String,
     pub description: String,
@@ -40,10 +43,22 @@ async fn connect(
         ClientCapabilities::default(),
         Implementation::new("lightbridge-control-plane", env!("CARGO_PKG_VERSION")),
     );
-    tokio::time::timeout(timeout, client_info.serve(transport))
-        .await
-        .map_err(|_| anyhow::anyhow!("connecting to the MCP server timed out"))?
-        .map_err(|error| anyhow::anyhow!("connecting to the MCP server failed: {error}"))
+    // rmcp 3.x targets the MCP 2026-07-28 protocol, which removed the initialize/initialized
+    // handshake in favor of stateless per-request metadata. `Auto` probes with `server/discover`
+    // (preferring the modern protocol) and falls back to the legacy initialize handshake when the
+    // peer is a legacy server — the right fit for calling heterogeneous in-cluster servers
+    // (brave-search/context7) that may not all speak 2026-07-28 yet.
+    let lifecycle = ClientLifecycleMode::Auto {
+        preferred_versions: vec![ProtocolVersion::V_2026_07_28],
+        legacy_version: Some(ProtocolVersion::V_2025_11_25),
+    };
+    tokio::time::timeout(
+        timeout,
+        client_info.serve_with_lifecycle(transport, lifecycle),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("connecting to the MCP server timed out"))?
+    .map_err(|error| anyhow::anyhow!("connecting to the MCP server failed: {error}"))
 }
 
 /// Bounded shutdown (see the comment at the call site in [`call_tool`] for why `close_with_timeout`
@@ -153,5 +168,202 @@ mod tests {
         let capped = cap_utf8(s, 5);
         assert!(capped.starts_with("éé"));
         assert!(capped.contains("truncated"));
+    }
+
+    // ── Wire-level integration test ─────────────────────────────────────────────────────────────
+    // rmcp 3.x targets the MCP 2026-07-28 protocol, which removed protocol-level sessions
+    // (Mcp-Session-Id, initialize/initialized handshake) in favor of a stateless-per-request model.
+    // That is exactly the kind of change that compiles fine and breaks at the wire level, so this
+    // test spins up a REAL in-process MCP server (rmcp's own StreamableHttpService over axum) and
+    // drives the control-plane client (`list_tools` / `call_tool`) against it over streamable HTTP —
+    // exercising the `server/discover` + `tools/call` round-trip end to end.
+
+    use axum::Router;
+    use rmcp::handler::server::{router::tool::ToolRouter, wrapper::Parameters};
+    use rmcp::model::{DiscoverRequestMethod, DiscoverResult, ServerCapabilities, ServerInfo};
+    use rmcp::service::RequestContext;
+    use rmcp::transport::streamable_http_server::{
+        StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
+    };
+    use rmcp::{
+        ErrorData, Json, RoleServer, ServerHandler, schemars, tool, tool_handler, tool_router,
+    };
+    use serde::{Deserialize, Serialize};
+    use std::sync::Arc;
+
+    #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+    struct EchoArgs {
+        text: String,
+    }
+
+    #[derive(Debug, Serialize, schemars::JsonSchema)]
+    struct EchoResult {
+        echoed: String,
+    }
+
+    struct EchoHandler {
+        tool_router: ToolRouter<Self>,
+    }
+
+    impl EchoHandler {
+        fn new() -> Self {
+            Self {
+                tool_router: Self::tool_router(),
+            }
+        }
+    }
+
+    #[tool_router]
+    impl EchoHandler {
+        #[tool(name = "echo", description = "Echo the input text")]
+        async fn echo_tool(
+            &self,
+            _context: RequestContext<RoleServer>,
+            Parameters(args): Parameters<EchoArgs>,
+        ) -> std::result::Result<Json<EchoResult>, ErrorData> {
+            Ok(Json(EchoResult { echoed: args.text }))
+        }
+    }
+
+    #[tool_handler(router = self.tool_router)]
+    impl ServerHandler for EchoHandler {
+        fn get_info(&self) -> ServerInfo {
+            ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+        }
+    }
+
+    /// A LEGACY (pre-2026-07-28) MCP server: it does not implement `server/discover`, so it answers
+    /// the client's discovery probe with a correlated JSON-RPC `method_not_found` error. That is
+    /// exactly what the client's `ClientLifecycleMode::Auto` treats as a legacy peer, triggering the
+    /// fallback to the legacy `initialize` / `notifications/initialized` handshake — the path
+    /// production relies on for in-cluster servers (brave-search/context7) that may not speak
+    /// 2026-07-28 yet.
+    struct LegacyEchoHandler {
+        tool_router: ToolRouter<Self>,
+    }
+
+    impl LegacyEchoHandler {
+        fn new() -> Self {
+            Self {
+                tool_router: Self::tool_router(),
+            }
+        }
+    }
+
+    #[tool_router]
+    impl LegacyEchoHandler {
+        #[tool(name = "echo", description = "Echo the input text")]
+        async fn echo_tool(
+            &self,
+            _context: RequestContext<RoleServer>,
+            Parameters(args): Parameters<EchoArgs>,
+        ) -> std::result::Result<Json<EchoResult>, ErrorData> {
+            Ok(Json(EchoResult { echoed: args.text }))
+        }
+    }
+
+    #[tool_handler(router = self.tool_router)]
+    impl ServerHandler for LegacyEchoHandler {
+        fn get_info(&self) -> ServerInfo {
+            ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+        }
+
+        // A legacy server rejects `server/discover` with method-not-found. The `#[tool_handler]`
+        // macro preserves this method (it only generates call_tool/list_tools/get_tool/get_info).
+        async fn discover(
+            &self,
+            _context: RequestContext<RoleServer>,
+        ) -> std::result::Result<DiscoverResult, ErrorData> {
+            Err(ErrorData::method_not_found::<DiscoverRequestMethod>())
+        }
+    }
+
+    /// Bind an in-process MCP server to an ephemeral port and return its base URL.
+    async fn spawn_mcp_server() -> std::io::Result<String> {
+        let service: StreamableHttpService<EchoHandler, LocalSessionManager> =
+            StreamableHttpService::new(
+                || Ok(EchoHandler::new()),
+                Arc::new(LocalSessionManager::default()),
+                StreamableHttpServerConfig::default().disable_allowed_hosts(),
+            );
+        let router = Router::new().fallback_service(service);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        tokio::spawn(async move {
+            if let Err(error) = axum::serve(listener, router).await {
+                eprintln!("mcp test server failed to serve: {error}");
+            }
+        });
+        Ok(format!("http://{addr}"))
+    }
+
+    /// Bind an in-process LEGACY MCP server (rejects `server/discover`) to an ephemeral port.
+    async fn spawn_legacy_mcp_server() -> std::io::Result<String> {
+        let service: StreamableHttpService<LegacyEchoHandler, LocalSessionManager> =
+            StreamableHttpService::new(
+                || Ok(LegacyEchoHandler::new()),
+                Arc::new(LocalSessionManager::default()),
+                StreamableHttpServerConfig::default().disable_allowed_hosts(),
+            );
+        let router = Router::new().fallback_service(service);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        tokio::spawn(async move {
+            if let Err(error) = axum::serve(listener, router).await {
+                eprintln!("mcp test server failed to serve: {error}");
+            }
+        });
+        Ok(format!("http://{addr}"))
+    }
+
+    #[tokio::test]
+    async fn client_lists_and_calls_tools_over_streamable_http() -> anyhow::Result<()> {
+        let base_url = spawn_mcp_server().await?;
+        let timeout = Duration::from_secs(10);
+
+        let tools = list_tools(&base_url, timeout).await?;
+        assert!(
+            tools.iter().any(|t| t.name == "echo"),
+            "server should advertise the echo tool, got: {tools:?}"
+        );
+
+        let out = call_tool(
+            &base_url,
+            "echo",
+            serde_json::json!({ "text": "hello from the client" }),
+            timeout,
+        )
+        .await?;
+        // The `echo` tool returns `Json<EchoResult>`, which rmcp serializes into a text content
+        // block — the same shape the real control-plane tools produce, and what `collect_text`
+        // extracts. Assert the JSON text round-tripped intact.
+        assert_eq!(out, r#"{"echoed":"hello from the client"}"#);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn client_falls_back_to_legacy_initialize_for_legacy_server() -> anyhow::Result<()> {
+        // A legacy server rejects `server/discover` with method-not-found. `ClientLifecycleMode::Auto`
+        // must classify that as a legacy peer and fall back to the legacy initialize handshake, then
+        // list/call tools over it. This pins the fallback half of the migration — the path production
+        // depends on for in-cluster servers that may not speak 2026-07-28 yet.
+        let base_url = spawn_legacy_mcp_server().await?;
+        let timeout = Duration::from_secs(10);
+
+        let tools = list_tools(&base_url, timeout).await?;
+        assert!(
+            tools.iter().any(|t| t.name == "echo"),
+            "legacy server should advertise the echo tool over the fallback, got: {tools:?}"
+        );
+
+        let out = call_tool(
+            &base_url,
+            "echo",
+            serde_json::json!({ "text": "legacy fallback works" }),
+            timeout,
+        )
+        .await?;
+        assert_eq!(out, r#"{"echoed":"legacy fallback works"}"#);
+        Ok(())
     }
 }

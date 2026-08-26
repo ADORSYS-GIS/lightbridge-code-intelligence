@@ -27,10 +27,11 @@
 //! via `LLM_CA_CERT`. For this probe, eaig's CA must therefore be trusted at the OS level (or a reqwest
 //! 0.13 client built separately). Wiring a custom-CA transport into rig is follow-up work for ADR-0075.
 
+use rig_agent::AgentBuilder;
+use rig_agent::completion::Prompt;
 use rig_core::client::CompletionClient;
-use rig_core::completion::{Prompt, ToolDefinition};
 use rig_core::providers::openai::CompletionsClient;
-use rig_core::tool::Tool;
+use rig_core::tool::PortableTool;
 use serde_json::json;
 
 #[derive(Debug)]
@@ -50,22 +51,22 @@ struct EchoArgs {
 /// A trivial tool: forces a tool-call turn (and thus a signature-bearing follow-up) with no side
 /// effects. Its output feeds straight back to the model.
 struct EchoTool;
-impl Tool for EchoTool {
+impl PortableTool for EchoTool {
     const NAME: &'static str = "echo";
     type Error = EchoError;
     type Args = EchoArgs;
     type Output = String;
 
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        ToolDefinition {
-            name: Self::NAME.to_string(),
-            description: "Echo the given text back verbatim.".to_string(),
-            parameters: json!({
-                "type": "object",
-                "properties": { "text": { "type": "string" } },
-                "required": ["text"]
-            }),
-        }
+    fn description(&self) -> String {
+        "Echo the given text back verbatim.".to_string()
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": { "text": { "type": "string" } },
+            "required": ["text"]
+        })
     }
 
     async fn call(&self, args: EchoArgs) -> Result<String, EchoError> {
@@ -91,8 +92,10 @@ async fn thought_signature_survival() -> anyhow::Result<()> {
         .base_url(&base_url)
         .build()?;
 
-    let agent = client
-        .agent(model)
+    // rig-agent 0.42.0: the agent abstraction lives in `rig-agent`; build a completion model from
+    // the client, then an agent with the echo tool.
+    let model = client.completion_model(model.as_str());
+    let agent = AgentBuilder::new(model)
         .preamble(
             "You are a test harness. When asked, call the `echo` tool exactly once, then reply \
              with only the echoed text.",

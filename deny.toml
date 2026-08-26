@@ -1,0 +1,59 @@
+# cargo-deny configuration. Run `cargo deny check advisories` (or `cargo deny check` for all).
+#
+# The advisories below are IGNORED deliberately. Each is pre-existing (present at the base of the
+# dependency-freshness sweep, not introduced by any bump in this workspace) and is pulled in by a
+# crate that is explicitly OUT OF SCOPE for the sweep (see the Story's "Out of Scope" list: neo4rs,
+# rsa, lci-codegraph). None has a safe upgrade available — they are acknowledged, reviewed risk, not
+# silent drift. Revisit each when the pulling crate is next touched.
+
+[advisories]
+# Fail the check on any advisory we have not explicitly accepted below (this is cargo-deny's default
+# for the `vulnerability`/`unmaintained`/`yanked`/`notice` categories).
+ignore = [
+    # RUSTSEC-2025-0012: `backoff` is unmaintained. Pulled only via `neo4rs` (control-plane's Neo4j
+    # Bolt client). No safe upgrade; replacing neo4rs is out of scope for the dependency sweep.
+    "RUSTSEC-2025-0012",
+    # RUSTSEC-2024-0384: `instant` is unmaintained. Transitive via `backoff` -> `neo4rs`. No fix.
+    "RUSTSEC-2024-0384",
+    # RUSTSEC-2024-0436: `paste` is unmaintained. Transitive via `neo4rs`. No fix.
+    "RUSTSEC-2024-0436",
+    # RUSTSEC-2023-0071: `rsa` Marvin Attack (timing sidechannel). `rsa` is already at the latest
+    # (0.9.10) with no safe upgrade; pulled by `jsonwebtoken` (JWT verification over the network, not
+    # a local-timing attacker model) and a dev-dependency. Accepted risk; revisit on the next
+    # jsonwebtoken/rsa bump.
+    "RUSTSEC-2023-0071",
+    # RUSTSEC-2025-0134: `rustls-pemfile` is unmaintained. Transitive via `neo4rs`. No fix.
+    "RUSTSEC-2025-0134",
+    # RUSTSEC-2026-0192: `ttf-parser` is unmaintained. Pulled only via the external `lci-codegraph`
+    # crate (pdf-extract -> lopdf). Out of scope; no fix.
+    "RUSTSEC-2026-0192",
+]
+
+[licenses]
+# Standard permissive allow list (matches cargo-deny's default config, which is what this repo
+# effectively used before a deny.toml existed). All are OSI/FOSS permissive or weak-copyleft
+# licenses used by this workspace's dependency set.
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-1-Clause",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "LGPL-2.1-or-later",
+    "MIT",
+    "MIT-0",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+
+[bans]
+# Warn (not fail) on multiple versions of the same crate (e.g. base64 0.22 via sqlx + 0.23 direct).
+multiple-versions = "warn"
+wildcards = "allow"

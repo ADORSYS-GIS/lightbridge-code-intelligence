@@ -20,14 +20,20 @@
 //! dropped. This harness answers, with fixtures that mirror what eaig emits: does rig's OpenAI provider
 //! preserve these fields?
 //!
-//! ## Verdict (rig-core 0.39.0, `providers::openai::completion`, Chat Completions API)
+//! ## Verdict (rig-core 0.42.0, `providers::openai::completion`, Chat Completions API)
 //!
 //! | field                         | preserved? | mechanism                                                        |
 //! |-------------------------------|------------|-----------------------------------------------------------------|
 //! | `thought_signature`/`extra_content` | **NO**     | rig's `ToolCall` has only `{id,type,function}` — no field for it |
 //! | `reasoning_content`           | **YES**    | `Message::Assistant.reasoning` (`rename = "reasoning_content"`)  |
-//! | bare `reasoning` alias        | **NO**     | rig maps only `reasoning_content`, not the bare `reasoning` key  |
-//! | `usage.*reasoning_tokens`     | **NO**     | rig's chat `Usage` is `{prompt,total,prompt_tokens_details}` only; the conversion hardcodes `reasoning_tokens: 0` |
+//! | bare `reasoning` alias        | **YES**    | `Message::Assistant.reasoning` now carries `alias = "reasoning"` (fixed in 0.42.0) |
+//! | `usage.*reasoning_tokens`     | **YES**    | rig's chat `Usage` now carries `reasoning_tokens` (fixed in 0.42.0) |
+//!
+//! **Verdict change vs 0.39.0:** the bare `reasoning` alias and `usage.*reasoning_tokens` were
+//! DROPPED in 0.39.0 and are PRESERVED in 0.42.0 — two of the four fidelity gaps closed. The
+//! remaining gap is `thought_signature`/`extra_content`, which rig's `ToolCall` still cannot model.
+//! This is exactly why the pin is exact: the verdict is version-specific and must be re-derived on
+//! every bump, not assumed.
 //!
 //! The offline `#[test]`s below encode that verdict as executable, network-free assertions. The real
 //! #300 verification against the live gateway lives in the sibling `rig_live_probe.rs` target (an
@@ -223,9 +229,11 @@ fn reasoning_verdict(reasoning_field: &'static str) -> FieldVerdict {
 /// Verdict for reasoning-token usage: does the count survive rig's conversion into its provider-neutral
 /// `completion::Usage`?
 fn usage_reasoning_verdict() -> FieldVerdict {
+    use rig_core::completion::NormalizeCompletionResponse;
+
     let resp = parse(&usage_with_reasoning_tokens());
-    let core: rig_core::completion::CompletionResponse<CompletionResponse> = resp
-        .try_into()
+    let core = resp
+        .normalize("openai")
         .expect("rig converts a valid chat.completion into its neutral response type");
 
     // Prompt/total tokens are expected to survive; only the reasoning slice is at risk.
@@ -279,41 +287,41 @@ fn reasoning_content_is_preserved() {
     assert!(v.preserved, "{}", v.detail);
 }
 
-/// FIDELITY GAP: rig maps only `reasoning_content`, not the bare `reasoning` alias some gateways emit —
-/// which our transport handles via `#[serde(alias = "reasoning")]`. A model that reports thinking under
-/// `reasoning` would log `reasoning_chars: 0` through rig (the deep-tier GLM symptom, #220).
+/// PRESERVED (since 0.42.0): the bare `reasoning` alias some gateways emit is now honored — rig's
+/// `Message::Assistant.reasoning` carries `alias = "reasoning"` (it was dropped in 0.39.0). A model
+/// that reports thinking under `reasoning` now logs `reasoning_chars` correctly through rig.
 #[test]
-fn bare_reasoning_alias_is_dropped_by_rig() {
+fn bare_reasoning_alias_is_preserved() {
     let v = reasoning_verdict("reasoning");
     println!("{}", v.line());
     assert!(
-        !v.preserved,
-        "regression check: rig started honoring the bare `reasoning` alias — {}",
+        v.preserved,
+        "regression check: rig stopped honoring the bare `reasoning` alias — {}",
         v.detail
     );
 }
 
-/// FIDELITY GAP: rig's Chat Completions `Usage` cannot represent reasoning tokens — the conversion
-/// hardcodes `reasoning_tokens: 0`. Both the nested `completion_tokens_details.reasoning_tokens` and
-/// the top-level fallback our transport reads are lost. (Rig's newer **Responses API** path does keep
-/// them, but eaig speaks Chat Completions, so that path is not the one we'd use.)
+/// PRESERVED (since 0.42.0): rig's Chat Completions `Usage` now carries `reasoning_tokens` — both the
+/// nested `completion_tokens_details.reasoning_tokens` and the top-level fallback our transport reads
+/// survive into `completion::Usage` (they were hardcoded to 0 in 0.39.0).
 #[test]
-fn usage_reasoning_tokens_are_dropped_by_rig_chat_completions() {
+fn usage_reasoning_tokens_are_preserved() {
     let v = usage_reasoning_verdict();
     println!("{}", v.line());
     assert!(
-        !v.preserved,
-        "regression check: rig's chat Usage started exposing reasoning tokens — {}",
+        v.preserved,
+        "regression check: rig's chat Usage stopped exposing reasoning tokens — {}",
         v.detail
     );
 }
 
-/// Prints the whole verdict table and asserts the overall shape (exactly one field — `reasoning_content`
-/// — is preserved by rig's OpenAI provider). This is the summary reproduced in the PR Verification body.
+/// Prints the whole verdict table and asserts the overall shape (three fields — `reasoning_content`,
+/// the bare `reasoning` alias, and `usage.reasoning_tokens` — are preserved by rig's OpenAI provider;
+/// only `thought_signature` remains dropped). This is the summary reproduced in the PR Verification body.
 #[test]
 fn fidelity_verdict_summary() {
     let verdict = full_verdict();
-    println!("\n=== rig-core 0.39.0 OpenAI-provider fidelity verdict ===");
+    println!("\n=== rig-core 0.42.0 OpenAI-provider fidelity verdict ===");
     for v in &verdict {
         println!("{}", v.line());
     }
@@ -324,7 +332,12 @@ fn fidelity_verdict_summary() {
         .collect();
     assert_eq!(
         preserved,
-        vec!["reasoning_content"],
-        "only reasoning_content should survive rig's OpenAI Chat Completions provider"
+        vec![
+            "reasoning_content",
+            "reasoning_content",
+            "usage.reasoning_tokens"
+        ],
+        "reasoning_content (both spellings) and usage.reasoning_tokens should survive rig's OpenAI \
+         Chat Completions provider; thought_signature should not"
     );
 }
