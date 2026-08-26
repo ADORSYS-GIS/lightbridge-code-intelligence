@@ -116,14 +116,14 @@ pub fn known_tool_names() -> Vec<&'static str> {
 ///
 /// `fs_write` (ADR-0104, story #497) gates `write_file`/`edit_file`/`list_directory` the same way —
 /// **deliberately not** via `tool_defs()`/`known_tool_names()`/the `ReviewTool` allowlist enum. Those
-/// drive the (currently native-loop-only) per-preset allowlist; on the live OpenCode-hosted review path
-/// every builtin `tool_registry` unconditionally registers is exposed to every preset regardless of its
-/// configured allowlist (a separate, already-flagged gap — the allowlist mechanism isn't wired into the
-/// live path at all yet). Since review must NEVER get write access, gating these three tools behind an
-/// explicit `bool` this function's every caller passes `false` for is safe *today*, independent of that
-/// other gap — no review preset can reach them no matter what its `tools:` config says, because nothing
-/// sets `fs_write: true` anywhere in production. `open` mode migrating onto this shared fs-tool family
-/// (ADR-0104's "More Information") is a future consumer that would pass `true`.
+/// drive the per-preset allowlist (ADR-0062/ADR-0103), now enforced on the live OpenCode-hosted review
+/// path via `Tools::with_offer`'s `TurnFilter` (the supervisor resolves the allowlist and `lci-review-mcp`
+/// applies it to both `tools/list` and `tools/call`). `fs_write` stays a SEPARATE `bool` so the fs-tool
+/// trio is never reachable through the (now-enforced) allowlist either. Since review must NEVER get
+/// write access, gating these three tools behind an explicit `bool` this function's every caller passes
+/// `false` for is safe regardless of a preset's `tools:` config — no review preset can reach them. `open`
+/// mode migrating onto this shared fs-tool family (ADR-0104's "More Information") is a future consumer
+/// that would pass `true`.
 #[allow(clippy::too_many_arguments)]
 pub fn tool_registry(
     client: Arc<ControlPlaneClient>,
@@ -186,6 +186,12 @@ pub struct Tools {
     registry: ToolRegistry,
     workspace: EagerWorkspace,
     task_id: Uuid,
+    /// The offered surface narrowed to a per-run allowlist (`review.<preset>.tools`, ADR-0062/
+    /// ADR-0103). `TurnFilter::all()` = every registered tool. Used by `lcireview-mcp`'s OpenCode
+    /// host so `tools/list` AND `tools/call` both honor the operator's preset config; the native loop
+    /// never sets this (it narrows at the per-turn `Conversation` layer instead), so its
+    /// `new`/`with_sast` constructors are untouched.
+    offered: TurnFilter,
 }
 
 impl Tools {
@@ -202,9 +208,9 @@ impl Tools {
             task_id,
             checkout_root,
             discovered,
-            None,
-            None,
-            false,
+            None,  // sast
+            None,  // min_priority
+            false, // fs_write
         )
     }
 
@@ -227,6 +233,35 @@ impl Tools {
         min_priority: Option<String>,
         fs_write: bool,
     ) -> Result<Self, RegistryError> {
+        Self::with_sast_and_filter(
+            client,
+            embedder,
+            task_id,
+            checkout_root,
+            discovered,
+            sast,
+            min_priority,
+            fs_write,
+            TurnFilter::all(),
+        )
+    }
+
+    /// The shared constructor behind [`Self::with_sast`] and [`Self::with_offer`]: builds the full
+    /// registered registry (via [`tool_registry`]), then narrows what `specs()`/`dispatch()` expose
+    /// to `offered`. The native path keeps [`Self::with_sast`] (a full-surface filter); the OpenCode
+    /// MCP path passes a per-preset [`TurnFilter::only_names`].
+    #[allow(clippy::too_many_arguments)]
+    fn with_sast_and_filter(
+        client: &ControlPlaneClient,
+        embedder: &EmbeddingsClient,
+        task_id: Uuid,
+        checkout_root: &Path,
+        discovered: impl IntoIterator<Item = ToolSpec>,
+        sast: Option<SastToolConfig>,
+        min_priority: Option<String>,
+        fs_write: bool,
+        offered: TurnFilter,
+    ) -> Result<Self, RegistryError> {
         Ok(Self {
             registry: tool_registry(
                 Arc::new(client.clone()),
@@ -239,7 +274,58 @@ impl Tools {
             )?,
             workspace: EagerWorkspace(checkout_root.to_path_buf()),
             task_id,
+            offered,
         })
+    }
+
+    /// Like [`Self::with_sast`], but additionally restricts the offered surface to `allowed_names`
+    /// (canonical registered tool names, e.g. `read_file` / `lightbridge_vector_semantic_search`).
+    /// Used by `lci-review-mcp`: the supervisor resolves the preset's `review.tools` allowlist and the
+    /// ADR-0066 `mcp__` selectors into exactly this set, set as `LCI_MCP_OFFERED_TOOLS`, and this
+    /// constructor applies it as a [`TurnFilter::only_names`] so both `specs()` (what `tools/list`
+    /// advertises) and `dispatch()` (what `tools/call` will execute) honor it.
+    ///
+    /// `None` = the allowlist is unset → the full registered surface (the ADR-0062/ADR-0103 default,
+    /// preserving today's behavior). `Some(…)`, INCLUDING an empty slice, = an operator-declared
+    /// allowlist; a resolved-empty set means the diff/SAST gates dropped every named built-in, and
+    /// only the always-registered loop-terminal `finish`/`abort` remain offered so a review can still
+    /// terminate cleanly. This closure-correctness distinction (declared-empty vs unset) is the whole
+    /// point — an empty allowlist must never widen back to the full registry.
+    ///
+    /// The allowed names are compared against REGISTERED names, so a bare canonical like
+    /// `lightbridge_vector_semantic_search` offered to OpenCode (where MCP prefixing renders it
+    /// `lightbridge_vector_semantic_search`) resolves regardless of the exact token; a name that
+    /// matches no registered tool is simply never offered (an unknown tool, refused at dispatch).
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_offer(
+        client: &ControlPlaneClient,
+        embedder: &EmbeddingsClient,
+        task_id: Uuid,
+        checkout_root: &Path,
+        discovered: impl IntoIterator<Item = ToolSpec>,
+        sast: Option<SastToolConfig>,
+        min_priority: Option<String>,
+        allowed_names: Option<&[String]>,
+    ) -> Result<Self, RegistryError> {
+        let offered = match allowed_names {
+            None => TurnFilter::all(),
+            // An operator-declared allowlist that resolved to zero built-ins is STILL a closed surface:
+            // only the always-registered loop-terminal tools remain offered, so a review can terminate
+            // cleanly instead of widening back to the full registry.
+            Some([]) => TurnFilter::only_names([FINISH.to_string(), ABORT.to_string()]),
+            Some(names) => TurnFilter::only_names(names.iter().cloned()),
+        };
+        Self::with_sast_and_filter(
+            client,
+            embedder,
+            task_id,
+            checkout_root,
+            discovered,
+            sast,
+            min_priority,
+            false, // fs_write — review never gets write access (ADR-0104); see `tool_registry`
+            offered,
+        )
     }
 
     pub async fn dispatch(&self, call: &ToolCallReq) -> ToolOutcome {
@@ -247,12 +333,7 @@ impl Tools {
             task_id: self.task_id,
             workspace: &self.workspace,
         };
-        match self
-            .registry
-            .view(&TurnFilter::all())
-            .dispatch(&cx, call)
-            .await
-        {
+        match self.registry.view(&self.offered).dispatch(&cx, call).await {
             DispatchResult::Completed(outcome) => outcome,
             DispatchResult::Refused(refusal) => render_refusal(refusal),
         }
@@ -264,7 +345,7 @@ impl Tools {
     /// instead of re-declaring them and risking drift.
     #[must_use]
     pub fn specs(&self) -> Vec<ToolSpec> {
-        self.registry.view(&TurnFilter::all()).specs().to_vec()
+        self.registry.view(&self.offered).specs().to_vec()
     }
 }
 
@@ -549,5 +630,152 @@ mod tests {
                 ToolOutcome::Continue(_)
             ));
         }
+    }
+
+    /// A control-plane mock that stubs every internal endpoint the review tools hit, so an
+    /// `add_review_comment`/`finish` that IS offered can dispatch to a clean result rather than an
+    /// `http://unused` connection error (which would still be refused correctly, but with a noisy
+    /// error line and a less clear assertion failure on the "stays offered" path).
+    async fn mock_offered_surface_cp() -> (MockServer, ControlPlaneClient) {
+        let cp = MockServer::start().await;
+        for endpoint in [
+            "review/inline",
+            "review/inline/retract",
+            "review/comment",
+            "review/summary",
+            "review/finalize",
+        ] {
+            Mock::given(method("POST"))
+                .and(path(format!("/internal/tasks/{}/{endpoint}", Uuid::nil())))
+                .respond_with(ResponseTemplate::new(204))
+                .mount(&cp)
+                .await;
+        }
+        let uri = cp.uri();
+        (cp, ControlPlaneClient::new(uri, "tok"))
+    }
+
+    // ADR-0062/ADR-0103 (#497/#537): `Tools::with_offer` narrows BOTH `specs()` (what `tools/list`
+    // advertises) and `dispatch()` (what `tools/call` executes) to the allowlist. An unlisted
+    // retrieval tool is refused as not-offered even though it IS registered.
+    #[tokio::test]
+    async fn with_offer_gates_specs_and_dispatch_to_the_allowlist() {
+        let (_cp, client) = mock_offered_surface_cp().await;
+        let embedder = EmbeddingsClient::new("http://unused", "key", "model");
+        // nosemgrep: rust-unwrap-unchecked — test fixture; the allowlist build must succeed or the test is broken
+        let tools = Tools::with_offer(
+            &client,
+            &embedder,
+            Uuid::nil(),
+            Path::new("/tmp"),
+            [],
+            None,
+            None,
+            Some(&[
+                ADD_REVIEW_COMMENT.to_string(),
+                FINISH.to_string(),
+                ABORT.to_string(),
+            ]),
+        )
+        .unwrap();
+
+        let names: Vec<String> = tools.specs().iter().map(|s| s.name().to_string()).collect();
+        assert_eq!(
+            names,
+            vec![ADD_REVIEW_COMMENT, FINISH, ABORT],
+            "tools/list must advertise exactly the allowlist"
+        );
+
+        // A retrieval tool that is NOT listed is refused, not dispatched.
+        let outcome = tools
+            .dispatch(&call("r", READ_FILE, r#"{"path":"a.rs","start_line":1}"#))
+            .await;
+        assert!(
+            matches!(outcome, ToolOutcome::Continue(ref message) if message.contains("unknown tool")),
+            "an unlisted but REGISTERED tool must be refused-not-dispatched: {outcome:?}"
+        );
+        let outcome = tools
+            .dispatch(&call("v", VECTOR_SEMANTIC_SEARCH, r#"{"query":"auth"}"#))
+            .await;
+        assert!(
+            matches!(outcome, ToolOutcome::Continue(ref message) if message.contains("unknown tool"))
+        );
+    }
+
+    #[tokio::test]
+    async fn with_offer_full_surface_when_the_allowlist_is_unset() {
+        let (_cp, client) = mock_offered_surface_cp().await;
+        let embedder = EmbeddingsClient::new("http://unused", "key", "model");
+        // nosemgrep: rust-unwrap-unchecked — test fixture; the allowlist build must succeed or the test is broken
+        let tools = Tools::with_offer(
+            &client,
+            &embedder,
+            Uuid::nil(),
+            Path::new("/tmp"),
+            [],
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        // Unset = the full registered surface (today's behavior when a preset's `tools` is unset) —
+        // every built-in is advertised and dispatchable.
+        let names: Vec<String> = tools.specs().iter().map(|s| s.name().to_string()).collect();
+        // `run_sast` is unregistered here (sast: None — see `tool_registry`), so the full-surface
+        // expectation is every OTHER built-in.
+        for builtin in known_tool_names().into_iter().filter(|n| *n != RUN_SAST) {
+            assert!(
+                names.contains(&builtin.to_string()),
+                "missing {builtin}: {names:?}"
+            );
+        }
+        assert_eq!(
+            tools
+                .dispatch(&call("f", FINISH, r#"{"summary":"done"}"#))
+                .await,
+            ToolOutcome::Finish
+        );
+    }
+
+    #[tokio::test]
+    async fn with_offer_empty_declared_allowlist_is_a_closed_surface() {
+        // An operator-declared allowlist that resolved to zero built-ins (the diff/SAST gate dropped
+        // every named tool) must NOT widen to the full registry: only the always-registered
+        // loop-terminal tools remain, so a review can still terminate cleanly. The `_SET` companion
+        // env keeps this "declared-empty" case distinct from "unset" across the process boundary.
+        let (_cp, client) = mock_offered_surface_cp().await;
+        let embedder = EmbeddingsClient::new("http://unused", "key", "model");
+        // nosemgrep: rust-unwrap-unchecked — test fixture; the allowlist build must succeed or the test is broken
+        let tools = Tools::with_offer(
+            &client,
+            &embedder,
+            Uuid::nil(),
+            Path::new("/tmp"),
+            [],
+            None,
+            None,
+            Some(&[]),
+        )
+        .unwrap();
+        let names: Vec<String> = tools.specs().iter().map(|s| s.name().to_string()).collect();
+        assert_eq!(
+            names,
+            vec![FINISH, ABORT],
+            "an EMPTY declared allowlist must offer only the always-registered loop-terminators"
+        );
+        assert_eq!(
+            tools
+                .dispatch(&call("f", FINISH, r#"{"summary":"done"}"#))
+                .await,
+            ToolOutcome::Finish
+        );
+        // A retrieval tool is refused under the closed empty allowlist.
+        let outcome = tools
+            .dispatch(&call("r", READ_FILE, r#"{"path":"a.rs","start_line":1}"#))
+            .await;
+        assert!(
+            matches!(outcome, ToolOutcome::Continue(ref message) if message.contains("unknown tool")),
+            "an unlisted retrieval tool must stay refused under an empty allowlist: {outcome:?}"
+        );
     }
 }
