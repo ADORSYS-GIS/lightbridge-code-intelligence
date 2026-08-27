@@ -115,13 +115,24 @@ fn split_line_by_bytes(line: &str, max_bytes: usize) -> Vec<&str> {
     let mut rest = line;
     while rest.len() > max_bytes {
         let mut end = max_bytes;
-        while !rest.is_char_boundary(end) {
+        while end > 0 && !rest.is_char_boundary(end) {
             end -= 1;
+        }
+        if end == 0 {
+            // max_bytes is smaller than the byte width of rest's own first character (e.g. a
+            // 4-byte emoji at max_bytes <= 3) — no boundary at or under the cap exists. Take
+            // that one character whole instead of looping forever on an empty slice; a
+            // multi-byte character can't be split further.
+            end = rest.char_indices().nth(1).map_or(rest.len(), |(i, _)| i);
         }
         pieces.push(&rest[..end]);
         rest = &rest[end..];
     }
-    pieces.push(rest);
+    // The fallback above can consume a final over-cap character exactly to the end of `rest`,
+    // which would otherwise leave a spurious empty piece here.
+    if !rest.is_empty() {
+        pieces.push(rest);
+    }
     pieces
 }
 
@@ -444,6 +455,16 @@ fn sub(a: i32, b: i32) -> i32 { a - b }
         let pieces = split_line_by_bytes(&line, 10);
         assert!(pieces.iter().all(|p| p.len() <= 10));
         assert_eq!(pieces.concat(), line, "no bytes lost or corrupted");
+    }
+
+    // Regression (lightbridge-assistant's review of #636): when max_bytes is smaller than a
+    // character's own byte width, no char boundary at or under the cap exists — the split must
+    // still take that one character whole rather than looping forever pushing empty slices.
+    #[test]
+    fn split_line_by_bytes_makes_progress_when_the_cap_is_smaller_than_one_char() {
+        let line = "😀😀😀"; // each is 4 bytes
+        let pieces = split_line_by_bytes(line, 2);
+        assert_eq!(pieces, vec!["😀", "😀", "😀"]);
     }
 
     // Regression: the byte accumulator must count the `\n` that `join("\n")` inserts between
