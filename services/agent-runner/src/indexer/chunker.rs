@@ -63,7 +63,26 @@ fn cap_chunk_bytes(chunk: Chunk, tuning: super::IndexTuning) -> Vec<Chunk> {
     let mut out = Vec::new();
     let mut start = 0usize;
     while start < lines.len() {
-        // Always take at least one line, so a single line longer than the cap still terminates.
+        // A line longer than the cap on its own can't be merged with anything — split the line
+        // itself instead of emitting it whole (a minified/generated single-line file otherwise
+        // sails straight past an embedding model's own input limit, unsplit).
+        if lines[start].len() > tuning.max_chunk_bytes {
+            let line_no = chunk.start_line + start as i32;
+            for piece in split_line_by_bytes(lines[start], tuning.max_chunk_bytes) {
+                out.push(Chunk {
+                    file_path: chunk.file_path.clone(),
+                    language: chunk.language.clone(),
+                    chunk_type: chunk.chunk_type.clone(),
+                    symbol_name: chunk.symbol_name.clone(),
+                    start_line: line_no,
+                    end_line: line_no,
+                    content: piece.to_string(),
+                });
+            }
+            start += 1;
+            continue;
+        }
+
         let mut end = start + 1;
         let mut size = lines[start].len();
         while end < lines.len() {
@@ -88,6 +107,22 @@ fn cap_chunk_bytes(chunk: Chunk, tuning: super::IndexTuning) -> Vec<Chunk> {
         start = end;
     }
     out
+}
+
+/// Split one line into `<= max_bytes`-sized pieces, each cut on a valid UTF-8 char boundary.
+fn split_line_by_bytes(line: &str, max_bytes: usize) -> Vec<&str> {
+    let mut pieces = Vec::new();
+    let mut rest = line;
+    while rest.len() > max_bytes {
+        let mut end = max_bytes;
+        while !rest.is_char_boundary(end) {
+            end -= 1;
+        }
+        pieces.push(&rest[..end]);
+        rest = &rest[end..];
+    }
+    pieces.push(rest);
+    pieces
 }
 
 fn ts_language(lang: &str) -> Option<Language> {
@@ -353,7 +388,7 @@ fn sub(a: i32, b: i32) -> i32 { a - b }
     }
 
     #[test]
-    fn a_single_line_longer_than_the_cap_still_terminates_as_its_own_chunk() {
+    fn a_single_line_longer_than_the_cap_is_split_into_capped_pieces() {
         let tuning = IndexTuning {
             max_chunk_bytes: 10,
             ..IndexTuning::default()
@@ -368,12 +403,47 @@ fn sub(a: i32, b: i32) -> i32 { a - b }
             content: "a".repeat(100),
         };
         let out = cap_chunk_bytes(chunk, tuning);
-        assert_eq!(
-            out.len(),
-            1,
-            "a single oversized line is still one chunk, not split mid-line"
+        assert!(
+            out.len() > 1,
+            "a 100-byte line at a 10-byte cap must split into multiple pieces"
         );
-        assert_eq!(out[0].content.len(), 100);
+        assert!(
+            out.iter()
+                .all(|c| c.content.len() <= tuning.max_chunk_bytes),
+            "no output chunk may exceed max_chunk_bytes"
+        );
+        assert_eq!(
+            out.iter().map(|c| c.content.len()).sum::<usize>(),
+            100,
+            "the pieces must reconstruct the full line with nothing dropped"
+        );
+        assert!(out.iter().all(|c| c.start_line == 0 && c.end_line == 0));
+    }
+
+    // Regression: ADORSYS-GIS/CoopData's frontend/openapi.json is one 191,026-byte line — a
+    // minified/generated file — which the embeddings API rejects outright past its own
+    // 131,072-char input limit. The splitter must never emit a chunk that large regardless of
+    // file shape.
+    #[test]
+    fn a_giant_single_line_json_file_is_split_under_the_embedding_models_limit() {
+        let tuning = IndexTuning::default(); // max_chunk_bytes: 16_000
+        let src = "x".repeat(191_026);
+        let chunks = chunk_file("openapi.json", &src, "json", tuning);
+        assert!(!chunks.is_empty());
+        assert!(
+            chunks
+                .iter()
+                .all(|c| c.content.len() <= tuning.max_chunk_bytes),
+            "no chunk may exceed max_chunk_bytes, even from a single giant line"
+        );
+    }
+
+    #[test]
+    fn split_line_by_bytes_never_slices_through_a_multibyte_char() {
+        let line = "€".repeat(20); // each € is 3 bytes — max_bytes not a multiple of 3
+        let pieces = split_line_by_bytes(&line, 10);
+        assert!(pieces.iter().all(|p| p.len() <= 10));
+        assert_eq!(pieces.concat(), line, "no bytes lost or corrupted");
     }
 
     // Regression: the byte accumulator must count the `\n` that `join("\n")` inserts between
