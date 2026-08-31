@@ -70,8 +70,11 @@ export function CodeGraphCanvas({
           fontSize: 12,
           fontFamily: "var(--font-mono, monospace)",
           padding: "6px 10px",
+          overflow: "hidden",
+          textOverflow: "ellipsis",
+          whiteSpace: "nowrap",
         },
-        title: `${n.source_file}:${n.start_line}`,
+        domAttributes: { title: `${n.label}\n${n.source_file}:${n.start_line}` },
       };
     });
 
