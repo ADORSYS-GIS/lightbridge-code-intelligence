@@ -70,8 +70,13 @@ export function CodeGraphCanvas({
           fontSize: 12,
           fontFamily: "var(--font-mono, monospace)",
           padding: "6px 10px",
+          // Clip labels to one line — long Rust paths have no natural wrap point.
+          overflow: "hidden",
+          textOverflow: "ellipsis",
+          whiteSpace: "nowrap",
         },
-        title: `${n.source_file}:${n.start_line}`,
+        // `domAttributes` is xyflow's escape hatch onto the node's wrapper div; a bare `title` field isn't rendered.
+        domAttributes: { title: `${n.label}\n${n.source_file}:${n.start_line}` },
       };
     });
 
