@@ -313,9 +313,20 @@ Both return a Server-Sent-Events stream of `StreamResponse` frames. The **ordere
 
 1. an initial **`task`** frame — the current `GetTask` snapshot (so a reconnect immediately re-grounds);
 2. then, in strict order, **`statusUpdate`** frames for each state transition
-   (`SUBMITTED → WORKING → …`) and, on completion, a **`artifactUpdate`** frame carrying the same
-   `review` artifact `GetTask` returns (summary + findings + review-context);
-3. the stream **closes** at the terminal state (`COMPLETED` / `FAILED` / `CANCELED` / `REJECTED`).
+   (`SUBMITTED → WORKING → …`);
+3. when the review finalizes (while still `WORKING`, before the terminal frame), the findings stream
+   **incrementally** ([ADR-0098](adr/0098-a2a-per-finding-review-streaming.md)) — one **`artifactUpdate`**
+   frame **per confirmed finding**, then a final **`artifactUpdate`** carrying the **conclusion**:
+   - each finding frame has `artifactId` `"finding-{file}:{line}"` and a single **data** part carrying
+     that finding's ADR-0032 JSON — byte-identical to one element of the `findings` array `GetTask`
+     returns, so you can act on finding #1 without waiting for the rest;
+   - the conclusion frame has `artifactId` `"review"` with a **text** summary part and a **data**
+     `context` part (repo/pr/effective SHAs/scope). It carries **no** findings blob — the findings were
+     the preceding frames. Its `reviewUrl` is `null` here (the PR review has not posted yet at finalize);
+4. the stream **closes** at the terminal state (`COMPLETED` / `FAILED` / `CANCELED` / `REJECTED`).
+
+The findings and verdict a subscriber assembles from the `finding-*` frames plus the `review` conclusion
+are the **same confirmed set** `GetTask` returns as one combined artifact — same content, streamed shape.
 
 Guarantees (RFC-0006 R6):
 
@@ -329,9 +340,12 @@ Guarantees (RFC-0006 R6):
   that flips the underlying status, so an event exists for every transition a poller could observe. You
   may freely mix `GetTask` and streaming on one task.
 
-Timing note: for a **posted** review the full artifact is written asynchronously (after the PR post),
-so a stream may close on `COMPLETED` *before* the artifact is available — do a single follow-up
-`GetTask` to fetch it. The terminal status and the ordered progress are always delivered on the stream.
+Permalink note: the findings and verdict arrive **on the stream** at finalize (step 3), so — unlike the
+earlier single-blob-at-completion behaviour — you no longer need a follow-up `GetTask` just to see them.
+What the stream's conclusion frame *cannot* carry is the posted-review **`reviewUrl`**: the PR review is
+posted asynchronously after finalize, so the streamed `context.reviewUrl` is `null`. If you need the
+permalink, do one follow-up `GetTask` after `COMPLETED` — its combined `review` artifact carries the
+populated `reviewUrl`.
 
 ## 5b. Push notifications (`CreateTaskPushNotificationConfig`) — webhook callbacks
 
