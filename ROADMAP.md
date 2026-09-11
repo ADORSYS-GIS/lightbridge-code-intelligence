@@ -9,9 +9,19 @@ open a PR to fix this file.
 > **Keeping this current is part of "done."** When a PR meaningfully ships, unblocks, or retires an item
 > here, update its status in the **same PR** (see [AGENTS.md](AGENTS.md)).
 
-_Last updated: 2026-08-21._
+_Last updated: 2026-09-11._
 
 ## Recently shipped
+
+- **`apps/web` retired; console moves to `apps/lci`** — supersedes the "`apps/web` full revamp" item
+  this file previously carried here. `apps/lci` (`ADORSYS-GIS/converse-frontends`, OIDC-authenticated,
+  its own design system) already ships the per-repo settings + model-override admin UI that revamp
+  was building toward, plus the general browsing surface, live at `lci.ai.camer.digital`.
+  `code-intelligence.ai.camer.digital` now redirects there; `apps/web`'s Kubernetes deployment (its
+  controller, RBAC, `better-auth` secret) is being removed from the `lightbridge-code-intelligence`
+  Helm chart. `apps/web`'s source code in this repo is not yet removed — a follow-up, not done here.
+  `clients/lci` (the TUI) is unaffected. ([ADR-0115](docs/adr/0115-retire-apps-web-move-console-to-lci-ui.md),
+  supersedes [ADR-0112](docs/adr/0112-invest-in-apps-web-supersede-0063.md))
 
 - **Symbol-level semantic search for the review agent** — a new `lightbridge_graph_semantic_search`
   MCP tool searches the Neo4j code graph by meaning, not just by name, additive alongside the existing
@@ -161,12 +171,6 @@ _Last updated: 2026-08-21._
   runner accepts the field, but no operator can set it until the chart surfaces it.
 - **Remove the dead native review path** — now unblocked (SAST is ported); delete `run_native_agent` and
   its native-only modules.
-- **`apps/web` full revamp** ([ADR-0112](docs/adr/0112-invest-in-apps-web-supersede-0063.md), supersedes
-  the retirement plan) — new shared `Toggle`/`Select`/provenance-badge components, then a full
-  `/dashboard/repositories/[id]` page exposing ADR-0111's per-repo settings (check-run reporting,
-  review-on-open, review-on-push, push-storm strategy, dedup scope) and a model-override picker
-  (ADR-0110), followed by a lower-priority consistency pass across Repositories/Runs/Overview/Settings.
-  Sliced per-page, in progress.
 - **A2A per-finding review streaming** — stream findings as they are confirmed at finalize.
   ([PR #458](https://github.com/vymalo/lightbridge-code-intelligence/pull/458) — open; no ADR yet)
 
