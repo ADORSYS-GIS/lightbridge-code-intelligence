@@ -1,11 +1,14 @@
 # Build and publish the container images the ai-helm deployment references.
 #
 # ADR-0080: nothing is compiled inside a container. The Rust workspace builds natively on the runner
-# as a static-musl binary (mimalloc allocator, sccache); the web app builds natively via pnpm + Turbo
-# remote cache. Those artifacts are then assembled into images by **buildah** — daemonless, no Docker
-# engine — over COPY-only Dockerfiles. PRs build + assemble (validate only, no push). Pushes to main
-# and version tags also push to GHCR and cosign-sign each digest; argocd-image-updater promotes the
-# newest signed `sha-<gitsha>` by committing it to adorsys-gis/ai-helm-values (see deploy/README.md).
+# as a static-musl binary (mimalloc allocator, sccache). Those artifacts are then assembled into
+# images by **buildah** — daemonless, no Docker engine — over COPY-only Dockerfiles. PRs build +
+# assemble (validate only, no push). Pushes to main and version tags also push to GHCR and
+# cosign-sign each digest; argocd-image-updater promotes the newest signed `sha-<gitsha>` by
+# committing it to adorsys-gis/ai-helm-values (see deploy/README.md).
+#
+# ADR-0115: `apps/web`'s Kubernetes deployment is retired — this pipeline no longer builds a
+# `lightbridge-web` image.
 #
 # The pipeline itself lives in the reusable image-pipeline.yml (shared with release-please.yml, which
 # publishes the versioned `:X.Y.Z` image on a release). This file only wires the triggers.
