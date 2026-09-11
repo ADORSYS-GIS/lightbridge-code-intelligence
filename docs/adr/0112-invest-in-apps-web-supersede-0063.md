@@ -1,6 +1,9 @@
 # ADR-0112: Invest in `apps/web` as a permanent admin surface (supersedes ADR-0063's retirement plan)
 
-- **Status:** Accepted
+- **Status:** Superseded by [ADR-0115](0115-retire-apps-web-move-console-to-lci-ui.md) — `apps/web`'s
+  deployment is retired in favor of `apps/lci` (`converse-frontends`); `clients/lci` is unaffected.
+  Everything else below (the ADR-0063 reversal reasoning, the design-lineage citations) stands
+  unchanged as historical record.
 - **Date:** 2026-08-02
 - **Deciders:** @stephane-segning
 
