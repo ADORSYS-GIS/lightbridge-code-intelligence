@@ -100,6 +100,12 @@ Epic #241 used.
   been functionally obsolete since ADR-0102.
 - Bad, because `apps/web`'s source code in this repo becomes dead weight until a follow-up removes
   it — not addressed by this ADR or its linked PRs.
+- Bad, because CI keeps actively building, pushing to GHCR, and cosign-signing a `lightbridge-web`
+  image on every push to `main` (`.github/workflows/build-images.yml` →
+  `image-pipeline.yml`'s `web-build` job and `images` matrix), for a service the linked infra PRs
+  leave with no Kubernetes deployment to consume it — an ongoing compute/storage cost, and a signed
+  `:latest` tag that could read as "still deployed." Not addressed by this ADR or its linked PRs;
+  tracked as its own follow-up in [#646](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/646).
 - Bad, because the console now lives in a different repository (`converse-frontends`) from the
   control-plane it talks to, a cross-repo split ADR-0006 never had to account for when `apps/web`
   was co-located; this ADR documents that reality, it does not resolve the coordination cost.
@@ -156,6 +162,8 @@ Epic #241 used.
 - Infra tracking: [ai-helm-values#435](https://github.com/ADORSYS-GIS/ai-helm-values/issues/435),
   [ai-helm#1122](https://github.com/ADORSYS-GIS/ai-helm/pull/1122),
   [ai-helm-values#436](https://github.com/ADORSYS-GIS/ai-helm-values/pull/436).
+- CI cleanup follow-up: [#646](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/646)
+  (stop building/pushing/signing the `lightbridge-web` image once `apps/web`'s deployment retires).
 - The replacement: `apps/lci` in `ADORSYS-GIS/converse-frontends`, deployed as its own Application
   (`lci-ui`, chart `converse-lci`) at `lci.ai.camer.digital`.
 - `clients/lci`, explicitly unaffected by this ADR: `clients/lci/README.md`.
