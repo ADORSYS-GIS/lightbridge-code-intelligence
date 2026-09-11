@@ -1,9 +1,11 @@
 # Reusable image pipeline (ADR-0080): compile natively → assemble with buildah → push + cosign-sign.
 #
 # Nothing is compiled inside a container. The Rust workspace builds natively on the runner as a
-# static-musl binary (sccache); the web app builds natively via pnpm + Turbo remote cache. Those
-# artifacts are assembled into images by buildah — daemonless, no Docker engine — over COPY-only
-# Dockerfiles.
+# static-musl binary (sccache). Those artifacts are assembled into images by buildah — daemonless,
+# no Docker engine — over COPY-only Dockerfiles.
+#
+# ADR-0115: `apps/web`'s Kubernetes deployment is retired (console moved to `apps/lci` in
+# converse-frontends) — this pipeline no longer builds, pushes, or signs a `lightbridge-web` image.
 #
 # Called by:
 #   - build-images.yml — on PRs (push=false, validate only) and on push to main / v* tags
@@ -84,42 +86,9 @@ jobs:
           path: dist
           key: rust-bins-${{ github.run_id }}
 
-  # ── Compile the Next.js app natively → the standalone bundle ──────────────────────────────────────
-  web-build:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-      - run: corepack enable
-      - name: pnpm install
-        run: pnpm install --frozen-lockfile
-      - name: turbo build (remote cache)
-        env:
-          TURBO_API: ${{ vars.TURBO_API }}
-          TURBO_TEAM: ${{ vars.TURBO_TEAM }}
-          TURBO_TOKEN: ${{ secrets.TURBO_TOKEN }}
-          # NEXT_PUBLIC_* vars are inlined into the client bundle at `next build` time (ADR-0102) —
-          # setting this at deploy/runtime instead would have no effect, the value is already baked
-          # into the compiled JS by then. Not a secret: it's a public URL and ends up in the bundle
-          # either way.
-          NEXT_PUBLIC_GRAFANA_URL: https://grafana.ai.camer.digital
-        run: pnpm turbo run build --filter=@lightbridge/web
-      - name: Stage bundle
-        run: |
-          mkdir -p web/standalone web/static web/public
-          cp -a apps/web/.next/standalone/. web/standalone/
-          cp -a apps/web/.next/static/.     web/static/
-          cp -a apps/web/public/.           web/public/
-      - uses: actions/cache/save@v4
-        with:
-          path: web
-          key: web-bundle-${{ github.run_id }}
-
   # ── Assemble images from the prebuilt artifacts, daemonless, with rootless podman ─────────────────
   images:
-    needs: [rust-build, web-build]
+    needs: [rust-build]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -132,18 +101,12 @@ jobs:
           - image: lightbridge-control-plane
             dockerfile: services/control-plane/Dockerfile
             target: ""
-            artifact: rust-bins
-          - image: lightbridge-web
-            dockerfile: apps/web/Dockerfile
-            target: ""
-            artifact: web-bundle
           # Two agent images from one Dockerfile. Since Graphify was retired (ADR-0086) both targets
           # alias one lean runtime and build to the same image; kept as separate tags for the two Job
           # kinds. Both COPY the same runner binary from context.
           - image: lightbridge-agent-runner
             dockerfile: services/agent-runner/Dockerfile
             target: indexer
-            artifact: rust-bins
           # ADR-0097 cutover: the review image is now OpenCode-based (the agent-runner Job binary
           # spawns `opencode acp` + the stdio lci-review-mcp + the plugins). The image NAME is
           # unchanged, so ai-helm-values needs NO edit — merging this rebuilds lightbridge-agent-review
@@ -153,7 +116,6 @@ jobs:
           - image: lightbridge-agent-review
             dockerfile: services/agent-runner/Dockerfile.review-opencode
             target: ""
-            artifact: rust-bins
     steps:
       - uses: actions/checkout@v4 # the Dockerfiles
       - name: Lowercase repository owner
@@ -162,8 +124,8 @@ jobs:
           echo "owner=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
       - uses: actions/cache/restore@v4
         with:
-          path: ${{ matrix.artifact == 'rust-bins' && 'dist' || 'web' }}
-          key: ${{ matrix.artifact }}-${{ github.run_id }}
+          path: dist
+          key: rust-bins-${{ github.run_id }}
           fail-on-cache-miss: true
       # These self-hosted hosts are rootless-podman hosts with no password-less sudo, so the images
       # are assembled with rootless `podman build` (buildah's engine, daemonless) directly on the
@@ -188,18 +150,13 @@ jobs:
         id: ctx
         run: |
           ctx="$(mktemp -d)"
-          case "${{ matrix.artifact }}" in
-            rust-bins)
-              cp dist/* "$ctx"/ && chmod +x "$ctx"/*
-              # The review-opencode image also needs the first-party plugins (ADR-0095) — the buildah
-              # context is dist/-only, so stage them here from the checkout under a context-relative
-              # name. node_modules is gitignored (absent from the checkout); pruned defensively.
-              mkdir -p "$ctx"/opencode-plugins
-              cp -r integrations/opencode/plugins/. "$ctx"/opencode-plugins/
-              find "$ctx"/opencode-plugins -type d -name node_modules -prune -exec rm -rf {} +
-              ;;
-            web-bundle) cp -a web/standalone web/static web/public "$ctx"/ ;;
-          esac
+          cp dist/* "$ctx"/ && chmod +x "$ctx"/*
+          # The review-opencode image also needs the first-party plugins (ADR-0095) — the buildah
+          # context is dist/-only, so stage them here from the checkout under a context-relative
+          # name. node_modules is gitignored (absent from the checkout); pruned defensively.
+          mkdir -p "$ctx"/opencode-plugins
+          cp -r integrations/opencode/plugins/. "$ctx"/opencode-plugins/
+          find "$ctx"/opencode-plugins -type d -name node_modules -prune -exec rm -rf {} +
           echo "dir=$ctx" >> "$GITHUB_OUTPUT"
       # Tag strings only — metadata-action needs no Docker daemon. With an explicit `version` (release
       # path) emit ONLY that semver; otherwise reproduce the original ref-derived tag set exactly.
