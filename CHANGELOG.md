@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.9.0](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/compare/v0.8.0...v0.9.0) (2026-09-14)
+
+
+### Features
+
+* **codegraph:** bump the lci-codegraph pin to the latest main ([#650](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/650)) ([0a2edd4](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/commit/0a2edd496e27fb86f3c5fd21129c7512ed7131cd))
+
+
+### Documentation
+
+* **adr:** retire apps/web's deployment, console moves to apps/lci (ADR-0115) ([#645](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/645)) ([9327031](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/commit/93270319e59945d2fb9aed7b54651c256e891334))
+
 ## [0.8.0](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/compare/v0.7.0...v0.8.0) (2026-08-31)
 
 
