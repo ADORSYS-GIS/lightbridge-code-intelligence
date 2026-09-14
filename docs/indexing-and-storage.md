@@ -193,12 +193,15 @@ checkout over one tree-sitter parse — no subprocess, no Python, no `graph.json
 on a blocking thread and maps the crate's `Graph` onto the internal-API `GraphNodePayload`/`GraphEdgePayload`.
 
 The crate emits symbol nodes (functions, methods, types, modules) with 1-based start lines and a `()`
-suffix on callables, plus `contains` / `method` / `calls` edges, with **cross-file symbol resolution
-for Rust** (a reference in file A resolved to a definition in file B). Languages without a graph
-extractor yet contribute no structural facts (they stay covered by the semantic chunker). The
-extractor has no embeddings; the semantic path stays entirely with our own chunker. An
+suffix on callables, plus `contains` / `method` / `calls` edges, with **cross-file symbol resolution**
+(a reference in file A resolved to a definition in file B) for Rust, Python, TypeScript/JavaScript
+(including TSX/JSX), Java, Scala, Dart, Swift and CrateStack — Java additionally resolves through
+Spring's annotation surface. Languages without a graph extractor yet (JSON, Jinja2 and Postgres are
+parsed but classify no definitions) contribute no structural facts, and stay covered by the semantic
+chunker. The extractor has no embeddings; the semantic path stays entirely with our own chunker. An
 operator-configurable, gitignore-style **ignore-list** (`LCI_CODEGRAPH_IGNORE_GLOBS`, composed with the
-repo `.gitignore`) and the `INDEX_*` tuning knobs govern the walk.
+repo `.gitignore`) and the crate's own `LCI_CODEGRAPH_MAX_CHUNK_LINES` / `_WINDOW_SIZE` / `_WINDOW_STEP`
+knobs govern the walk. The `INDEX_*` knobs below tune our chunker, not the crate's walk.
 
 ### Storage — `:Symbol` graph (`services/control-plane/src/integrations/neo4j.rs`)
 
