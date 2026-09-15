@@ -94,9 +94,25 @@ async fn submit_chunks_posts_batch_with_bearer() {
     let server = MockServer::start().await;
     let task_id = Uuid::nil();
 
+    // Pin the wire shape `ingest_chunks` deserializes, including the `node_id` it keys the
+    // symbol-embedding attach on (ADR-0117).
     Mock::given(method("POST"))
         .and(path(format!("/internal/tasks/{task_id}/chunks")))
         .and(bearer_token("runner-secret"))
+        .and(body_json(serde_json::json!({
+            "commit_sha": "abc123",
+            "chunks": [{
+                "file_path": "src/main.rs",
+                "language": "rust",
+                "chunk_type": "function",
+                "symbol_name": "main",
+                "start_line": 0,
+                "end_line": 5,
+                "content": "fn main() {}",
+                "embedding": [0.0, 0.0, 0.0, 0.0],
+                "node_id": "src/main.rs#1:main",
+            }],
+        })))
         .respond_with(ResponseTemplate::new(204))
         .expect(1)
         .mount(&server)
@@ -117,6 +133,59 @@ async fn submit_chunks_posts_batch_with_bearer() {
                     end_line: 5,
                     content: "fn main() {}".to_string(),
                     embedding: vec![0.0; 4],
+                    node_id: Some("src/main.rs#1:main".to_string()),
+                }],
+            },
+        )
+        .await
+        .expect("chunks submitted");
+}
+
+#[tokio::test]
+async fn submit_chunks_omits_node_id_for_a_chunk_that_is_not_a_definition() {
+    use lci_agent_clients::{ChunkBatch, ChunkPayload};
+
+    let server = MockServer::start().await;
+    let task_id = Uuid::nil();
+
+    // A windowed slice links to no symbol; `node_id` must be absent from the body rather than null,
+    // so the control plane's `Option` default applies and no embedding is offered to Neo4j.
+    Mock::given(method("POST"))
+        .and(path(format!("/internal/tasks/{task_id}/chunks")))
+        .and(bearer_token("runner-secret"))
+        .and(body_json(serde_json::json!({
+            "commit_sha": "abc123",
+            "chunks": [{
+                "file_path": "README.md",
+                "language": "text",
+                "chunk_type": "window",
+                "start_line": 0,
+                "end_line": 99,
+                "content": "# readme",
+                "embedding": [0.0, 0.0, 0.0, 0.0],
+            }],
+        })))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = ControlPlaneClient::new(server.uri(), "runner-secret");
+    client
+        .submit_chunks(
+            task_id,
+            ChunkBatch {
+                commit_sha: "abc123".to_string(),
+                chunks: vec![ChunkPayload {
+                    file_path: "README.md".to_string(),
+                    language: "text".to_string(),
+                    chunk_type: "window".to_string(),
+                    symbol_name: None,
+                    start_line: 0,
+                    end_line: 99,
+                    content: "# readme".to_string(),
+                    embedding: vec![0.0; 4],
+                    node_id: None,
                 }],
             },
         )
@@ -161,9 +230,25 @@ async fn submit_graph_posts_nodes_and_edges_with_bearer() {
     let server = MockServer::start().await;
     let task_id = Uuid::nil();
 
+    // Structural facts only: a node payload carries no vector (ADR-0117), so `body_json`'s exact
+    // match is what proves no `embedding` key is emitted.
     Mock::given(method("POST"))
         .and(path(format!("/internal/tasks/{task_id}/graph")))
         .and(bearer_token("runner-secret"))
+        .and(body_json(serde_json::json!({
+            "commit_sha": "abc123",
+            "nodes": [{
+                "node_id": "src_math_add",
+                "label": "add()",
+                "source_file": "src/math.rs",
+                "start_line": 2,
+            }],
+            "edges": [{
+                "source": "src_math_calc_bump",
+                "target": "src_math_add",
+                "relation": "calls",
+            }],
+        })))
         .respond_with(ResponseTemplate::new(204))
         .expect(1)
         .mount(&server)
@@ -180,7 +265,6 @@ async fn submit_graph_posts_nodes_and_edges_with_bearer() {
                     label: "add()".to_string(),
                     source_file: "src/math.rs".to_string(),
                     start_line: 2,
-                    embedding: None,
                 }],
                 edges: vec![GraphEdgePayload {
                     source: "src_math_calc_bump".to_string(),
