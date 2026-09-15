@@ -114,9 +114,8 @@ see below): `TASK_ID`, `REPOSITORY_ID`, `INSTALLATION_ID`, `COMMAND`, `TARGET_TY
 `ATTEMPT`, `BASE_SHA` / `HEAD_SHA`, `CONTROL_PLANE_URL`, `AGENT_RUNNER_TOKEN` 🔒 (a fresh per-task
 signed JWT), `TRACEPARENT`, plus (from Secret `lightbridge-agent-secrets`) `LLM_BASE_URL` /
 `LLM_API_KEY` 🔒 / `LLM_MODEL` (optional — absent skips review) and `EMBEDDINGS_BASE_URL` /
-`EMBEDDINGS_API_KEY` 🔒 / `EMBEDDINGS_MODEL` (required), and the forwarded indexer-tuning vars
-(`INDEX_EMBED_BATCH_SIZE`, `INDEX_MAX_CHUNK_LINES`, `INDEX_WINDOW_SIZE`, `INDEX_WINDOW_STEP`) and
-observability vars (`OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_TRACES_SAMPLER_ARG`) from the dispatcher's
+`EMBEDDINGS_API_KEY` 🔒 / `EMBEDDINGS_MODEL` (required), and the forwarded indexer-tuning var
+(`INDEX_EMBED_BATCH_SIZE`) and observability vars (`OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_TRACES_SAMPLER_ARG`) from the dispatcher's
 own env.
 
 ### A2A role ([RFC-0006](../docs/rfc/0006-a2a-agent-surface.md))
@@ -234,10 +233,12 @@ points at the newline-delimited changed-file list scoping the scan.
 | Variable | Default | Description |
 |---|---|---|
 | `INDEX_EMBED_BATCH_SIZE` | `32` (clamped ≥1) | Chunks embedded + submitted per round-trip. |
-| `INDEX_MAX_CHUNK_LINES` | `150` (clamped ≥1) | Max lines a structured chunk spans before windowing. |
-| `INDEX_WINDOW_SIZE` | `100` (clamped ≥1) | Windowed-fallback window size (lines). |
-| `INDEX_WINDOW_STEP` | `50` (clamped ≥1) | Windowed-fallback step (lines). |
-| `INDEX_MAX_CHUNK_BYTES` | `16000` (clamped ≥1) | Ceiling on a single chunk's byte length.¹ |
+
+Chunk *shape* is tuned on `lci-codegraph`, which owns the walk that produces the chunks
+([ADR-0117](../docs/adr/0117-one-walk-node-id-symbol-embeddings.md)): `LCI_CODEGRAPH_MAX_CHUNK_LINES`,
+`LCI_CODEGRAPH_WINDOW_SIZE`, `LCI_CODEGRAPH_WINDOW_STEP`, `LCI_CODEGRAPH_MAX_CHUNK_BYTES`, and
+`LCI_CODEGRAPH_IGNORE_GLOBS`. The `INDEX_`-prefixed equivalents are retired; none was set in any
+deployed environment.
 
 ### Review-loop runtime
 
@@ -357,11 +358,11 @@ A standalone TUI/CLI client, separate from the deployed platform.
 
 ## Notes and known gaps
 
-- ¹ `INDEX_MAX_CHUNK_BYTES` is read by the runner but, unlike its four siblings
-  (`INDEX_EMBED_BATCH_SIZE`/`INDEX_MAX_CHUNK_LINES`/`INDEX_WINDOW_SIZE`/`INDEX_WINDOW_STEP`), is not
-  in the dispatcher's forwarding list in
-  [`k8s.rs`](../services/control-plane/src/integrations/k8s.rs) — so an operator override never
-  reaches the Job. Worth a fix or an explicit "intentional" note if you rely on it.
+- The dispatcher forwards `INDEX_EMBED_BATCH_SIZE` plus the `LCI_CODEGRAPH_*` walk knobs from its
+  own env into each Job ([`k8s.rs`](../services/control-plane/src/integrations/k8s.rs)); `open`-mode
+  Jobs get none of them. The earlier gap where `INDEX_MAX_CHUNK_BYTES` was read by the runner but
+  missing from that list is gone with the knob itself — chunk shape is `lci-codegraph`'s now, and all
+  five of its knobs are forwarded.
 - No committed JSON config file in this repo uses `{env:NAME:-default}` templating today — that
   pattern is applied by the operator-managed values in the sibling `ai-helm-values` repo, not
   checked in here. The Rust-side defaults in this doc are the authoritative fallback regardless of

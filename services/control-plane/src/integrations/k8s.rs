@@ -523,17 +523,20 @@ fn job_manifest(name: &str, cfg: JobConfig, task: &ClaimedTask) -> Value {
         env.push(json!({ "name": "REVIEW_SYSTEM_PROMPT", "value": prompt }));
     }
 
-    // Operator-tunable indexer knobs (INDEX_*): forwarded from the control-plane's own environment so
-    // they can be set once on the control-plane deployment (Helm) instead of baked into the runner
-    // image. Unset → the runner's built-in defaults apply (embed batch 32, chunk-line ceiling 150,
-    // window 100/50). Chief use: shrinking INDEX_EMBED_BATCH_SIZE when a gateway caps the batched
-    // embeddings response body.
+    // Operator-tunable indexer knobs: forwarded from the control-plane's own environment so they can
+    // be set once on the control-plane deployment (Helm) instead of baked into the runner image.
+    // Unset → built-in defaults apply. `INDEX_EMBED_BATCH_SIZE` governs how many chunks are embedded
+    // per round trip — chief use is shrinking it when a gateway caps the batched embeddings response
+    // body. The `LCI_CODEGRAPH_*` knobs govern the walk that produces the chunks, which the crate
+    // owns (ADR-0117): chunk shape and the operator ignore-list layer.
     if !is_open {
         for key in [
             "INDEX_EMBED_BATCH_SIZE",
-            "INDEX_MAX_CHUNK_LINES",
-            "INDEX_WINDOW_SIZE",
-            "INDEX_WINDOW_STEP",
+            "LCI_CODEGRAPH_MAX_CHUNK_LINES",
+            "LCI_CODEGRAPH_WINDOW_SIZE",
+            "LCI_CODEGRAPH_WINDOW_STEP",
+            "LCI_CODEGRAPH_MAX_CHUNK_BYTES",
+            "LCI_CODEGRAPH_IGNORE_GLOBS",
         ] {
             if let Ok(value) = std::env::var(key) {
                 env.push(json!({ "name": key, "value": value }));
@@ -1084,7 +1087,8 @@ mod tests {
             "open must NOT carry embeddings credentials"
         );
         assert!(
-            !env.iter().any(|e| e.name.starts_with("INDEX_")),
+            !env.iter()
+                .any(|e| e.name.starts_with("INDEX_") || e.name.starts_with("LCI_CODEGRAPH_")),
             "open must NOT carry index knobs"
         );
         // Every secret this pod references is an `llm-*` key of the agent secret — no forge/DB secret.

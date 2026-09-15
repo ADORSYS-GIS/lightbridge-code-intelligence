@@ -20,8 +20,10 @@ pub struct GraphNode {
     pub source_file: String,
     /// 1-based start line (as emitted by `lci-codegraph`).
     pub start_line: i64,
-    /// Embedding of the symbol's definition text (ADR-0114), when the runner found a correlated
-    /// chunk to embed. `None` leaves any existing `s.embedding` untouched on a re-index.
+    /// A symbol's vector arrives on the chunk that is its body (ADR-0117), so a current runner
+    /// leaves this `None`. Kept because `None` means "leave any existing `s.embedding` alone", which
+    /// is what a structure-only submit wants, and because a runner from before ADR-0117 still sends
+    /// one.
     pub embedding: Option<Vec<f32>>,
 }
 
@@ -130,6 +132,54 @@ pub async fn upsert_graph(
 
     txn.commit().await.context("commit neo4j txn")?;
     Ok((nodes.len(), edges.len()))
+}
+
+/// Attach chunk vectors to the symbols they are the body of (ADR-0117).
+///
+/// `rows` are `(node_id, embedding)` pairs taken from the chunks the runner just submitted, each
+/// linked to its definition during the walk that produced both. `MATCH`, not `MERGE`: a vector whose
+/// symbol is not in the graph — because the structural submit failed, or the snapshot predates this
+/// commit — is dropped rather than creating a `:Symbol` carrying an embedding and nothing else.
+/// Returns the number of symbols updated, which is at most `rows.len()`.
+pub async fn attach_symbol_embeddings(
+    graph: &Graph,
+    repository_id: i64,
+    commit_sha: &str,
+    rows: &[(String, Vec<f32>)],
+) -> anyhow::Result<u64> {
+    use anyhow::Context;
+    if rows.is_empty() {
+        return Ok(0);
+    }
+    let params: Vec<HashMap<String, BoltType>> = rows
+        .iter()
+        .map(|(node_id, embedding)| {
+            HashMap::from([
+                ("id".to_string(), node_id.as_str().into()),
+                ("embedding".to_string(), embedding.clone().into()),
+            ])
+        })
+        .collect();
+    let mut result = graph
+        .execute(
+            query(
+                "UNWIND $rows AS r \
+                 MATCH (s:Symbol {repo_id: $repo, commit: $commit, node_id: r.id}) \
+                 SET s.embedding = r.embedding \
+                 RETURN count(s) AS updated",
+            )
+            .param("repo", repository_id)
+            .param("commit", commit_sha)
+            .param("rows", params),
+        )
+        .await
+        .context("attach symbol embeddings")?;
+
+    let updated = match result.next().await.context("read attach result")? {
+        Some(row) => row.get::<i64>("updated").unwrap_or(0),
+        None => 0,
+    };
+    Ok(updated.max(0) as u64)
 }
 
 /// Delete **all** graph data for a repository (every commit snapshot), used when a repo is removed
@@ -720,6 +770,102 @@ mod tests {
         // Cleanup.
         graph
             .run(query("MATCH (s:Symbol {commit: $c}) DETACH DELETE s").param("c", commit))
+            .await
+            .expect("final cleanup");
+    }
+
+    /// Live round-trip for `attach_symbol_embeddings` (ADR-0117): a chunk's vector reaches the
+    /// `:Symbol` it is the body of, a vector for an unknown symbol is dropped rather than creating
+    /// one, and a later structure-only `upsert_graph` leaves an attached vector intact. Ignored by
+    /// default (no Neo4j in CI) — run with `--ignored` after `docker compose up -d neo4j`.
+    #[tokio::test]
+    #[ignore = "requires a live Neo4j (docker compose up -d neo4j)"]
+    async fn attach_symbol_embeddings_writes_to_matching_symbols_only() {
+        let uri =
+            std::env::var("NEO4J_URI").unwrap_or_else(|_| "bolt://localhost:7687".to_string());
+        let graph = Graph::new(&uri, "neo4j", "lightbridge")
+            .await
+            .expect("connect neo4j");
+
+        let repo = 7117i64;
+        let commit = "test-commit-attach";
+        delete_repo_graph(&graph, repo).await.expect("cleanup");
+
+        // Structure lands first, carrying no vectors — what a current runner submits.
+        let nodes = vec![
+            GraphNode {
+                node_id: "src/auth.rs#40:validate".into(),
+                label: "validate()".into(),
+                source_file: "src/auth.rs".into(),
+                start_line: 40,
+                embedding: None,
+            },
+            GraphNode {
+                node_id: "src/auth.rs#60:refresh".into(),
+                label: "refresh()".into(),
+                source_file: "src/auth.rs".into(),
+                start_line: 60,
+                embedding: None,
+            },
+        ];
+        upsert_graph(&graph, repo, commit, &nodes, &[])
+            .await
+            .expect("upsert structure");
+        assert_eq!(
+            symbol_embedding(&graph, repo, commit, "src/auth.rs#40:validate")
+                .await
+                .expect("read"),
+            None,
+            "a structure-only submit leaves the symbol without a vector"
+        );
+
+        // One known symbol, one that is not in the graph.
+        let rows = vec![
+            ("src/auth.rs#40:validate".to_string(), vec![0.25f32; 8]),
+            ("src/auth.rs#99:ghost".to_string(), vec![0.75f32; 8]),
+        ];
+        let updated = attach_symbol_embeddings(&graph, repo, commit, &rows)
+            .await
+            .expect("attach");
+        assert_eq!(updated, 1, "only the symbol that exists is updated");
+
+        let (label, stored) = symbol_embedding(&graph, repo, commit, "src/auth.rs#40:validate")
+            .await
+            .expect("read back")
+            .expect("a vector");
+        assert_eq!(label, "validate()");
+        assert_eq!(stored.len(), 8);
+        assert!((stored[0] - 0.25).abs() < 1e-6, "the chunk's own vector");
+
+        // MATCH, not MERGE: the unknown node_id created nothing.
+        let mut count = graph
+            .execute(
+                query("MATCH (s:Symbol {repo_id: $r, commit: $c}) RETURN count(s) AS n")
+                    .param("r", repo)
+                    .param("c", commit),
+            )
+            .await
+            .expect("count");
+        let row = count.next().await.expect("row").expect("present");
+        assert_eq!(
+            row.get::<i64>("n").unwrap(),
+            2,
+            "a vector for an absent symbol must not create one"
+        );
+
+        // A re-index that only recomputes structure must not wipe the attached vector.
+        upsert_graph(&graph, repo, commit, &nodes, &[])
+            .await
+            .expect("re-upsert structure");
+        assert!(
+            symbol_embedding(&graph, repo, commit, "src/auth.rs#40:validate")
+                .await
+                .expect("read after re-upsert")
+                .is_some(),
+            "structure-only re-upsert preserves the embedding"
+        );
+
+        delete_repo_graph(&graph, repo)
             .await
             .expect("final cleanup");
     }

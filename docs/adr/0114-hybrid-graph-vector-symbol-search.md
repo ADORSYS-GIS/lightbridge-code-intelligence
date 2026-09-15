@@ -1,6 +1,9 @@
 # ADR-0114: Hybrid graph + vector symbol search — Neo4j vector index and a new MCP tool
 
-- **Status:** Accepted
+- **Status:** Accepted — index-time symbol embedding amended by
+  [ADR-0117](0117-one-walk-node-id-symbol-embeddings.md) (one walk; the vector rides the chunk
+  that is the symbol's body, keyed by `node_id`, instead of a line-range match); the
+  hybrid-search half — both indexes, the WRRF query, the MCP tool — stands unchanged
 - **Date:** 2026-08-18
 - **Deciders:** @leghadjeu-christian
 - **Builds on:** [ADR-0089](0089-embeddings-on-the-code-graph.md) (symbol embeddings on `:Symbol`),
@@ -140,8 +143,11 @@ wanted now exists. `ensure_indexes` treats that specific outcome as success rath
 so a multi-role startup race converges on the same end state (the index exists) instead of one role
 logging a spurious failure.
 
-**Who writes it:** `agent-runner`'s indexer (`services/agent-runner/src/indexer/graph.rs`), reusing the
-same `EmbeddingsClient` already injected for chunk embedding — not `lci-codegraph`, which stays a pure
+**Who writes it:** superseded in mechanism by
+[ADR-0117](0117-one-walk-node-id-symbol-embeddings.md) — the vector now arrives on the chunk that is
+the symbol's body, keyed by `node_id`, and this ADR's range correlation is gone. As originally
+shipped: `agent-runner`'s indexer (`services/agent-runner/src/indexer/graph.rs`), reusing the same
+`EmbeddingsClient` already injected for chunk embedding — not `lci-codegraph`, which stays a pure
 structural walker (see Decision Drivers). Symbol text for embedding is correlated in-tree against the
 chunker's already-collected chunks by range containment — a symbol's start line falling inside a
 chunk's `[start_line, end_line]` span, rather than an exact line match — since the two walks number
@@ -263,6 +269,9 @@ is a separate, later decision, not part of this ADR.
 
 - [ADR-0089](0089-embeddings-on-the-code-graph.md) — the original symbol-embeddings proposal this ADR
   makes concrete.
+- [ADR-0117](0117-one-walk-node-id-symbol-embeddings.md) — retires this ADR's "`lci-codegraph` stays
+  embeddings-free" driver and replaces the range correlation in §"Who writes it" with the `node_id`
+  the walk records. Measured: the range join gave ~38% of symbols the wrong vector.
 - [ADR-0090](0090-hybrid-retrieval-tools.md) — the original hybrid-tool proposal; `lightbridge_graph_semantic_search`'s
   name is inherited from here.
 - [ADR-0062](0062-two-tier-review-fast-auto-deep-on-demand.md) — the per-tier tool allowlist the new
