@@ -9,9 +9,23 @@ open a PR to fix this file.
 > **Keeping this current is part of "done."** When a PR meaningfully ships, unblocks, or retires an item
 > here, update its status in the **same PR** (see [AGENTS.md](AGENTS.md)).
 
-_Last updated: 2026-09-11._
+_Last updated: 2026-09-15._
 
 ## Recently shipped
+
+- **One walk, and a symbol's vector comes from its own code** — indexing used to run two independent
+  chunkers over the same checkout and join them by line range, which gave roughly 38% of symbols the
+  wrong vector: because a container's chunk is emitted before its children, every method on an `impl`
+  received the whole `impl`'s vector, making those symbols indistinguishable to
+  `lightbridge_graph_semantic_search`. `agent-runner`'s chunker is deleted; one `lci-codegraph` walk
+  now produces both halves of the index, and each chunk carries the `node_id` of the definition it is
+  the body of, so the control plane attaches the vector by identity instead of position. Exact symbol
+  coverage 61% → 98%; live-model retrieval over the affected symbols went top-1 18.4% → 76.3%.
+  Semantic indexing also picks up the eight languages the graph already understood (Dart, Swift,
+  Kotlin, TSX, JSON, Jinja2, Postgres, `.cstack`), each text is embedded once rather than twice, and
+  the structural submit no longer carries vectors — which clears the 32 MiB body limit that was
+  failing graph writes on large repositories. **Requires a full re-index of every repository.**
+  ([ADR-0116](docs/adr/0116-one-walk-node-id-symbol-embeddings.md), #654, #652)
 
 - **`apps/web` retired; console moves to `apps/lci`** — supersedes the "`apps/web` full revamp" item
   this file previously carried here. `apps/lci` (`ADORSYS-GIS/converse-frontends`, OIDC-authenticated,
@@ -30,10 +44,11 @@ _Last updated: 2026-09-11._
   required the model to guess a symbol's exact name and hope it matched — the new tool returns a real,
   traversable graph node directly, so a diff that duplicates existing logic under a different name is
   now findable. Backed by two new Neo4j indexes on `:Symbol` (vector + fulltext), symbol embeddings
-  computed at index time from the chunker's already-embedded chunks (correlated by range containment,
-  not an exact line match — the two walks number source lines differently), and a Weighted Reciprocal
-  Rank Fusion query — Neo4j's own documented hybrid-search pattern — fusing the two signals. Index
-  bootstrap is idempotent under concurrent startup across the roles that open a Neo4j connection.
+  taken at index time from the chunk that is the symbol's body (by `node_id` since
+  [ADR-0116](docs/adr/0116-one-walk-node-id-symbol-embeddings.md); originally by range containment),
+  and a Weighted Reciprocal Rank Fusion query — Neo4j's own documented hybrid-search pattern —
+  fusing the two signals. Index bootstrap is idempotent under concurrent startup across the roles
+  that open a Neo4j connection.
   ([ADR-0114](docs/adr/0114-hybrid-graph-vector-symbol-search.md), #621)
 
 - **One service, one domain, path-routed** (Epic #492) — `/a2a`, `/mcp` and `/api/v2` (including

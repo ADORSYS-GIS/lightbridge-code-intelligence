@@ -18,6 +18,12 @@ pub struct ChunkPayload {
     pub end_line: i32,
     pub content: String,
     pub embedding: Vec<f32>,
+    /// The graph node this chunk is the body of, when `lci-codegraph` linked one during the parse
+    /// that produced both. The control plane attaches this chunk's vector to that `:Symbol`
+    /// (ADR-0116). `None` for a chunk that is not a definition — a windowed slice, a text file, or a
+    /// definition the graph pass did not emit a node for.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub node_id: Option<String>,
 }
 
 /// Body for `POST /internal/tasks/{id}/chunks`.
@@ -27,18 +33,15 @@ pub struct ChunkBatch {
     pub chunks: Vec<ChunkPayload>,
 }
 
-/// One structural-graph node (mirrors `internal.rs::GraphNodeInput`).
+/// One structural-graph node (mirrors `internal.rs::GraphNodeInput`). Structural facts only — a
+/// symbol's vector reaches `:Symbol.embedding` on the chunk that is its body, keyed by `node_id`
+/// (ADR-0116), so this payload never carries one.
 #[derive(Debug, Serialize)]
 pub struct GraphNodePayload {
     pub node_id: String,
     pub label: String,
     pub source_file: String,
     pub start_line: i64,
-    /// Embedding of the symbol's definition text (ADR-0114), when a correlated chunk was found.
-    /// `None` for a symbol kind the chunker doesn't produce a chunk for — it still gets structural
-    /// edges, it just won't surface from a semantic search until a chunk-producing edit touches it.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub embedding: Option<Vec<f32>>,
 }
 
 /// One directed edge (`contains` / `method` / `calls` / …).
