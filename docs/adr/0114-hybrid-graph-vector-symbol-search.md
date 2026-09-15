@@ -1,6 +1,8 @@
 # ADR-0114: Hybrid graph + vector symbol search — Neo4j vector index and a new MCP tool
 
-- **Status:** Accepted
+- **Status:** Accepted — index-time symbol embedding amended by
+  [ADR-0116](0116-symbol-embeddings-reuse-chunk-vectors.md) (the vector is reused from the chunk
+  pass, not embedded a second time); everything else stands
 - **Date:** 2026-08-18
 - **Deciders:** @leghadjeu-christian
 - **Builds on:** [ADR-0089](0089-embeddings-on-the-code-graph.md) (symbol embeddings on `:Symbol`),
@@ -140,13 +142,12 @@ wanted now exists. `ensure_indexes` treats that specific outcome as success rath
 so a multi-role startup race converges on the same end state (the index exists) instead of one role
 logging a spurious failure.
 
-**Who writes it:** `agent-runner`'s indexer (`services/agent-runner/src/indexer/graph.rs`), reusing the
-same `EmbeddingsClient` already injected for chunk embedding — not `lci-codegraph`, which stays a pure
-structural walker (see Decision Drivers). Symbol text for embedding is correlated in-tree against the
-chunker's already-collected chunks by range containment — a symbol's start line falling inside a
-chunk's `[start_line, end_line]` span, rather than an exact line match — since the two walks number
-lines by different conventions and a symbol nested inside a larger chunk (e.g. a method inside an
-`impl` block) should still resolve to that chunk's text.
+**Who writes it:** `agent-runner`'s indexer (`services/agent-runner/src/indexer/graph.rs`) — not
+`lci-codegraph`, which stays a pure structural walker (see Decision Drivers). A symbol is correlated
+in-tree against the chunker's already-collected chunks by range containment — a symbol's start line
+falling inside a chunk's `[start_line, end_line]` span, rather than an exact line match — since the
+two walks number lines by different conventions and a symbol nested inside a larger chunk (e.g. a
+method inside an `impl` block) should still resolve to that chunk's text.
 
 ### 2. Hybrid search via Weighted Reciprocal Rank Fusion (WRRF)
 
@@ -247,8 +248,9 @@ is a separate, later decision, not part of this ADR.
   similar" to "a graph node it can traverse."
 - **Bad:** real new engineering — two indexes, a fused-ranking query, a new op on an existing internal
   endpoint, a new MCP tool, and index-time embedding added to the runner's indexer. ADR-0089's own
-  accepted cost line still applies: roughly double the embedding-API calls at index time (symbols ≈
-  chunks in count).
+  accepted cost line applied here — roughly double the embedding-API calls at index time (symbols ≈
+  chunks in count) — until [ADR-0116](0116-symbol-embeddings-reuse-chunk-vectors.md) retired it by
+  reusing the chunk pass's vectors (#652).
 - **Bad:** the structural signal is a deliberate simplification (hop-distance follow-up, not a true
   FastRP-ranked third source) — a real, disclosed scope reduction from Neo4j's full documented pattern,
   not the whole thing.
@@ -263,6 +265,8 @@ is a separate, later decision, not part of this ADR.
 
 - [ADR-0089](0089-embeddings-on-the-code-graph.md) — the original symbol-embeddings proposal this ADR
   makes concrete.
+- [ADR-0116](0116-symbol-embeddings-reuse-chunk-vectors.md) — amends how the symbol vector is
+  obtained at index time; the search half of this ADR is unaffected.
 - [ADR-0090](0090-hybrid-retrieval-tools.md) — the original hybrid-tool proposal; `lightbridge_graph_semantic_search`'s
   name is inherited from here.
 - [ADR-0062](0062-two-tier-review-fast-auto-deep-on-demand.md) — the per-tier tool allowlist the new

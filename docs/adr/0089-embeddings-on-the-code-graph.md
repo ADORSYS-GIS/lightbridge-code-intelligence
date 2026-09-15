@@ -57,7 +57,9 @@ into "Neo4j = structure + symbol-level semantics; pgvector = chunk-level semanti
   vector to the overlapping symbol by file+range. Cheaper, but chunk↔symbol is many-to-many (a chunk
   can contain several defs; a large def spans several chunks), so averaging/attribution is fuzzy and
   loses fidelity. Rejected as the default; can be a cost-saving fallback if index-time embedding cost
-  bites.
+  bites. **Adopted 2026-09-15 by [ADR-0116](0116-symbol-embeddings-reuse-chunk-vectors.md):** the cost
+  bit (#651), and the shipped implementation already embedded the covering chunk's text rather than the
+  symbol's own def span, so it carried this option's fidelity while paying A's price.
 - **C — `:Chunk` nodes with embeddings in Neo4j.** Mirror the chunk vectors onto new `:Chunk` nodes
   linked to `:Symbol` by range, giving Neo4j a full chunk-level semantic index. Enables chunk-level
   hybrid queries but **duplicates pgvector's data in a second, approximate store** — two semantic
@@ -99,9 +101,11 @@ Chosen option: **A** — symbol-level embeddings on `:Symbol`, plus a Neo4j cosi
   symbol-granular semantic recall complements chunk recall; the exact pgvector path is untouched; the
   incremental write is one property + one index, reusing the embedder we already run.
 - **Bad** — **+N embedding calls per index** (symbols ≈ chunks, so roughly **2× index-time embedding
-  cost/latency**; watch eaig cost and the batch tunable — this is the main price, and Option B is the
-  escape hatch if it bites); a **second, approximate** vector index to keep in sync with the graph
-  write; Neo4j-community is a **single instance** and now carries semantic-search load too.
+  cost/latency**; watch eaig cost and the batch tunable — this was the main price, and Option B was
+  the escape hatch if it bit; it did, and
+  [ADR-0116](0116-symbol-embeddings-reuse-chunk-vectors.md) took it); a **second, approximate**
+  vector index to keep in sync with the graph write; Neo4j-community is a **single instance** and
+  now carries semantic-search load too.
 - **Neutral** — 4096 sits at Neo4j 5.26's **maximum** vector dimension: confirm the index accepts it
   at build time (it should); an embedder wider than 4096 later would force this lane onto pgvector or
   a dimensionality reduction. Recall becomes **approximate** for this lane (HNSW) — acceptable because

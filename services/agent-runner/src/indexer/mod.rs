@@ -76,16 +76,28 @@ fn env_usize(key: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
+/// A chunk's location in the checkout paired with the vector embedded for its text.
+///
+/// `index_graph` (ADR-0114) resolves each symbol node to the chunk whose line span contains it and
+/// attaches that chunk's vector to the node, so the structural pass needs a chunk's position and
+/// embedding but never its text — the content stays behind in the semantic pass that submitted it.
+#[derive(Clone, Debug)]
+pub struct EmbeddedChunk {
+    pub file_path: String,
+    pub start_line: i32,
+    pub end_line: i32,
+    pub embedding: Vec<f32>,
+}
+
 /// Index the checkout directory and submit all chunks to the control plane.
-/// Returns the total number of chunks submitted, plus the chunks themselves — `index_graph`
-/// (ADR-0114) correlates them against `lci-codegraph`'s symbol nodes to embed each symbol's
-/// definition text, without needing `lci-codegraph` itself to expose an end line.
+/// Returns the total number of chunks submitted, plus each chunk's position and vector for
+/// `index_graph` (ADR-0114) to attach to the symbol nodes `lci-codegraph` finds at the same lines.
 pub async fn index_checkout(
     context: &TaskContext,
     checkout: &Path,
     client: &ControlPlaneClient,
     embedder: &EmbeddingsClient,
-) -> anyhow::Result<(usize, Vec<chunker::Chunk>)> {
+) -> anyhow::Result<(usize, Vec<EmbeddedChunk>)> {
     let commit_sha = context
         .head_sha
         .as_deref()
@@ -98,7 +110,7 @@ pub async fn index_checkout(
         .context("collecting chunks")?;
     if chunks.is_empty() {
         tracing::info!("no chunks produced (empty or all-binary repo)");
-        return Ok((0, chunks));
+        return Ok((0, Vec::new()));
     }
     tracing::info!(
         chunk_count = chunks.len(),
@@ -108,6 +120,9 @@ pub async fn index_checkout(
 
     let mut submitted = 0usize;
     let total = chunks.len();
+    // Every vector this pass computes is kept, so the structural pass can attach a symbol's vector
+    // without asking the embeddings endpoint for text that was embedded here.
+    let mut embedded: Vec<EmbeddedChunk> = Vec::with_capacity(total);
 
     for (batch_idx, batch_chunks) in chunks.chunks(tuning.embed_batch_size).enumerate() {
         let texts: Vec<&str> = batch_chunks.iter().map(|c| c.content.as_str()).collect();
@@ -116,10 +131,15 @@ pub async fn index_checkout(
             .await
             .with_context(|| format!("embedding batch {batch_idx}"))?;
 
-        let payloads: Vec<ChunkPayload> = batch_chunks
-            .iter()
-            .zip(embeddings)
-            .map(|(c, emb)| ChunkPayload {
+        let mut payloads: Vec<ChunkPayload> = Vec::with_capacity(batch_chunks.len());
+        for (c, embedding) in batch_chunks.iter().zip(embeddings) {
+            embedded.push(EmbeddedChunk {
+                file_path: c.file_path.clone(),
+                start_line: c.start_line,
+                end_line: c.end_line,
+                embedding: embedding.clone(),
+            });
+            payloads.push(ChunkPayload {
                 file_path: c.file_path.clone(),
                 language: c.language.clone(),
                 chunk_type: c.chunk_type.clone(),
@@ -127,9 +147,9 @@ pub async fn index_checkout(
                 start_line: c.start_line,
                 end_line: c.end_line,
                 content: c.content.clone(),
-                embedding: emb,
-            })
-            .collect();
+                embedding,
+            });
+        }
 
         client
             .submit_chunks(
@@ -146,7 +166,7 @@ pub async fn index_checkout(
         tracing::info!(submitted, total, "indexing progress");
     }
 
-    Ok((submitted, chunks))
+    Ok((submitted, embedded))
 }
 
 /// Walk the checkout directory and produce chunks for every indexable file.

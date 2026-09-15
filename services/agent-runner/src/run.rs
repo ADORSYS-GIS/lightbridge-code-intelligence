@@ -402,10 +402,10 @@ async fn perform_indexing(
     // replaced the retired Python Graphify CLI (ADR-0019) — no flag, no fallback.
     // Best-effort: the semantic index already landed, and the graph store may be unconfigured
     // (control plane returns 503). A graph failure is logged, not fatal — the task still succeeds.
-    // `chunks` (already collected above) are reused to embed each symbol's definition text
-    // (ADR-0114) — no second file walk, no lci-codegraph change.
-    let graph_result =
-        indexer::graph::index_graph(context, checkout, client, embedder, &chunks).await;
+    // Each symbol node takes its `:Symbol.embedding` from the chunk covering it (ADR-0114), using
+    // the vectors the semantic pass above already computed (ADR-0116) — no second file walk and no
+    // embeddings call from this pass.
+    let graph_result = indexer::graph::index_graph(context, checkout, client, &chunks).await;
     let graph = match graph_result {
         Ok((nodes, edges)) => format!("{nodes} nodes / {edges} edges"),
         Err(error) => {

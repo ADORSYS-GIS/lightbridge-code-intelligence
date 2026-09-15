@@ -9,9 +9,19 @@ open a PR to fix this file.
 > **Keeping this current is part of "done."** When a PR meaningfully ships, unblocks, or retires an item
 > here, update its status in the **same PR** (see [AGENTS.md](AGENTS.md)).
 
-_Last updated: 2026-09-11._
+_Last updated: 2026-09-15._
 
 ## Recently shipped
+
+- **Indexing embeds each text once** — the structural pass no longer calls the embeddings endpoint.
+  It used to re-embed the very text the semantic pass had just embedded, to fill `:Symbol.embedding`;
+  it now takes the vector already computed for the chunk covering the symbol. Stored values, the
+  correlation rule and everything downstream in
+  [ADR-0114](docs/adr/0114-hybrid-graph-vector-symbol-search.md)'s hybrid search are unchanged — this
+  removes recomputation, not a capability. Measured on `cratestack/cratestack`: 25,413 → 14,244 texts
+  sent to the model per index run, and 5,083 → 2,849 embedding calls at the deployed batch size.
+  Index jobs on large repositories still exhaust their runtime cap for other reasons (#651).
+  ([ADR-0116](docs/adr/0116-symbol-embeddings-reuse-chunk-vectors.md), #652)
 
 - **`apps/web` retired; console moves to `apps/lci`** — supersedes the "`apps/web` full revamp" item
   this file previously carried here. `apps/lci` (`ADORSYS-GIS/converse-frontends`, OIDC-authenticated,
@@ -30,10 +40,11 @@ _Last updated: 2026-09-11._
   required the model to guess a symbol's exact name and hope it matched — the new tool returns a real,
   traversable graph node directly, so a diff that duplicates existing logic under a different name is
   now findable. Backed by two new Neo4j indexes on `:Symbol` (vector + fulltext), symbol embeddings
-  computed at index time from the chunker's already-embedded chunks (correlated by range containment,
-  not an exact line match — the two walks number source lines differently), and a Weighted Reciprocal
-  Rank Fusion query — Neo4j's own documented hybrid-search pattern — fusing the two signals. Index
-  bootstrap is idempotent under concurrent startup across the roles that open a Neo4j connection.
+  taken at index time from the chunker's already-embedded chunks (correlated by range containment,
+  not an exact line match — the two walks number source lines differently; see ADR-0116), and a
+  Weighted Reciprocal Rank Fusion query — Neo4j's own documented hybrid-search pattern — fusing the
+  two signals. Index bootstrap is idempotent under concurrent startup across the roles that open a
+  Neo4j connection.
   ([ADR-0114](docs/adr/0114-hybrid-graph-vector-symbol-search.md), #621)
 
 - **One service, one domain, path-routed** (Epic #492) — `/a2a`, `/mcp` and `/api/v2` (including
