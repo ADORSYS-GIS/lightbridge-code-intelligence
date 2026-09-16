@@ -296,6 +296,7 @@ async fn run(
     .with_timeout(std::time::Duration::from_secs(
         embeddings_config.request_timeout_secs,
     ))
+    .with_max_input_bytes(embeddings_config.max_input_bytes)
     .with_attribution(&attribution);
 
     let checkout = clone::checkout(&context, &config.workdir).await?;
@@ -394,18 +395,16 @@ async fn perform_indexing(
     if let Some(status) = status {
         status.set_phase(Phase::Indexing);
     }
-    // ── Semantic index: tree-sitter → pgvector (epic #5, slice 2) ────────────────────────
-    let (chunk_count, chunks) =
-        indexer::index_checkout(context, checkout, client, embedder).await?;
+    // One `lci-codegraph` walk produces both halves of the index from a single parse (ADR-0086):
+    // the semantic chunks and the structural graph.
+    let out = indexer::walk(checkout).await?;
+
     // ── Structural index: in-house lci-codegraph → Neo4j (epic #5, slice 3, ADR-0086) ─────
-    // The structural graph is built in-process by the `lci-codegraph` crate (tree-sitter); it
-    // replaced the retired Python Graphify CLI (ADR-0019) — no flag, no fallback.
-    // Best-effort: the semantic index already landed, and the graph store may be unconfigured
-    // (control plane returns 503). A graph failure is logged, not fatal — the task still succeeds.
-    // `chunks` (already collected above) are reused to embed each symbol's definition text
-    // (ADR-0114) — no second file walk, no lci-codegraph change.
-    let graph_result =
-        indexer::graph::index_graph(context, checkout, client, embedder, &chunks).await;
+    // Submitted first so each `:Symbol` exists before `index_chunks` offers its vector (ADR-0116).
+    // Best-effort: the graph store may be unconfigured (control plane returns 503). A graph failure
+    // is logged, not fatal — the task still succeeds with the semantic index alone, and the symbols
+    // that failed to land simply carry no vector.
+    let graph_result = indexer::graph::index_graph(context, &out, client).await;
     let graph = match graph_result {
         Ok((nodes, edges)) => format!("{nodes} nodes / {edges} edges"),
         Err(error) => {
@@ -415,6 +414,9 @@ async fn perform_indexing(
             "graph skipped".to_string()
         }
     };
+
+    // ── Semantic index: chunks → pgvector, and each linked chunk's vector → its `:Symbol` ──
+    let chunk_count = indexer::index_chunks(context, &out, client, embedder).await?;
     Ok((chunk_count, graph))
 }
 

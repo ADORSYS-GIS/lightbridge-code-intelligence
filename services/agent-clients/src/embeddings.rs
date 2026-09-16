@@ -12,6 +12,15 @@ use crate::ratelimit::{self, RateLimitSnapshot};
 /// deterministic and never retried. The indexer already batches conservatively to stay under the
 /// gateway's token-per-minute budget — this is the safety net for the bursts that still slip through.
 const MAX_RETRIES: u32 = 3;
+/// Ceiling on the bytes of any one input string sent to the model, and the default for
+/// [`EmbeddingsClient::max_input_bytes`].
+///
+/// Callers bound the *shape* of what they embed — a chunker in lines, a query by construction — but
+/// none of them knows the model's input limit, and a single oversized string fails the whole request
+/// for every string batched with it. This client does know, so it is the one place that guarantees a
+/// request is acceptable. Truncation is a backstop, not a feature: it is counted and warned about so
+/// a caller routinely exceeding it is visible rather than silently losing its tail.
+pub const DEFAULT_MAX_INPUT_BYTES: usize = 16_000;
 const BASE_BACKOFF: Duration = Duration::from_millis(500);
 const MAX_BACKOFF: Duration = Duration::from_secs(8);
 
@@ -41,6 +50,8 @@ pub struct EmbeddingsClient {
     /// Attribution headers (epic #89) added to every request so the gateway can bill the right
     /// project. Empty by default; set via [`EmbeddingsClient::with_attribution`].
     attribution: reqwest::header::HeaderMap,
+    /// Per-input byte ceiling; see [`DEFAULT_MAX_INPUT_BYTES`].
+    max_input_bytes: usize,
 }
 
 /// Build the HTTP client, additionally trusting the CA PEM at `EMBEDDINGS_CA_CERT` if set. The eaig
@@ -74,6 +85,19 @@ fn load_ca(path: &str) -> anyhow::Result<reqwest::Certificate> {
     Ok(reqwest::Certificate::from_pem(&pem)?)
 }
 
+/// `text`, or its first `max_bytes` bytes cut on a `char` boundary so the slice can never split a
+/// multi-byte character.
+fn bound_input(text: &str, max_bytes: usize) -> &str {
+    if text.len() <= max_bytes {
+        return text;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
 impl EmbeddingsClient {
     pub fn new(base_url: &str, api_key: impl Into<String>, model: impl Into<String>) -> Self {
         Self {
@@ -82,7 +106,16 @@ impl EmbeddingsClient {
             model: model.into(),
             http: build_http_client(None),
             attribution: reqwest::header::HeaderMap::new(),
+            max_input_bytes: DEFAULT_MAX_INPUT_BYTES,
         }
+    }
+
+    /// Override the per-input byte ceiling ([`DEFAULT_MAX_INPUT_BYTES`]). Clamped to ≥1 so a
+    /// misconfiguration cannot make every input empty.
+    #[must_use]
+    pub fn with_max_input_bytes(mut self, max_input_bytes: usize) -> Self {
+        self.max_input_bytes = max_input_bytes.max(1);
+        self
     }
 
     /// Apply a per-request timeout (ADR-0051; from `embeddings.config.request_timeout_secs`). Rebuilds
@@ -156,6 +189,25 @@ impl EmbeddingsClient {
     /// and soft-warns when it's nearly spent or this response was itself rate-limited (advisory only;
     /// the budget is shared across runners, see [`crate::ratelimit`]).
     async fn embed_once(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbedError> {
+        let bounded: Vec<&str> = texts
+            .iter()
+            .map(|text| bound_input(text, self.max_input_bytes))
+            .collect();
+        let truncated = bounded
+            .iter()
+            .zip(texts)
+            .filter(|(kept, original)| kept.len() < original.len())
+            .count();
+        if truncated > 0 {
+            tracing::warn!(
+                model = %self.model,
+                truncated,
+                of = texts.len(),
+                max_input_bytes = self.max_input_bytes,
+                "embeddings: inputs truncated to the per-input ceiling"
+            );
+        }
+
         let response = self
             .http
             .post(&self.url)
@@ -163,7 +215,7 @@ impl EmbeddingsClient {
             .headers(self.attribution.clone())
             .json(&EmbedRequest {
                 model: &self.model,
-                input: texts,
+                input: &bounded,
             })
             .send()
             .await
@@ -407,5 +459,73 @@ mod tests {
             .await
             .expect_err("wrong vector count must fail");
         assert!(format!("{error:#}").contains("returned 0 vectors for 1 inputs"));
+    }
+
+    #[test]
+    fn an_input_within_the_ceiling_is_sent_whole() {
+        assert_eq!(
+            bound_input("fn main() {}", DEFAULT_MAX_INPUT_BYTES),
+            "fn main() {}"
+        );
+        assert_eq!(bound_input("abcd", 4), "abcd", "exactly at the ceiling");
+    }
+
+    #[test]
+    fn an_oversized_input_is_cut_to_the_ceiling() {
+        assert_eq!(bound_input("abcdefghij", 4), "abcd");
+    }
+
+    /// A ceiling landing mid-character must not panic or emit a partial code point — the reason this
+    /// walks back to a `char` boundary rather than slicing at `max_bytes` directly.
+    #[test]
+    fn a_cut_inside_a_multibyte_character_falls_back_to_the_boundary_below() {
+        let text = "aé€"; // 1 + 2 + 3 bytes
+        assert_eq!(bound_input(text, 2), "a", "mid-`é` cuts back");
+        assert_eq!(bound_input(text, 3), "aé");
+        assert_eq!(bound_input(text, 5), "aé", "mid-`€` cuts back");
+        assert_eq!(bound_input(text, 6), "aé€");
+    }
+
+    #[test]
+    fn a_ceiling_below_the_first_character_yields_empty_rather_than_panicking() {
+        assert_eq!(bound_input("€", 1), "");
+    }
+
+    /// The ceiling is applied to what actually goes on the wire, not merely computed — an oversized
+    /// input must not reach the gateway, since one of them fails the whole batched request.
+    #[tokio::test]
+    async fn the_request_body_carries_the_bounded_text() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/embeddings"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [
+                    {"embedding": [0.0], "index": 0},
+                    {"embedding": [0.0], "index": 1},
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        EmbeddingsClient::new(&server.uri(), "key", "model")
+            .with_max_input_bytes(4)
+            .embed(&["abcdefghij", "ok"])
+            .await
+            .expect("bounded request accepted");
+
+        let requests = server.received_requests().await.expect("recorded requests");
+        let body: serde_json::Value =
+            serde_json::from_slice(&requests[0].body).expect("request body is json");
+        assert_eq!(
+            body["input"],
+            serde_json::json!(["abcd", "ok"]),
+            "the oversized input is cut before it leaves the process; a small one is untouched"
+        );
+    }
+
+    #[test]
+    fn a_zero_ceiling_clamps_to_one_rather_than_emptying_every_input() {
+        let client = EmbeddingsClient::new("http://unused", "key", "model").with_max_input_bytes(0);
+        assert_eq!(client.max_input_bytes, 1);
     }
 }

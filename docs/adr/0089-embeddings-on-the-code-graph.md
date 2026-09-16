@@ -57,7 +57,10 @@ into "Neo4j = structure + symbol-level semantics; pgvector = chunk-level semanti
   vector to the overlapping symbol by file+range. Cheaper, but chunk↔symbol is many-to-many (a chunk
   can contain several defs; a large def spans several chunks), so averaging/attribution is fuzzy and
   loses fidelity. Rejected as the default; can be a cost-saving fallback if index-time embedding cost
-  bites.
+  bites. **Adopted 2026-09-15 by [ADR-0116](0116-one-walk-node-id-symbol-embeddings.md)** — the cost
+  bit (#651), and the many-to-many objection is answered rather than accepted: `lci-codegraph` records
+  which chunk *is* a definition's body during the parse that emits the node, so the attribution is an
+  identity, not an overlap heuristic.
 - **C — `:Chunk` nodes with embeddings in Neo4j.** Mirror the chunk vectors onto new `:Chunk` nodes
   linked to `:Symbol` by range, giving Neo4j a full chunk-level semantic index. Enables chunk-level
   hybrid queries but **duplicates pgvector's data in a second, approximate store** — two semantic

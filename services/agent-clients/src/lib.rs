@@ -12,4 +12,4 @@ pub use control_plane::{
     ChunkBatch, ChunkHit, ChunkPayload, ControlPlaneClient, DiscoveredTool, GraphBatch,
     GraphEdgePayload, GraphNodePayload, KnowledgeToolResult, StoredStep, SymbolHit, TaskContext,
 };
-pub use embeddings::EmbeddingsClient;
+pub use embeddings::{DEFAULT_MAX_INPUT_BYTES, EmbeddingsClient};
