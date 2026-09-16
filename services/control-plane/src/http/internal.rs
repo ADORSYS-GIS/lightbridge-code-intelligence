@@ -819,7 +819,9 @@ pub async fn ingest_graph(
         return (StatusCode::NOT_FOUND, "task not found").into_response();
     };
 
-    if batch.nodes.is_empty() {
+    // A batch carries nodes, edges, or both: the runner pages a large graph into node-only requests
+    // followed by edge-only ones, so an edge-only batch is a normal shape, not an empty submit.
+    if batch.nodes.is_empty() && batch.edges.is_empty() {
         return StatusCode::NO_CONTENT.into_response();
     }
 

@@ -365,6 +365,36 @@ pub async fn ensure_indexes(graph: &Graph, dimension: i64) -> anyhow::Result<()>
         "symbol_label_fulltext",
     )
     .await?;
+
+    // Every symbol read and write addresses a node by its full identity triple — the graph upsert's
+    // MERGE, both endpoint MATCHes on each edge, `find_symbol`, `get_callers`, `symbol_embedding`,
+    // `prune_graph`, and the chunk-side embedding attach. A composite index applies when a query
+    // supplies all three with equality, which all of them do; without one each lookup scans every
+    // `:Symbol` in the database, so one repository's write cost grows with every other repository
+    // indexed.
+    //
+    // A uniqueness constraint rather than a bare index: it creates its own backing range index, it
+    // lets MERGE plan a unique-index seek, and the triple genuinely is unique — a second node
+    // sharing it would be a duplicate symbol. (`IS NODE KEY` additionally requires all three to be
+    // present, and is Enterprise-only.)
+    //
+    // Creation is rejected outright if duplicate triples already exist, which `MERGE` on that same
+    // key should never produce. That is reported and stepped over rather than propagated: the
+    // indexes above are already in place by this point, and an absent identity index costs write
+    // latency, not correctness.
+    if let Err(error) = create_index_idempotent(
+        graph,
+        "CREATE CONSTRAINT symbol_identity IF NOT EXISTS \
+         FOR (s:Symbol) REQUIRE (s.repo_id, s.commit, s.node_id) IS UNIQUE",
+        "symbol_identity",
+    )
+    .await
+    {
+        tracing::warn!(
+            ?error,
+            "symbol identity constraint not created; symbol lookups will scan the label"
+        );
+    }
     Ok(())
 }
 
@@ -770,6 +800,94 @@ mod tests {
         // Cleanup.
         graph
             .run(query("MATCH (s:Symbol {commit: $c}) DETACH DELETE s").param("c", commit))
+            .await
+            .expect("final cleanup");
+    }
+
+    /// Live proof that a graph written as pages matches one written whole (ADR-0116 / #656). The
+    /// failure this guards is silent: an edge is written by matching both endpoints, so an edge page
+    /// that lands before its nodes writes nothing and reports success. Ignored by default (no Neo4j
+    /// in CI) — run with `--ignored` after `docker compose up -d neo4j`.
+    #[tokio::test]
+    #[ignore = "requires a live Neo4j (docker compose up -d neo4j)"]
+    async fn a_paged_graph_write_matches_an_unpaged_one() {
+        let uri =
+            std::env::var("NEO4J_URI").unwrap_or_else(|_| "bolt://localhost:7687".to_string());
+        let graph = Graph::new(&uri, "neo4j", "lightbridge")
+            .await
+            .expect("connect neo4j");
+
+        let repo = 6561i64;
+        delete_repo_graph(&graph, repo).await.expect("cleanup");
+
+        let nodes: Vec<GraphNode> = (0..25)
+            .map(|i| GraphNode {
+                node_id: format!("src/a.rs#{i}:f{i}"),
+                label: format!("f{i}()"),
+                source_file: "src/a.rs".into(),
+                start_line: i,
+                embedding: None,
+            })
+            .collect();
+        let edges: Vec<GraphEdge> = (0..24)
+            .map(|i| GraphEdge {
+                source: format!("src/a.rs#{i}:f{i}"),
+                target: format!("src/a.rs#{}:f{}", i + 1, i + 1),
+                relation: "calls".into(),
+            })
+            .collect();
+
+        let counts = |commit: &'static str| {
+            let graph = graph.clone();
+            async move {
+                let mut rows = graph
+                    .execute(
+                        query(
+                            "MATCH (s:Symbol {repo_id: $r, commit: $c}) \
+                             OPTIONAL MATCH (s)-[e:REL]->() \
+                             RETURN count(DISTINCT s) AS nodes, count(e) AS edges",
+                        )
+                        .param("r", repo)
+                        .param("c", commit),
+                    )
+                    .await
+                    .expect("count query");
+                let row = rows.next().await.expect("row").expect("present");
+                (
+                    row.get::<i64>("nodes").unwrap(),
+                    row.get::<i64>("edges").unwrap(),
+                )
+            }
+        };
+
+        upsert_graph(&graph, repo, "whole", &nodes, &edges)
+            .await
+            .expect("unpaged upsert");
+        let whole = counts("whole").await;
+        assert_eq!(
+            whole,
+            (25, 24),
+            "baseline: one submit writes the full graph"
+        );
+
+        // Same graph, delivered the way `submit_graph_paged` delivers it: every node page first.
+        for page in nodes.chunks(7) {
+            upsert_graph(&graph, repo, "paged", page, &[])
+                .await
+                .expect("node page");
+        }
+        for page in edges.chunks(7) {
+            upsert_graph(&graph, repo, "paged", &[], page)
+                .await
+                .expect("edge page");
+        }
+        assert_eq!(
+            counts("paged").await,
+            whole,
+            "a paged write must produce the same graph as an unpaged one"
+        );
+
+        delete_repo_graph(&graph, repo)
             .await
             .expect("final cleanup");
     }

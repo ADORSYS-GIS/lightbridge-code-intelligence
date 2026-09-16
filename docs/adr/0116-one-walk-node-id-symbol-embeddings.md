@@ -212,6 +212,26 @@ reject a batch that already landed in the store review actually depends on.
 - **Good** — the structural submit carries no vectors, so its payload drops from ~582 MB to ~8.8 MB
   on a repo this size. That is the `ingest_graph` 32 MiB body-limit failure in #651, fixed as a
   consequence rather than as separate work.
+- **Bad** — removing the size failure exposed a **duration** failure underneath it, observed in prod
+  on `ADORSYS-GIS/CoopData` (task `7e41350b…`): the submit now reaches Neo4j and is simply too slow,
+  timing out client-side at exactly `DEFAULT_REQUEST_TIMEOUT_SECS` (180 s) and logging
+  `structural graph indexing failed (non-fatal)`. Under the old payload this submit was rejected
+  outright, so this is progress, not a regression — but it is an incomplete fix, and the repo ends up
+  with a semantic index and no structural one while the task still reports `succeeded`.
+
+  Two causes, neither introduced here:
+  - **No index on the identity triple.** `ensure_indexes` creates a vector index and a fulltext
+    index; nothing indexes `(repo_id, commit, node_id)`, which every `MERGE` and every edge `MATCH`
+    keys on. Each lookup is therefore a label scan over every `:Symbol` in the database — all repos,
+    all retained commits — so cost grows as the platform indexes more repositories. Measured on
+    Community 5.26 with 60,018 symbols: one lookup costs **145,029 db hits** (`NodeByLabelScan`),
+    versus **3** (`NodeUniqueIndexSeek`) once `(repo_id, commit, node_id)` carries a composite
+    `IS UNIQUE` constraint — which also enforces the invariant `MERGE` already assumes, and creates
+    its own backing range index. (`IS NODE KEY` is the Enterprise-only variant and is not wanted.)
+  - **`submit_graph` is one unbounded request**, so its duration scales with repo size against a
+    fixed timeout, and the whole graph lands in a single Neo4j transaction.
+
+  Both are tracked in #656 with an implementation plan; neither is in this ADR's scope.
 - **Good** — the O(n·m) correlation scan (157,954,980 comparisons) disappears entirely; there is
   nothing left to correlate.
 - **Good** — each text is embedded exactly **once** per run, closing #652. Where the structural pass
