@@ -2868,6 +2868,51 @@ async fn search_code_chunks_ranks_by_cosine_and_scopes(pool: PgPool) {
     );
 }
 
+/// `indexed_chunk_keys` reports what a snapshot already holds, scoped to that snapshot, so a
+/// re-running index embeds only the gap. The tuple it returns is the conflict target
+/// `upsert_code_chunks` writes against — a key present here is present with its embedding.
+#[sqlx::test]
+async fn indexed_chunk_keys_are_scoped_to_one_snapshot(pool: PgPool) {
+    let repo_id = seed(&pool).await;
+
+    // Never indexed → nothing to skip.
+    assert!(
+        indexed_chunk_keys(&pool, repo_id, "sha-a")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    upsert_code_chunks(
+        &pool,
+        repo_id,
+        "sha-a",
+        &[chunk_at("a.rs", 1, 0), chunk_at("b.rs", 40, 0)],
+    )
+    .await
+    .unwrap();
+    upsert_code_chunks(&pool, repo_id, "sha-b", &[chunk_at("c.rs", 7, 0)])
+        .await
+        .unwrap();
+
+    let keys = indexed_chunk_keys(&pool, repo_id, "sha-a").await.unwrap();
+    assert_eq!(keys.len(), 2, "only this snapshot's chunks");
+    assert!(keys.contains(&("a.rs".to_string(), 1, 6)));
+    assert!(keys.contains(&("b.rs".to_string(), 40, 45)));
+
+    // A different commit of the same repo is a different snapshot.
+    let other = indexed_chunk_keys(&pool, repo_id, "sha-b").await.unwrap();
+    assert_eq!(other, vec![("c.rs".to_string(), 7, 12)]);
+
+    // A different repository never leaks in.
+    assert!(
+        indexed_chunk_keys(&pool, repo_id + 9_999, "sha-a")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
 /// `latest_indexed_commit` returns the most-recently-indexed snapshot (ADR-0050): `None` for an
 /// un-indexed repo, and the newest `commit_sha` once chunks exist — the single anchor reviews reuse
 /// and pin retrieval to, so the skip decision and the search scope can't disagree (no hollow index).

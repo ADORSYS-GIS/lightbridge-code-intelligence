@@ -413,6 +413,11 @@ fn api_v2_router() -> Router<AppState> {
             "/internal/tasks/{id}/chunks",
             post(internal::ingest_chunks).layer(DefaultBodyLimit::max(16 * 1024 * 1024)),
         )
+        // What this task's snapshot already holds, so a re-run embeds only the gap.
+        .route(
+            "/internal/tasks/{id}/chunks/indexed",
+            get(internal::indexed_chunks),
+        )
         // The structural graph (lci-codegraph → Neo4j, ADR-0086). A whole-repo graph can be large,
         // so raise the body limit here too.
         .route(

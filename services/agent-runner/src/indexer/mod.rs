@@ -9,6 +9,7 @@
 
 pub mod graph;
 
+use std::collections::HashSet;
 use std::path::Path;
 
 use anyhow::Context;
@@ -16,7 +17,7 @@ use anyhow::Context;
 use lci_agent_clients::{
     ChunkBatch, ChunkPayload, ControlPlaneClient, EmbeddingsClient, TaskContext,
 };
-use lci_codegraph::IndexOutput;
+use lci_codegraph::{Chunk, IndexOutput};
 
 /// Chunks embedded and submitted per round-trip. Larger = fewer requests (kinder to per-minute rate
 /// limits) but a bigger embeddings response body, which some gateways cap.
@@ -74,17 +75,40 @@ pub async fn index_chunks(
     }
 
     let batch_size = embed_batch_size();
-    let total = out.chunks.len();
     let linked = out.chunks.iter().filter(|c| c.node_id.is_some()).count();
+
+    // Chunks already stored for this snapshot keep their embedding, so an index re-running over a
+    // commit it has partially indexed embeds only the gap. A lookup that fails is treated as an
+    // empty set: re-embedding is wasteful, not wrong, and is preferable to failing the run.
+    let already_indexed = match client.indexed_chunk_keys(context.task_id).await {
+        Ok(keys) => keys,
+        Err(error) => {
+            tracing::warn!(error = %format!("{error:#}"), "indexed-chunk lookup failed; embedding every chunk");
+            HashSet::new()
+        }
+    };
+    let pending: Vec<&Chunk> = out
+        .chunks
+        .iter()
+        .filter(|c| !already_indexed.contains(&(c.file_path.clone(), c.start_line, c.end_line)))
+        .collect();
+
+    let total = pending.len();
     tracing::info!(
-        chunk_count = total,
+        chunk_count = out.chunks.len(),
+        already_indexed = out.chunks.len() - total,
+        pending = total,
         linked_to_a_symbol = linked,
         embed_batch_size = batch_size,
         "walk complete; embedding in batches"
     );
+    if pending.is_empty() {
+        tracing::info!("every chunk for this snapshot is already indexed");
+        return Ok(0);
+    }
 
     let mut submitted = 0usize;
-    for (batch_idx, batch_chunks) in out.chunks.chunks(batch_size).enumerate() {
+    for (batch_idx, batch_chunks) in pending.chunks(batch_size).enumerate() {
         // The embeddings client bounds each input to what the model accepts, so an oversized chunk
         // is its concern, not this loop's.
         let texts: Vec<&str> = batch_chunks.iter().map(|c| c.content.as_str()).collect();
