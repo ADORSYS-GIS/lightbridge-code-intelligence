@@ -407,8 +407,7 @@ pub async fn ensure_indexes(graph: &Graph, dimension: i64) -> anyhow::Result<()>
     //
     // A uniqueness constraint rather than a bare index: it creates its own backing range index, it
     // lets MERGE plan a unique-index seek, and the triple genuinely is unique — a second node
-    // sharing it would be a duplicate symbol. (`IS NODE KEY` additionally requires all three to be
-    // present, and is Enterprise-only.)
+    // sharing it would be a duplicate symbol.
     //
     // Creation is rejected outright if duplicate triples already exist, which `MERGE` on that same
     // key should never produce. That is reported and stepped over rather than propagated: the

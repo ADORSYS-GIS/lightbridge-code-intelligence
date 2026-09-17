@@ -227,7 +227,7 @@ reject a batch that already landed in the store review actually depends on.
     Community 5.26.29 with 60,018 symbols: a single node upsert costs **120,517 db accesses**
     (`NodeByLabelScan` + `Filter`), versus **3** (`NodeUniqueIndexSeek`) once
     `(repo_id, commit, node_id)` carries a composite `IS UNIQUE` constraint — which also enforces the invariant `MERGE` already assumes, and creates
-    its own backing range index. (`IS NODE KEY` is the Enterprise-only variant and is not wanted.)
+    its own backing range index.
   - **`submit_graph` is one unbounded request**, so its duration scales with repo size against a
     fixed timeout, and the whole graph lands in a single Neo4j transaction.
 

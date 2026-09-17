@@ -195,7 +195,6 @@ FOR (s:Symbol) REQUIRE (s.repo_id, s.commit, s.node_id) IS UNIQUE
 A uniqueness constraint rather than a bare index: it creates its own backing range index, it lets
 `MERGE` plan a unique-index seek, and the triple genuinely is unique — a second node sharing it would
 be a duplicate symbol, so the constraint states an invariant the write path already assumes.
-(`IS NODE KEY` would additionally require all three properties to be present; it is Enterprise-only.)
 
 It is declared **last and non-fatally**. Creation is rejected outright if duplicate triples already
 exist, and propagating that would take the vector and fulltext indexes down with it — an absent
