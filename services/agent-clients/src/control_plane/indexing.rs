@@ -77,8 +77,8 @@ pub struct GraphBatch {
 }
 
 impl ControlPlaneClient {
-    /// `POST /internal/tasks/{id}/chunks` — submit a batch of indexed code chunks.
-    /// The chunks already stored for this task's snapshot, as `(file_path, start_line, end_line)`.
+    /// `GET /internal/tasks/{id}/chunks/indexed` — the chunks already stored for this task's
+    /// snapshot, as `(file_path, start_line, end_line)`.
     ///
     /// An index re-running over a commit it has partially indexed can embed only what is missing.
     /// Empty for a snapshot that has never been indexed.
@@ -107,6 +107,7 @@ impl ControlPlaneClient {
             .collect())
     }
 
+    /// `POST /internal/tasks/{id}/chunks` — submit a batch of indexed code chunks.
     pub async fn submit_chunks(&self, task_id: Uuid, batch: ChunkBatch) -> anyhow::Result<()> {
         use anyhow::Context;
         let url = format!("{}/internal/tasks/{task_id}/chunks", self.base_url);
