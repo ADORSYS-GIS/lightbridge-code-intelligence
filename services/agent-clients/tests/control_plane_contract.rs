@@ -352,6 +352,63 @@ async fn submit_graph_paged_sends_every_node_page_before_any_edge_page() {
 }
 
 #[tokio::test]
+async fn submit_graph_paged_stops_at_the_first_failing_page() {
+    use lci_agent_clients::GraphNodePayload;
+
+    let server = MockServer::start().await;
+    let task_id = Uuid::nil();
+
+    // Every page is rejected, so the first attempt is also the last.
+    Mock::given(method("POST"))
+        .and(path(format!("/internal/tasks/{task_id}/graph")))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server)
+        .await;
+
+    let nodes: Vec<GraphNodePayload> = (0..10)
+        .map(|i| GraphNodePayload {
+            node_id: format!("n{i}"),
+            label: format!("f{i}()"),
+            source_file: "src/a.rs".to_string(),
+            start_line: i,
+        })
+        .collect();
+
+    let error = ControlPlaneClient::new(server.uri(), "runner-secret")
+        .submit_graph_paged(task_id, "abc123", &nodes, &[], 2)
+        .await
+        .expect_err("a rejected page fails the sequence");
+    assert!(
+        format!("{error:#}").contains("node page 0"),
+        "the failing page is named in the error: {error:#}"
+    );
+    assert_eq!(
+        server.received_requests().await.expect("recorded").len(),
+        1,
+        "the sequence stops rather than sending the remaining pages"
+    );
+}
+
+#[tokio::test]
+async fn discard_graph_deletes_the_task_snapshot() {
+    let server = MockServer::start().await;
+    let task_id = Uuid::nil();
+
+    Mock::given(method("DELETE"))
+        .and(path(format!("/internal/tasks/{task_id}/graph")))
+        .and(bearer_token("runner-secret"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    ControlPlaneClient::new(server.uri(), "runner-secret")
+        .discard_graph(task_id)
+        .await
+        .expect("snapshot discarded");
+}
+
+#[tokio::test]
 async fn submit_graph_paged_with_nothing_to_send_makes_no_request() {
     let server = MockServer::start().await;
     let task_id = Uuid::nil();

@@ -84,7 +84,6 @@ impl ControlPlaneClient {
         Ok(())
     }
 
-    /// `POST /internal/tasks/{id}/graph` — submit the structural code graph (lci-codegraph → Neo4j).
     /// Submit a structural graph as a sequence of bounded pages.
     ///
     /// Every node page is sent before any edge page: an edge is written by matching both of its
@@ -129,6 +128,25 @@ impl ControlPlaneClient {
         Ok(())
     }
 
+    /// `DELETE /internal/tasks/{id}/graph` — discard this task's commit snapshot from the graph.
+    ///
+    /// Returns the snapshot to "not indexed" after a page sequence stops partway, so readers see an
+    /// absent graph rather than a subset of one.
+    pub async fn discard_graph(&self, task_id: Uuid) -> anyhow::Result<()> {
+        use anyhow::Context;
+        let url = format!("{}/internal/tasks/{task_id}/graph", self.base_url);
+        self.http
+            .delete(&url)
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .context("discarding graph")?
+            .error_for_status()
+            .context("control plane rejected the graph discard")?;
+        Ok(())
+    }
+
+    /// `POST /internal/tasks/{id}/graph` — submit the structural code graph (lci-codegraph → Neo4j).
     pub async fn submit_graph(&self, task_id: Uuid, batch: GraphBatch) -> anyhow::Result<()> {
         use anyhow::Context;
         let url = format!("{}/internal/tasks/{task_id}/graph", self.base_url);

@@ -182,6 +182,38 @@ pub async fn attach_symbol_embeddings(
     Ok(updated.max(0) as u64)
 }
 
+/// Delete one commit snapshot's graph for a repository. Returns the number of nodes deleted.
+///
+/// A graph arrives as a sequence of pages, each its own transaction, so a sequence that stops partway
+/// leaves the pages that already committed in place. Discarding the snapshot returns the commit to
+/// "not indexed", which readers already handle, rather than leaving a subset that looks whole —
+/// an absent edge is indistinguishable from a symbol that genuinely has no callers.
+pub async fn delete_commit_graph(
+    graph: &Graph,
+    repository_id: i64,
+    commit_sha: &str,
+) -> anyhow::Result<u64> {
+    use anyhow::Context;
+    let mut result = graph
+        .execute(
+            query(
+                "MATCH (s:Symbol {repo_id: $repo, commit: $commit}) \
+                 WITH s, count(s) AS _c \
+                 DETACH DELETE s \
+                 RETURN count(_c) AS deleted",
+            )
+            .param("repo", repository_id)
+            .param("commit", commit_sha),
+        )
+        .await
+        .context("delete commit graph")?;
+    let deleted = match result.next().await.context("read delete result")? {
+        Some(row) => row.get::<i64>("deleted").unwrap_or(0),
+        None => 0,
+    };
+    Ok(deleted.max(0) as u64)
+}
+
 /// Delete **all** graph data for a repository (every commit snapshot), used when a repo is removed
 /// from the installation or denied (Epic #75, Milestone B). Returns the number of nodes deleted.
 /// `DETACH DELETE` removes the nodes' relationships too. Idempotent (deletes nothing for an
@@ -800,6 +832,72 @@ mod tests {
         // Cleanup.
         graph
             .run(query("MATCH (s:Symbol {commit: $c}) DETACH DELETE s").param("c", commit))
+            .await
+            .expect("final cleanup");
+    }
+
+    /// Live proof that discarding a snapshot clears exactly that commit. The state this exists for
+    /// is a page sequence that stopped partway: the pages that committed must not survive as a graph
+    /// that reads as complete. Ignored by default — run with `--ignored` after
+    /// `docker compose up -d neo4j`.
+    #[tokio::test]
+    #[ignore = "requires a live Neo4j (docker compose up -d neo4j)"]
+    async fn discarding_a_snapshot_clears_that_commit_and_leaves_others() {
+        let uri =
+            std::env::var("NEO4J_URI").unwrap_or_else(|_| "bolt://localhost:7687".to_string());
+        let graph = Graph::new(&uri, "neo4j", "lightbridge")
+            .await
+            .expect("connect neo4j");
+
+        let repo = 6571i64;
+        delete_repo_graph(&graph, repo).await.expect("cleanup");
+
+        let nodes: Vec<GraphNode> = (0..6)
+            .map(|i| GraphNode {
+                node_id: format!("src/a.rs#{i}:f{i}"),
+                label: format!("f{i}()"),
+                source_file: "src/a.rs".into(),
+                start_line: i,
+                embedding: None,
+            })
+            .collect();
+        let edges = vec![GraphEdge {
+            source: "src/a.rs#0:f0".into(),
+            target: "src/a.rs#1:f1".into(),
+            relation: "calls".into(),
+        }];
+
+        // A sequence that stopped partway: nodes landed, edges did not.
+        upsert_graph(&graph, repo, "partial", &nodes, &[])
+            .await
+            .expect("node pages");
+        // An unrelated snapshot of the same repository, which must survive.
+        upsert_graph(&graph, repo, "keep", &nodes, &edges)
+            .await
+            .expect("other snapshot");
+
+        let deleted = delete_commit_graph(&graph, repo, "partial")
+            .await
+            .expect("discard");
+        assert_eq!(deleted, 6, "every node of that snapshot");
+
+        assert!(
+            find_symbol(&graph, repo, "partial", "f0", 10)
+                .await
+                .expect("find")
+                .is_empty(),
+            "the discarded snapshot reads as absent, not as a partial graph"
+        );
+        assert_eq!(
+            find_symbol(&graph, repo, "keep", "f0", 10)
+                .await
+                .expect("find")
+                .len(),
+            1,
+            "a different commit of the same repository is untouched"
+        );
+
+        delete_repo_graph(&graph, repo)
             .await
             .expect("final cleanup");
     }

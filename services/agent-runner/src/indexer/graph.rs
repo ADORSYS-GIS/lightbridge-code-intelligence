@@ -73,10 +73,22 @@ pub async fn index_graph(
 
     let (n, e) = (nodes.len(), edges.len());
     let page_size = graph_page_size();
-    client
+    if let Err(error) = client
         .submit_graph_paged(context.task_id, &commit_sha, &nodes, &edges, page_size)
         .await
-        .context("submitting codegraph structural graph")?;
+    {
+        // Pages commit individually, so a sequence that stops partway leaves the ones that already
+        // landed. Discarding the snapshot leaves the commit un-indexed, which readers handle, rather
+        // than a subset that reads as a complete graph — a missing edge is indistinguishable from a
+        // symbol that genuinely has no callers.
+        if let Err(discard) = client.discard_graph(context.task_id).await {
+            tracing::warn!(
+                error = %format!("{discard:#}"),
+                "discarding the partial graph failed; the snapshot may hold an incomplete graph"
+            );
+        }
+        return Err(error).context("submitting codegraph structural graph");
+    }
     tracing::info!(
         nodes = n,
         edges = e,

@@ -413,7 +413,7 @@ async fn perform_indexing(
             tracing::warn!(error = %detail, "structural graph indexing failed (non-fatal)");
             // Carry the cause into the task summary: a repository with no symbols and one whose
             // graph never landed are otherwise indistinguishable to an operator reading it.
-            format!("graph skipped ({})", error.root_cause())
+            format!("graph skipped ({detail})")
         }
     };
 
