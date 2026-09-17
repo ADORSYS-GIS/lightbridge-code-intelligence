@@ -200,26 +200,41 @@ It is declared **last and non-fatally**. Creation is rejected outright if duplic
 exist, and propagating that would take the vector and fulltext indexes down with it — an absent
 identity index costs write latency, not correctness, so it warns and steps over.
 
-**A failed sequence leaves nothing behind.** Pages commit individually, so `index_graph` compensates:
+**A failed sequence leaves behind nothing it created.** Pages commit individually, so `index_graph`
+compensates — but only over its own writes. `DELETE /internal/tasks/{id}/graph` resolves the task to
+its `(repository_id, commit_sha)` and `DETACH DELETE`s that snapshot, and that scope is the whole
+subtlety: a commit can already carry a graph from an earlier run, and the delete cannot tell the two
+apart. So the runner reads the snapshot's size before its first page and decides from that:
+
+```rust
+#[must_use]
+fn may_discard(symbols_before: Option<u64>) -> bool {
+    matches!(symbols_before, Some(0))
+}
+```
 
 ```rust
 if let Err(error) = client
     .submit_graph_paged(context.task_id, &commit_sha, &nodes, &edges, page_size)
     .await
 {
-    if let Err(discard) = client.discard_graph(context.task_id).await {
+    if may_discard(symbols_before) {
+        if let Err(discard) = client.discard_graph(context.task_id).await { /* warn */ }
+    } else {
         tracing::warn!(
-            error = %format!("{discard:#}"),
-            "discarding the partial graph failed; the snapshot may hold an incomplete graph"
+            symbols_before = ?symbols_before,
+            "graph submit failed over a snapshot that predates this run; leaving it in place"
         );
     }
     return Err(error).context("submitting codegraph structural graph");
 }
 ```
 
-`DELETE /internal/tasks/{id}/graph` resolves the task to its `(repository_id, commit_sha)` and
-`DETACH DELETE`s that snapshot. The commit returns to "not indexed", which every reader already
-handles.
+On a first index the commit returns to "not indexed", which every reader already handles. On a
+re-index the earlier graph stays: it is a complete graph for this commit, and the pages that landed
+re-`MERGE`d the same identities onto it rather than hollowing it out. An unknown prior state — the
+size read itself failed — counts as pre-existing, because a graph left in place is recoverable on the
+next run and one deleted is not.
 
 ### Consequences
 
@@ -241,6 +256,9 @@ handles.
   a warning records it. The failure mode is narrow (the discard is a single `DETACH DELETE` against a
   database the submit was just talking to) but it is real, and it is the price of not holding a
   transaction open across requests.
+- **Bad** — the rollback costs one extra round trip per structural submit, the snapshot-size read.
+  It buys the distinction between a first index and a re-index, without which the compensation would
+  delete a graph it did not write.
 - **Bad** — a paged submit is not idempotent as a whole. A retry re-`MERGE`s pages that already
   landed, which is harmless for nodes and edges but means the work is redone rather than resumed.
 - **Neutral** — more requests per run (a 5,154-node, 7,893-edge graph becomes 7 requests at the
@@ -257,6 +275,9 @@ handles.
 
 - Resumption. A failed sequence restarts from the first page rather than continuing from the last one
   that landed; checkpointing the structural pass is separate work.
+- Distinguishing *this run's* pages from an earlier run's within a snapshot that already existed. The
+  size read separates "empty" from "populated", which is what the discard decision needs; per-node
+  provenance would be needed to prune only the pages this run wrote, and nothing requires that yet.
 - Concurrency. Pages are submitted sequentially. Overlapping them would trade Neo4j lock contention
   for wall-clock time and needs its own measurement.
 - The two-property read queries (`list_symbols`, `prune_graph`, the caller side of `get_callers`),
