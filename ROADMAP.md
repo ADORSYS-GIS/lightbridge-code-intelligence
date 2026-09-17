@@ -9,9 +9,25 @@ open a PR to fix this file.
 > **Keeping this current is part of "done."** When a PR meaningfully ships, unblocks, or retires an item
 > here, update its status in the **same PR** (see [AGENTS.md](AGENTS.md)).
 
-_Last updated: 2026-09-15._
+_Last updated: 2026-09-17._
 
 ## Recently shipped
+
+- **Structural graph writes are bounded, indexed and all-or-nothing** — the structural half of an
+  index run used to leave the runner as one request whose size *and* duration both scaled with the
+  repository, against two fixed constants (a 32 MiB body limit and a 180 s client timeout), so the
+  largest indexable repository was an emergent property rather than a configured one. The runner now
+  pages the graph into all node pages followed by all edge pages (`GRAPH_SUBMIT_PAGE_SIZE`, default
+  2,000), so a request's cost is a function of a configured unit of work and repository growth adds
+  requests rather than seconds. Alongside it, `(repo_id, commit, node_id)` — the triple every symbol
+  read and write addresses a node by — finally carries an index: a composite `IS UNIQUE` constraint
+  turns each lookup from a label scan across every repository and retained commit into a unique-index
+  seek (145,029 db hits → 3 on a 60,018-symbol corpus), so one repository's write cost no longer grows
+  with every other repository indexed. Because pages commit individually, a sequence that stops partway
+  discards the snapshot rather than leaving a subset that reads as a complete graph — an absent edge is
+  indistinguishable from a symbol that genuinely has no callers. `graph skipped` now carries its cause.
+  No migration and no re-index.
+  ([ADR-0117](docs/adr/0117-paged-graph-submission-and-symbol-identity.md), #656)
 
 - **One walk, and a symbol's vector comes from its own code** — indexing used to run two independent
   chunkers over the same checkout and join them by line range, which gave roughly 38% of symbols the

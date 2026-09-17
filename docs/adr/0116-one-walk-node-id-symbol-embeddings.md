@@ -231,7 +231,8 @@ reject a batch that already landed in the store review actually depends on.
   - **`submit_graph` is one unbounded request**, so its duration scales with repo size against a
     fixed timeout, and the whole graph lands in a single Neo4j transaction.
 
-  Both are tracked in #656 with an implementation plan; neither is in this ADR's scope.
+  Both are addressed by [ADR-0117](0117-paged-graph-submission-and-symbol-identity.md) (#656);
+  neither is in this ADR's scope.
 - **Good** — the O(n·m) correlation scan (157,954,980 comparisons) disappears entirely; there is
   nothing left to correlate.
 - **Good** — each text is embedded exactly **once** per run, closing #652. Where the structural pass
