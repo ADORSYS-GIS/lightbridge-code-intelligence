@@ -278,6 +278,62 @@ async fn submit_graph_posts_nodes_and_edges_with_bearer() {
 }
 
 #[tokio::test]
+async fn indexed_chunk_keys_parses_the_stored_positions() {
+    let server = MockServer::start().await;
+    let task_id = Uuid::nil();
+
+    Mock::given(method("GET"))
+        .and(path(format!("/internal/tasks/{task_id}/chunks/indexed")))
+        .and(bearer_token("runner-secret"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "commit_sha": "abc123",
+            "keys": [
+                { "file_path": "src/a.rs", "start_line": 0,  "end_line": 12 },
+                { "file_path": "src/b.rs", "start_line": 40, "end_line": 58 },
+            ],
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let keys = ControlPlaneClient::new(server.uri(), "runner-secret")
+        .indexed_chunk_keys(task_id)
+        .await
+        .expect("keys fetched");
+
+    assert_eq!(keys.len(), 2);
+    assert!(keys.contains(&("src/a.rs".to_string(), 0, 12)));
+    assert!(keys.contains(&("src/b.rs".to_string(), 40, 58)));
+    assert!(
+        !keys.contains(&("src/a.rs".to_string(), 0, 13)),
+        "the end line is part of the key"
+    );
+}
+
+#[tokio::test]
+async fn indexed_chunk_keys_is_empty_for_a_snapshot_never_indexed() {
+    let server = MockServer::start().await;
+    let task_id = Uuid::nil();
+
+    Mock::given(method("GET"))
+        .and(path(format!("/internal/tasks/{task_id}/chunks/indexed")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "commit_sha": "abc123",
+            "keys": [],
+        })))
+        .mount(&server)
+        .await;
+
+    assert!(
+        ControlPlaneClient::new(server.uri(), "runner-secret")
+            .indexed_chunk_keys(task_id)
+            .await
+            .expect("keys fetched")
+            .is_empty()
+    );
+}
+
+#[tokio::test]
 async fn search_posts_embedding_and_parses_hits() {
     let server = MockServer::start().await;
     let task_id = Uuid::nil();

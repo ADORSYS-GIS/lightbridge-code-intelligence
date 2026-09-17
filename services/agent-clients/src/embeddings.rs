@@ -265,11 +265,18 @@ impl EmbeddingsClient {
             });
         }
 
-        let mut data = response
-            .json::<EmbedResponse>()
-            .await
+        // Reading the body and parsing it are separated so the two failures stay distinguishable:
+        // a body that stops arriving mid-stream is a transport failure worth retrying, while one
+        // that arrives whole and does not parse is deterministic. Decoding straight into the type
+        // collapses both into one decode error.
+        let body = response.bytes().await.map_err(|e| EmbedError {
+            error: anyhow::Error::new(e).context("reading embeddings response"),
+            transient: true,
+            retry_after: None,
+        })?;
+
+        let mut data = serde_json::from_slice::<EmbedResponse>(&body)
             .map_err(|e| EmbedError {
-                // A malformed 2xx body is not a transport problem — don't retry it.
                 error: anyhow::Error::new(e).context("parsing embeddings response"),
                 transient: false,
                 retry_after: None,
@@ -459,6 +466,55 @@ mod tests {
             .await
             .expect_err("wrong vector count must fail");
         assert!(format!("{error:#}").contains("returned 0 vectors for 1 inputs"));
+    }
+
+    /// A server that promises more body than it delivers, then closes. `wiremock` always sends a
+    /// well-formed response, so this uses a raw listener to produce the truncation seen against the
+    /// gateway at large batch sizes.
+    ///
+    /// The first connection truncates; the second answers properly. `embed` must reach the second.
+    #[tokio::test]
+    async fn a_truncated_response_body_is_retried_rather_than_failing_the_call() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+
+        let server = std::thread::spawn(move || {
+            for (attempt, stream) in listener.incoming().enumerate().take(2) {
+                let mut stream = stream.expect("accept");
+                let mut buf = [0u8; 8192];
+                let _ = stream.read(&mut buf);
+                if attempt == 0 {
+                    // Content-Length outruns the bytes written, then the socket closes.
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                          Content-Length: 4096\r\n\r\n{\"data\":[{\"embed",
+                    );
+                } else {
+                    let body = br#"{"data":[{"embedding":[0.5],"index":0}]}"#;
+                    let _ = stream.write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                             Content-Length: {}\r\n\r\n",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    );
+                    let _ = stream.write_all(body);
+                }
+                let _ = stream.flush();
+            }
+        });
+
+        let vectors = EmbeddingsClient::new(&format!("http://{addr}"), "key", "model")
+            .embed(&["one"])
+            .await
+            .expect("a truncated body is retried, and the retry succeeds");
+        assert_eq!(vectors, vec![vec![0.5]]);
+
+        server.join().expect("server thread");
     }
 
     #[test]
