@@ -224,9 +224,9 @@ reject a batch that already landed in the store review actually depends on.
     index; nothing indexes `(repo_id, commit, node_id)`, which every `MERGE` and every edge `MATCH`
     keys on. Each lookup is therefore a label scan over every `:Symbol` in the database — all repos,
     all retained commits — so cost grows as the platform indexes more repositories. Measured on
-    Community 5.26 with 60,018 symbols: one lookup costs **145,029 db hits** (`NodeByLabelScan`),
-    versus **3** (`NodeUniqueIndexSeek`) once `(repo_id, commit, node_id)` carries a composite
-    `IS UNIQUE` constraint — which also enforces the invariant `MERGE` already assumes, and creates
+    Community 5.26.29 with 60,018 symbols: a single node upsert costs **120,517 db accesses**
+    (`NodeByLabelScan` + `Filter`), versus **3** (`NodeUniqueIndexSeek`) once
+    `(repo_id, commit, node_id)` carries a composite `IS UNIQUE` constraint — which also enforces the invariant `MERGE` already assumes, and creates
     its own backing range index. (`IS NODE KEY` is the Enterprise-only variant and is not wanted.)
   - **`submit_graph` is one unbounded request**, so its duration scales with repo size against a
     fixed timeout, and the whole graph lands in a single Neo4j transaction.

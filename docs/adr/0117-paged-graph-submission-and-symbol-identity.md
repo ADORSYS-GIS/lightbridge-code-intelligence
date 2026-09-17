@@ -33,17 +33,48 @@ bound a structural submit?
 
 ### Identity lookups are scans
 
-Profiled on Neo4j 5.26 Community. Both rows are the same query shape the write path issues, differing
-only in whether `(repo_id, commit, node_id)` carries a composite `IS UNIQUE` constraint:
+Profiled on Neo4j 5.26.29 Community seeded to 60,018 `:Symbol` nodes, running the statements
+`upsert_graph` actually issues with a single row each — so these are the cost of **one** lookup, not
+of a batch. The only variable between the two runs is whether `(repo_id, commit, node_id)` carries
+the composite `IS UNIQUE` constraint.
 
-| corpus | plan | db hits per lookup |
+The node upsert without it resolves the node by reading the whole label and discarding almost all of
+it:
+
+```text
+| Operator         |    Rows | DB Hits | Details
+| +SetProperties   |       1 |       2 |
+| +Merge           |       1 |       0 | CREATE (s:Symbol {repo_id: …, commit: …, node_id: n.id})
+| +Filter          |       1 |  60,496 | (s.repo_id = … AND s.commit = … AND s.node_id = n.id)
+| +NodeByLabelScan |  60,018 |  60,019 | s:Symbol
+
+Total database accesses: 120,517
+```
+
+With the constraint the scan and the filter are gone entirely — the planner seeks straight to the
+node, and `Rows` at the leaf drops from 60,018 to 1:
+
+```text
+| Operator                      | Rows | Details
+| +SetProperties                |    1 |
+| +Merge                        |    1 | CREATE (s:Symbol {repo_id: …, commit: …, node_id: n.id})
+| +NodeUniqueIndexSeek(Locking) |    1 | UNIQUE s:Symbol(repo_id, commit, node_id)
+
+Total database accesses: 3
+```
+
+The edge write matches **both** endpoints, so it pays the lookup twice and the two plans diverge
+further:
+
+| statement `upsert_graph` issues | without the constraint | with it |
 |---|---|---|
-| 60,018 symbols, no constraint | `NodeByLabelScan` + `Filter` | **145,029** |
-| 60,018 symbols, constraint | `NodeUniqueIndexSeek` | **3** |
+| node `MERGE` (one node) | 120,517 | **3** |
+| edge `MATCH` + `MATCH` + `MERGE` (one edge) | 241,037 | **9** |
 
-The cost is a function of *every* `:Symbol` in the database — all repositories, all retained commits
-— not of the repository being written. A submit performing ~21,000 such lookups therefore gets
-slower every time an unrelated repository is indexed.
+The unindexed cost is a function of *every* `:Symbol` in the database — all repositories, all
+retained commits — not of the repository being written. A submit performing ~21,000 such lookups
+therefore gets slower every time an unrelated repository is indexed, which is the shape of a write
+path that worked until it didn't.
 
 ### The index applies to all three properties or to none
 
@@ -105,8 +136,8 @@ lengthens the window in which a single stalled request holds a Job open against 
 
 ### C — Declare the constraint, keep the single request
 
-Genuinely large: the seek alone takes the profiled per-lookup cost from 145,029 db hits to 3, which
-is most of the observed duration. Rejected **as the whole answer** because it fixes the constant and
+Genuinely large: the seek alone takes a node upsert from 120,517 db accesses to 3, which is most of
+the observed duration. Rejected **as the whole answer** because it fixes the constant and
 leaves the shape: duration still scales with repository size against a fixed timeout, and the 32 MiB
 body limit is still a size ceiling one growth spurt away. It makes the current corpus fit; it does
 not make fit a property of the design.
@@ -196,9 +227,10 @@ handles.
 - **Good** — a request's duration is bounded by `page_size`, a constant, instead of by repository
   size. Repository growth adds requests rather than seconds to one request, so the 180 s timeout is
   measured against a fixed unit of work and stops being an unwritten size limit.
-- **Good** — per-lookup cost drops from a full label scan to a unique-index seek (145,029 → 3 db hits
-  on the profiled corpus), and stops growing with the number of repositories indexed. This is the
-  larger share of the observed improvement; paging is what keeps it bounded as repositories grow.
+- **Good** — per-lookup cost drops from a full label scan to a unique-index seek (120,517 → 3 db
+  accesses for a node upsert, 241,037 → 9 for an edge write), and stops growing with the number of
+  repositories indexed. This is the larger share of the observed improvement; paging is what keeps
+  it bounded as repositories grow.
 - **Good** — the 32 MiB body limit is no longer reachable by an ordinary repository, since a page's
   size is configured rather than emergent.
 - **Good** — `graph skipped` in the task summary now carries the cause. A repository with no symbols

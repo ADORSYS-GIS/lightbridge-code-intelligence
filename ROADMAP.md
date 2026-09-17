@@ -22,7 +22,8 @@ _Last updated: 2026-09-17._
   requests rather than seconds. Alongside it, `(repo_id, commit, node_id)` — the triple every symbol
   read and write addresses a node by — finally carries an index: a composite `IS UNIQUE` constraint
   turns each lookup from a label scan across every repository and retained commit into a unique-index
-  seek (145,029 db hits → 3 on a 60,018-symbol corpus), so one repository's write cost no longer grows
+  seek (a node upsert: 120,517 db accesses → 3 on a 60,018-symbol corpus; an edge write: 241,037 → 9),
+  so one repository's write cost no longer grows
   with every other repository indexed. Because pages commit individually, a sequence that stops partway
   discards the snapshot rather than leaving a subset that reads as a complete graph — an absent edge is
   indistinguishable from a symbol that genuinely has no callers. `graph skipped` now carries its cause.
