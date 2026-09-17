@@ -4,7 +4,7 @@
 
 use std::sync::OnceLock;
 
-use metrics::{counter, histogram};
+use metrics::{counter, gauge, histogram};
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 
 static HANDLE: OnceLock<PrometheusHandle> = OnceLock::new();
@@ -52,6 +52,25 @@ pub fn webhook_delivery(platform: &str, event: &str) {
         "event" => event.to_string(),
     )
     .increment(1);
+}
+
+/// Whether a Neo4j index the control plane manages is usable, labelled with the state Neo4j
+/// reports (`ONLINE`, `POPULATING`, `FAILED`, `ABSENT`).
+///
+/// A gauge rather than a log line because the question it answers — "is the identity index doing
+/// its job right now?" — is asked long after startup, usually while diagnosing a slow graph write,
+/// and `/metrics` is reachable where a pod's startup logs may already have rotated.
+pub fn neo4j_index_state(name: &str, state: &str) {
+    gauge!(
+        "lci_neo4j_index_ready",
+        "index" => name.to_string(),
+        "state" => state.to_string(),
+    )
+    .set(if state.eq_ignore_ascii_case("ONLINE") {
+        1.0
+    } else {
+        0.0
+    });
 }
 
 pub fn webhook_signature_failure(platform: &str) {
