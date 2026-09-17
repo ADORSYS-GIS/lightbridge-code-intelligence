@@ -9,9 +9,20 @@
 use anyhow::Context;
 
 use lci_agent_clients::{
-    ControlPlaneClient, GraphBatch, GraphEdgePayload, GraphNodePayload, TaskContext,
+    ControlPlaneClient, DEFAULT_GRAPH_PAGE_SIZE, GraphEdgePayload, GraphNodePayload, TaskContext,
 };
 use lci_codegraph::IndexOutput;
+
+/// Read `GRAPH_SUBMIT_PAGE_SIZE`, clamped to ≥1. Falls back to [`DEFAULT_GRAPH_PAGE_SIZE`] when
+/// unset or unparseable.
+#[must_use]
+pub fn graph_page_size() -> usize {
+    std::env::var("GRAPH_SUBMIT_PAGE_SIZE")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .map(|n| n.max(1))
+        .unwrap_or(DEFAULT_GRAPH_PAGE_SIZE)
+}
 
 /// Submit the structural half of `out` — nodes and edges, no vectors — to the control plane.
 /// Returns `(nodes, edges)` submitted; an empty graph is a no-op. Best-effort: the caller logs a
@@ -61,20 +72,27 @@ pub async fn index_graph(
         .collect();
 
     let (n, e) = (nodes.len(), edges.len());
-    client
-        .submit_graph(
-            context.task_id,
-            GraphBatch {
-                commit_sha,
-                nodes,
-                edges,
-            },
-        )
+    let page_size = graph_page_size();
+    if let Err(error) = client
+        .submit_graph_paged(context.task_id, &commit_sha, &nodes, &edges, page_size)
         .await
-        .context("submitting codegraph structural graph")?;
+    {
+        // Pages commit individually, so a sequence that stops partway leaves the ones that already
+        // landed. Discarding the snapshot leaves the commit un-indexed, which readers handle, rather
+        // than a subset that reads as a complete graph — a missing edge is indistinguishable from a
+        // symbol that genuinely has no callers.
+        if let Err(discard) = client.discard_graph(context.task_id).await {
+            tracing::warn!(
+                error = %format!("{discard:#}"),
+                "discarding the partial graph failed; the snapshot may hold an incomplete graph"
+            );
+        }
+        return Err(error).context("submitting codegraph structural graph");
+    }
     tracing::info!(
         nodes = n,
         edges = e,
+        page_size,
         "in-house (lci-codegraph) structural graph submitted"
     );
     Ok((n, e))

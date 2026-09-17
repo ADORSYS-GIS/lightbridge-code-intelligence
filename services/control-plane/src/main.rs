@@ -417,7 +417,9 @@ fn api_v2_router() -> Router<AppState> {
         // so raise the body limit here too.
         .route(
             "/internal/tasks/{id}/graph",
-            post(internal::ingest_graph).layer(DefaultBodyLimit::max(32 * 1024 * 1024)),
+            post(internal::ingest_graph)
+                .delete(internal::discard_graph)
+                .layer(DefaultBodyLimit::max(32 * 1024 * 1024)),
         )
         // Retrieval for the MCP servers (slice 4): semantic search (pgvector) + structural queries
         // (Neo4j), each scoped server-side to the task's repo snapshot.

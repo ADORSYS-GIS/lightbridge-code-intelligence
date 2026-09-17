@@ -36,7 +36,7 @@ pub struct ChunkBatch {
 /// One structural-graph node (mirrors `internal.rs::GraphNodeInput`). Structural facts only — a
 /// symbol's vector reaches `:Symbol.embedding` on the chunk that is its body, keyed by `node_id`
 /// (ADR-0116), so this payload never carries one.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct GraphNodePayload {
     pub node_id: String,
     pub label: String,
@@ -45,12 +45,19 @@ pub struct GraphNodePayload {
 }
 
 /// One directed edge (`contains` / `method` / `calls` / …).
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct GraphEdgePayload {
     pub source: String,
     pub target: String,
     pub relation: String,
 }
+
+/// Nodes or edges carried by one `submit_graph` request.
+///
+/// Bounds a request's duration by a constant rather than by repository size: the control plane
+/// writes a batch in a single Neo4j transaction, so an unbounded submit grows with the repository
+/// until it outlives the client's request timeout.
+pub const DEFAULT_GRAPH_PAGE_SIZE: usize = 2_000;
 
 /// Body for `POST /internal/tasks/{id}/graph`.
 #[derive(Debug, Serialize)]
@@ -74,6 +81,68 @@ impl ControlPlaneClient {
             .context("submitting chunks")?
             .error_for_status()
             .context("control plane rejected chunk batch")?;
+        Ok(())
+    }
+
+    /// Submit a structural graph as a sequence of bounded pages.
+    ///
+    /// Every node page is sent before any edge page: an edge is written by matching both of its
+    /// endpoints, and a match that finds nothing is a silent no-op, so an edge that arrives ahead of
+    /// its endpoints is dropped without error.
+    pub async fn submit_graph_paged(
+        &self,
+        task_id: Uuid,
+        commit_sha: &str,
+        nodes: &[GraphNodePayload],
+        edges: &[GraphEdgePayload],
+        page_size: usize,
+    ) -> anyhow::Result<()> {
+        use anyhow::Context;
+        let page_size = page_size.max(1);
+
+        for (page, chunk) in nodes.chunks(page_size).enumerate() {
+            self.submit_graph(
+                task_id,
+                GraphBatch {
+                    commit_sha: commit_sha.to_string(),
+                    nodes: chunk.to_vec(),
+                    edges: Vec::new(),
+                },
+            )
+            .await
+            .with_context(|| format!("submitting graph node page {page}"))?;
+        }
+
+        for (page, chunk) in edges.chunks(page_size).enumerate() {
+            self.submit_graph(
+                task_id,
+                GraphBatch {
+                    commit_sha: commit_sha.to_string(),
+                    nodes: Vec::new(),
+                    edges: chunk.to_vec(),
+                },
+            )
+            .await
+            .with_context(|| format!("submitting graph edge page {page}"))?;
+        }
+        Ok(())
+    }
+
+    /// `DELETE /internal/tasks/{id}/graph` — discard this task's commit snapshot from the graph.
+    ///
+    /// Returns the snapshot to "not indexed" after a page sequence stops partway, so readers see an
+    /// absent graph rather than a subset of one.
+    pub async fn discard_graph(&self, task_id: Uuid) -> anyhow::Result<()> {
+        use anyhow::Context;
+        let url = format!("{}/internal/tasks/{task_id}/graph", self.base_url);
+        self.http
+            .delete(&url)
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .context("discarding graph")?
+            .error_for_status()
+            .context("control plane rejected the graph discard")?;
         Ok(())
     }
 

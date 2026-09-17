@@ -411,7 +411,9 @@ async fn perform_indexing(
             // Alternate formatting keeps the full causal chain, which operators need to diagnose the failure.
             let detail = format!("{error:#}");
             tracing::warn!(error = %detail, "structural graph indexing failed (non-fatal)");
-            "graph skipped".to_string()
+            // Carry the cause into the task summary: a repository with no symbols and one whose
+            // graph never landed are otherwise indistinguishable to an operator reading it.
+            format!("graph skipped ({detail})")
         }
     };
 
