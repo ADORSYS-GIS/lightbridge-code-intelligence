@@ -6,7 +6,7 @@
 //! holds them (trust boundary, ADR-0002) — the same reason chunk ingestion routes through the control
 //! plane rather than direct DB access.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use neo4rs::{BoltType, Graph, query};
 use rmcp::schemars;
@@ -180,6 +180,86 @@ pub async fn attach_symbol_embeddings(
         None => 0,
     };
     Ok(updated.max(0) as u64)
+}
+
+/// The indexes `ensure_indexes` declares, in the order it declares them.
+pub const MANAGED_INDEXES: [&str; 3] = [
+    "symbol_embedding_idx",
+    "symbol_label_fulltext",
+    "symbol_identity",
+];
+
+/// The identity index. Without it every symbol lookup — each node `MERGE`, both endpoints of each
+/// edge — scans the whole `:Symbol` label.
+pub const IDENTITY_INDEX: &str = "symbol_identity";
+
+/// Reported for an index `SHOW INDEXES` does not list.
+pub const ABSENT: &str = "ABSENT";
+
+/// Whether the planner will use an index in this state.
+#[must_use]
+pub fn is_usable(state: &str) -> bool {
+    state.eq_ignore_ascii_case("ONLINE")
+}
+
+/// The identity index's state when it is *not* usable, or `None` when it is.
+///
+/// `cached` short-circuits the common case: an index that has reached `ONLINE` stays there unless
+/// something drops it, so a cached `true` never needs re-reading. A cached `false` is re-read every
+/// time, which lets an index that was still building at startup clear itself without a restart —
+/// and keeps the check off the hot path once it has.
+pub async fn identity_index_unready(
+    graph: &Graph,
+    cached: &std::sync::atomic::AtomicBool,
+) -> Option<String> {
+    use std::sync::atomic::Ordering;
+    if cached.load(Ordering::Relaxed) {
+        return None;
+    }
+    let state = match index_states(graph).await {
+        Ok(states) => states
+            .get(IDENTITY_INDEX)
+            .cloned()
+            .unwrap_or_else(|| ABSENT.to_string()),
+        // An unreadable state is not evidence of an unusable index; say nothing rather than
+        // attribute a slow write to a cause that was never established.
+        Err(_) => return None,
+    };
+    crate::http::metrics::neo4j_index_state(IDENTITY_INDEX, &state);
+    if is_usable(&state) {
+        cached.store(true, Ordering::Relaxed);
+        None
+    } else {
+        Some(state)
+    }
+}
+
+/// State of each managed index as Neo4j reports it: `ONLINE`, `POPULATING`, `FAILED`, or [`ABSENT`].
+///
+/// Declaring an index says nothing about whether it is usable. Creation is online, so an index can
+/// exist and still be building, and the planner falls back to a scan until it is `ONLINE` — which
+/// looks exactly like no index at all. A declaration can also be rejected outright, which
+/// `ensure_indexes` reports and steps over. Reading the state back is what separates those cases.
+pub async fn index_states(graph: &Graph) -> anyhow::Result<BTreeMap<String, String>> {
+    use anyhow::Context;
+    let mut states: BTreeMap<String, String> = MANAGED_INDEXES
+        .iter()
+        .map(|name| ((*name).to_string(), ABSENT.to_string()))
+        .collect();
+
+    let mut result = graph
+        .execute(query("SHOW INDEXES YIELD name, state RETURN name, state"))
+        .await
+        .context("show indexes")?;
+    while let Some(row) = result.next().await.context("read index row")? {
+        let (Ok(name), Ok(state)) = (row.get::<String>("name"), row.get::<String>("state")) else {
+            continue;
+        };
+        if let Some(slot) = states.get_mut(&name) {
+            *slot = state;
+        }
+    }
+    Ok(states)
 }
 
 /// Delete one commit snapshot's graph for a repository. Returns the number of nodes deleted.
@@ -422,11 +502,48 @@ pub async fn ensure_indexes(graph: &Graph, dimension: i64) -> anyhow::Result<()>
     .await
     {
         tracing::warn!(
-            ?error,
+            error = %format!("{error:#}"),
             "symbol identity constraint not created; symbol lookups will scan the label"
         );
     }
+
+    report_index_states(graph).await;
     Ok(())
+}
+
+/// Log what each managed index is actually in state, and publish it as a gauge.
+///
+/// A creation that returns `Ok` can still leave an index the planner will not use, so the states are
+/// read back rather than inferred from the declarations above. This is the signal that ties a slow
+/// graph write to its cause: without it the only evidence is a write that takes too long, which is
+/// indistinguishable from a database that is merely busy.
+async fn report_index_states(graph: &Graph) {
+    let states = match index_states(graph).await {
+        Ok(states) => states,
+        Err(error) => {
+            tracing::warn!(
+                error = %format!("{error:#}"),
+                "could not read neo4j index states; graph write performance cannot be explained from logs"
+            );
+            return;
+        }
+    };
+
+    for (name, state) in &states {
+        crate::http::metrics::neo4j_index_state(name, state);
+        if is_usable(state) {
+            tracing::info!(index = %name, state = %state, "neo4j index ready");
+        } else if name == IDENTITY_INDEX {
+            tracing::warn!(
+                index = %name,
+                state = %state,
+                "identity index unusable; every symbol lookup is a label scan and graph submits will \
+                 be slow in proportion to the total number of symbols stored"
+            );
+        } else {
+            tracing::warn!(index = %name, state = %state, "neo4j index not ready");
+        }
+    }
 }
 
 /// `CREATE ... IF NOT EXISTS` is not atomic across concurrent callers — multiple roles can open a
@@ -833,6 +950,105 @@ mod tests {
             .run(query("MATCH (s:Symbol {commit: $c}) DETACH DELETE s").param("c", commit))
             .await
             .expect("final cleanup");
+    }
+
+    #[test]
+    fn only_an_online_index_counts_as_usable() {
+        assert!(is_usable("ONLINE"));
+        assert!(is_usable("online"), "state casing is Neo4j's to choose");
+        assert!(
+            !is_usable("POPULATING"),
+            "the planner falls back to a scan until the build finishes"
+        );
+        assert!(!is_usable("FAILED"));
+        assert!(
+            !is_usable(ABSENT),
+            "an index that was never created is the case this whole report exists for"
+        );
+    }
+
+    /// Live proof that the state read distinguishes the situations an operator has to tell apart:
+    /// an index that does not exist, and one the planner will use. A declaration's return value
+    /// cannot make that distinction — creation succeeds whether or not the index ends up usable.
+    #[tokio::test]
+    #[ignore = "requires a live Neo4j (docker compose up -d neo4j)"]
+    async fn index_states_reports_absent_then_online_for_the_identity_index() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let uri =
+            std::env::var("NEO4J_URI").unwrap_or_else(|_| "bolt://localhost:7687".to_string());
+        let graph = Graph::new(&uri, "neo4j", "lightbridge")
+            .await
+            .expect("connect neo4j");
+
+        let restore = is_usable(
+            index_states(&graph)
+                .await
+                .expect("states")
+                .get(IDENTITY_INDEX)
+                .expect("identity index is always reported"),
+        );
+        graph
+            .run(query("DROP CONSTRAINT symbol_identity IF EXISTS"))
+            .await
+            .expect("drop for a known starting point");
+
+        let states = index_states(&graph).await.expect("states");
+        assert_eq!(
+            states.len(),
+            MANAGED_INDEXES.len(),
+            "every managed index is reported, present or not"
+        );
+        assert_eq!(
+            states.get(IDENTITY_INDEX).map(String::as_str),
+            Some(ABSENT),
+            "an index that was never created reads as ABSENT rather than going unmentioned"
+        );
+
+        let cached = AtomicBool::new(false);
+        assert_eq!(
+            identity_index_unready(&graph, &cached).await.as_deref(),
+            Some(ABSENT),
+            "the write path can name the cause instead of reporting only that it was slow"
+        );
+        assert!(
+            !cached.load(Ordering::Relaxed),
+            "an unusable index does not latch, so it is re-read until it becomes usable"
+        );
+
+        graph
+            .run(query(
+                "CREATE CONSTRAINT symbol_identity IF NOT EXISTS \
+                 FOR (s:Symbol) REQUIRE (s.repo_id, s.commit, s.node_id) IS UNIQUE",
+            ))
+            .await
+            .expect("create");
+        graph.run(query("CALL db.awaitIndexes(60)")).await.ok();
+
+        assert_eq!(
+            index_states(&graph)
+                .await
+                .expect("states")
+                .get(IDENTITY_INDEX)
+                .map(String::as_str),
+            Some("ONLINE"),
+            "once built it reports ONLINE, which is what the planner requires"
+        );
+        assert!(
+            identity_index_unready(&graph, &cached).await.is_none(),
+            "a usable index produces no warning"
+        );
+        assert!(
+            cached.load(Ordering::Relaxed),
+            "and latches, so the check leaves the hot path"
+        );
+
+        if !restore {
+            graph
+                .run(query("DROP CONSTRAINT symbol_identity IF EXISTS"))
+                .await
+                .expect("restore the starting state");
+        }
     }
 
     /// Live proof that discarding a snapshot clears exactly that commit. The state this exists for
