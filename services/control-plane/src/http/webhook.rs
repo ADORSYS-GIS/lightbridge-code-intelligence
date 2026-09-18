@@ -304,6 +304,8 @@ enum DeliveryResult {
     Error,
 }
 
+/// Record a delivery for dedup. Only events the platform router acts on keep their payload; every
+/// other event is recorded with `{}`, since its row exists only so a redelivery is recognised.
 async fn persist_delivery(
     state: &AppState,
     platform: Platform,
@@ -313,10 +315,16 @@ async fn persist_delivery(
 ) -> DeliveryResult {
     match &state.db {
         Some(pool) => {
+            let empty = serde_json::Value::Object(serde_json::Map::new());
+            let stored = if is_routed_event(platform, event) {
+                payload
+            } else {
+                &empty
+            };
             let step_name = StepName::from(format!("webhook:{delivery_id}"));
             let step_result = Passthrough
                 .step(step_name, async || {
-                    crate::db::record_delivery(pool, platform, delivery_id, event, payload)
+                    crate::db::record_delivery(pool, platform, delivery_id, event, stored)
                         .await
                         .map_err(|e| StepError::terminal(e.to_string()))
                 })
@@ -465,6 +473,30 @@ fn verify_bitbucket_project_webhook_with_registry(
     repo.client.verify_webhook(headers, body)
 }
 
+/// Whether the platform router acts on `event`. Must list the same events as the `route_*_event`
+/// matches below; an event missing here is still routed, it just isn't stored with its payload.
+fn is_routed_event(platform: Platform, event: &str) -> bool {
+    match platform {
+        Platform::GitHub => matches!(
+            event,
+            "pull_request"
+                | "push"
+                | "issue_comment"
+                | "installation"
+                | "installation_repositories"
+        ),
+        Platform::GitLab => matches!(event, "Merge Request Hook" | "Push Hook" | "Note Hook"),
+        Platform::Bitbucket => matches!(
+            event,
+            "pullrequest:created"
+                | "pullrequest:fulfilled"
+                | "pullrequest:rejected"
+                | "pullrequest:comment_created"
+                | "repo:push"
+        ),
+    }
+}
+
 /// GitHub webhook → internal action mapping (the only events that do anything beyond being
 /// persisted):
 ///
@@ -478,7 +510,7 @@ fn verify_bitbucket_project_webhook_with_registry(
 ///   installation_repositories  added | removed         → register pending / disable those repos
 ///
 /// Repos start **pending** and need admin approval before any review/index runs (Epic #75).
-/// Everything else is persisted to `webhook_deliveries` only.
+/// Everything else is recorded in `webhook_deliveries` for dedup only, without its payload.
 async fn route_github_event(
     state: &AppState,
     event: &str,
@@ -2766,12 +2798,13 @@ mod tests {
     /// A persistence error inside the wrapped step still surfaces as the same 500 the un-wrapped code
     /// returned. A payload containing a bare NUL byte is rejected by Postgres's `jsonb` input
     /// ("unsupported Unicode escape sequence"), giving a real, deterministic `sqlx::Error` without
-    /// tearing down the pool — the same failure mode `record_delivery` can hit in production.
+    /// tearing down the pool — the same failure mode `record_delivery` can hit in production. The
+    /// event is a routed one, so its payload is what gets stored; the 500 returns before routing.
     #[sqlx::test]
     async fn webhook_ingress_step_wrap_surfaces_persistence_errors_as_500(pool: PgPool) {
         let state = gitlab_only_state(pool);
         let mut headers = HeaderMap::new();
-        headers.insert("x-gitlab-event", "Job Hook".parse().unwrap());
+        headers.insert("x-gitlab-event", "Push Hook".parse().unwrap());
         headers.insert("x-gitlab-token", "secret-a".parse().unwrap());
         headers.insert("x-gitlab-event-uuid", "wrap-error-uuid".parse().unwrap());
         let body = Bytes::from(
@@ -3554,5 +3587,93 @@ mod tests {
             preset, "fast",
             "no repo config → the platform-default pr_open mapping applies (ADR-0062 behavior preserved)"
         );
+    }
+
+    async fn stored_payload(pool: &PgPool, delivery_id: &str) -> serde_json::Value {
+        sqlx::query_scalar("SELECT payload_json FROM webhook_deliveries WHERE delivery_id = $1")
+            .bind(delivery_id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[test]
+    fn is_routed_event_covers_each_platform_router() {
+        for event in [
+            "pull_request",
+            "push",
+            "issue_comment",
+            "installation",
+            "installation_repositories",
+        ] {
+            assert!(is_routed_event(Platform::GitHub, event), "{event}");
+        }
+        for event in ["Merge Request Hook", "Push Hook", "Note Hook"] {
+            assert!(is_routed_event(Platform::GitLab, event), "{event}");
+        }
+        for event in [
+            "pullrequest:created",
+            "pullrequest:fulfilled",
+            "pullrequest:rejected",
+            "pullrequest:comment_created",
+            "repo:push",
+        ] {
+            assert!(is_routed_event(Platform::Bitbucket, event), "{event}");
+        }
+
+        for event in [
+            "workflow_job",
+            "check_run",
+            "check_suite",
+            "workflow_run",
+            "issues",
+        ] {
+            assert!(!is_routed_event(Platform::GitHub, event), "{event}");
+        }
+        assert!(!is_routed_event(Platform::GitLab, "Job Hook"));
+        assert!(!is_routed_event(Platform::Bitbucket, "pullrequest:updated"));
+        assert!(
+            !is_routed_event(Platform::GitLab, "push"),
+            "event names are per platform"
+        );
+    }
+
+    /// A routed event is stored with its payload; any other event is stored with `{}`.
+    #[sqlx::test]
+    async fn persist_delivery_stores_payloads_only_for_routed_events(pool: PgPool) {
+        let state = gitlab_only_state(pool.clone());
+        let payload = serde_json::json!({ "action": "completed", "workflow_job": { "id": 7 } });
+
+        let routed =
+            persist_delivery(&state, Platform::GitHub, "routed", "pull_request", &payload).await;
+        let unrouted = persist_delivery(
+            &state,
+            Platform::GitHub,
+            "unrouted",
+            "workflow_job",
+            &payload,
+        )
+        .await;
+
+        assert!(matches!(routed, DeliveryResult::Persisted));
+        assert!(matches!(unrouted, DeliveryResult::Persisted));
+        assert_eq!(stored_payload(&pool, "routed").await, payload);
+        assert_eq!(
+            stored_payload(&pool, "unrouted").await,
+            serde_json::json!({})
+        );
+    }
+
+    /// A delivery stored without its payload still dedups a redelivery of the same id.
+    #[sqlx::test]
+    async fn unrouted_delivery_without_payload_still_dedups(pool: PgPool) {
+        let state = gitlab_only_state(pool);
+        let payload = serde_json::json!({ "action": "queued" });
+
+        let first = persist_delivery(&state, Platform::GitHub, "d-1", "check_run", &payload).await;
+        let again = persist_delivery(&state, Platform::GitHub, "d-1", "check_run", &payload).await;
+
+        assert!(matches!(first, DeliveryResult::Persisted));
+        assert!(matches!(again, DeliveryResult::Duplicate));
     }
 }
