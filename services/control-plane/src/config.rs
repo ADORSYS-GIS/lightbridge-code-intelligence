@@ -501,6 +501,13 @@ pub struct DispatcherSection {
     /// pruning (ADR-0059). Default 30.
     #[serde(default, deserialize_with = "lci_config::de::opt_i64")]
     pub outbox_failed_retention_days: Option<i64>,
+    /// Days a webhook delivery keeps its JSON payload before the payload sweeper compacts it to
+    /// `{}`. The row itself is kept for dedup. Default 7.
+    #[serde(default, deserialize_with = "lci_config::de::opt_i64")]
+    pub webhook_payload_retention_days: Option<i64>,
+    /// Max webhook payloads compacted per GC tick. Default 5000.
+    #[serde(default, deserialize_with = "lci_config::de::opt_i64")]
+    pub webhook_payload_sweep_batch: Option<i64>,
 }
 
 /// Load the control-plane config file if it exists. `Ok(None)` when absent (use env); `Err` when it
