@@ -182,6 +182,52 @@ pub async fn attach_symbol_embeddings(
     Ok(updated.max(0) as u64)
 }
 
+/// Nodes removed per transaction when deleting graph data.
+///
+/// Neo4j holds a transaction's whole state on the heap until it commits, so a delete sized by its
+/// input grows with the snapshot it removes. Batching keeps each transaction to a fixed size however
+/// large the repository is.
+const DELETE_BATCH_ROWS: u32 = 1_000;
+
+/// Delete every `:Symbol` the `selector` matches, with its relationships, in transactions of
+/// [`DELETE_BATCH_ROWS`]. Returns how many nodes matched.
+///
+/// `selector` is a `MATCH … WHERE …` binding `s`. `CALL { … } IN TRANSACTIONS` commits each batch on
+/// its own and only runs in an auto-commit transaction, which is what `Graph::run` issues. The count
+/// is read first because deleted nodes leave the query context.
+async fn delete_symbols_in_batches(
+    graph: &Graph,
+    selector: &str,
+    params: &[(&str, BoltType)],
+) -> anyhow::Result<u64> {
+    use anyhow::Context;
+
+    let mut count = query(&format!("{selector} RETURN count(s) AS n"));
+    for (name, value) in params {
+        count = count.param(name, value.clone());
+    }
+    let mut rows = graph
+        .execute(count)
+        .await
+        .context("count symbols to delete")?;
+    let matched = match rows.next().await.context("read delete count")? {
+        Some(row) => row.get::<i64>("n").unwrap_or(0).max(0) as u64,
+        None => 0,
+    };
+    if matched == 0 {
+        return Ok(0);
+    }
+
+    let mut delete = query(&format!(
+        "{selector} CALL (s) {{ DETACH DELETE s }} IN TRANSACTIONS OF {DELETE_BATCH_ROWS} ROWS"
+    ));
+    for (name, value) in params {
+        delete = delete.param(name, value.clone());
+    }
+    graph.run(delete).await.context("delete symbols")?;
+    Ok(matched)
+}
+
 /// Delete one commit snapshot's graph for a repository. Returns the number of nodes deleted.
 ///
 /// A graph arrives as a sequence of pages, each its own transaction, so a sequence that stops partway
@@ -194,51 +240,32 @@ pub async fn delete_commit_graph(
     commit_sha: &str,
 ) -> anyhow::Result<u64> {
     use anyhow::Context;
-    let mut result = graph
-        .execute(
-            query(
-                "MATCH (s:Symbol {repo_id: $repo, commit: $commit}) \
-                 WITH s, count(s) AS _c \
-                 DETACH DELETE s \
-                 RETURN count(_c) AS deleted",
-            )
-            .param("repo", repository_id)
-            .param("commit", commit_sha),
-        )
-        .await
-        .context("delete commit graph")?;
-    let deleted = match result.next().await.context("read delete result")? {
-        Some(row) => row.get::<i64>("deleted").unwrap_or(0),
-        None => 0,
-    };
-    Ok(deleted.max(0) as u64)
+    delete_symbols_in_batches(
+        graph,
+        "MATCH (s:Symbol {repo_id: $repo, commit: $commit})",
+        &[
+            ("repo", repository_id.into()),
+            ("commit", commit_sha.into()),
+        ],
+    )
+    .await
+    .context("delete commit graph")
 }
 
 /// Delete **all** graph data for a repository (every commit snapshot), used when a repo is removed
 /// from the installation or denied (Epic #75, Milestone B). Returns the number of nodes deleted.
-/// `DETACH DELETE` removes the nodes' relationships too. Idempotent (deletes nothing for an
-/// already-clean repo).
+/// Idempotent (deletes nothing for an already-clean repo).
 pub async fn delete_repo_graph(graph: &Graph, repository_id: i64) -> anyhow::Result<u64> {
     use anyhow::Context;
-    // Count BEFORE deleting: a `RETURN count(s)` after `DETACH DELETE s` is unreliable (the nodes are
-    // gone from the query context). Collect + count first, then delete via FOREACH.
-    let mut rows = graph
-        .execute(
-            query(
-                "MATCH (s:Symbol {repo_id: $repo}) \
-                 WITH collect(s) AS nodes, count(s) AS deleted \
-                 FOREACH (n IN nodes | DETACH DELETE n) \
-                 RETURN deleted",
-            )
-            .param("repo", repository_id),
-        )
-        .await
-        .context("delete repo graph")?;
-    let deleted = match rows.next().await.context("read delete count")? {
-        Some(row) => row.get::<i64>("deleted").unwrap_or(0).max(0) as u64,
-        None => 0,
-    };
-    Ok(deleted)
+    // `commit IS NOT NULL` holds for every symbol; stating it lets the `(repo_id, commit)` index
+    // serve a match that names only the repository.
+    delete_symbols_in_batches(
+        graph,
+        "MATCH (s:Symbol) WHERE s.repo_id = $repo AND s.commit IS NOT NULL",
+        &[("repo", repository_id.into())],
+    )
+    .await
+    .context("delete repo graph")
 }
 
 /// Prune a repo's stale structural-graph snapshots: delete every `Symbol` for `repository_id` whose
@@ -254,25 +281,16 @@ pub async fn prune_graph(
     if keep.is_empty() {
         return Ok(0);
     }
-    // Count BEFORE deleting (same reason as `delete_repo_graph`: the nodes leave the query context).
-    let mut rows = graph
-        .execute(
-            query(
-                "MATCH (s:Symbol {repo_id: $repo}) WHERE NOT s.commit IN $keep \
-                 WITH collect(s) AS nodes, count(s) AS deleted \
-                 FOREACH (n IN nodes | DETACH DELETE n) \
-                 RETURN deleted",
-            )
-            .param("repo", repository_id)
-            .param("keep", keep.to_vec()),
-        )
-        .await
-        .context("prune repo graph")?;
-    let deleted = match rows.next().await.context("read prune count")? {
-        Some(row) => row.get::<i64>("deleted").unwrap_or(0).max(0) as u64,
-        None => 0,
-    };
-    Ok(deleted)
+    delete_symbols_in_batches(
+        graph,
+        "MATCH (s:Symbol {repo_id: $repo}) WHERE NOT s.commit IN $keep",
+        &[
+            ("repo", repository_id.into()),
+            ("keep", keep.to_vec().into()),
+        ],
+    )
+    .await
+    .context("prune repo graph")
 }
 
 /// A symbol returned by a graph query. Serialized straight to the retrieval API the graph MCP calls.
@@ -395,6 +413,16 @@ pub async fn ensure_indexes(graph: &Graph, dimension: i64) -> anyhow::Result<()>
         "CREATE FULLTEXT INDEX symbol_label_fulltext IF NOT EXISTS \
          FOR (s:Symbol) ON EACH [s.label, s.source_file]",
         "symbol_label_fulltext",
+    )
+    .await?;
+
+    // Snapshot-level reads and deletes — discarding a commit, pruning stale commits, removing a
+    // repository — select by `(repo_id, commit)` and never name a node. The identity index below
+    // needs all three properties, so without this one each of them scans the whole label.
+    create_index_idempotent(
+        graph,
+        "CREATE INDEX symbol_snapshot IF NOT EXISTS FOR (s:Symbol) ON (s.repo_id, s.commit)",
+        "symbol_snapshot",
     )
     .await?;
 
@@ -839,6 +867,103 @@ mod tests {
     /// is a page sequence that stopped partway: the pages that committed must not survive as a graph
     /// that reads as complete. Ignored by default — run with `--ignored` after
     /// `docker compose up -d neo4j`.
+    /// Live proof that deletes larger than one batch remove exactly their selection. Each path —
+    /// discarding a commit, pruning stale commits, removing a repository — spans several
+    /// `DELETE_BATCH_ROWS` transactions here, which is the shape that must not grow with the snapshot.
+    #[tokio::test]
+    #[ignore = "requires a live Neo4j (docker compose up -d neo4j)"]
+    async fn deletes_spanning_several_batches_remove_exactly_their_selection() {
+        let uri =
+            std::env::var("NEO4J_URI").unwrap_or_else(|_| "bolt://localhost:7687".to_string());
+        let graph = Graph::new(&uri, "neo4j", "lightbridge")
+            .await
+            .expect("connect neo4j");
+
+        let (repo, other_repo) = (6621i64, 6622i64);
+        let per_commit = DELETE_BATCH_ROWS as i64 * 2 + 500;
+        let nodes: Vec<GraphNode> = (0..per_commit)
+            .map(|i| GraphNode {
+                node_id: format!("src/f{i}.rs#1:f{i}"),
+                label: format!("f{i}()"),
+                source_file: format!("src/f{i}.rs"),
+                start_line: 1,
+                embedding: None,
+            })
+            .collect();
+        let edges: Vec<GraphEdge> = (1..per_commit)
+            .map(|i| GraphEdge {
+                source: format!("src/f{i}.rs#1:f{i}"),
+                target: "src/f0.rs#1:f0".to_string(),
+                relation: "calls".to_string(),
+            })
+            .collect();
+        for r in [repo, other_repo] {
+            delete_repo_graph(&graph, r).await.expect("cleanup");
+        }
+        for commit in ["discard", "stale", "current"] {
+            upsert_graph(&graph, repo, commit, &nodes, &edges)
+                .await
+                .expect("seed");
+        }
+        upsert_graph(&graph, other_repo, "current", &nodes, &[])
+            .await
+            .expect("seed other repo");
+
+        let expected = per_commit as u64;
+        assert_eq!(
+            delete_commit_graph(&graph, repo, "discard")
+                .await
+                .expect("discard"),
+            expected,
+            "a discard reports every node of its snapshot"
+        );
+        assert_eq!(
+            prune_graph(&graph, repo, &["current".to_string()])
+                .await
+                .expect("prune"),
+            expected,
+            "pruning removes the one stale commit left"
+        );
+        assert_eq!(
+            count_snapshot(&graph, repo, "current").await,
+            per_commit,
+            "the kept commit is intact"
+        );
+
+        assert_eq!(
+            delete_repo_graph(&graph, repo).await.expect("repo delete"),
+            expected,
+            "removing the repository takes its last snapshot"
+        );
+        assert_eq!(count_snapshot(&graph, repo, "current").await, 0);
+        assert_eq!(
+            count_snapshot(&graph, other_repo, "current").await,
+            per_commit,
+            "another repository is untouched"
+        );
+
+        delete_repo_graph(&graph, other_repo)
+            .await
+            .expect("final cleanup");
+    }
+
+    async fn count_snapshot(graph: &Graph, repo: i64, commit: &str) -> i64 {
+        let mut rows = graph
+            .execute(
+                query("MATCH (s:Symbol {repo_id: $repo, commit: $commit}) RETURN count(s) AS n")
+                    .param("repo", repo)
+                    .param("commit", commit),
+            )
+            .await
+            .expect("count");
+        rows.next()
+            .await
+            .expect("row")
+            .expect("one row")
+            .get::<i64>("n")
+            .expect("n")
+    }
+
     #[tokio::test]
     #[ignore = "requires a live Neo4j (docker compose up -d neo4j)"]
     async fn discarding_a_snapshot_clears_that_commit_and_leaves_others() {
