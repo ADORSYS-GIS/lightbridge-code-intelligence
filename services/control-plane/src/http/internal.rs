@@ -756,6 +756,40 @@ pub async fn ingest_chunks(
     StatusCode::NO_CONTENT.into_response()
 }
 
+/// `GET /internal/tasks/{id}/graph` — how many symbols this task's commit snapshot already holds.
+///
+/// The runner reads this before submitting so it can tell a commit it is indexing for the first
+/// time from one that already carries a graph. Only the former may be discarded on failure.
+pub async fn graph_snapshot(
+    _auth: RunnerAuth,
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Response {
+    let Some(pool) = state.db.as_ref() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "no database").into_response();
+    };
+    let Some(neo4j) = state.neo4j.as_ref() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "neo4j not configured").into_response();
+    };
+    let (repository_id, commit_sha) = match task_scope(pool, id).await {
+        Ok(Some(scope)) => scope,
+        Ok(None) => return (StatusCode::NOT_FOUND, "task not found").into_response(),
+        Err(error) => {
+            tracing::error!(%error, task_id = %id, "graph-snapshot scope lookup failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "query error").into_response();
+        }
+    };
+
+    match crate::integrations::neo4j::count_commit_symbols(neo4j, repository_id, &commit_sha).await
+    {
+        Ok(nodes) => Json(serde_json::json!({ "nodes": nodes })).into_response(),
+        Err(error) => {
+            tracing::error!(%error, task_id = %id, "graph snapshot count failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "query error").into_response()
+        }
+    }
+}
+
 /// `DELETE /internal/tasks/{id}/graph` — discard this task's commit snapshot from the graph.
 ///
 /// A graph arrives as a sequence of pages, each committed on its own, so a sequence that stops

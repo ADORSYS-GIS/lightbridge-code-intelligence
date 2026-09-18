@@ -24,6 +24,18 @@ pub fn graph_page_size() -> usize {
         .unwrap_or(DEFAULT_GRAPH_PAGE_SIZE)
 }
 
+/// Whether a failed page sequence may discard the commit's snapshot.
+///
+/// Pages commit individually, so an interrupted sequence leaves the ones that already landed.
+/// Removing them is right only when this run created them: a snapshot that predates the run is a
+/// complete graph for this commit, and replacing it is this run's job where destroying it is not.
+/// An unknown prior state (`None`) is treated as pre-existing — leaving a graph in place is
+/// recoverable on the next run, deleting one is not.
+#[must_use]
+fn may_discard(symbols_before: Option<u64>) -> bool {
+    matches!(symbols_before, Some(0))
+}
+
 /// Submit the structural half of `out` — nodes and edges, no vectors — to the control plane.
 /// Returns `(nodes, edges)` submitted; an empty graph is a no-op. Best-effort: the caller logs a
 /// failure without failing the whole task. Languages without a graph extractor yet contribute no
@@ -73,18 +85,36 @@ pub async fn index_graph(
 
     let (n, e) = (nodes.len(), edges.len());
     let page_size = graph_page_size();
+
+    // Read before the first page lands; afterwards the count reflects this run's own writes.
+    let symbols_before = match client.graph_node_count(context.task_id).await {
+        Ok(count) => Some(count),
+        Err(error) => {
+            tracing::warn!(
+                error = %format!("{error:#}"),
+                "graph snapshot lookup failed; a failed submit will leave the snapshot in place"
+            );
+            None
+        }
+    };
     if let Err(error) = client
         .submit_graph_paged(context.task_id, &commit_sha, &nodes, &edges, page_size)
         .await
     {
-        // Pages commit individually, so a sequence that stops partway leaves the ones that already
-        // landed. Discarding the snapshot leaves the commit un-indexed, which readers handle, rather
-        // than a subset that reads as a complete graph — a missing edge is indistinguishable from a
-        // symbol that genuinely has no callers.
-        if let Err(discard) = client.discard_graph(context.task_id).await {
+        // Discarding leaves the commit un-indexed, which readers handle, rather than a subset that
+        // reads as a complete graph — a missing edge is indistinguishable from a symbol that
+        // genuinely has no callers. That trade only applies to a snapshot this run created.
+        if may_discard(symbols_before) {
+            if let Err(discard) = client.discard_graph(context.task_id).await {
+                tracing::warn!(
+                    error = %format!("{discard:#}"),
+                    "discarding the partial graph failed; the snapshot may hold an incomplete graph"
+                );
+            }
+        } else {
             tracing::warn!(
-                error = %format!("{discard:#}"),
-                "discarding the partial graph failed; the snapshot may hold an incomplete graph"
+                symbols_before = ?symbols_before,
+                "graph submit failed over a snapshot that predates this run; leaving it in place"
             );
         }
         return Err(error).context("submitting codegraph structural graph");
@@ -96,4 +126,30 @@ pub async fn index_graph(
         "in-house (lci-codegraph) structural graph submitted"
     );
     Ok((n, e))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::may_discard;
+
+    #[test]
+    fn only_a_snapshot_this_run_created_may_be_discarded() {
+        assert!(
+            may_discard(Some(0)),
+            "the commit had no graph, so every page came from this run"
+        );
+        assert!(
+            !may_discard(Some(1)),
+            "a snapshot that predates this run is a complete graph; replacing it is this run's job"
+        );
+        assert!(
+            !may_discard(Some(5_154)),
+            "a populated snapshot is never this run's to delete"
+        );
+        assert!(
+            !may_discard(None),
+            "an unknown prior state leaves the snapshot alone: a graph left in place is recoverable \
+             on the next run, one deleted is not"
+        );
+    }
 }

@@ -182,6 +182,31 @@ pub async fn attach_symbol_embeddings(
     Ok(updated.max(0) as u64)
 }
 
+/// How many symbols one commit snapshot holds for a repository.
+///
+/// Distinguishes a commit that has never been indexed from one that already carries a graph, which
+/// decides whether a failed submit may discard the snapshot or must leave it alone.
+pub async fn count_commit_symbols(
+    graph: &Graph,
+    repository_id: i64,
+    commit_sha: &str,
+) -> anyhow::Result<u64> {
+    use anyhow::Context;
+    let mut result = graph
+        .execute(
+            query("MATCH (s:Symbol {repo_id: $repo, commit: $commit}) RETURN count(s) AS n")
+                .param("repo", repository_id)
+                .param("commit", commit_sha),
+        )
+        .await
+        .context("count commit symbols")?;
+    let n = match result.next().await.context("read count result")? {
+        Some(row) => row.get::<i64>("n").unwrap_or(0),
+        None => 0,
+    };
+    Ok(n.max(0) as u64)
+}
+
 /// Delete one commit snapshot's graph for a repository. Returns the number of nodes deleted.
 ///
 /// A graph arrives as a sequence of pages, each its own transaction, so a sequence that stops partway
@@ -831,6 +856,62 @@ mod tests {
         // Cleanup.
         graph
             .run(query("MATCH (s:Symbol {commit: $c}) DETACH DELETE s").param("c", commit))
+            .await
+            .expect("final cleanup");
+    }
+
+    /// Live proof that a commit's symbol count distinguishes a first index from a re-index. The
+    /// runner reads it before its first page: a populated snapshot must not be discarded when a
+    /// later page fails, because deleting it is not recoverable.
+    #[tokio::test]
+    #[ignore = "requires a live Neo4j (docker compose up -d neo4j)"]
+    async fn counting_a_snapshot_separates_a_first_index_from_a_re_index() {
+        let uri =
+            std::env::var("NEO4J_URI").unwrap_or_else(|_| "bolt://localhost:7687".to_string());
+        let graph = Graph::new(&uri, "neo4j", "lightbridge")
+            .await
+            .expect("connect neo4j");
+
+        let repo = 6572i64;
+        delete_repo_graph(&graph, repo).await.expect("cleanup");
+
+        assert_eq!(
+            count_commit_symbols(&graph, repo, "c1")
+                .await
+                .expect("count"),
+            0,
+            "a commit never indexed reads as empty, so a failed run may discard its own pages"
+        );
+
+        let nodes: Vec<GraphNode> = (0..4)
+            .map(|i| GraphNode {
+                node_id: format!("src/a.rs#{i}:f{i}"),
+                label: format!("f{i}()"),
+                source_file: "src/a.rs".into(),
+                start_line: i,
+                embedding: None,
+            })
+            .collect();
+        upsert_graph(&graph, repo, "c1", &nodes, &[])
+            .await
+            .expect("first index");
+
+        assert_eq!(
+            count_commit_symbols(&graph, repo, "c1")
+                .await
+                .expect("count"),
+            4,
+            "a re-index sees the graph it would otherwise delete"
+        );
+        assert_eq!(
+            count_commit_symbols(&graph, repo, "c2")
+                .await
+                .expect("count"),
+            0,
+            "the count is scoped to the commit, not the repository"
+        );
+
+        delete_repo_graph(&graph, repo)
             .await
             .expect("final cleanup");
     }

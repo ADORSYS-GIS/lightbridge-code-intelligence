@@ -390,6 +390,28 @@ async fn submit_graph_paged_stops_at_the_first_failing_page() {
 }
 
 #[tokio::test]
+async fn graph_node_count_reads_the_task_snapshot_size() {
+    let server = MockServer::start().await;
+    let task_id = Uuid::nil();
+
+    Mock::given(method("GET"))
+        .and(path(format!("/internal/tasks/{task_id}/graph")))
+        .and(bearer_token("runner-secret"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({ "nodes": 5154 })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let count = ControlPlaneClient::new(server.uri(), "runner-secret")
+        .graph_node_count(task_id)
+        .await
+        .expect("snapshot read");
+    assert_eq!(count, 5154, "the count the discard decision turns on");
+}
+
+#[tokio::test]
 async fn discard_graph_deletes_the_task_snapshot() {
     let server = MockServer::start().await;
     let task_id = Uuid::nil();

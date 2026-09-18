@@ -25,8 +25,10 @@ _Last updated: 2026-09-17._
   seek (a node upsert: 120,517 db accesses → 3 on a 60,018-symbol corpus; an edge write: 241,037 → 9),
   so one repository's write cost no longer grows
   with every other repository indexed. Because pages commit individually, a sequence that stops partway
-  discards the snapshot rather than leaving a subset that reads as a complete graph — an absent edge is
-  indistinguishable from a symbol that genuinely has no callers. `graph skipped` now carries its cause.
+  discards the snapshot it created rather than leaving a subset that reads as a complete graph — an
+  absent edge is indistinguishable from a symbol that genuinely has no callers. The runner reads the
+  snapshot's size before its first page, so a re-index that fails partway leaves the earlier complete
+  graph in place instead of deleting it. `graph skipped` now carries its cause.
   No migration and no re-index.
   ([ADR-0117](docs/adr/0117-paged-graph-submission-and-symbol-identity.md), #656)
 

@@ -418,6 +418,7 @@ fn api_v2_router() -> Router<AppState> {
         .route(
             "/internal/tasks/{id}/graph",
             post(internal::ingest_graph)
+                .get(internal::graph_snapshot)
                 .delete(internal::discard_graph)
                 .layer(DefaultBodyLimit::max(32 * 1024 * 1024)),
         )
