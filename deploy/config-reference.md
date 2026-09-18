@@ -118,6 +118,17 @@ signed JWT), `TRACEPARENT`, plus (from Secret `lightbridge-agent-secrets`) `LLM_
 (`INDEX_EMBED_BATCH_SIZE`) and observability vars (`OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_TRACES_SAMPLER_ARG`) from the dispatcher's
 own env.
 
+**Storage GC** — file-config only, under `control-plane.json`'s `dispatcher` section. The sweeps
+run on the dispatcher's `prune_interval_seconds` tick (default `600`); a zero or negative value falls
+back to the default.
+
+| Key | Default | Description |
+|---|---|---|
+| `outbox_posted_retention_days` | `7` | Days a delivered `outbox` row is kept. |
+| `outbox_failed_retention_days` | `30` | Days a dead-lettered `outbox` row is kept. |
+| `webhook_payload_retention_days` | `7` | Days a webhook delivery keeps its JSON payload. Older payloads are compacted to `{}`; the row is kept, so redelivery dedup and task references are unaffected. |
+| `webhook_payload_sweep_batch` | `5000` | Max webhook payloads compacted per tick. |
+
 ### A2A role ([RFC-0006](../docs/rfc/0006-a2a-agent-surface.md))
 
 | Variable | Default | Description |

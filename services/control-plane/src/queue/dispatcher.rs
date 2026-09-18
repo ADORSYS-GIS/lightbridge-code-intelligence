@@ -39,6 +39,12 @@ const DEFAULT_A2A_TASK_TTL_DAYS: i64 = 30;
 /// Bounded rows-per-sweep so one GC tick never holds a long lock on `a2a_tasks`; a large backlog drains
 /// across ticks. From `A2A_TASK_SWEEP_BATCH`.
 const DEFAULT_A2A_TASK_SWEEP_BATCH: i64 = 500;
+/// Webhook payloads are only read around ingest (routing, and the one-hour MCP-review quota window),
+/// so a week keeps them available for debugging recent deliveries with ample margin.
+const DEFAULT_WEBHOOK_PAYLOAD_RETENTION_DAYS: i64 = 7;
+/// Payloads compacted per GC tick. At the default 10-minute tick this is ~720k rows/day: well above
+/// the ingest rate, while spreading a large backlog's write volume across ticks.
+const DEFAULT_WEBHOOK_PAYLOAD_SWEEP_BATCH: i64 = 5000;
 /// The data-purge backstop is a rare recovery net (a spawned purge lost to a restart), so it runs on
 /// its own slow tick — 10 min — instead of riding the ~30s reaper cadence. Its "which disabled repos
 /// still have data?" scan probes `code_chunks` once per ever-disabled repo, which is cheap warm but
@@ -72,6 +78,10 @@ pub struct DispatcherConfig {
     pub a2a_task_ttl_days: i64,
     /// Max terminal `a2a_tasks` mappings deleted per GC tick. From `A2A_TASK_SWEEP_BATCH`.
     pub a2a_task_sweep_batch: i64,
+    /// Days a webhook delivery keeps its payload before the payload sweeper compacts it.
+    pub webhook_payload_retention_days: i64,
+    /// Max webhook payloads compacted per GC tick.
+    pub webhook_payload_sweep_batch: i64,
 }
 
 impl DispatcherConfig {
@@ -134,6 +144,14 @@ impl DispatcherConfig {
             ),
             a2a_task_ttl_days: env_days("A2A_TASK_TTL_DAYS", DEFAULT_A2A_TASK_TTL_DAYS),
             a2a_task_sweep_batch: env_days("A2A_TASK_SWEEP_BATCH", DEFAULT_A2A_TASK_SWEEP_BATCH),
+            webhook_payload_retention_days: days(
+                section.and_then(|s| s.webhook_payload_retention_days),
+                DEFAULT_WEBHOOK_PAYLOAD_RETENTION_DAYS,
+            ),
+            webhook_payload_sweep_batch: section
+                .and_then(|s| s.webhook_payload_sweep_batch)
+                .filter(|&b| b > 0)
+                .unwrap_or(DEFAULT_WEBHOOK_PAYLOAD_SWEEP_BATCH),
         }
     }
 }
@@ -237,6 +255,17 @@ pub async fn run<L: TaskLauncher + Sync>(
                     tokio::spawn(async move {
                         if let Err(error) = crate::queue::a2a_sweeper::sweep_once(&pool, ttl_days, batch).await {
                             tracing::error!(%error, "a2a task sweeper cycle failed");
+                        }
+                    });
+                }
+                {
+                    // Compact aged webhook payloads; the rows stay for dedup and task references.
+                    let pool = pool.clone();
+                    let retention_days = cfg.webhook_payload_retention_days;
+                    let batch = cfg.webhook_payload_sweep_batch;
+                    tokio::spawn(async move {
+                        if let Err(error) = crate::queue::webhook_payload_sweeper::sweep_once(&pool, retention_days, batch).await {
+                            tracing::error!(%error, "webhook payload sweeper cycle failed");
                         }
                     });
                 }
@@ -527,6 +556,43 @@ mod tests {
         assert_eq!(
             config(Some("0"), Some("100")).a2a_task_ttl_days,
             DEFAULT_A2A_TASK_TTL_DAYS
+        );
+    }
+
+    // Webhook payload retention defaults to a week, is config-overridable, and a non-positive
+    // retention or batch falls back to the default rather than compacting every payload.
+    #[test]
+    fn webhook_payload_retention_defaults_overrides_and_non_positive_falls_back() {
+        let cfg = DispatcherConfig::default();
+        assert_eq!(
+            cfg.webhook_payload_retention_days,
+            DEFAULT_WEBHOOK_PAYLOAD_RETENTION_DAYS
+        );
+        assert_eq!(
+            cfg.webhook_payload_sweep_batch,
+            DEFAULT_WEBHOOK_PAYLOAD_SWEEP_BATCH
+        );
+
+        let overridden = DispatcherConfig::from_file(Some(&DispatcherSection {
+            webhook_payload_retention_days: Some(3),
+            webhook_payload_sweep_batch: Some(200),
+            ..Default::default()
+        }));
+        assert_eq!(overridden.webhook_payload_retention_days, 3);
+        assert_eq!(overridden.webhook_payload_sweep_batch, 200);
+
+        let zeroed = DispatcherConfig::from_file(Some(&DispatcherSection {
+            webhook_payload_retention_days: Some(0),
+            webhook_payload_sweep_batch: Some(-5),
+            ..Default::default()
+        }));
+        assert_eq!(
+            zeroed.webhook_payload_retention_days,
+            DEFAULT_WEBHOOK_PAYLOAD_RETENTION_DAYS
+        );
+        assert_eq!(
+            zeroed.webhook_payload_sweep_batch,
+            DEFAULT_WEBHOOK_PAYLOAD_SWEEP_BATCH
         );
     }
 
