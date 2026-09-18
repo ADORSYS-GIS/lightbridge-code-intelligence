@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.9.0](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/compare/v0.8.0...v0.9.0) (2026-09-18)
+
+
+### Features
+
+* **codegraph:** bump the lci-codegraph pin to the latest main ([#650](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/650)) ([0a2edd4](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/commit/0a2edd496e27fb86f3c5fd21129c7512ed7131cd))
+* **graph:** index symbol identity in Neo4j, and submit the graph in pages ([#657](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/657)) ([5c936ab](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/commit/5c936ab258b85553357464c0627a30eb31d7e9d2))
+
+
+### Bug Fixes
+
+* **indexer:** one walk, and a symbol's vector rides its own chunk (ADR-0116) ([#655](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/655)) ([f3bd0df](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/commit/f3bd0df647c3e9db0f5195dccb8a429431cdd1d7)), closes [#654](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/654) [#652](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/652) [#651](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/651)
+
+
+### Documentation
+
+* **adr:** retire apps/web's deployment, console moves to apps/lci (ADR-0115) ([#645](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/645)) ([9327031](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/commit/93270319e59945d2fb9aed7b54651c256e891334))
+* record webhook_deliveries unbounded growth as P0 ([#638](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/638)) ([2054b46](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/commit/2054b465ac75cc98c67628d7f0a8ba381c6c5857))
+
 ## [0.8.0](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/compare/v0.7.0...v0.8.0) (2026-08-31)
 
 
