@@ -1,7 +1,7 @@
 //! Ingest submission: indexed code chunks (for pgvector search) and the structural code graph (for
 //! Neo4j via lci-codegraph).
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::ControlPlaneClient;
@@ -65,6 +65,12 @@ pub struct GraphBatch {
     pub commit_sha: String,
     pub nodes: Vec<GraphNodePayload>,
     pub edges: Vec<GraphEdgePayload>,
+}
+
+/// Body of `GET /internal/tasks/{id}/graph`.
+#[derive(Debug, Deserialize)]
+struct GraphSnapshot {
+    nodes: u64,
 }
 
 impl ControlPlaneClient {
@@ -132,6 +138,28 @@ impl ControlPlaneClient {
     ///
     /// Returns the snapshot to "not indexed" after a page sequence stops partway, so readers see an
     /// absent graph rather than a subset of one.
+    /// The number of symbols already stored for this task's commit snapshot.
+    ///
+    /// A non-zero count means the commit carries a graph that predates this run — replacing it is
+    /// this run's job, discarding it is not.
+    pub async fn graph_node_count(&self, task_id: Uuid) -> anyhow::Result<u64> {
+        use anyhow::Context;
+        let url = format!("{}/internal/tasks/{task_id}/graph", self.base_url);
+        let body: GraphSnapshot = self
+            .http
+            .get(&url)
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .context("reading the graph snapshot")?
+            .error_for_status()
+            .context("control plane rejected the graph snapshot read")?
+            .json()
+            .await
+            .context("parsing the graph snapshot")?;
+        Ok(body.nodes)
+    }
+
     pub async fn discard_graph(&self, task_id: Uuid) -> anyhow::Result<()> {
         use anyhow::Context;
         let url = format!("{}/internal/tasks/{task_id}/graph", self.base_url);
