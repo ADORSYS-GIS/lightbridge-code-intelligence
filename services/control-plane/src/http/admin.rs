@@ -851,6 +851,38 @@ fn repo_commit_scope(repo: &crate::db::RepositoryRow) -> &str {
     &repo.default_branch
 }
 
+/// Query params for the symbol-identity repair.
+#[derive(Debug, Deserialize)]
+pub struct SymbolIdentityRepairQuery {
+    /// Collapse the duplicates found. Without it the endpoint only reports them.
+    #[serde(default)]
+    apply: bool,
+}
+
+/// `POST /admin/graph/symbol-identity/repair?apply=` — report every graph snapshot that holds a
+/// symbol more than once and, with `apply=true`, reduce each to one node per key and move the
+/// identity key onto its uniqueness constraint. Edges and embeddings on the surplus copies are kept
+/// on the survivor. Safe to repeat: a clean database reports nothing and changes nothing.
+pub async fn repair_symbol_identity(
+    caller: Caller,
+    State(state): State<AppState>,
+    Query(q): Query<SymbolIdentityRepairQuery>,
+) -> Response {
+    if let Err(e) = caller.require("repo:configure") {
+        return e.into_response();
+    }
+    let Some(neo4j) = state.neo4j.as_ref() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "neo4j not configured").into_response();
+    };
+    match crate::integrations::neo4j::identity::repair(neo4j, q.apply).await {
+        Ok(report) => Json(report).into_response(),
+        Err(error) => {
+            tracing::error!(error = %format!("{error:#}"), "symbol identity repair failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "repair failed").into_response()
+        }
+    }
+}
+
 /// Query params shared by the neighborhood/overview endpoint.
 #[derive(Debug, Deserialize)]
 pub struct GraphQuery {
