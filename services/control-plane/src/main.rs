@@ -367,8 +367,8 @@ fn api_v2_router() -> Router<AppState> {
         .route("/tasks/{id}/feedback", get(tasks::get_feedback))
         .route("/tasks/{id}/cancel", post(tasks::cancel))
         .route("/repositories", get(tasks::list_repositories))
-        // Windowed review and feedback aggregates for the LCI app's analytics pages (converse-frontends
-        // ADR 0018): one request per subject, each carrying its own previous-window comparison.
+        // Windowed review and feedback aggregates for the LCI app's analytics pages (ADR-0116):
+        // one request per subject, each carrying its own previous-window comparison.
         .route("/analytics/reviews", get(analytics::reviews))
         .route("/analytics/feedback", get(analytics::feedback))
         // Deployment/config read for the web console (GitLab base URL, etc.) — no `GITLAB_URL` env.
@@ -729,9 +729,13 @@ fn reconciler_env_u64(primary: &str, legacy: &str, default: u64) -> u64 {
 /// `GET /analytics/feedback`, which reports it so a page can say where reactions stop being kept
 /// current. Each reads its own process env, so the two roles must be deployed with the same value.
 pub(crate) fn reconciler_window_days() -> i32 {
-    i32::try_from(reconciler_env_u64("RECONCILER_WINDOW_DAYS", "POLLER_WINDOW_DAYS", 14))
-        .unwrap_or(i32::MAX)
-        .max(1)
+    i32::try_from(reconciler_env_u64(
+        "RECONCILER_WINDOW_DAYS",
+        "POLLER_WINDOW_DAYS",
+        14,
+    ))
+    .unwrap_or(i32::MAX)
+    .max(1)
 }
 
 /// The reconciler role (ADR-0058): a single replica that owns **all platform egress** — it drains
