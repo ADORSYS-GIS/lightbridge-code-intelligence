@@ -367,9 +367,8 @@ fn api_v2_router() -> Router<AppState> {
         .route("/tasks/{id}/feedback", get(tasks::get_feedback))
         .route("/tasks/{id}/cancel", post(tasks::cancel))
         .route("/repositories", get(tasks::list_repositories))
-        // Windowed review and feedback aggregates for the LCI app's analytics pages (ADR-0116):
-        // one request per subject, each carrying its own previous-window comparison.
-        .route("/analytics/reviews", get(analytics::reviews))
+        // Windowed reviewer-reaction aggregates for the LCI app's feedback pages (ADR-0116),
+        // carrying their own previous-window comparison.
         .route("/analytics/feedback", get(analytics::feedback))
         // Deployment/config read for the web console (GitLab base URL, etc.) — no `GITLAB_URL` env.
         .route("/config", get(http::config::deployment_config))

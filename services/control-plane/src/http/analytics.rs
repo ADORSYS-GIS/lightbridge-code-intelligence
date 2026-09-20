@@ -1,10 +1,8 @@
-//! `GET /analytics/reviews` and `GET /analytics/feedback` — windowed, optionally repository-scoped
-//! aggregates for the LCI app's Analytics page and repository Insights tab (ADR-0116).
+//! `GET /analytics/feedback` — windowed, optionally repository-scoped reaction aggregates for the
+//! LCI app's Feedback page and per-repository Feedback tab (ADR-0116).
 //!
-//! Both are gated on `task:read`: they summarize the rows `GET /tasks` lists, so seeing the summary
-//! takes exactly the permission seeing the rows does. They are two endpoints rather than one document
-//! because feedback lags reviews by up to a poll cycle and fails independently — a feedback query that
-//! errors should cost a page one zone, not its run counts.
+//! It is gated on `task:read`: it summarizes the rows `GET /tasks` lists, so seeing the summary takes
+//! exactly the permission seeing the rows does.
 //!
 //! Every parameter is required and validated loudly. A window that silently became a different
 //! window, or a bucket that quietly fell back to a default, would answer a different question than the
@@ -235,34 +233,8 @@ impl AnalyticsParams {
     }
 }
 
-/// `GET /analytics/reviews?repository_id=&from=&to=&bucket=` — run outcomes, durations, and what the
-/// finalized reviews found, with the previous window beside each total.
-pub async fn reviews(
-    caller: Caller,
-    State(state): State<AppState>,
-    Query(query): Query<AnalyticsQuery>,
-) -> Response {
-    if let Err(e) = caller.require("task:read") {
-        return e.into_response();
-    }
-    let Some(pool) = state.db.as_ref() else {
-        return (StatusCode::SERVICE_UNAVAILABLE, "no database").into_response();
-    };
-    let params = match AnalyticsParams::try_from(query) {
-        Ok(params) => params,
-        Err(rejection) => return rejection.into_response(),
-    };
-    match crate::db::review_analytics(pool, &params.window()).await {
-        Ok(analytics) => Json(params.envelope(analytics)).into_response(),
-        Err(error) => {
-            tracing::error!(%error, "review analytics failed");
-            (StatusCode::INTERNAL_SERVER_ERROR, "query error").into_response()
-        }
-    }
-}
-
 /// `GET /analytics/feedback?repository_id=&from=&to=&bucket=` — the standing 👍/👎 on the comments
-/// posted in the window, by finding priority and category, plus the most down-voted findings.
+/// posted in the window, bucketed, with the preceding window beside every total.
 pub async fn feedback(
     caller: Caller,
     State(state): State<AppState>,
@@ -406,7 +378,7 @@ mod tests {
     #[test]
     fn parses_a_real_query_string_including_a_form_encoded_space() {
         let uri: axum::http::Uri =
-            format!("/analytics/reviews?repository_id=7&from={FROM}&to={TO}&bucket=1+day")
+            format!("/analytics/feedback?repository_id=7&from={FROM}&to={TO}&bucket=1+day")
                 .parse()
                 .expect("valid uri");
         let Query(query) = Query::<AnalyticsQuery>::try_from_uri(&uri).expect("parses");
