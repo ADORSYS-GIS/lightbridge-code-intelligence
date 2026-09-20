@@ -165,18 +165,34 @@ logs a `WARNING` and never rolls back the review write.
 
 This is not primarily a dashboard optimisation. Today both the Grafana board and this repo's own
 ADR-0044 feedback memory recover the finding behind a 👎 by joining `review_comments.(file, line)`
-to a jsonb element:
+to a jsonb element — and, worth stating because the two are easy to conflate, **they do not compare
+the same way**. `rejected_findings_for_repo` casts the jsonb line to `int`:
 
 ```sql
+-- services/control-plane/src/db/feedback.rs
 JOIN LATERAL jsonb_array_elements(r.findings) finding
   ON finding->>'file' = rc.file AND (finding->>'line')::int = rc.line
 ```
 
-`rejected_findings_for_repo`'s own doc comment concedes it is best-effort and that "a
+while the Grafana generator casts the column to `text`:
+
+```sql
+-- tools/dashboard-gen/lci_dashboards/feedback.py
+WHERE rc.kind = 'inline' AND f->>'file' = rc.file AND f->>'line' = rc.line::text
+```
+
+`rejected_findings_for_repo`'s own doc comment concedes the match is best-effort and that "a
 path-normalization mismatch just misses a row". Every "👎 by category" figure in existence is
 therefore under-counted by an unknown amount, and the memory fed back into the reviewer is missing
-rows for the same reason. A real key fixes the correctness problem and makes the aggregation an
-index scan as a side effect.
+rows for the same reason.
+
+**What the projection buys, precisely.** The match becomes typed and indexed — one
+`(task_id, file, line)` comparison against a real table — so the aggregation is an index scan and the
+two call sites above can no longer disagree with each other. It does **not** fix path normalization:
+a finding whose `file` string does not match the comment's still misses, and only a finding key
+recorded on the comment at post time would close that gap (deferred; see **A5**). Reactions that
+match no finding are reported as `unresolved` rather than dropped, so what remains unmatched is
+visible instead of silently shrinking the breakdowns.
 
 Indexes land with it: `tasks (repository_id, created_at DESC)`, `reviews (created_at)` and
 `review_findings (task_id, file, line)` — see amendment **A5** for the feedback-side index this
