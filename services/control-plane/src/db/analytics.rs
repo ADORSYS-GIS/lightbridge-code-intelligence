@@ -1,4 +1,4 @@
-//! Review and feedback analytics (converse-frontends ADR 0018): the windowed, optionally
+//! Review and feedback analytics (ADR-0116): the windowed, optionally
 //! repository-scoped aggregates behind `GET /analytics/reviews` and `GET /analytics/feedback`.
 //!
 //! Every query takes a half-open window `[from, to)` and computes the immediately preceding window of
@@ -1344,7 +1344,7 @@ mod tests {
         );
     }
 
-    /// ADR 0018 D7: the windowed statements must stay servable by an index. With sequential scans
+    /// ADR-0116 D7: the windowed statements must stay servable by an index. With sequential scans
     /// priced out, a plan that still scans `tasks`/`reviews`/`review_comments` sequentially means no
     /// index matches the window predicate any more — which on a real estate is the page going slow.
     #[sqlx::test]

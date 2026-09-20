@@ -1,4 +1,4 @@
--- Review analytics (converse-frontends ADR 0018 D6): a normalized projection of `reviews.findings`,
+-- Review analytics (ADR-0116 D6): a normalized projection of `reviews.findings`,
 -- plus the indexes the windowed, repository-scoped aggregates behind `GET /analytics/*` range over.
 --
 -- `reviews.findings` stays the verbatim audit record of what the agent said. `review_findings` is a

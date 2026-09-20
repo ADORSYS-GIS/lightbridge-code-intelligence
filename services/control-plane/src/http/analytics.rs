@@ -1,5 +1,5 @@
 //! `GET /analytics/reviews` and `GET /analytics/feedback` — windowed, optionally repository-scoped
-//! aggregates for the LCI app's Overview and repository Insights pages (converse-frontends ADR 0018).
+//! aggregates for the LCI app's Analytics page and repository Insights tab (ADR-0116).
 //!
 //! Both are gated on `task:read`: they summarize the rows `GET /tasks` lists, so seeing the summary
 //! takes exactly the permission seeing the rows does. They are two endpoints rather than one document
