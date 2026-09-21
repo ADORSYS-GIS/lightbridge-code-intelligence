@@ -22,7 +22,10 @@ mod search;
 mod tasks;
 
 pub use durable_step::StoredStep;
-pub use indexing::{ChunkBatch, ChunkPayload, GraphBatch, GraphEdgePayload, GraphNodePayload};
+pub use indexing::{
+    ChunkBatch, ChunkPayload, DEFAULT_GRAPH_PAGE_SIZE, GraphBatch, GraphEdgePayload,
+    GraphNodePayload,
+};
 pub use knowledge::{DiscoveredTool, KnowledgeToolResult};
 pub use search::{ChunkHit, SymbolHit};
 

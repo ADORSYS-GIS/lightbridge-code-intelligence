@@ -28,34 +28,43 @@ submits everything over the internal API).
 ```mermaid
 flowchart LR
   subgraph Runner["agent-runner Job"]
-    A[Clone checkout] --> B[Walk files]
-    B --> C[Tree-sitter chunker]
+    A[Clone checkout] --> W[lci-codegraph walk<br/>one parse, in-process]
+    W --> H[nodes/edges]
+    W --> C["chunks<br/>(each carrying node_id<br/>when it is a definition's body)"]
     C --> D[Embeddings client]
-    A --> G[lci-codegraph walk<br/>in-process, tree-sitter]
-    G --> H[nodes/edges]
   end
-  D -- submit_chunks --> CP[(Control plane API)]
-  H -- submit_graph --> CP
+  H -- "submit_graph (structure only)" --> CP[(Control plane API)]
+  D -- "submit_chunks (vector + node_id)" --> CP
   CP --> PG[(pgvector: code_chunks)]
   CP --> NEO[(Neo4j: :Symbol graph)]
 ```
 
-Two independent indexers run in the same task:
+**One walk produces both indexes** ([ADR-0116](adr/0116-one-walk-node-id-symbol-embeddings.md)). The
+in-house `lci-codegraph` crate parses each file once and emits, from that single parse, the semantic
+chunks *and* the structural nodes/edges — and records on each chunk the `node_id` of the definition it
+is the body of, when it is one. The crate lives at
+[ADORSYS-GIS/lci-codegraph](https://github.com/ADORSYS-GIS/lci-codegraph) and is consumed as a pinned
+git dependency (see `services/agent-runner/Cargo.toml`); it replaced the Python Graphify CLI
+(ADR-0086), with no flag and no fallback.
 
-- **Semantic** — our own tree-sitter chunker embeds each chunk and submits batches to the control
-  plane, which upserts `code_chunks` rows (pgvector). Code: `services/agent-runner/src/indexer/mod.rs`,
-  `services/agent-runner/src/indexer/chunker.rs`, `services/agent-clients/src/embeddings.rs`.
-- **Structural** — the in-house `lci-codegraph` crate walks the same checkout (in-process, tree-sitter)
-  and produces symbol nodes + `contains`/`method`/`calls` edges; the runner submits them and the
-  control plane writes Neo4j. Code: `services/agent-runner/src/indexer/graph.rs` (the host that calls
-  the crate), `services/control-plane/src/integrations/neo4j.rs`. This replaced the Python Graphify
-  CLI (ADR-0086); there is no flag and no fallback. The crate itself is no longer in this repo — it
-  lives at [vymalo/lci-codegraph](https://github.com/vymalo/lci-codegraph) and is consumed as a pinned git
-  dependency (see `services/agent-runner/Cargo.toml`).
+Two submissions follow, in this order:
 
-The structural pass is **best-effort**: it runs after the semantic pass, and a graph failure (or
-an unconfigured graph store returning 503) is logged, not fatal — the task still succeeds with a
-populated pgvector index (`services/agent-runner/src/main.rs`).
+- **Structural** — nodes + `contains`/`method`/`calls` edges, **carrying no vectors**. Code:
+  `services/agent-runner/src/indexer/graph.rs`,
+  `services/control-plane/src/integrations/neo4j.rs`.
+- **Semantic** — each chunk is embedded once and submitted with its `node_id`. The control plane
+  upserts the `code_chunks` row (pgvector) and, when a `node_id` is present, attaches that same vector
+  to the matching `:Symbol`. Code: `services/agent-runner/src/indexer/mod.rs`,
+  `services/agent-clients/src/embeddings.rs`.
+
+The order matters: the symbol attach uses `MATCH`, never `MERGE`, so a vector whose symbol is not in
+the graph is dropped rather than creating a node with an embedding and no structural facts.
+
+The structural pass is **best-effort** — a graph failure (or an unconfigured graph store returning
+503) is logged, not fatal. The task still succeeds with a populated pgvector index; the symbols that
+never landed simply carry no vector. The symbol attach is best-effort for the same reason, and runs
+*after* the pgvector write, so a graph outage cannot reject a batch that already reached the store
+retrieval depends on.
 
 ## When indexing runs (and when it is skipped)
 
@@ -87,31 +96,31 @@ is already in flight so a burst of pushes doesn't pile up duplicates.
 
 ## Semantic index (pgvector)
 
-### Chunking — `chunker.rs`
+### Chunking — `lci-codegraph`
 
-Syntax-aware first, windowed fallback second ([ADR-0010](adr/0010-graphify-treesitter-indexing-baseline.md)).
+Syntax-aware first, windowed fallback second ([ADR-0010](adr/0010-graphify-treesitter-indexing-baseline.md)),
+now owned by the crate rather than by a second chunker in this repo
+([ADR-0116](adr/0116-one-walk-node-id-symbol-embeddings.md)).
 
-- For languages we ship a grammar for — **Rust, TypeScript, JavaScript, Python** (`language::has_grammar`)
-  — tree-sitter walks the full tree and extracts named items. The recursion descends into `impl`/class
-  bodies so methods are independently indexed. Captured node kinds → `chunk_type`:
-  - Rust: `function`, `impl`, `struct`, `enum`, `trait`, `module`, `type`
-  - TS/JS: `function` (declarations, expressions, arrow fns), `class`, `method`
-  - Python: `function`, `class`, decorated definitions
-- Tree-sitter is **error-tolerant**: the chunker deliberately does *not* bail on `root.has_error()`,
-  so one bad expression doesn't dump an entire file into the windowed fallback.
-- A structured chunk spanning more than `MAX_CHUNK_LINES` (150) is split by recursing into interesting
-  children; a large leaf with no nested items (e.g. a 200-line function) is emitted as one chunk and
-  the embedding API truncates if needed.
-- **Fallback** (`window_chunks`): everything else — `text`/markdown/config files, and grammar-less
-  languages — gets fixed line windows (`WINDOW_SIZE` 100, `WINDOW_STEP` 50, so 50-line overlap),
-  `chunk_type` `window`.
-
-Guards: binary content (a null byte in the first 512 bytes) is skipped; files over 5 MiB are skipped;
-`.git`, `node_modules`, `target`, `.next`, `dist`, `.venv`/`venv`, `__pycache__`, `build` directories
-are pruned during the walk (`mod.rs`). Language detection is by extension only (`language.rs`).
+- Languages with a grammar get tree-sitter chunks of named items — functions, methods, classes,
+  `impl` blocks, structs, enums, traits, modules — and the recursion descends into container bodies so
+  methods are independently indexed. The crate's language registry is the source of truth for which
+  languages those are; it is considerably wider than the four this repo's own chunker used to handle,
+  and it matches the set the graph pass understands, by construction.
+- Tree-sitter is **error-tolerant**: a file is not dumped into the windowed fallback just because one
+  expression fails to parse.
+- Everything else — text/markdown/config files, and grammar-less languages — gets fixed overlapping
+  line windows, `chunk_type` `window`.
+- Guards (binary sniffing, a maximum file size, ignored directories) live in the crate, which honours
+  the repo's own `.gitignore` composed with an operator-configurable glob layer — not a hardcoded
+  directory list.
 
 Each `Chunk` carries `file_path` (forward-slashed, OS-independent), `language`, `chunk_type`,
-optional `symbol_name`, `start_line`/`end_line`, and the raw `content`.
+optional `symbol_name`, `start_line`/`end_line`, the raw `content`, and — the load-bearing addition —
+`node_id`: the graph node this chunk is the body of, recorded during the same parse that emitted that
+node. It is `None` for a windowed slice, a text file, or any chunk the graph pass produced no node
+for; it is never a guess, since the crate only sets an id it has verified exists in that file's own
+graph facts.
 
 ### Embeddings — `embeddings.rs`
 
@@ -187,18 +196,29 @@ The pgvector column is fixed-width, so changing the embedding model's dimension 
 
 ### Extraction — `graph.rs` + the `lci-codegraph` crate
 
+> The same walk also produces the semantic chunks — see [Who builds what](#who-builds-what). This
+> section covers the structural half of its output.
+
 The structural graph is built **in-process** by the `lci-codegraph` crate (ADR-0086), which walks the
 checkout over one tree-sitter parse — no subprocess, no Python, no `graph.json` on disk. The runner's
 `indexer/graph.rs` is a thin host: it calls `lci_codegraph::walk_checkout_from_env(&checkout, /* build_graph */ true)`
 on a blocking thread and maps the crate's `Graph` onto the internal-API `GraphNodePayload`/`GraphEdgePayload`.
 
 The crate emits symbol nodes (functions, methods, types, modules) with 1-based start lines and a `()`
-suffix on callables, plus `contains` / `method` / `calls` edges, with **cross-file symbol resolution
-for Rust** (a reference in file A resolved to a definition in file B). Languages without a graph
-extractor yet contribute no structural facts (they stay covered by the semantic chunker). The
-extractor has no embeddings; the semantic path stays entirely with our own chunker. An
-operator-configurable, gitignore-style **ignore-list** (`LCI_CODEGRAPH_IGNORE_GLOBS`, composed with the
-repo `.gitignore`) and the `INDEX_*` tuning knobs govern the walk.
+suffix on callables, plus `contains` / `method` / `calls` edges, with **cross-file symbol resolution**
+(a reference in file A resolved to a definition in file B) for Rust, Python, TypeScript/JavaScript
+(including TSX/JSX), Java, Scala, Dart, Swift and CrateStack — Java additionally resolves through
+Spring's annotation surface. Languages without a graph extractor yet (JSON, Jinja2 and Postgres are
+parsed but classify no definitions) contribute no structural facts, and stay covered by the semantic
+chunks from the same walk. An operator-configurable, gitignore-style **ignore-list**
+(`LCI_CODEGRAPH_IGNORE_GLOBS`, composed with the repo `.gitignore`) and the crate's own
+`LCI_CODEGRAPH_MAX_CHUNK_LINES` / `_WINDOW_SIZE` / `_WINDOW_STEP` knobs govern the walk — chunk shape
+is the crate's to tune. `INDEX_EMBED_BATCH_SIZE` stays this repo's, and governs only how many chunks
+are embedded per round trip.
+
+A symbol's `:Symbol.embedding` does **not** arrive on this payload. It rides the chunk that is the
+symbol's body, keyed by `node_id` ([ADR-0116](adr/0116-one-walk-node-id-symbol-embeddings.md)) — which
+is why the structural submit runs first and carries structure only.
 
 ### Storage — `:Symbol` graph (`services/control-plane/src/integrations/neo4j.rs`)
 

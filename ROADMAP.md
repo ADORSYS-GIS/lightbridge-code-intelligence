@@ -13,6 +13,37 @@ _Last updated: 2026-09-21._
 
 ## Recently shipped
 
+- **Structural graph writes are bounded, indexed and all-or-nothing** — the structural half of an
+  index run used to leave the runner as one request whose size *and* duration both scaled with the
+  repository, against two fixed constants (a 32 MiB body limit and a 180 s client timeout), so the
+  largest indexable repository was an emergent property rather than a configured one. The runner now
+  pages the graph into all node pages followed by all edge pages (`GRAPH_SUBMIT_PAGE_SIZE`, default
+  2,000), so a request's cost is a function of a configured unit of work and repository growth adds
+  requests rather than seconds. Alongside it, `(repo_id, commit, node_id)` — the triple every symbol
+  read and write addresses a node by — finally carries an index: a composite `IS UNIQUE` constraint
+  turns each lookup from a label scan across every repository and retained commit into a unique-index
+  seek (a node upsert: 120,517 db accesses → 3 on a 60,018-symbol corpus; an edge write: 241,037 → 9),
+  so one repository's write cost no longer grows
+  with every other repository indexed. Because pages commit individually, a sequence that stops partway
+  discards the snapshot rather than leaving a subset that reads as a complete graph — an absent edge is
+  indistinguishable from a symbol that genuinely has no callers. `graph skipped` now carries its cause.
+  No migration and no re-index.
+  ([ADR-0117](docs/adr/0117-paged-graph-submission-and-symbol-identity.md), #656)
+
+- **One walk, and a symbol's vector comes from its own code** — indexing used to run two independent
+  chunkers over the same checkout and join them by line range, which gave roughly 38% of symbols the
+  wrong vector: because a container's chunk is emitted before its children, every method on an `impl`
+  received the whole `impl`'s vector, making those symbols indistinguishable to
+  `lightbridge_graph_semantic_search`. `agent-runner`'s chunker is deleted; one `lci-codegraph` walk
+  now produces both halves of the index, and each chunk carries the `node_id` of the definition it is
+  the body of, so the control plane attaches the vector by identity instead of position. Exact symbol
+  coverage 61% → 98%; live-model retrieval over the affected symbols went top-1 18.4% → 76.3%.
+  Semantic indexing also picks up the eight languages the graph already understood (Dart, Swift,
+  Kotlin, TSX, JSON, Jinja2, Postgres, `.cstack`), each text is embedded once rather than twice, and
+  the structural submit no longer carries vectors — which clears the 32 MiB body limit that was
+  failing graph writes on large repositories. **Requires a full re-index of every repository.**
+  ([ADR-0116](docs/adr/0116-one-walk-node-id-symbol-embeddings.md), #654, #652)
+
 - **`apps/web` retired; console moves to `apps/lci`** — supersedes the "`apps/web` full revamp" item
   this file previously carried here. `apps/lci` (`ADORSYS-GIS/converse-frontends`, OIDC-authenticated,
   its own design system) already ships the per-repo settings + model-override admin UI that revamp
@@ -30,10 +61,11 @@ _Last updated: 2026-09-21._
   required the model to guess a symbol's exact name and hope it matched — the new tool returns a real,
   traversable graph node directly, so a diff that duplicates existing logic under a different name is
   now findable. Backed by two new Neo4j indexes on `:Symbol` (vector + fulltext), symbol embeddings
-  computed at index time from the chunker's already-embedded chunks (correlated by range containment,
-  not an exact line match — the two walks number source lines differently), and a Weighted Reciprocal
-  Rank Fusion query — Neo4j's own documented hybrid-search pattern — fusing the two signals. Index
-  bootstrap is idempotent under concurrent startup across the roles that open a Neo4j connection.
+  taken at index time from the chunk that is the symbol's body (by `node_id` since
+  [ADR-0116](docs/adr/0116-one-walk-node-id-symbol-embeddings.md); originally by range containment),
+  and a Weighted Reciprocal Rank Fusion query — Neo4j's own documented hybrid-search pattern —
+  fusing the two signals. Index bootstrap is idempotent under concurrent startup across the roles
+  that open a Neo4j connection.
   ([ADR-0114](docs/adr/0114-hybrid-graph-vector-symbol-search.md), #621)
 
 - **One service, one domain, path-routed** (Epic #492) — `/a2a`, `/mcp` and `/api/v2` (including
@@ -172,7 +204,7 @@ _Last updated: 2026-09-21._
   (not by reconcile time), with the acceptance rate over 👍+👎 only, coverage beside it, and the
   previous window from the same statement. Schema cost: one `review_comments (created_at)` index
   (migration 0040). Scope was deliberately cut to reactions only before merge — see the review
-  analytics item under Planned. ([ADR-0116](docs/adr/0116-feedback-analytics-aggregates.md) — Proposed,
+  analytics item under Planned. ([ADR-0118](docs/adr/0118-feedback-analytics-aggregates.md) — Proposed,
   #649 (draft); frontend [converse-frontends#517](https://github.com/ADORSYS-GIS/converse-frontends/pull/517);
   spike [converse-frontends#516](https://github.com/ADORSYS-GIS/converse-frontends/issues/516))
 - **Allowlist `run_sast` in ai-helm-values** — the single remaining blocker to SAST going live on the
@@ -202,7 +234,7 @@ _Last updated: 2026-09-21._
   catch calibration regressions (not started, being reframed around presets — see #491), the #285
   severity-stability watch, and the observability work above.
 
-- **Review analytics (deferred from ADR-0116)** (#667) — findings by P0/P1/P2 and category, run
+- **Review analytics (deferred from ADR-0118)** (#667) — findings by P0/P1/P2 and category, run
   outcomes and durations, and the finding-linked feedback views (👎 by category, most down-voted
   findings), backed by a `review_findings` projection of `reviews.findings` kept in sync by a trigger.
   Built and tested in #649, then cut before merge; #667 holds the removed migration, queries, types,

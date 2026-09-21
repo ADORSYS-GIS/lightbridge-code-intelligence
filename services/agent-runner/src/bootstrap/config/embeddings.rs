@@ -1,5 +1,7 @@
 //! [`EmbeddingsConfig`] — connection + tuning for the OpenAI-compatible embeddings API (ADR-0018).
 
+use lci_agent_clients::DEFAULT_MAX_INPUT_BYTES;
+
 use super::defaults::DEFAULT_REQUEST_TIMEOUT_SECS;
 use super::env::{parse_env_u64, require, require_field};
 use super::file::FileConfig;
@@ -19,6 +21,11 @@ pub struct EmbeddingsConfig {
     /// Per-request timeout (seconds) for one embeddings call (ADR-0051). From `embeddings.config
     /// .request_timeout_secs` / `EMBEDDINGS_REQUEST_TIMEOUT_SECS`, else [`DEFAULT_REQUEST_TIMEOUT_SECS`].
     pub request_timeout_secs: u64,
+    /// Ceiling on the bytes of one input string sent to the model. From
+    /// `EMBEDDINGS_MAX_INPUT_BYTES`, else [`DEFAULT_MAX_INPUT_BYTES`]. Chunk shape is bounded in
+    /// lines, so a slice of long unwrapped lines can be far larger than its line count suggests;
+    /// this keeps a request inside what the model accepts.
+    pub max_input_bytes: usize,
 }
 
 impl EmbeddingsConfig {
@@ -29,6 +36,7 @@ impl EmbeddingsConfig {
             model: require("EMBEDDINGS_MODEL")?,
             request_timeout_secs: parse_env_u64("EMBEDDINGS_REQUEST_TIMEOUT_SECS")
                 .unwrap_or(DEFAULT_REQUEST_TIMEOUT_SECS),
+            max_input_bytes: max_input_bytes_from_env(),
         })
     }
 
@@ -47,8 +55,17 @@ impl EmbeddingsConfig {
                     .and_then(|c| c.request_timeout_secs)
                     .or_else(|| parse_env_u64("EMBEDDINGS_REQUEST_TIMEOUT_SECS"))
                     .unwrap_or(DEFAULT_REQUEST_TIMEOUT_SECS),
+                max_input_bytes: max_input_bytes_from_env(),
             }),
             None => Self::from_env(),
         }
     }
+}
+
+/// Read `EMBEDDINGS_MAX_INPUT_BYTES`, falling back to [`DEFAULT_MAX_INPUT_BYTES`] when unset or
+/// unparseable. The client clamps to ≥1, so a `0` here cannot empty every input.
+fn max_input_bytes_from_env() -> usize {
+    parse_env_u64("EMBEDDINGS_MAX_INPUT_BYTES")
+        .and_then(|n| usize::try_from(n).ok())
+        .unwrap_or(DEFAULT_MAX_INPUT_BYTES)
 }

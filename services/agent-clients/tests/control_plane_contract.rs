@@ -94,9 +94,25 @@ async fn submit_chunks_posts_batch_with_bearer() {
     let server = MockServer::start().await;
     let task_id = Uuid::nil();
 
+    // Pin the wire shape `ingest_chunks` deserializes, including the `node_id` it keys the
+    // symbol-embedding attach on (ADR-0116).
     Mock::given(method("POST"))
         .and(path(format!("/internal/tasks/{task_id}/chunks")))
         .and(bearer_token("runner-secret"))
+        .and(body_json(serde_json::json!({
+            "commit_sha": "abc123",
+            "chunks": [{
+                "file_path": "src/main.rs",
+                "language": "rust",
+                "chunk_type": "function",
+                "symbol_name": "main",
+                "start_line": 0,
+                "end_line": 5,
+                "content": "fn main() {}",
+                "embedding": [0.0, 0.0, 0.0, 0.0],
+                "node_id": "src/main.rs#1:main",
+            }],
+        })))
         .respond_with(ResponseTemplate::new(204))
         .expect(1)
         .mount(&server)
@@ -117,6 +133,59 @@ async fn submit_chunks_posts_batch_with_bearer() {
                     end_line: 5,
                     content: "fn main() {}".to_string(),
                     embedding: vec![0.0; 4],
+                    node_id: Some("src/main.rs#1:main".to_string()),
+                }],
+            },
+        )
+        .await
+        .expect("chunks submitted");
+}
+
+#[tokio::test]
+async fn submit_chunks_omits_node_id_for_a_chunk_that_is_not_a_definition() {
+    use lci_agent_clients::{ChunkBatch, ChunkPayload};
+
+    let server = MockServer::start().await;
+    let task_id = Uuid::nil();
+
+    // A windowed slice links to no symbol; `node_id` must be absent from the body rather than null,
+    // so the control plane's `Option` default applies and no embedding is offered to Neo4j.
+    Mock::given(method("POST"))
+        .and(path(format!("/internal/tasks/{task_id}/chunks")))
+        .and(bearer_token("runner-secret"))
+        .and(body_json(serde_json::json!({
+            "commit_sha": "abc123",
+            "chunks": [{
+                "file_path": "README.md",
+                "language": "text",
+                "chunk_type": "window",
+                "start_line": 0,
+                "end_line": 99,
+                "content": "# readme",
+                "embedding": [0.0, 0.0, 0.0, 0.0],
+            }],
+        })))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = ControlPlaneClient::new(server.uri(), "runner-secret");
+    client
+        .submit_chunks(
+            task_id,
+            ChunkBatch {
+                commit_sha: "abc123".to_string(),
+                chunks: vec![ChunkPayload {
+                    file_path: "README.md".to_string(),
+                    language: "text".to_string(),
+                    chunk_type: "window".to_string(),
+                    symbol_name: None,
+                    start_line: 0,
+                    end_line: 99,
+                    content: "# readme".to_string(),
+                    embedding: vec![0.0; 4],
+                    node_id: None,
                 }],
             },
         )
@@ -161,9 +230,25 @@ async fn submit_graph_posts_nodes_and_edges_with_bearer() {
     let server = MockServer::start().await;
     let task_id = Uuid::nil();
 
+    // Structural facts only: a node payload carries no vector (ADR-0116), so `body_json`'s exact
+    // match is what proves no `embedding` key is emitted.
     Mock::given(method("POST"))
         .and(path(format!("/internal/tasks/{task_id}/graph")))
         .and(bearer_token("runner-secret"))
+        .and(body_json(serde_json::json!({
+            "commit_sha": "abc123",
+            "nodes": [{
+                "node_id": "src_math_add",
+                "label": "add()",
+                "source_file": "src/math.rs",
+                "start_line": 2,
+            }],
+            "edges": [{
+                "source": "src_math_calc_bump",
+                "target": "src_math_add",
+                "relation": "calls",
+            }],
+        })))
         .respond_with(ResponseTemplate::new(204))
         .expect(1)
         .mount(&server)
@@ -180,7 +265,6 @@ async fn submit_graph_posts_nodes_and_edges_with_bearer() {
                     label: "add()".to_string(),
                     source_file: "src/math.rs".to_string(),
                     start_line: 2,
-                    embedding: None,
                 }],
                 edges: vec![GraphEdgePayload {
                     source: "src_math_calc_bump".to_string(),
@@ -191,6 +275,157 @@ async fn submit_graph_posts_nodes_and_edges_with_bearer() {
         )
         .await
         .expect("graph submitted");
+}
+
+#[tokio::test]
+async fn submit_graph_paged_sends_every_node_page_before_any_edge_page() {
+    use lci_agent_clients::{GraphEdgePayload, GraphNodePayload};
+
+    let server = MockServer::start().await;
+    let task_id = Uuid::nil();
+
+    Mock::given(method("POST"))
+        .and(path(format!("/internal/tasks/{task_id}/graph")))
+        .and(bearer_token("runner-secret"))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&server)
+        .await;
+
+    let nodes: Vec<GraphNodePayload> = (0..5)
+        .map(|i| GraphNodePayload {
+            node_id: format!("n{i}"),
+            label: format!("f{i}()"),
+            source_file: "src/a.rs".to_string(),
+            start_line: i,
+        })
+        .collect();
+    let edges: Vec<GraphEdgePayload> = (0..3)
+        .map(|i| GraphEdgePayload {
+            source: format!("n{i}"),
+            target: format!("n{}", i + 1),
+            relation: "calls".to_string(),
+        })
+        .collect();
+
+    ControlPlaneClient::new(server.uri(), "runner-secret")
+        .submit_graph_paged(task_id, "abc123", &nodes, &edges, 2)
+        .await
+        .expect("paged graph submitted");
+
+    let bodies: Vec<serde_json::Value> = server
+        .received_requests()
+        .await
+        .expect("recorded requests")
+        .iter()
+        .map(|r| serde_json::from_slice(&r.body).expect("json body"))
+        .collect();
+
+    // 5 nodes and 3 edges at 2 per page: 3 node pages, then 2 edge pages.
+    assert_eq!(
+        bodies.len(),
+        5,
+        "ceil(5/2) node pages + ceil(3/2) edge pages"
+    );
+    let kinds: Vec<&str> = bodies
+        .iter()
+        .map(|b| {
+            if b["nodes"].as_array().is_some_and(|a| !a.is_empty()) {
+                "nodes"
+            } else {
+                "edges"
+            }
+        })
+        .collect();
+    assert_eq!(
+        kinds,
+        vec!["nodes", "nodes", "nodes", "edges", "edges"],
+        "an edge is written by matching both endpoints, so every node page must land first"
+    );
+    assert!(
+        bodies[3]["nodes"]
+            .as_array()
+            .expect("nodes key present")
+            .is_empty(),
+        "an edge page carries no nodes, and the key is still present for the server's decoder"
+    );
+    assert_eq!(bodies[0]["commit_sha"], "abc123");
+}
+
+#[tokio::test]
+async fn submit_graph_paged_stops_at_the_first_failing_page() {
+    use lci_agent_clients::GraphNodePayload;
+
+    let server = MockServer::start().await;
+    let task_id = Uuid::nil();
+
+    // Every page is rejected, so the first attempt is also the last.
+    Mock::given(method("POST"))
+        .and(path(format!("/internal/tasks/{task_id}/graph")))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server)
+        .await;
+
+    let nodes: Vec<GraphNodePayload> = (0..10)
+        .map(|i| GraphNodePayload {
+            node_id: format!("n{i}"),
+            label: format!("f{i}()"),
+            source_file: "src/a.rs".to_string(),
+            start_line: i,
+        })
+        .collect();
+
+    let error = ControlPlaneClient::new(server.uri(), "runner-secret")
+        .submit_graph_paged(task_id, "abc123", &nodes, &[], 2)
+        .await
+        .expect_err("a rejected page fails the sequence");
+    assert!(
+        format!("{error:#}").contains("node page 0"),
+        "the failing page is named in the error: {error:#}"
+    );
+    assert_eq!(
+        server.received_requests().await.expect("recorded").len(),
+        1,
+        "the sequence stops rather than sending the remaining pages"
+    );
+}
+
+#[tokio::test]
+async fn discard_graph_deletes_the_task_snapshot() {
+    let server = MockServer::start().await;
+    let task_id = Uuid::nil();
+
+    Mock::given(method("DELETE"))
+        .and(path(format!("/internal/tasks/{task_id}/graph")))
+        .and(bearer_token("runner-secret"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    ControlPlaneClient::new(server.uri(), "runner-secret")
+        .discard_graph(task_id)
+        .await
+        .expect("snapshot discarded");
+}
+
+#[tokio::test]
+async fn submit_graph_paged_with_nothing_to_send_makes_no_request() {
+    let server = MockServer::start().await;
+    let task_id = Uuid::nil();
+
+    ControlPlaneClient::new(server.uri(), "runner-secret")
+        .submit_graph_paged(task_id, "abc123", &[], &[], 2)
+        .await
+        .expect("empty graph is a no-op");
+
+    assert!(
+        server
+            .received_requests()
+            .await
+            .expect("recorded")
+            .is_empty(),
+        "an empty graph costs no round trip"
+    );
 }
 
 #[tokio::test]

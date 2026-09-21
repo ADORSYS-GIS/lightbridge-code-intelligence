@@ -1,5 +1,5 @@
 //! `GET /analytics/feedback` — windowed, optionally repository-scoped reaction aggregates for the
-//! LCI app's Feedback page and per-repository Feedback tab (ADR-0116).
+//! LCI app's Feedback page and per-repository Feedback tab (ADR-0118).
 //!
 //! It is gated on `task:read`: it summarizes the rows `GET /tasks` lists, so seeing the summary takes
 //! exactly the permission seeing the rows does.

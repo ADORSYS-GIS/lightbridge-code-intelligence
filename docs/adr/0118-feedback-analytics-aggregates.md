@@ -1,4 +1,4 @@
-# ADR-0116: Reviewer feedback is a product surface fed by control-plane aggregates, not Grafana iframes
+# ADR-0118: Reviewer feedback is a product surface fed by control-plane aggregates, not Grafana iframes
 
 - **Status:** Proposed
 - **Date:** 2026-09-20

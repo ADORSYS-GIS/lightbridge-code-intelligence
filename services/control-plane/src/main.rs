@@ -367,7 +367,7 @@ fn api_v2_router() -> Router<AppState> {
         .route("/tasks/{id}/feedback", get(tasks::get_feedback))
         .route("/tasks/{id}/cancel", post(tasks::cancel))
         .route("/repositories", get(tasks::list_repositories))
-        // Windowed reviewer-reaction aggregates for the LCI app's feedback pages (ADR-0116),
+        // Windowed reviewer-reaction aggregates for the LCI app's feedback pages (ADR-0118),
         // carrying their own previous-window comparison.
         .route("/analytics/feedback", get(analytics::feedback))
         // Deployment/config read for the web console (GitLab base URL, etc.) — no `GITLAB_URL` env.
@@ -420,7 +420,9 @@ fn api_v2_router() -> Router<AppState> {
         // so raise the body limit here too.
         .route(
             "/internal/tasks/{id}/graph",
-            post(internal::ingest_graph).layer(DefaultBodyLimit::max(32 * 1024 * 1024)),
+            post(internal::ingest_graph)
+                .delete(internal::discard_graph)
+                .layer(DefaultBodyLimit::max(32 * 1024 * 1024)),
         )
         // Retrieval for the MCP servers (slice 4): semantic search (pgvector) + structural queries
         // (Neo4j), each scoped server-side to the task's repo snapshot.
