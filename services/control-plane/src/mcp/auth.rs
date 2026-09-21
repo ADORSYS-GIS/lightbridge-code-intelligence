@@ -106,6 +106,7 @@ mod tests {
             platforms: std::collections::HashMap::new(),
             runner_token_signer: None,
             neo4j: None,
+            identity_index_ready: Default::default(),
             metrics: crate::http::metrics::install(),
             review: std::sync::Arc::new(crate::config::ReviewSection::default()),
             knowledge_tools: std::sync::Arc::new(crate::config::KnowledgeToolsSection::default()),

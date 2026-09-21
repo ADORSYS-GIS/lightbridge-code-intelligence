@@ -875,6 +875,23 @@ pub async fn ingest_graph(
         return StatusCode::NO_CONTENT.into_response();
     }
 
+    // Name the cause while the effect is happening. A submit that outlives the runner's timeout
+    // reports only that it timed out; the reason is almost always here, and an operator reading the
+    // failing job's logs has no view of a warning the control plane emitted at startup.
+    if let Some(index_state) =
+        crate::integrations::neo4j::identity_index_unready(neo4j, &state.identity_index_ready).await
+    {
+        tracing::warn!(
+            task_id = %id,
+            index = crate::integrations::neo4j::IDENTITY_INDEX,
+            state = %index_state,
+            nodes = batch.nodes.len(),
+            edges = batch.edges.len(),
+            "writing a graph page while the identity index is unusable; every symbol lookup is a \
+             label scan, so this write is slow in proportion to all symbols stored"
+        );
+    }
+
     let nodes: Vec<crate::integrations::neo4j::GraphNode> = batch
         .nodes
         .into_iter()

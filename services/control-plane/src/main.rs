@@ -113,6 +113,9 @@ pub struct AppState {
     /// unset — the graph-ingest route then fails closed (503). Held here so the untrusted Job never
     /// gets Neo4j creds (it POSTs the graph through the internal API instead).
     pub neo4j: Option<Arc<neo4rs::Graph>>,
+    /// Whether the Neo4j identity index has been observed `ONLINE`. Latched: once true it stays
+    /// true, so the graph-write path re-reads the state only while the index is unusable.
+    pub identity_index_ready: Arc<std::sync::atomic::AtomicBool>,
     /// Prometheus render handle backing `/metrics` (scraped by Alloy for the Operations dashboard).
     pub metrics: PrometheusHandle,
     /// Review-feedback config (PR reactions + outcome labels) from the file config's `review` section
@@ -285,6 +288,7 @@ impl AppState {
             platforms,
             runner_token_signer: runner_token::RunnerTokenSigner::from_env().map(Arc::new),
             neo4j,
+            identity_index_ready: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             metrics,
             review: Arc::new(review),
             knowledge_tools: Arc::new(knowledge_tools),
