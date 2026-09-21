@@ -21,6 +21,7 @@ use uuid::Uuid;
 
 use crate::integrations::platform::Platform;
 
+mod analytics;
 mod code_chunks;
 mod durable_step;
 mod feedback;
@@ -33,6 +34,7 @@ mod repositories;
 mod reviews;
 mod tasks;
 
+pub use analytics::*;
 pub use code_chunks::*;
 pub use durable_step::*;
 pub use feedback::*;
