@@ -1,4 +1,4 @@
-# ADR-0118: Reviewer feedback is a product surface fed by control-plane aggregates, not Grafana iframes
+# ADR-0118: Reviewer feedback is a product surface fed by control-plane aggregates
 
 - **Status:** Proposed
 - **Date:** 2026-09-20
@@ -13,18 +13,12 @@ is visible anywhere a user of the product can reach — only in a Grafana behind
 proxy ([ADR-0046](0046-observability-dashboard-deployment.md)), at estate scope.
 
 The console that [ADR-0115](0115-retire-apps-web-move-console-to-lci-ui.md) moved to `apps/lci` in
-`ADORSYS-GIS/converse-frontends` could not show it:
-
-- **Nothing in the app can express a time window.** Its Overview page calls `GET /tasks` with no
-  parameters, which this control plane caps at 100 rows
-  (`services/control-plane/src/queue/tasks.rs:16`), then aggregates those rows in JavaScript. On any
-  estate busy enough to matter, "the last 14 days" is the last day and a half and "Total runs" reads
-  `100` permanently. There is no range picker because there is nothing a range picker could do: the
-  endpoint underneath has no window parameter and no aggregate.
-- **Per-repository analytics was two Grafana `d-solo` iframes** — "Billed cost" and "Tokens used".
-  Those are the only two panels in the generated board set that are genuinely repository-scoped;
-  `review-quality.py`'s own comment records that its Postgres findings and reactions panels are
-  **not** filtered by `$repo` and were left out of the embed "rather than guessed at".
+`ADORSYS-GIS/converse-frontends` could not show it, because **nothing in the app can express a time
+window.** Its Overview page calls `GET /tasks` with no parameters, which this control plane caps at
+100 rows (`services/control-plane/src/queue/tasks.rs:16`), then aggregates those rows in JavaScript.
+On any estate busy enough to matter, "the last 14 days" is the last day and a half and "Total runs"
+reads `100` permanently. There is no range picker because there is nothing a range picker could do:
+the endpoint underneath has no window parameter and no aggregate.
 
 This control plane offers no aggregate endpoint at all: `/tasks`, `/tasks/{id}`,
 `/tasks/{id}/review`, `/tasks/{id}/feedback` and `/repositories` are all row readers, and the
@@ -43,15 +37,13 @@ read API?
 - Fast, with a number behind the word: the query must be index-servable and stay that way.
 - Honest: no figure may imply a precision the underlying sample does not have (reaction coverage is
   unmeasured and self-selecting; reconcile time is not reaction time).
-- Billed cost and tokens live in the AI-Gateway's Loki billing stream and are **not in this
-  database at all** since [ADR-0100](0100-retire-db-transcript-logs-as-observability.md) retired the
-  DB run transcript. Whatever is built must not appear able to answer money.
+- Additive: a new surface beside the existing screens, changing none of them.
 
 ## Considered Options
 
 - **A — An aggregate read endpoint on the control plane**, consumed by a first-class page in
   `apps/lci`.
-- **B — Keep embedding Grafana**, and add the missing panels there.
+- **B — Add feedback panels to the operators' Grafana boards** and link to them from the app.
 - **C — Aggregate in the Next.js layer** over a bigger page of `GET /tasks`.
 - **D — A daily rollup table** from the start.
 - **E — A single composite, operator-tunable "review quality" score** as the headline figure.
@@ -62,7 +54,7 @@ Chosen option: **"A — an aggregate read endpoint on the control plane"**, beca
 already here, the window is a SQL predicate rather than a client-side filter, and it is the only
 option that makes the review pipeline's own signal reachable from the product without a second
 origin, a second auth hop and a theme we do not control. The decisions below are what "option A"
-means concretely; they are labelled `D1`–`D8` and cited by that label from the code in both
+means concretely; they are labelled `D1`–`D7` and cited by that label from the code in both
 repositories.
 
 **Scope, deliberately narrow (owner directive, 2026-09-20).** The first shipment reports **reactions
@@ -76,8 +68,8 @@ record of what a later, wider scope would restore.
 
 Two scopes, estate-wide (`/feedback`) and per-repository (a Feedback tab beside Overview / Graph /
 Settings). The estate/per-entity split is the shape that console already uses for the same question,
-and the per-repo view is the drill-down target of the estate view's repository table. The repository
-Overview keeps its facts (branch, platform, run count, approval provenance) and loses the iframes.
+and the per-repo view is the drill-down target of the estate view's repository table. Both are new
+destinations; no existing screen changes.
 
 ### D2 — The data contract is an aggregated read API on the control plane; the app never aggregates a row listing
 
@@ -193,26 +185,12 @@ window**, measured on the control plane. The plan for the windowed statement is 
 `EXPLAIN` assertion in the test suite (sequential scans priced out), so an index that stops being
 used fails CI rather than quietly degrading the page.
 
-### D8 — Grafana keeps operations; the app takes the product surface
-
-After D1 lands, the two per-repo iframes are deleted. The run-logs embed on a run's page **stays** —
-it is a Loki log viewer ([ADR-0102](0102-grafana-loki-embedded-run-logs.md)), not an analytics
-panel, and rebuilding it here buys nothing.
-
-The generated boards in `deploy/observability/` remain the operator's tool: RED metrics, ingress and
-queue health, and — the part that cannot move — **billed cost and token usage, which live in the
-AI-Gateway's Loki billing stream and are not in this database at all** since ADR-0100. A
-control-plane-fed page can report volume, outcome and feedback. It cannot report money, and it must
-not appear to.
-
 ### Consequences
 
 - Good, because a window question gets a windowed answer at any estate size, instead of a chart
   drawn over whatever 100 rows happened to come back.
 - Good, because the 👍/👎 signal becomes visible to the people who produce it — the same data the
   agent already consumes privately under ADR-0044.
-- Good, because one fewer origin, one fewer auth hop, one fewer theme surface, and the figures stop
-  disappearing when `NEXT_PUBLIC_GRAFANA_URL` is unset, which is the default.
 - Good, because the schema change is one index. No trigger on the audit table, no backfill inside a
   migration transaction, and nothing new to keep in sync with `Finding::priority`.
 - Bad, because the page cannot say *what* was rejected — only how much. "The bot is noisy" gets a
@@ -220,9 +198,6 @@ not appear to.
 - Bad, because numbers will not match Grafana's feedback board, which buckets by reconcile time.
   The difference is deliberate (D5, rule 2) but reviewers comparing the two will see different
   totals.
-- Bad, because the app loses its only per-repository cost view. If money must stay visible in the
-  product, the "Billed cost" embed has to come back as an explicitly labelled Grafana panel in its
-  own zone, rather than the page implying the control plane could answer it.
 - Neutral, because `serve` and the reconciler each read `RECONCILER_WINDOW_DAYS` from their own env;
   deploy both roles with the same value or the reported poll window is wrong.
 - Neutral, because D5 rests on a number nobody has measured yet — reaction coverage. That is what
@@ -237,14 +212,13 @@ not appear to.
 - Good, because the previous-window comparison is free in the same statement.
 - Bad, because it is new API surface the consumer repository is blocked on.
 
-### B — Keep embedding Grafana, and add the missing panels there
+### B — Add feedback panels to the operators' Grafana boards and link to them from the app
 
 - Good, because it is the cheapest option and it is where the SQL already is.
 - Bad, because only two existing panels are repository-scoped, and making the rest so means adding a
   `$repo` variable to boards whose own comments record that this was considered and declined.
 - Bad, because it leaves the product's core signal behind a second origin, a second auth hop and a
   theme the app does not control.
-- Bad, because it does nothing about the Overview page, which has no Grafana in it at all.
 
 ### C — Aggregate in the Next.js layer over a bigger page of `GET /tasks`
 
@@ -301,8 +275,6 @@ written; each is a deliberate choice, not drift.
 - [ADR-0035](0035-review-feedback-signal.md) — the polled 👍/👎 signal and why there is no webhook
 - [ADR-0044](0044-feedback-memory-m1.md) — the feedback memory whose best-effort join D6 describes
 - [ADR-0046](0046-observability-dashboard-deployment.md) — why the generated boards read Postgres
-- [ADR-0100](0100-retire-db-transcript-logs-as-observability.md) — tokens and cost are Loki-only
-- [ADR-0102](0102-grafana-loki-embedded-run-logs.md) — the run-logs embed D8 keeps
 - [ADR-0115](0115-retire-apps-web-move-console-to-lci-ui.md) — the console this page lives in
 - `converse-frontends` ADR 0008 / 0010 / 0011 / 0013 (visual direction, primitive stack, URL-first
   state, information architecture), ADR 0014 (`apps/lci`'s scaffolding), ADR 0015 (the panel-type

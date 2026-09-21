@@ -198,8 +198,8 @@ _Last updated: 2026-09-21._
 ## In progress / near-term follow-ups
 
 - **Reviewer-feedback analytics for the LCI console** — a windowed `GET /api/v2/analytics/feedback`
-  (`task:read`-gated, one repository or the whole estate) behind a Feedback page and a per-repository
-  Feedback tab in `apps/lci`, replacing the two Grafana `d-solo` iframes on the repository Overview.
+  (`task:read`-gated, one repository or the whole estate) behind a new Feedback page and a
+  per-repository Feedback tab in `apps/lci`.
   Reports 👍/👎 on the bot's comments, counted on the comment they were left on by when it was posted
   (not by reconcile time), with the acceptance rate over 👍+👎 only, coverage beside it, and the
   previous window from the same statement. Schema cost: one `review_comments (created_at)` index
