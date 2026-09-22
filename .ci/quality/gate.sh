@@ -69,7 +69,10 @@ fi
 declare -A CHANGED_LINES
 
 if [[ -n "$PR_BASE" ]]; then
-  merge_base=$(git merge-base "$PR_BASE" HEAD 2>/dev/null || echo "HEAD~10")
+  if ! merge_base=$(git merge-base "$PR_BASE" HEAD 2>/dev/null); then
+    log_error "No merge base between '${PR_BASE}' and HEAD; cannot tell which lines the pull request changed."
+    exit 1
+  fi
   current_file=""
   while IFS= read -r diff_line; do
     if [[ "$diff_line" == "+++ "* ]]; then
