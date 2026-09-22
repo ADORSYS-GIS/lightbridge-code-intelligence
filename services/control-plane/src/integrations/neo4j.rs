@@ -7,6 +7,7 @@
 //! plane rather than direct DB access.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use neo4rs::{BoltType, Graph, query};
 use rmcp::schemars;
@@ -68,7 +69,26 @@ pub async fn upsert_graph(
     edges: &[GraphEdge],
 ) -> anyhow::Result<(usize, usize)> {
     use anyhow::Context;
+    // Without its constraint the lock below excludes nothing, so a write that cannot establish it
+    // fails instead of proceeding unserialized.
+    ensure_snapshot_write_lock(graph)
+        .await
+        .context("snapshot write lock unavailable")?;
     let mut txn = graph.start_txn().await.context("begin neo4j txn")?;
+
+    // Writes to one snapshot run one at a time. `MERGE` only guarantees a single node per key when
+    // a uniqueness constraint backs it; without one, two transactions writing the same snapshot can
+    // both find a symbol absent and both create it. Merging the snapshot's lock node takes its
+    // unique-index entry, which Neo4j holds until this transaction ends — so a concurrent writer to
+    // the same snapshot waits here, then sees this one's committed nodes. Deleting the node in the
+    // same statement keeps the lock without leaving anything behind.
+    txn.run(
+        query("MERGE (l:SnapshotWriteLock {repo_id: $repo, commit: $commit}) DELETE l")
+            .param("repo", repository_id)
+            .param("commit", commit_sha),
+    )
+    .await
+    .context("lock snapshot for writing")?;
 
     if !nodes.is_empty() {
         // Each row's `embedding` is an empty list when the node has none, which is otherwise
@@ -389,6 +409,31 @@ pub async fn get_callers(
     Ok(hits)
 }
 
+/// Whether `snapshot_write_lock` is known to exist in the database this process writes to.
+static SNAPSHOT_WRITE_LOCK_DECLARED: AtomicBool = AtomicBool::new(false);
+
+/// Declare the uniqueness constraint that makes [`upsert_graph`]'s snapshot lock exclusive.
+///
+/// A `MERGE` on the lock node serializes writers only because this constraint turns its key into a
+/// unique-index entry that one transaction at a time can hold. Its label never keeps a node past a
+/// write, so there are never existing duplicates for creation to trip on. Once declared it is not
+/// asked for again; until then every call tries, so a declaration that fails at startup is retried
+/// by the next write rather than leaving writes unserialized.
+pub async fn ensure_snapshot_write_lock(graph: &Graph) -> anyhow::Result<()> {
+    if SNAPSHOT_WRITE_LOCK_DECLARED.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    create_index_idempotent(
+        graph,
+        "CREATE CONSTRAINT snapshot_write_lock IF NOT EXISTS \
+         FOR (l:SnapshotWriteLock) REQUIRE (l.repo_id, l.commit) IS UNIQUE",
+        "snapshot_write_lock",
+    )
+    .await?;
+    SNAPSHOT_WRITE_LOCK_DECLARED.store(true, Ordering::Release);
+    Ok(())
+}
+
 /// Create the vector and fulltext indexes hybrid search needs, if they don't already exist
 /// (ADR-0114). Idempotent, so safe to call on every startup, mirroring how Postgres migrations
 /// already run unconditionally on connect.
@@ -398,6 +443,13 @@ pub async fn get_callers(
 /// pgvector column. Cypher schema DDL can't be parameterized, so the value is interpolated directly,
 /// which is safe here since it comes from trusted server-side config, never request input.
 pub async fn ensure_indexes(graph: &Graph, dimension: i64) -> anyhow::Result<()> {
+    if let Err(error) = ensure_snapshot_write_lock(graph).await {
+        tracing::error!(
+            error = %format!("{error:#}"),
+            "snapshot write lock not declared; graph writes will retry it and fail until it exists"
+        );
+    }
+
     create_index_idempotent(
         graph,
         &format!(
@@ -740,6 +792,11 @@ pub async fn edges_among(
 mod tests {
     use super::*;
 
+    /// Held by tests that drop or create constraints every other live test's writes go through, so
+    /// they never run alongside one another.
+    static SHARED_SCHEMA: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+        std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+
     #[test]
     fn escapes_lucene_metacharacters_a_model_query_could_plausibly_contain() {
         assert_eq!(
@@ -866,10 +923,6 @@ mod tests {
             .expect("final cleanup");
     }
 
-    /// Live proof that discarding a snapshot clears exactly that commit. The state this exists for
-    /// is a page sequence that stopped partway: the pages that committed must not survive as a graph
-    /// that reads as complete. Ignored by default — run with `--ignored` after
-    /// `docker compose up -d neo4j`.
     /// Live proof that each delete path removes exactly its selection when that selection spans
     /// several batches' worth of rows: discarding a commit, pruning stale commits and removing a
     /// repository each leave the kept commit and the other repository intact.
@@ -1018,6 +1071,160 @@ mod tests {
             .expect("n")
     }
 
+    /// Live proof that concurrent writes to one snapshot cannot duplicate a symbol, with no identity
+    /// constraint to fall back on. Four writers submit the same nodes at once; each must wait for
+    /// the snapshot lock, so every writer after the first matches the nodes the first created.
+    #[tokio::test]
+    #[ignore = "requires a live Neo4j (docker compose up -d neo4j)"]
+    async fn concurrent_writes_to_one_snapshot_create_each_symbol_once() {
+        let _schema = SHARED_SCHEMA.lock().await;
+        let uri =
+            std::env::var("NEO4J_URI").unwrap_or_else(|_| "bolt://localhost:7687".to_string());
+        let graph = Graph::new(&uri, "neo4j", "lightbridge")
+            .await
+            .expect("connect neo4j");
+
+        // Remove the identity constraint for the duration, so only the snapshot lock stands
+        // between the writers and a duplicate; restore it if it was there.
+        let had_identity = constraint_exists(&graph, "symbol_identity").await;
+        graph
+            .run(query("DROP CONSTRAINT symbol_identity IF EXISTS"))
+            .await
+            .expect("drop identity constraint");
+        ensure_snapshot_write_lock(&graph)
+            .await
+            .expect("lock constraint");
+
+        let repo = 6631i64;
+        delete_repo_graph(&graph, repo).await.expect("cleanup");
+        let nodes: Vec<GraphNode> = (0..1_500)
+            .map(|i| GraphNode {
+                node_id: format!("src/f{i}.rs"),
+                label: format!("f{i}.rs"),
+                source_file: format!("src/f{i}.rs"),
+                start_line: 1,
+                embedding: None,
+            })
+            .collect();
+
+        let writers: Vec<_> = (0..4)
+            .map(|_| {
+                let (graph, nodes) = (graph.clone(), nodes.clone());
+                tokio::spawn(async move { upsert_graph(&graph, repo, "main", &nodes, &[]).await })
+            })
+            .collect();
+        for writer in writers {
+            writer.await.expect("join").expect("write");
+        }
+
+        let mut rows = graph
+            .execute(
+                query(
+                    "MATCH (s:Symbol {repo_id: $repo, commit: 'main'}) \
+                     WITH s.node_id AS id, count(*) AS copies \
+                     RETURN count(id) AS ids, sum(copies) AS nodes",
+                )
+                .param("repo", repo),
+            )
+            .await
+            .expect("count");
+        let row = rows.next().await.expect("row").expect("one row");
+        assert_eq!(row.get::<i64>("ids").expect("ids"), 1_500);
+        assert_eq!(
+            row.get::<i64>("nodes").expect("nodes"),
+            1_500,
+            "every symbol exists once, however many writers raced to create it"
+        );
+
+        let mut left = graph
+            .execute(query("MATCH (l:SnapshotWriteLock) RETURN count(l) AS n"))
+            .await
+            .expect("count locks");
+        assert_eq!(
+            left.next()
+                .await
+                .expect("row")
+                .expect("one row")
+                .get::<i64>("n")
+                .expect("n"),
+            0,
+            "the lock leaves no node behind"
+        );
+
+        delete_repo_graph(&graph, repo)
+            .await
+            .expect("final cleanup");
+        if had_identity {
+            graph
+                .run(query(
+                    "CREATE CONSTRAINT symbol_identity IF NOT EXISTS \
+                     FOR (s:Symbol) REQUIRE (s.repo_id, s.commit, s.node_id) IS UNIQUE",
+                ))
+                .await
+                .expect("restore identity constraint");
+        }
+    }
+
+    /// Live proof that a write establishes the snapshot lock when startup did not. The constraint is
+    /// removed and the process's record of it cleared, as after a failed declaration at boot; the
+    /// next write must restore it rather than take a lock that excludes nothing.
+    #[tokio::test]
+    #[ignore = "requires a live Neo4j (docker compose up -d neo4j)"]
+    async fn a_write_declares_the_snapshot_lock_when_startup_did_not() {
+        let _schema = SHARED_SCHEMA.lock().await;
+        let uri =
+            std::env::var("NEO4J_URI").unwrap_or_else(|_| "bolt://localhost:7687".to_string());
+        let graph = Graph::new(&uri, "neo4j", "lightbridge")
+            .await
+            .expect("connect neo4j");
+
+        graph
+            .run(query("DROP CONSTRAINT snapshot_write_lock IF EXISTS"))
+            .await
+            .expect("drop lock constraint");
+        SNAPSHOT_WRITE_LOCK_DECLARED.store(false, Ordering::Release);
+
+        let repo = 6632i64;
+        delete_repo_graph(&graph, repo).await.expect("cleanup");
+        let node = GraphNode {
+            node_id: "src/a.rs".to_string(),
+            label: "a.rs".to_string(),
+            source_file: "src/a.rs".to_string(),
+            start_line: 1,
+            embedding: None,
+        };
+        upsert_graph(&graph, repo, "main", &[node], &[])
+            .await
+            .expect("write");
+
+        assert!(
+            constraint_exists(&graph, "snapshot_write_lock").await,
+            "the write restored the constraint its lock depends on"
+        );
+        delete_repo_graph(&graph, repo)
+            .await
+            .expect("final cleanup");
+    }
+
+    async fn constraint_exists(graph: &Graph, name: &str) -> bool {
+        let mut rows = graph
+            .execute(
+                query("SHOW CONSTRAINTS YIELD name WHERE name = $name RETURN count(*) AS n")
+                    .param("name", name),
+            )
+            .await
+            .expect("show constraints");
+        rows.next()
+            .await
+            .expect("row")
+            .map(|row| row.get::<i64>("n").unwrap_or(0) > 0)
+            .unwrap_or(false)
+    }
+
+    /// Live proof that discarding a snapshot clears exactly that commit. The state this exists for
+    /// is a page sequence that stopped partway: the pages that committed must not survive as a graph
+    /// that reads as complete. Ignored by default — run with `--ignored` after
+    /// `docker compose up -d neo4j`.
     #[tokio::test]
     #[ignore = "requires a live Neo4j (docker compose up -d neo4j)"]
     async fn discarding_a_snapshot_clears_that_commit_and_leaves_others() {
