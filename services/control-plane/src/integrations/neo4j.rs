@@ -218,14 +218,17 @@ async fn delete_symbols_in_batches(
         return Ok(0);
     }
 
-    let mut delete = query(&format!(
-        "{selector} CALL (s) {{ DETACH DELETE s }} IN TRANSACTIONS OF {DELETE_BATCH_ROWS} ROWS"
-    ));
+    let mut delete = query(&batched_delete(selector));
     for (name, value) in params {
         delete = delete.param(name, value.clone());
     }
     graph.run(delete).await.context("delete symbols")?;
     Ok(matched)
+}
+
+/// The statement that deletes what `selector` matches, committing every [`DELETE_BATCH_ROWS`] rows.
+fn batched_delete(selector: &str) -> String {
+    format!("{selector} CALL (s) {{ DETACH DELETE s }} IN TRANSACTIONS OF {DELETE_BATCH_ROWS} ROWS")
 }
 
 /// Delete one commit snapshot's graph for a repository. Returns the number of nodes deleted.
@@ -257,11 +260,11 @@ pub async fn delete_commit_graph(
 /// Idempotent (deletes nothing for an already-clean repo).
 pub async fn delete_repo_graph(graph: &Graph, repository_id: i64) -> anyhow::Result<u64> {
     use anyhow::Context;
-    // `commit IS NOT NULL` holds for every symbol; stating it lets the `(repo_id, commit)` index
-    // serve a match that names only the repository.
+    // Selected by repository alone, so every node the repository owns is removed whatever other
+    // properties it carries.
     delete_symbols_in_batches(
         graph,
-        "MATCH (s:Symbol) WHERE s.repo_id = $repo AND s.commit IS NOT NULL",
+        "MATCH (s:Symbol {repo_id: $repo})",
         &[("repo", repository_id.into())],
     )
     .await
@@ -416,9 +419,9 @@ pub async fn ensure_indexes(graph: &Graph, dimension: i64) -> anyhow::Result<()>
     )
     .await?;
 
-    // Snapshot-level reads and deletes — discarding a commit, pruning stale commits, removing a
-    // repository — select by `(repo_id, commit)` and never name a node. The identity index below
-    // needs all three properties, so without this one each of them scans the whole label.
+    // Snapshot-level reads and deletes — discarding a commit, pruning stale commits — select by
+    // `(repo_id, commit)` and never name a node. The identity index below needs all three
+    // properties, so without this one each of them scans the whole label.
     create_index_idempotent(
         graph,
         "CREATE INDEX symbol_snapshot IF NOT EXISTS FOR (s:Symbol) ON (s.repo_id, s.commit)",
@@ -867,9 +870,9 @@ mod tests {
     /// is a page sequence that stopped partway: the pages that committed must not survive as a graph
     /// that reads as complete. Ignored by default — run with `--ignored` after
     /// `docker compose up -d neo4j`.
-    /// Live proof that deletes larger than one batch remove exactly their selection. Each path —
-    /// discarding a commit, pruning stale commits, removing a repository — spans several
-    /// `DELETE_BATCH_ROWS` transactions here, which is the shape that must not grow with the snapshot.
+    /// Live proof that each delete path removes exactly its selection when that selection spans
+    /// several batches' worth of rows: discarding a commit, pruning stale commits and removing a
+    /// repository each leave the kept commit and the other repository intact.
     #[tokio::test]
     #[ignore = "requires a live Neo4j (docker compose up -d neo4j)"]
     async fn deletes_spanning_several_batches_remove_exactly_their_selection() {
@@ -943,6 +946,57 @@ mod tests {
         );
 
         delete_repo_graph(&graph, other_repo)
+            .await
+            .expect("final cleanup");
+    }
+
+    /// Live proof that a delete commits in batches of [`DELETE_BATCH_ROWS`] rather than as one
+    /// transaction. The selection is made to fail on its last node: with batching, every full batch
+    /// before it is already committed; as one transaction, the failure rolls everything back.
+    #[tokio::test]
+    #[ignore = "requires a live Neo4j (docker compose up -d neo4j)"]
+    async fn a_delete_commits_each_batch_on_its_own() {
+        let uri =
+            std::env::var("NEO4J_URI").unwrap_or_else(|_| "bolt://localhost:7687".to_string());
+        let graph = Graph::new(&uri, "neo4j", "lightbridge")
+            .await
+            .expect("connect neo4j");
+
+        let repo = 6623i64;
+        let batch = i64::from(DELETE_BATCH_ROWS);
+        let total = batch * 2 + batch / 2;
+        delete_repo_graph(&graph, repo).await.expect("cleanup");
+        graph
+            .run(
+                query(
+                    "UNWIND range(1, $total) AS n \
+                     CREATE (:Symbol {repo_id: $repo, commit: 'c', node_id: 'n' + toString(n), n: n})",
+                )
+                .param("repo", repo)
+                .param("total", total),
+            )
+            .await
+            .expect("seed");
+
+        let failing = graph
+            .run(
+                query(&batched_delete(
+                    "MATCH (s:Symbol {repo_id: $repo}) WHERE 1 / (s.n - $total) IS NOT NULL",
+                ))
+                .param("repo", repo)
+                .param("total", total),
+            )
+            .await;
+        assert!(failing.is_err(), "the selection fails on its last node");
+
+        let deleted = total - count_snapshot(&graph, repo, "c").await;
+        assert_eq!(
+            deleted,
+            batch * 2,
+            "the two full batches before the failure stay committed"
+        );
+
+        delete_repo_graph(&graph, repo)
             .await
             .expect("final cleanup");
     }
