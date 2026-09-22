@@ -278,6 +278,157 @@ async fn submit_graph_posts_nodes_and_edges_with_bearer() {
 }
 
 #[tokio::test]
+async fn submit_graph_paged_sends_every_node_page_before_any_edge_page() {
+    use lci_agent_clients::{GraphEdgePayload, GraphNodePayload};
+
+    let server = MockServer::start().await;
+    let task_id = Uuid::nil();
+
+    Mock::given(method("POST"))
+        .and(path(format!("/internal/tasks/{task_id}/graph")))
+        .and(bearer_token("runner-secret"))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&server)
+        .await;
+
+    let nodes: Vec<GraphNodePayload> = (0..5)
+        .map(|i| GraphNodePayload {
+            node_id: format!("n{i}"),
+            label: format!("f{i}()"),
+            source_file: "src/a.rs".to_string(),
+            start_line: i,
+        })
+        .collect();
+    let edges: Vec<GraphEdgePayload> = (0..3)
+        .map(|i| GraphEdgePayload {
+            source: format!("n{i}"),
+            target: format!("n{}", i + 1),
+            relation: "calls".to_string(),
+        })
+        .collect();
+
+    ControlPlaneClient::new(server.uri(), "runner-secret")
+        .submit_graph_paged(task_id, "abc123", &nodes, &edges, 2)
+        .await
+        .expect("paged graph submitted");
+
+    let bodies: Vec<serde_json::Value> = server
+        .received_requests()
+        .await
+        .expect("recorded requests")
+        .iter()
+        .map(|r| serde_json::from_slice(&r.body).expect("json body"))
+        .collect();
+
+    // 5 nodes and 3 edges at 2 per page: 3 node pages, then 2 edge pages.
+    assert_eq!(
+        bodies.len(),
+        5,
+        "ceil(5/2) node pages + ceil(3/2) edge pages"
+    );
+    let kinds: Vec<&str> = bodies
+        .iter()
+        .map(|b| {
+            if b["nodes"].as_array().is_some_and(|a| !a.is_empty()) {
+                "nodes"
+            } else {
+                "edges"
+            }
+        })
+        .collect();
+    assert_eq!(
+        kinds,
+        vec!["nodes", "nodes", "nodes", "edges", "edges"],
+        "an edge is written by matching both endpoints, so every node page must land first"
+    );
+    assert!(
+        bodies[3]["nodes"]
+            .as_array()
+            .expect("nodes key present")
+            .is_empty(),
+        "an edge page carries no nodes, and the key is still present for the server's decoder"
+    );
+    assert_eq!(bodies[0]["commit_sha"], "abc123");
+}
+
+#[tokio::test]
+async fn submit_graph_paged_stops_at_the_first_failing_page() {
+    use lci_agent_clients::GraphNodePayload;
+
+    let server = MockServer::start().await;
+    let task_id = Uuid::nil();
+
+    // Every page is rejected, so the first attempt is also the last.
+    Mock::given(method("POST"))
+        .and(path(format!("/internal/tasks/{task_id}/graph")))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server)
+        .await;
+
+    let nodes: Vec<GraphNodePayload> = (0..10)
+        .map(|i| GraphNodePayload {
+            node_id: format!("n{i}"),
+            label: format!("f{i}()"),
+            source_file: "src/a.rs".to_string(),
+            start_line: i,
+        })
+        .collect();
+
+    let error = ControlPlaneClient::new(server.uri(), "runner-secret")
+        .submit_graph_paged(task_id, "abc123", &nodes, &[], 2)
+        .await
+        .expect_err("a rejected page fails the sequence");
+    assert!(
+        format!("{error:#}").contains("node page 0"),
+        "the failing page is named in the error: {error:#}"
+    );
+    assert_eq!(
+        server.received_requests().await.expect("recorded").len(),
+        1,
+        "the sequence stops rather than sending the remaining pages"
+    );
+}
+
+#[tokio::test]
+async fn discard_graph_deletes_the_task_snapshot() {
+    let server = MockServer::start().await;
+    let task_id = Uuid::nil();
+
+    Mock::given(method("DELETE"))
+        .and(path(format!("/internal/tasks/{task_id}/graph")))
+        .and(bearer_token("runner-secret"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    ControlPlaneClient::new(server.uri(), "runner-secret")
+        .discard_graph(task_id)
+        .await
+        .expect("snapshot discarded");
+}
+
+#[tokio::test]
+async fn submit_graph_paged_with_nothing_to_send_makes_no_request() {
+    let server = MockServer::start().await;
+    let task_id = Uuid::nil();
+
+    ControlPlaneClient::new(server.uri(), "runner-secret")
+        .submit_graph_paged(task_id, "abc123", &[], &[], 2)
+        .await
+        .expect("empty graph is a no-op");
+
+    assert!(
+        server
+            .received_requests()
+            .await
+            .expect("recorded")
+            .is_empty(),
+        "an empty graph costs no round trip"
+    );
+}
+
+#[tokio::test]
 async fn indexed_chunk_keys_parses_the_stored_positions() {
     let server = MockServer::start().await;
     let task_id = Uuid::nil();

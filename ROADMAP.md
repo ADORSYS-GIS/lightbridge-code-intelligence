@@ -9,9 +9,26 @@ open a PR to fix this file.
 > **Keeping this current is part of "done."** When a PR meaningfully ships, unblocks, or retires an item
 > here, update its status in the **same PR** (see [AGENTS.md](AGENTS.md)).
 
-_Last updated: 2026-09-15._
+_Last updated: 2026-09-21._
 
 ## Recently shipped
+
+- **Structural graph writes are bounded, indexed and all-or-nothing** — the structural half of an
+  index run used to leave the runner as one request whose size *and* duration both scaled with the
+  repository, against two fixed constants (a 32 MiB body limit and a 180 s client timeout), so the
+  largest indexable repository was an emergent property rather than a configured one. The runner now
+  pages the graph into all node pages followed by all edge pages (`GRAPH_SUBMIT_PAGE_SIZE`, default
+  2,000), so a request's cost is a function of a configured unit of work and repository growth adds
+  requests rather than seconds. Alongside it, `(repo_id, commit, node_id)` — the triple every symbol
+  read and write addresses a node by — finally carries an index: a composite `IS UNIQUE` constraint
+  turns each lookup from a label scan across every repository and retained commit into a unique-index
+  seek (a node upsert: 120,517 db accesses → 3 on a 60,018-symbol corpus; an edge write: 241,037 → 9),
+  so one repository's write cost no longer grows
+  with every other repository indexed. Because pages commit individually, a sequence that stops partway
+  discards the snapshot rather than leaving a subset that reads as a complete graph — an absent edge is
+  indistinguishable from a symbol that genuinely has no callers. `graph skipped` now carries its cause.
+  No migration and no re-index.
+  ([ADR-0117](docs/adr/0117-paged-graph-submission-and-symbol-identity.md), #656)
 
 - **One walk, and a symbol's vector comes from its own code** — indexing used to run two independent
   chunkers over the same checkout and join them by line range, which gave roughly 38% of symbols the
@@ -180,6 +197,16 @@ _Last updated: 2026-09-15._
 
 ## In progress / near-term follow-ups
 
+- **Reviewer-feedback analytics for the LCI console** — a windowed `GET /api/v2/analytics/feedback`
+  (`task:read`-gated, one repository or the whole estate) behind a new Feedback page and a
+  per-repository Feedback tab in `apps/lci`.
+  Reports 👍/👎 on the bot's comments, counted on the comment they were left on by when it was posted
+  (not by reconcile time), with the acceptance rate over 👍+👎 only, coverage beside it, and the
+  previous window from the same statement. Schema cost: one `review_comments (created_at)` index
+  (migration 0040). Scope was deliberately cut to reactions only before merge — see the review
+  analytics item under Planned. ([ADR-0118](docs/adr/0118-feedback-analytics-aggregates.md) — Proposed,
+  #649 (draft); frontend [converse-frontends#517](https://github.com/ADORSYS-GIS/converse-frontends/pull/517);
+  spike [converse-frontends#516](https://github.com/ADORSYS-GIS/converse-frontends/issues/516))
 - **Allowlist `run_sast` in ai-helm-values** — the single remaining blocker to SAST going live on the
   reviewer (the code is on both paths; the tool is just not offered until the values allowlist enables it).
 - **Expose `config.review.opencode` in the ai-helm chart** — companion to the operator overlay above; the
@@ -206,6 +233,14 @@ _Last updated: 2026-09-15._
 - **Review quality & reliability** (Epic #252) — the durable quality track: a fast-tier eval harness to
   catch calibration regressions (not started, being reframed around presets — see #491), the #285
   severity-stability watch, and the observability work above.
+
+- **Review analytics (deferred from ADR-0118)** (#667) — findings by P0/P1/P2 and category, run
+  outcomes and durations, and the finding-linked feedback views (👎 by category, most down-voted
+  findings), backed by a `review_findings` projection of `reviews.findings` kept in sync by a trigger.
+  Built and tested in #649, then cut before merge; #667 holds the removed migration, queries, types,
+  tests and frontend panels verbatim, with acceptance criteria for restoring them. Restoring the
+  projection would also make the ADR-0044 feedback memory's best-effort jsonb `(file, line)` join
+  typed and indexed (path normalization stays unfixed without a finding key on the comment).
 
 ## Where the detail lives
 

@@ -826,6 +826,56 @@ pub async fn indexed_chunks(
     }
 }
 
+/// `DELETE /internal/tasks/{id}/graph` — discard this task's commit snapshot from the graph.
+///
+/// A graph arrives as a sequence of pages, each committed on its own, so a sequence that stops
+/// partway leaves the pages that already landed. Discarding them returns the commit to "not
+/// indexed" — a state every reader already handles — instead of leaving a subset that reads as
+/// complete.
+pub async fn discard_graph(
+    _auth: RunnerAuth,
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Response {
+    let Some(pool) = state.db.as_ref() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "no database").into_response();
+    };
+    let Some(neo4j) = state.neo4j.as_ref() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "neo4j not configured").into_response();
+    };
+
+    let row: Option<(i64, Option<String>, String)> = match sqlx::query_as(
+        "SELECT t.repository_id, t.head_sha, r.default_branch \
+         FROM tasks t JOIN repositories r ON r.id = t.repository_id WHERE t.id = $1",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await
+    {
+        Ok(row) => row,
+        Err(error) => {
+            tracing::error!(%error, task_id = %id, "load task for graph discard failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "query error").into_response();
+        }
+    };
+
+    let Some((repository_id, head_sha, default_branch)) = row else {
+        return (StatusCode::NOT_FOUND, "task not found").into_response();
+    };
+    let commit_sha = head_sha.unwrap_or(default_branch);
+
+    match crate::integrations::neo4j::delete_commit_graph(neo4j, repository_id, &commit_sha).await {
+        Ok(deleted) => {
+            tracing::info!(task_id = %id, deleted, "commit graph discarded");
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Err(error) => {
+            tracing::error!(%error, task_id = %id, "graph discard failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "delete error").into_response()
+        }
+    }
+}
+
 /// One structural-graph node submitted by the runner (from `lci-codegraph`).
 #[derive(Debug, Deserialize)]
 pub struct GraphNodeInput {
@@ -889,7 +939,9 @@ pub async fn ingest_graph(
         return (StatusCode::NOT_FOUND, "task not found").into_response();
     };
 
-    if batch.nodes.is_empty() {
+    // A batch carries nodes, edges, or both: the runner pages a large graph into node-only requests
+    // followed by edge-only ones, so an edge-only batch is a normal shape, not an empty submit.
+    if batch.nodes.is_empty() && batch.edges.is_empty() {
         return StatusCode::NO_CONTENT.into_response();
     }
 

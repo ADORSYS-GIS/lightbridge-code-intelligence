@@ -182,31 +182,93 @@ pub async fn attach_symbol_embeddings(
     Ok(updated.max(0) as u64)
 }
 
-/// Delete **all** graph data for a repository (every commit snapshot), used when a repo is removed
-/// from the installation or denied (Epic #75, Milestone B). Returns the number of nodes deleted.
-/// `DETACH DELETE` removes the nodes' relationships too. Idempotent (deletes nothing for an
-/// already-clean repo).
-pub async fn delete_repo_graph(graph: &Graph, repository_id: i64) -> anyhow::Result<u64> {
+/// Nodes removed per transaction when deleting graph data.
+///
+/// Neo4j holds a transaction's whole state on the heap until it commits, so a delete sized by its
+/// input grows with the snapshot it removes. Batching keeps each transaction to a fixed size however
+/// large the repository is.
+const DELETE_BATCH_ROWS: u32 = 1_000;
+
+/// Delete every `:Symbol` the `selector` matches, with its relationships, in transactions of
+/// [`DELETE_BATCH_ROWS`]. Returns how many nodes matched.
+///
+/// `selector` is a `MATCH … WHERE …` binding `s`. `CALL { … } IN TRANSACTIONS` commits each batch on
+/// its own and only runs in an auto-commit transaction, which is what `Graph::run` issues. The count
+/// is read first because deleted nodes leave the query context.
+async fn delete_symbols_in_batches(
+    graph: &Graph,
+    selector: &str,
+    params: &[(&str, BoltType)],
+) -> anyhow::Result<u64> {
     use anyhow::Context;
-    // Count BEFORE deleting: a `RETURN count(s)` after `DETACH DELETE s` is unreliable (the nodes are
-    // gone from the query context). Collect + count first, then delete via FOREACH.
+
+    let mut count = query(&format!("{selector} RETURN count(s) AS n"));
+    for (name, value) in params {
+        count = count.param(name, value.clone());
+    }
     let mut rows = graph
-        .execute(
-            query(
-                "MATCH (s:Symbol {repo_id: $repo}) \
-                 WITH collect(s) AS nodes, count(s) AS deleted \
-                 FOREACH (n IN nodes | DETACH DELETE n) \
-                 RETURN deleted",
-            )
-            .param("repo", repository_id),
-        )
+        .execute(count)
         .await
-        .context("delete repo graph")?;
-    let deleted = match rows.next().await.context("read delete count")? {
-        Some(row) => row.get::<i64>("deleted").unwrap_or(0).max(0) as u64,
+        .context("count symbols to delete")?;
+    let matched = match rows.next().await.context("read delete count")? {
+        Some(row) => row.get::<i64>("n").unwrap_or(0).max(0) as u64,
         None => 0,
     };
-    Ok(deleted)
+    if matched == 0 {
+        return Ok(0);
+    }
+
+    let mut delete = query(&batched_delete(selector));
+    for (name, value) in params {
+        delete = delete.param(name, value.clone());
+    }
+    graph.run(delete).await.context("delete symbols")?;
+    Ok(matched)
+}
+
+/// The statement that deletes what `selector` matches, committing every [`DELETE_BATCH_ROWS`] rows.
+fn batched_delete(selector: &str) -> String {
+    format!("{selector} CALL (s) {{ DETACH DELETE s }} IN TRANSACTIONS OF {DELETE_BATCH_ROWS} ROWS")
+}
+
+/// Delete one commit snapshot's graph for a repository. Returns the number of nodes deleted.
+///
+/// A graph arrives as a sequence of pages, each its own transaction, so a sequence that stops partway
+/// leaves the pages that already committed in place. Discarding the snapshot returns the commit to
+/// "not indexed", which readers already handle, rather than leaving a subset that looks whole —
+/// an absent edge is indistinguishable from a symbol that genuinely has no callers.
+pub async fn delete_commit_graph(
+    graph: &Graph,
+    repository_id: i64,
+    commit_sha: &str,
+) -> anyhow::Result<u64> {
+    use anyhow::Context;
+    delete_symbols_in_batches(
+        graph,
+        "MATCH (s:Symbol {repo_id: $repo, commit: $commit})",
+        &[
+            ("repo", repository_id.into()),
+            ("commit", commit_sha.into()),
+        ],
+    )
+    .await
+    .context("delete commit graph")
+}
+
+/// Delete **all** graph data for a repository (every commit snapshot), used when a repo is removed
+/// from the installation or denied (Epic #75, Milestone B). Returns the number of nodes deleted.
+/// Idempotent (deletes nothing for an already-clean repo).
+pub async fn delete_repo_graph(graph: &Graph, repository_id: i64) -> anyhow::Result<u64> {
+    use anyhow::Context;
+    // Selected by repository alone, so every node the repository owns is removed whatever other
+    // properties it carries.
+    delete_symbols_in_batches(
+        graph,
+        "MATCH (s:Symbol {repo_id: $repo})",
+        &[("repo", repository_id.into())],
+    )
+    .await
+    .context("delete repo graph")
 }
 
 /// Prune a repo's stale structural-graph snapshots: delete every `Symbol` for `repository_id` whose
@@ -222,25 +284,16 @@ pub async fn prune_graph(
     if keep.is_empty() {
         return Ok(0);
     }
-    // Count BEFORE deleting (same reason as `delete_repo_graph`: the nodes leave the query context).
-    let mut rows = graph
-        .execute(
-            query(
-                "MATCH (s:Symbol {repo_id: $repo}) WHERE NOT s.commit IN $keep \
-                 WITH collect(s) AS nodes, count(s) AS deleted \
-                 FOREACH (n IN nodes | DETACH DELETE n) \
-                 RETURN deleted",
-            )
-            .param("repo", repository_id)
-            .param("keep", keep.to_vec()),
-        )
-        .await
-        .context("prune repo graph")?;
-    let deleted = match rows.next().await.context("read prune count")? {
-        Some(row) => row.get::<i64>("deleted").unwrap_or(0).max(0) as u64,
-        None => 0,
-    };
-    Ok(deleted)
+    delete_symbols_in_batches(
+        graph,
+        "MATCH (s:Symbol {repo_id: $repo}) WHERE NOT s.commit IN $keep",
+        &[
+            ("repo", repository_id.into()),
+            ("keep", keep.to_vec().into()),
+        ],
+    )
+    .await
+    .context("prune repo graph")
 }
 
 /// A symbol returned by a graph query. Serialized straight to the retrieval API the graph MCP calls.
@@ -365,6 +418,45 @@ pub async fn ensure_indexes(graph: &Graph, dimension: i64) -> anyhow::Result<()>
         "symbol_label_fulltext",
     )
     .await?;
+
+    // Snapshot-level reads and deletes — discarding a commit, pruning stale commits — select by
+    // `(repo_id, commit)` and never name a node. The identity index below needs all three
+    // properties, so without this one each of them scans the whole label.
+    create_index_idempotent(
+        graph,
+        "CREATE INDEX symbol_snapshot IF NOT EXISTS FOR (s:Symbol) ON (s.repo_id, s.commit)",
+        "symbol_snapshot",
+    )
+    .await?;
+
+    // Every symbol read and write addresses a node by its full identity triple — the graph upsert's
+    // MERGE, both endpoint MATCHes on each edge, `find_symbol`, `get_callers`, `symbol_embedding`,
+    // `prune_graph`, and the chunk-side embedding attach. A composite index applies when a query
+    // supplies all three with equality, which all of them do; without one each lookup scans every
+    // `:Symbol` in the database, so one repository's write cost grows with every other repository
+    // indexed.
+    //
+    // A uniqueness constraint rather than a bare index: it creates its own backing range index, it
+    // lets MERGE plan a unique-index seek, and the triple genuinely is unique — a second node
+    // sharing it would be a duplicate symbol.
+    //
+    // Creation is rejected outright if duplicate triples already exist, which `MERGE` on that same
+    // key should never produce. That is reported and stepped over rather than propagated: the
+    // indexes above are already in place by this point, and an absent identity index costs write
+    // latency, not correctness.
+    if let Err(error) = create_index_idempotent(
+        graph,
+        "CREATE CONSTRAINT symbol_identity IF NOT EXISTS \
+         FOR (s:Symbol) REQUIRE (s.repo_id, s.commit, s.node_id) IS UNIQUE",
+        "symbol_identity",
+    )
+    .await
+    {
+        tracing::warn!(
+            ?error,
+            "symbol identity constraint not created; symbol lookups will scan the label"
+        );
+    }
     Ok(())
 }
 
@@ -770,6 +862,308 @@ mod tests {
         // Cleanup.
         graph
             .run(query("MATCH (s:Symbol {commit: $c}) DETACH DELETE s").param("c", commit))
+            .await
+            .expect("final cleanup");
+    }
+
+    /// Live proof that discarding a snapshot clears exactly that commit. The state this exists for
+    /// is a page sequence that stopped partway: the pages that committed must not survive as a graph
+    /// that reads as complete. Ignored by default — run with `--ignored` after
+    /// `docker compose up -d neo4j`.
+    /// Live proof that each delete path removes exactly its selection when that selection spans
+    /// several batches' worth of rows: discarding a commit, pruning stale commits and removing a
+    /// repository each leave the kept commit and the other repository intact.
+    #[tokio::test]
+    #[ignore = "requires a live Neo4j (docker compose up -d neo4j)"]
+    async fn deletes_spanning_several_batches_remove_exactly_their_selection() {
+        let uri =
+            std::env::var("NEO4J_URI").unwrap_or_else(|_| "bolt://localhost:7687".to_string());
+        let graph = Graph::new(&uri, "neo4j", "lightbridge")
+            .await
+            .expect("connect neo4j");
+
+        let (repo, other_repo) = (6621i64, 6622i64);
+        let per_commit = DELETE_BATCH_ROWS as i64 * 2 + 500;
+        let nodes: Vec<GraphNode> = (0..per_commit)
+            .map(|i| GraphNode {
+                node_id: format!("src/f{i}.rs#1:f{i}"),
+                label: format!("f{i}()"),
+                source_file: format!("src/f{i}.rs"),
+                start_line: 1,
+                embedding: None,
+            })
+            .collect();
+        let edges: Vec<GraphEdge> = (1..per_commit)
+            .map(|i| GraphEdge {
+                source: format!("src/f{i}.rs#1:f{i}"),
+                target: "src/f0.rs#1:f0".to_string(),
+                relation: "calls".to_string(),
+            })
+            .collect();
+        for r in [repo, other_repo] {
+            delete_repo_graph(&graph, r).await.expect("cleanup");
+        }
+        for commit in ["discard", "stale", "current"] {
+            upsert_graph(&graph, repo, commit, &nodes, &edges)
+                .await
+                .expect("seed");
+        }
+        upsert_graph(&graph, other_repo, "current", &nodes, &[])
+            .await
+            .expect("seed other repo");
+
+        let expected = per_commit as u64;
+        assert_eq!(
+            delete_commit_graph(&graph, repo, "discard")
+                .await
+                .expect("discard"),
+            expected,
+            "a discard reports every node of its snapshot"
+        );
+        assert_eq!(
+            prune_graph(&graph, repo, &["current".to_string()])
+                .await
+                .expect("prune"),
+            expected,
+            "pruning removes the one stale commit left"
+        );
+        assert_eq!(
+            count_snapshot(&graph, repo, "current").await,
+            per_commit,
+            "the kept commit is intact"
+        );
+
+        assert_eq!(
+            delete_repo_graph(&graph, repo).await.expect("repo delete"),
+            expected,
+            "removing the repository takes its last snapshot"
+        );
+        assert_eq!(count_snapshot(&graph, repo, "current").await, 0);
+        assert_eq!(
+            count_snapshot(&graph, other_repo, "current").await,
+            per_commit,
+            "another repository is untouched"
+        );
+
+        delete_repo_graph(&graph, other_repo)
+            .await
+            .expect("final cleanup");
+    }
+
+    /// Live proof that a delete commits in batches of [`DELETE_BATCH_ROWS`] rather than as one
+    /// transaction. The selection is made to fail on its last node: with batching, every full batch
+    /// before it is already committed; as one transaction, the failure rolls everything back.
+    #[tokio::test]
+    #[ignore = "requires a live Neo4j (docker compose up -d neo4j)"]
+    async fn a_delete_commits_each_batch_on_its_own() {
+        let uri =
+            std::env::var("NEO4J_URI").unwrap_or_else(|_| "bolt://localhost:7687".to_string());
+        let graph = Graph::new(&uri, "neo4j", "lightbridge")
+            .await
+            .expect("connect neo4j");
+
+        let repo = 6623i64;
+        let batch = i64::from(DELETE_BATCH_ROWS);
+        let total = batch * 2 + batch / 2;
+        delete_repo_graph(&graph, repo).await.expect("cleanup");
+        graph
+            .run(
+                query(
+                    "UNWIND range(1, $total) AS n \
+                     CREATE (:Symbol {repo_id: $repo, commit: 'c', node_id: 'n' + toString(n), n: n})",
+                )
+                .param("repo", repo)
+                .param("total", total),
+            )
+            .await
+            .expect("seed");
+
+        let failing = graph
+            .run(
+                query(&batched_delete(
+                    "MATCH (s:Symbol {repo_id: $repo}) WHERE 1 / (s.n - $total) IS NOT NULL",
+                ))
+                .param("repo", repo)
+                .param("total", total),
+            )
+            .await;
+        assert!(failing.is_err(), "the selection fails on its last node");
+
+        let deleted = total - count_snapshot(&graph, repo, "c").await;
+        assert_eq!(
+            deleted,
+            batch * 2,
+            "the two full batches before the failure stay committed"
+        );
+
+        delete_repo_graph(&graph, repo)
+            .await
+            .expect("final cleanup");
+    }
+
+    async fn count_snapshot(graph: &Graph, repo: i64, commit: &str) -> i64 {
+        let mut rows = graph
+            .execute(
+                query("MATCH (s:Symbol {repo_id: $repo, commit: $commit}) RETURN count(s) AS n")
+                    .param("repo", repo)
+                    .param("commit", commit),
+            )
+            .await
+            .expect("count");
+        rows.next()
+            .await
+            .expect("row")
+            .expect("one row")
+            .get::<i64>("n")
+            .expect("n")
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a live Neo4j (docker compose up -d neo4j)"]
+    async fn discarding_a_snapshot_clears_that_commit_and_leaves_others() {
+        let uri =
+            std::env::var("NEO4J_URI").unwrap_or_else(|_| "bolt://localhost:7687".to_string());
+        let graph = Graph::new(&uri, "neo4j", "lightbridge")
+            .await
+            .expect("connect neo4j");
+
+        let repo = 6571i64;
+        delete_repo_graph(&graph, repo).await.expect("cleanup");
+
+        let nodes: Vec<GraphNode> = (0..6)
+            .map(|i| GraphNode {
+                node_id: format!("src/a.rs#{i}:f{i}"),
+                label: format!("f{i}()"),
+                source_file: "src/a.rs".into(),
+                start_line: i,
+                embedding: None,
+            })
+            .collect();
+        let edges = vec![GraphEdge {
+            source: "src/a.rs#0:f0".into(),
+            target: "src/a.rs#1:f1".into(),
+            relation: "calls".into(),
+        }];
+
+        // A sequence that stopped partway: nodes landed, edges did not.
+        upsert_graph(&graph, repo, "partial", &nodes, &[])
+            .await
+            .expect("node pages");
+        // An unrelated snapshot of the same repository, which must survive.
+        upsert_graph(&graph, repo, "keep", &nodes, &edges)
+            .await
+            .expect("other snapshot");
+
+        let deleted = delete_commit_graph(&graph, repo, "partial")
+            .await
+            .expect("discard");
+        assert_eq!(deleted, 6, "every node of that snapshot");
+
+        assert!(
+            find_symbol(&graph, repo, "partial", "f0", 10)
+                .await
+                .expect("find")
+                .is_empty(),
+            "the discarded snapshot reads as absent, not as a partial graph"
+        );
+        assert_eq!(
+            find_symbol(&graph, repo, "keep", "f0", 10)
+                .await
+                .expect("find")
+                .len(),
+            1,
+            "a different commit of the same repository is untouched"
+        );
+
+        delete_repo_graph(&graph, repo)
+            .await
+            .expect("final cleanup");
+    }
+
+    /// Live proof that a graph written as pages matches one written whole (ADR-0116 / #656). The
+    /// failure this guards is silent: an edge is written by matching both endpoints, so an edge page
+    /// that lands before its nodes writes nothing and reports success. Ignored by default (no Neo4j
+    /// in CI) — run with `--ignored` after `docker compose up -d neo4j`.
+    #[tokio::test]
+    #[ignore = "requires a live Neo4j (docker compose up -d neo4j)"]
+    async fn a_paged_graph_write_matches_an_unpaged_one() {
+        let uri =
+            std::env::var("NEO4J_URI").unwrap_or_else(|_| "bolt://localhost:7687".to_string());
+        let graph = Graph::new(&uri, "neo4j", "lightbridge")
+            .await
+            .expect("connect neo4j");
+
+        let repo = 6561i64;
+        delete_repo_graph(&graph, repo).await.expect("cleanup");
+
+        let nodes: Vec<GraphNode> = (0..25)
+            .map(|i| GraphNode {
+                node_id: format!("src/a.rs#{i}:f{i}"),
+                label: format!("f{i}()"),
+                source_file: "src/a.rs".into(),
+                start_line: i,
+                embedding: None,
+            })
+            .collect();
+        let edges: Vec<GraphEdge> = (0..24)
+            .map(|i| GraphEdge {
+                source: format!("src/a.rs#{i}:f{i}"),
+                target: format!("src/a.rs#{}:f{}", i + 1, i + 1),
+                relation: "calls".into(),
+            })
+            .collect();
+
+        let counts = |commit: &'static str| {
+            let graph = graph.clone();
+            async move {
+                let mut rows = graph
+                    .execute(
+                        query(
+                            "MATCH (s:Symbol {repo_id: $r, commit: $c}) \
+                             OPTIONAL MATCH (s)-[e:REL]->() \
+                             RETURN count(DISTINCT s) AS nodes, count(e) AS edges",
+                        )
+                        .param("r", repo)
+                        .param("c", commit),
+                    )
+                    .await
+                    .expect("count query");
+                let row = rows.next().await.expect("row").expect("present");
+                (
+                    row.get::<i64>("nodes").unwrap(),
+                    row.get::<i64>("edges").unwrap(),
+                )
+            }
+        };
+
+        upsert_graph(&graph, repo, "whole", &nodes, &edges)
+            .await
+            .expect("unpaged upsert");
+        let whole = counts("whole").await;
+        assert_eq!(
+            whole,
+            (25, 24),
+            "baseline: one submit writes the full graph"
+        );
+
+        // Same graph, delivered the way `submit_graph_paged` delivers it: every node page first.
+        for page in nodes.chunks(7) {
+            upsert_graph(&graph, repo, "paged", page, &[])
+                .await
+                .expect("node page");
+        }
+        for page in edges.chunks(7) {
+            upsert_graph(&graph, repo, "paged", &[], page)
+                .await
+                .expect("edge page");
+        }
+        assert_eq!(
+            counts("paged").await,
+            whole,
+            "a paged write must produce the same graph as an unpaged one"
+        );
+
+        delete_repo_graph(&graph, repo)
             .await
             .expect("final cleanup");
     }

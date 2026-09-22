@@ -3,6 +3,7 @@
 //! the crate root (`main.rs`).
 
 pub(crate) mod admin;
+pub(crate) mod analytics;
 pub(crate) mod config;
 pub(crate) mod internal;
 pub(crate) mod metrics;

@@ -527,13 +527,15 @@ fn job_manifest(name: &str, cfg: JobConfig, task: &ClaimedTask) -> Value {
     // be set once on the control-plane deployment (Helm) instead of baked into the runner image.
     // Unset → built-in defaults apply. `INDEX_EMBED_BATCH_SIZE` governs how many chunks are embedded
     // per round trip — chief use is shrinking it when a gateway caps the batched embeddings response
-    // body, and `EMBEDDINGS_MAX_INPUT_BYTES` bounds how much of any one input is sent. The `LCI_CODEGRAPH_*`
+    // body, `EMBEDDINGS_MAX_INPUT_BYTES` bounds how much of any one input is sent, and
+    // `GRAPH_SUBMIT_PAGE_SIZE` bounds how much of the structural graph travels per request. The `LCI_CODEGRAPH_*`
     // knobs govern the walk that produces the chunks, which the crate owns (ADR-0116): chunk shape
     // in lines, and the operator ignore-list layer.
     if !is_open {
         for key in [
             "INDEX_EMBED_BATCH_SIZE",
             "EMBEDDINGS_MAX_INPUT_BYTES",
+            "GRAPH_SUBMIT_PAGE_SIZE",
             "LCI_CODEGRAPH_MAX_CHUNK_LINES",
             "LCI_CODEGRAPH_WINDOW_SIZE",
             "LCI_CODEGRAPH_WINDOW_STEP",
