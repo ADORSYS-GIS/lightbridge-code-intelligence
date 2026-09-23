@@ -9,9 +9,30 @@ open a PR to fix this file.
 > **Keeping this current is part of "done."** When a PR meaningfully ships, unblocks, or retires an item
 > here, update its status in the **same PR** (see [AGENTS.md](AGENTS.md)).
 
-_Last updated: 2026-09-21._
+_Last updated: 2026-09-23._
 
 ## Recently shipped
+
+- **`webhook_deliveries` stops growing, and stops being able to take the platform down with it** —
+  the table had no retention, and on 2026-08-29 it exhausted the volume of the CNPG cluster this
+  service shares with every other lightbridge tenant: PostgreSQL died with `PANIC: could not write
+  to file`, both instances went down, and authentication went with them — the 10 MB `app` database
+  taken offline by a 5,061 MB table of webhook bodies, 84% of it `payload_json`. Deleting rows was
+  never available: the `delivery_id` PRIMARY KEY *is* the redelivery dedup, `tasks.webhook_delivery_id`
+  references it, and the MCP quota reads the payload back. Two changes, each with a different reason
+  to exist. **Ingest now records a delivery only when a router acts on it** (#661): routing is decided
+  from the event name alone, so a redelivered `check_run` is routed where the first one was — nowhere —
+  and a row for it guarded against duplicate work that cannot happen, at ~180 bytes on the 94.4% of
+  deliveries that are CI noise (measured 2026-09-17: `workflow_job`, `check_run`, `workflow_run` and
+  `check_suite` alone are 80% of ingest). **What is recorded is compacted after a week** (#660): a
+  fourth sweeper on the storage-GC tick the index, outbox and A2A sweeps already share replaces
+  `payload_json` with `{}` past `dispatcher.webhook_payload_retention_days`, keeping every row, so
+  dedup and the foreign key are untouched. The batch bound (`webhook_payload_sweep_batch`, 5,000/tick)
+  is about WAL on the same volume rather than lock time, and the `mcp.review` quota ledger is excluded
+  outright because the window it is read over lives in another role's environment. Growth at the
+  measured 40,100 deliveries/day falls from ~214 MB/day to a rounding error; the space already
+  allocated needs the separate, locking rewrite below.
+  ([ADR-0119](docs/adr/0119-webhook-delivery-payload-retention.md), #637, #660, #661)
 
 - **Structural graph writes are bounded, indexed and all-or-nothing** — the structural half of an
   index run used to leave the runner as one request whose size *and* duration both scaled with the
@@ -215,6 +236,16 @@ _Last updated: 2026-09-21._
   its native-only modules.
 - **A2A per-finding review streaming** — stream findings as they are confirmed at finalize.
   ([PR #458](https://github.com/vymalo/lightbridge-code-intelligence/pull/458) — open; no ADR yet)
+- **Reclaim the space `webhook_deliveries` already holds** — compaction stops the growth but does not
+  return the existing multi-GB to the volume; PostgreSQL only makes it reusable inside the table. The
+  rewrite that does holds an `ACCESS EXCLUSIVE` lock on the table the webhook receiver writes to, so
+  it is an operator-run Job with a runbook rather than a migration
+  ([ai-helm-values#449](https://github.com/ADORSYS-GIS/ai-helm-values/pull/449), ADR-0119 D6). Run it
+  once #660's backlog has drained and #661 has been live for the retention window, so the rewrite
+  copies as little live data — and holds the lock for as little time — as possible.
+- **Volume-fill alerting for the shared database** — nothing in the cluster alerts on a PVC filling;
+  the 2026-08-29 outage's first signal was the `PANIC`. Cheaper than any of the work above and not yet
+  tracked by an issue in this repo.
 
 ## Planned — open epics
 
