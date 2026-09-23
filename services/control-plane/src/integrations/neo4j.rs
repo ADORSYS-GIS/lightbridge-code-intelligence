@@ -7,6 +7,7 @@
 //! plane rather than direct DB access.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use neo4rs::{BoltType, Graph, query};
 use rmcp::schemars;
@@ -68,7 +69,26 @@ pub async fn upsert_graph(
     edges: &[GraphEdge],
 ) -> anyhow::Result<(usize, usize)> {
     use anyhow::Context;
+    // Without its constraint the lock below excludes nothing, so a write that cannot establish it
+    // fails instead of proceeding unserialized.
+    ensure_snapshot_write_lock(graph)
+        .await
+        .context("snapshot write lock unavailable")?;
     let mut txn = graph.start_txn().await.context("begin neo4j txn")?;
+
+    // Writes to one snapshot run one at a time. `MERGE` only guarantees a single node per key when
+    // a uniqueness constraint backs it; without one, two transactions writing the same snapshot can
+    // both find a symbol absent and both create it. Merging the snapshot's lock node takes its
+    // unique-index entry, which Neo4j holds until this transaction ends — so a concurrent writer to
+    // the same snapshot waits here, then sees this one's committed nodes. Deleting the node in the
+    // same statement keeps the lock without leaving anything behind.
+    txn.run(
+        query("MERGE (l:SnapshotWriteLock {repo_id: $repo, commit: $commit}) DELETE l")
+            .param("repo", repository_id)
+            .param("commit", commit_sha),
+    )
+    .await
+    .context("lock snapshot for writing")?;
 
     if !nodes.is_empty() {
         // Each row's `embedding` is an empty list when the node has none, which is otherwise
@@ -182,6 +202,55 @@ pub async fn attach_symbol_embeddings(
     Ok(updated.max(0) as u64)
 }
 
+/// Nodes removed per transaction when deleting graph data.
+///
+/// Neo4j holds a transaction's whole state on the heap until it commits, so a delete sized by its
+/// input grows with the snapshot it removes. Batching keeps each transaction to a fixed size however
+/// large the repository is.
+const DELETE_BATCH_ROWS: u32 = 1_000;
+
+/// Delete every `:Symbol` the `selector` matches, with its relationships, in transactions of
+/// [`DELETE_BATCH_ROWS`]. Returns how many nodes matched.
+///
+/// `selector` is a `MATCH … WHERE …` binding `s`. `CALL { … } IN TRANSACTIONS` commits each batch on
+/// its own and only runs in an auto-commit transaction, which is what `Graph::run` issues. The count
+/// is read first because deleted nodes leave the query context.
+async fn delete_symbols_in_batches(
+    graph: &Graph,
+    selector: &str,
+    params: &[(&str, BoltType)],
+) -> anyhow::Result<u64> {
+    use anyhow::Context;
+
+    let mut count = query(&format!("{selector} RETURN count(s) AS n"));
+    for (name, value) in params {
+        count = count.param(name, value.clone());
+    }
+    let mut rows = graph
+        .execute(count)
+        .await
+        .context("count symbols to delete")?;
+    let matched = match rows.next().await.context("read delete count")? {
+        Some(row) => row.get::<i64>("n").unwrap_or(0).max(0) as u64,
+        None => 0,
+    };
+    if matched == 0 {
+        return Ok(0);
+    }
+
+    let mut delete = query(&batched_delete(selector));
+    for (name, value) in params {
+        delete = delete.param(name, value.clone());
+    }
+    graph.run(delete).await.context("delete symbols")?;
+    Ok(matched)
+}
+
+/// The statement that deletes what `selector` matches, committing every [`DELETE_BATCH_ROWS`] rows.
+fn batched_delete(selector: &str) -> String {
+    format!("{selector} CALL (s) {{ DETACH DELETE s }} IN TRANSACTIONS OF {DELETE_BATCH_ROWS} ROWS")
+}
+
 /// Delete one commit snapshot's graph for a repository. Returns the number of nodes deleted.
 ///
 /// A graph arrives as a sequence of pages, each its own transaction, so a sequence that stops partway
@@ -194,51 +263,32 @@ pub async fn delete_commit_graph(
     commit_sha: &str,
 ) -> anyhow::Result<u64> {
     use anyhow::Context;
-    let mut result = graph
-        .execute(
-            query(
-                "MATCH (s:Symbol {repo_id: $repo, commit: $commit}) \
-                 WITH s, count(s) AS _c \
-                 DETACH DELETE s \
-                 RETURN count(_c) AS deleted",
-            )
-            .param("repo", repository_id)
-            .param("commit", commit_sha),
-        )
-        .await
-        .context("delete commit graph")?;
-    let deleted = match result.next().await.context("read delete result")? {
-        Some(row) => row.get::<i64>("deleted").unwrap_or(0),
-        None => 0,
-    };
-    Ok(deleted.max(0) as u64)
+    delete_symbols_in_batches(
+        graph,
+        "MATCH (s:Symbol {repo_id: $repo, commit: $commit})",
+        &[
+            ("repo", repository_id.into()),
+            ("commit", commit_sha.into()),
+        ],
+    )
+    .await
+    .context("delete commit graph")
 }
 
 /// Delete **all** graph data for a repository (every commit snapshot), used when a repo is removed
 /// from the installation or denied (Epic #75, Milestone B). Returns the number of nodes deleted.
-/// `DETACH DELETE` removes the nodes' relationships too. Idempotent (deletes nothing for an
-/// already-clean repo).
+/// Idempotent (deletes nothing for an already-clean repo).
 pub async fn delete_repo_graph(graph: &Graph, repository_id: i64) -> anyhow::Result<u64> {
     use anyhow::Context;
-    // Count BEFORE deleting: a `RETURN count(s)` after `DETACH DELETE s` is unreliable (the nodes are
-    // gone from the query context). Collect + count first, then delete via FOREACH.
-    let mut rows = graph
-        .execute(
-            query(
-                "MATCH (s:Symbol {repo_id: $repo}) \
-                 WITH collect(s) AS nodes, count(s) AS deleted \
-                 FOREACH (n IN nodes | DETACH DELETE n) \
-                 RETURN deleted",
-            )
-            .param("repo", repository_id),
-        )
-        .await
-        .context("delete repo graph")?;
-    let deleted = match rows.next().await.context("read delete count")? {
-        Some(row) => row.get::<i64>("deleted").unwrap_or(0).max(0) as u64,
-        None => 0,
-    };
-    Ok(deleted)
+    // Selected by repository alone, so every node the repository owns is removed whatever other
+    // properties it carries.
+    delete_symbols_in_batches(
+        graph,
+        "MATCH (s:Symbol {repo_id: $repo})",
+        &[("repo", repository_id.into())],
+    )
+    .await
+    .context("delete repo graph")
 }
 
 /// Prune a repo's stale structural-graph snapshots: delete every `Symbol` for `repository_id` whose
@@ -254,25 +304,16 @@ pub async fn prune_graph(
     if keep.is_empty() {
         return Ok(0);
     }
-    // Count BEFORE deleting (same reason as `delete_repo_graph`: the nodes leave the query context).
-    let mut rows = graph
-        .execute(
-            query(
-                "MATCH (s:Symbol {repo_id: $repo}) WHERE NOT s.commit IN $keep \
-                 WITH collect(s) AS nodes, count(s) AS deleted \
-                 FOREACH (n IN nodes | DETACH DELETE n) \
-                 RETURN deleted",
-            )
-            .param("repo", repository_id)
-            .param("keep", keep.to_vec()),
-        )
-        .await
-        .context("prune repo graph")?;
-    let deleted = match rows.next().await.context("read prune count")? {
-        Some(row) => row.get::<i64>("deleted").unwrap_or(0).max(0) as u64,
-        None => 0,
-    };
-    Ok(deleted)
+    delete_symbols_in_batches(
+        graph,
+        "MATCH (s:Symbol {repo_id: $repo}) WHERE NOT s.commit IN $keep",
+        &[
+            ("repo", repository_id.into()),
+            ("keep", keep.to_vec().into()),
+        ],
+    )
+    .await
+    .context("prune repo graph")
 }
 
 /// A symbol returned by a graph query. Serialized straight to the retrieval API the graph MCP calls.
@@ -368,6 +409,31 @@ pub async fn get_callers(
     Ok(hits)
 }
 
+/// Whether `snapshot_write_lock` is known to exist in the database this process writes to.
+static SNAPSHOT_WRITE_LOCK_DECLARED: AtomicBool = AtomicBool::new(false);
+
+/// Declare the uniqueness constraint that makes [`upsert_graph`]'s snapshot lock exclusive.
+///
+/// A `MERGE` on the lock node serializes writers only because this constraint turns its key into a
+/// unique-index entry that one transaction at a time can hold. Its label never keeps a node past a
+/// write, so there are never existing duplicates for creation to trip on. Once declared it is not
+/// asked for again; until then every call tries, so a declaration that fails at startup is retried
+/// by the next write rather than leaving writes unserialized.
+pub async fn ensure_snapshot_write_lock(graph: &Graph) -> anyhow::Result<()> {
+    if SNAPSHOT_WRITE_LOCK_DECLARED.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    create_index_idempotent(
+        graph,
+        "CREATE CONSTRAINT snapshot_write_lock IF NOT EXISTS \
+         FOR (l:SnapshotWriteLock) REQUIRE (l.repo_id, l.commit) IS UNIQUE",
+        "snapshot_write_lock",
+    )
+    .await?;
+    SNAPSHOT_WRITE_LOCK_DECLARED.store(true, Ordering::Release);
+    Ok(())
+}
+
 /// Create the vector and fulltext indexes hybrid search needs, if they don't already exist
 /// (ADR-0114). Idempotent, so safe to call on every startup, mirroring how Postgres migrations
 /// already run unconditionally on connect.
@@ -377,6 +443,13 @@ pub async fn get_callers(
 /// pgvector column. Cypher schema DDL can't be parameterized, so the value is interpolated directly,
 /// which is safe here since it comes from trusted server-side config, never request input.
 pub async fn ensure_indexes(graph: &Graph, dimension: i64) -> anyhow::Result<()> {
+    if let Err(error) = ensure_snapshot_write_lock(graph).await {
+        tracing::error!(
+            error = %format!("{error:#}"),
+            "snapshot write lock not declared; graph writes will retry it and fail until it exists"
+        );
+    }
+
     create_index_idempotent(
         graph,
         &format!(
@@ -395,6 +468,16 @@ pub async fn ensure_indexes(graph: &Graph, dimension: i64) -> anyhow::Result<()>
         "CREATE FULLTEXT INDEX symbol_label_fulltext IF NOT EXISTS \
          FOR (s:Symbol) ON EACH [s.label, s.source_file]",
         "symbol_label_fulltext",
+    )
+    .await?;
+
+    // Snapshot-level reads and deletes — discarding a commit, pruning stale commits — select by
+    // `(repo_id, commit)` and never name a node. The identity index below needs all three
+    // properties, so without this one each of them scans the whole label.
+    create_index_idempotent(
+        graph,
+        "CREATE INDEX symbol_snapshot IF NOT EXISTS FOR (s:Symbol) ON (s.repo_id, s.commit)",
+        "symbol_snapshot",
     )
     .await?;
 
@@ -709,6 +792,11 @@ pub async fn edges_among(
 mod tests {
     use super::*;
 
+    /// Held by tests that drop or create constraints every other live test's writes go through, so
+    /// they never run alongside one another.
+    static SHARED_SCHEMA: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+        std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+
     #[test]
     fn escapes_lucene_metacharacters_a_model_query_could_plausibly_contain() {
         assert_eq!(
@@ -833,6 +921,304 @@ mod tests {
             .run(query("MATCH (s:Symbol {commit: $c}) DETACH DELETE s").param("c", commit))
             .await
             .expect("final cleanup");
+    }
+
+    /// Live proof that each delete path removes exactly its selection when that selection spans
+    /// several batches' worth of rows: discarding a commit, pruning stale commits and removing a
+    /// repository each leave the kept commit and the other repository intact.
+    #[tokio::test]
+    #[ignore = "requires a live Neo4j (docker compose up -d neo4j)"]
+    async fn deletes_spanning_several_batches_remove_exactly_their_selection() {
+        let uri =
+            std::env::var("NEO4J_URI").unwrap_or_else(|_| "bolt://localhost:7687".to_string());
+        let graph = Graph::new(&uri, "neo4j", "lightbridge")
+            .await
+            .expect("connect neo4j");
+
+        let (repo, other_repo) = (6621i64, 6622i64);
+        let per_commit = DELETE_BATCH_ROWS as i64 * 2 + 500;
+        let nodes: Vec<GraphNode> = (0..per_commit)
+            .map(|i| GraphNode {
+                node_id: format!("src/f{i}.rs#1:f{i}"),
+                label: format!("f{i}()"),
+                source_file: format!("src/f{i}.rs"),
+                start_line: 1,
+                embedding: None,
+            })
+            .collect();
+        let edges: Vec<GraphEdge> = (1..per_commit)
+            .map(|i| GraphEdge {
+                source: format!("src/f{i}.rs#1:f{i}"),
+                target: "src/f0.rs#1:f0".to_string(),
+                relation: "calls".to_string(),
+            })
+            .collect();
+        for r in [repo, other_repo] {
+            delete_repo_graph(&graph, r).await.expect("cleanup");
+        }
+        for commit in ["discard", "stale", "current"] {
+            upsert_graph(&graph, repo, commit, &nodes, &edges)
+                .await
+                .expect("seed");
+        }
+        upsert_graph(&graph, other_repo, "current", &nodes, &[])
+            .await
+            .expect("seed other repo");
+
+        let expected = per_commit as u64;
+        assert_eq!(
+            delete_commit_graph(&graph, repo, "discard")
+                .await
+                .expect("discard"),
+            expected,
+            "a discard reports every node of its snapshot"
+        );
+        assert_eq!(
+            prune_graph(&graph, repo, &["current".to_string()])
+                .await
+                .expect("prune"),
+            expected,
+            "pruning removes the one stale commit left"
+        );
+        assert_eq!(
+            count_snapshot(&graph, repo, "current").await,
+            per_commit,
+            "the kept commit is intact"
+        );
+
+        assert_eq!(
+            delete_repo_graph(&graph, repo).await.expect("repo delete"),
+            expected,
+            "removing the repository takes its last snapshot"
+        );
+        assert_eq!(count_snapshot(&graph, repo, "current").await, 0);
+        assert_eq!(
+            count_snapshot(&graph, other_repo, "current").await,
+            per_commit,
+            "another repository is untouched"
+        );
+
+        delete_repo_graph(&graph, other_repo)
+            .await
+            .expect("final cleanup");
+    }
+
+    /// Live proof that a delete commits in batches of [`DELETE_BATCH_ROWS`] rather than as one
+    /// transaction. The selection is made to fail on its last node: with batching, every full batch
+    /// before it is already committed; as one transaction, the failure rolls everything back.
+    #[tokio::test]
+    #[ignore = "requires a live Neo4j (docker compose up -d neo4j)"]
+    async fn a_delete_commits_each_batch_on_its_own() {
+        let uri =
+            std::env::var("NEO4J_URI").unwrap_or_else(|_| "bolt://localhost:7687".to_string());
+        let graph = Graph::new(&uri, "neo4j", "lightbridge")
+            .await
+            .expect("connect neo4j");
+
+        let repo = 6623i64;
+        let batch = i64::from(DELETE_BATCH_ROWS);
+        let total = batch * 2 + batch / 2;
+        delete_repo_graph(&graph, repo).await.expect("cleanup");
+        graph
+            .run(
+                query(
+                    "UNWIND range(1, $total) AS n \
+                     CREATE (:Symbol {repo_id: $repo, commit: 'c', node_id: 'n' + toString(n), n: n})",
+                )
+                .param("repo", repo)
+                .param("total", total),
+            )
+            .await
+            .expect("seed");
+
+        let failing = graph
+            .run(
+                query(&batched_delete(
+                    "MATCH (s:Symbol {repo_id: $repo}) WHERE 1 / (s.n - $total) IS NOT NULL",
+                ))
+                .param("repo", repo)
+                .param("total", total),
+            )
+            .await;
+        assert!(failing.is_err(), "the selection fails on its last node");
+
+        let deleted = total - count_snapshot(&graph, repo, "c").await;
+        assert_eq!(
+            deleted,
+            batch * 2,
+            "the two full batches before the failure stay committed"
+        );
+
+        delete_repo_graph(&graph, repo)
+            .await
+            .expect("final cleanup");
+    }
+
+    async fn count_snapshot(graph: &Graph, repo: i64, commit: &str) -> i64 {
+        let mut rows = graph
+            .execute(
+                query("MATCH (s:Symbol {repo_id: $repo, commit: $commit}) RETURN count(s) AS n")
+                    .param("repo", repo)
+                    .param("commit", commit),
+            )
+            .await
+            .expect("count");
+        rows.next()
+            .await
+            .expect("row")
+            .expect("one row")
+            .get::<i64>("n")
+            .expect("n")
+    }
+
+    /// Live proof that concurrent writes to one snapshot cannot duplicate a symbol, with no identity
+    /// constraint to fall back on. Four writers submit the same nodes at once; each must wait for
+    /// the snapshot lock, so every writer after the first matches the nodes the first created.
+    #[tokio::test]
+    #[ignore = "requires a live Neo4j (docker compose up -d neo4j)"]
+    async fn concurrent_writes_to_one_snapshot_create_each_symbol_once() {
+        let _schema = SHARED_SCHEMA.lock().await;
+        let uri =
+            std::env::var("NEO4J_URI").unwrap_or_else(|_| "bolt://localhost:7687".to_string());
+        let graph = Graph::new(&uri, "neo4j", "lightbridge")
+            .await
+            .expect("connect neo4j");
+
+        // Remove the identity constraint for the duration, so only the snapshot lock stands
+        // between the writers and a duplicate; restore it if it was there.
+        let had_identity = constraint_exists(&graph, "symbol_identity").await;
+        graph
+            .run(query("DROP CONSTRAINT symbol_identity IF EXISTS"))
+            .await
+            .expect("drop identity constraint");
+        ensure_snapshot_write_lock(&graph)
+            .await
+            .expect("lock constraint");
+
+        let repo = 6631i64;
+        delete_repo_graph(&graph, repo).await.expect("cleanup");
+        let nodes: Vec<GraphNode> = (0..1_500)
+            .map(|i| GraphNode {
+                node_id: format!("src/f{i}.rs"),
+                label: format!("f{i}.rs"),
+                source_file: format!("src/f{i}.rs"),
+                start_line: 1,
+                embedding: None,
+            })
+            .collect();
+
+        let writers: Vec<_> = (0..4)
+            .map(|_| {
+                let (graph, nodes) = (graph.clone(), nodes.clone());
+                tokio::spawn(async move { upsert_graph(&graph, repo, "main", &nodes, &[]).await })
+            })
+            .collect();
+        for writer in writers {
+            writer.await.expect("join").expect("write");
+        }
+
+        let mut rows = graph
+            .execute(
+                query(
+                    "MATCH (s:Symbol {repo_id: $repo, commit: 'main'}) \
+                     WITH s.node_id AS id, count(*) AS copies \
+                     RETURN count(id) AS ids, sum(copies) AS nodes",
+                )
+                .param("repo", repo),
+            )
+            .await
+            .expect("count");
+        let row = rows.next().await.expect("row").expect("one row");
+        assert_eq!(row.get::<i64>("ids").expect("ids"), 1_500);
+        assert_eq!(
+            row.get::<i64>("nodes").expect("nodes"),
+            1_500,
+            "every symbol exists once, however many writers raced to create it"
+        );
+
+        let mut left = graph
+            .execute(query("MATCH (l:SnapshotWriteLock) RETURN count(l) AS n"))
+            .await
+            .expect("count locks");
+        assert_eq!(
+            left.next()
+                .await
+                .expect("row")
+                .expect("one row")
+                .get::<i64>("n")
+                .expect("n"),
+            0,
+            "the lock leaves no node behind"
+        );
+
+        delete_repo_graph(&graph, repo)
+            .await
+            .expect("final cleanup");
+        if had_identity {
+            graph
+                .run(query(
+                    "CREATE CONSTRAINT symbol_identity IF NOT EXISTS \
+                     FOR (s:Symbol) REQUIRE (s.repo_id, s.commit, s.node_id) IS UNIQUE",
+                ))
+                .await
+                .expect("restore identity constraint");
+        }
+    }
+
+    /// Live proof that a write establishes the snapshot lock when startup did not. The constraint is
+    /// removed and the process's record of it cleared, as after a failed declaration at boot; the
+    /// next write must restore it rather than take a lock that excludes nothing.
+    #[tokio::test]
+    #[ignore = "requires a live Neo4j (docker compose up -d neo4j)"]
+    async fn a_write_declares_the_snapshot_lock_when_startup_did_not() {
+        let _schema = SHARED_SCHEMA.lock().await;
+        let uri =
+            std::env::var("NEO4J_URI").unwrap_or_else(|_| "bolt://localhost:7687".to_string());
+        let graph = Graph::new(&uri, "neo4j", "lightbridge")
+            .await
+            .expect("connect neo4j");
+
+        graph
+            .run(query("DROP CONSTRAINT snapshot_write_lock IF EXISTS"))
+            .await
+            .expect("drop lock constraint");
+        SNAPSHOT_WRITE_LOCK_DECLARED.store(false, Ordering::Release);
+
+        let repo = 6632i64;
+        delete_repo_graph(&graph, repo).await.expect("cleanup");
+        let node = GraphNode {
+            node_id: "src/a.rs".to_string(),
+            label: "a.rs".to_string(),
+            source_file: "src/a.rs".to_string(),
+            start_line: 1,
+            embedding: None,
+        };
+        upsert_graph(&graph, repo, "main", &[node], &[])
+            .await
+            .expect("write");
+
+        assert!(
+            constraint_exists(&graph, "snapshot_write_lock").await,
+            "the write restored the constraint its lock depends on"
+        );
+        delete_repo_graph(&graph, repo)
+            .await
+            .expect("final cleanup");
+    }
+
+    async fn constraint_exists(graph: &Graph, name: &str) -> bool {
+        let mut rows = graph
+            .execute(
+                query("SHOW CONSTRAINTS YIELD name WHERE name = $name RETURN count(*) AS n")
+                    .param("name", name),
+            )
+            .await
+            .expect("show constraints");
+        rows.next()
+            .await
+            .expect("row")
+            .map(|row| row.get::<i64>("n").unwrap_or(0) > 0)
+            .unwrap_or(false)
     }
 
     /// Live proof that discarding a snapshot clears exactly that commit. The state this exists for
