@@ -1,6 +1,10 @@
 # `webhook_deliveries` grows without bound — P0
 
-**Status:** open, not yet fixed. **Filed:** 2026-08-29, after it took down a shared database.
+**Status:** growth bounded by payload compaction ([ADR-0119](../adr/0119-webhook-delivery-payload-retention.md),
+`dispatcher.webhook_payload_retention_days`, see
+[config reference](../../deploy/config-reference.md)); space already allocated is returned by a
+one-off `VACUUM FULL` once the backlog is compacted. **Filed:** 2026-08-29, after it took down a
+shared database.
 
 `webhook_deliveries` has no retention. It is the only append-only table in the control plane
 without one, and it is now the largest object in the cluster's shared Postgres by a wide margin.

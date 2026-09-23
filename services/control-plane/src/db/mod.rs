@@ -33,6 +33,7 @@ mod repo_settings;
 mod repositories;
 mod reviews;
 mod tasks;
+mod webhook_deliveries;
 
 pub use analytics::*;
 pub use code_chunks::*;
@@ -46,6 +47,7 @@ pub use repo_settings::*;
 pub use repositories::*;
 pub use reviews::*;
 pub use tasks::*;
+pub use webhook_deliveries::*;
 
 #[cfg(test)]
 mod tests;

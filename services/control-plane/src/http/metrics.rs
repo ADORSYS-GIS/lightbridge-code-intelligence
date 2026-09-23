@@ -127,6 +127,11 @@ pub fn a2a_task_sweep_deleted(deleted: u64) {
     counter!("lci_a2a_task_sweep_deleted_total").increment(deleted);
 }
 
+/// Webhook delivery payloads compacted by one retention sweep (the rows themselves are kept).
+pub fn webhook_payloads_compacted(compacted: u64) {
+    counter!("lci_webhook_payloads_compacted_total").increment(compacted);
+}
+
 /// An outbox delivery outcome (ADR-0059/0072): `posted` (success), `skipped` (silently consumed —
 /// e.g. a `failure_notice` dedup gate), or `failed` (retry/dead-letter), labelled by `platform`
 /// (`"github"` / `"gitlab"`) and `kind` (`review` / `reply` / `reaction` / `failure_notice`).
