@@ -39,8 +39,8 @@ const DEFAULT_A2A_TASK_TTL_DAYS: i64 = 30;
 /// Bounded rows-per-sweep so one GC tick never holds a long lock on `a2a_tasks`; a large backlog drains
 /// across ticks. From `A2A_TASK_SWEEP_BATCH`.
 const DEFAULT_A2A_TASK_SWEEP_BATCH: i64 = 500;
-/// Webhook payloads are only read around ingest (routing, and the one-hour MCP-review quota window),
-/// so a week keeps them available for debugging recent deliveries with ample margin.
+/// A webhook payload is only read while the delivery is being routed, so a week is purely about
+/// keeping recent deliveries readable for debugging.
 const DEFAULT_WEBHOOK_PAYLOAD_RETENTION_DAYS: i64 = 7;
 /// Payloads compacted per GC tick. At the default 10-minute tick this is ~720k rows/day: well above
 /// the ingest rate, while spreading a large backlog's write volume across ticks.

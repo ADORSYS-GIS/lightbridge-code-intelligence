@@ -3,8 +3,9 @@
 //! Every accepted webhook delivery is stored with its full JSON payload, and nothing else ever
 //! shrinks that table. This sweeper, run on the dispatcher's storage-GC tick alongside the index,
 //! outbox and A2A sweepers, compacts payloads older than the retention window (see
-//! [`crate::db::compact_webhook_payloads`] for why the rows themselves are kept). Each tick handles a
-//! bounded batch, so a large backlog drains over several ticks rather than in one write burst.
+//! [`crate::db::compact_webhook_payloads`] for why the rows themselves are kept, and why the
+//! `mcp.review` quota ledger is left alone). Each tick handles a bounded batch, so a large backlog
+//! drains over several ticks rather than in one write burst.
 //! Idempotent: a compacted row no longer matches, and a failed cycle is retried next tick.
 
 use sqlx::PgPool;
@@ -78,6 +79,40 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(rows, 2, "compaction never deletes a row");
+    }
+
+    /// The `mcp.review` quota ledger keeps its payload at any age: `reserve_mcp_run_slot` reads
+    /// `payload_json->>'caller'` back over a window this sweep cannot see.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn mcp_review_rows_are_never_compacted(pool: PgPool) {
+        let provenance = json!({ "source": "mcp", "caller": "svc-a", "repo": "o/r", "pr": 1 });
+        assert!(
+            db::reserve_mcp_run_slot(
+                &pool,
+                "svc-a",
+                3600,
+                20,
+                Platform::GitHub,
+                "mcp-1",
+                &provenance,
+            )
+            .await
+            .unwrap()
+        );
+        seed_delivery(&pool, "gh-1", "pull_request", 999).await;
+        sqlx::query(
+            "UPDATE webhook_deliveries SET received_at = now() - interval '999 days' \
+                     WHERE delivery_id = 'mcp-1'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let compacted = db::compact_webhook_payloads(&pool, 7, 100).await.unwrap();
+
+        assert_eq!(compacted, 1, "only the platform delivery is compacted");
+        assert_eq!(payload_of(&pool, "mcp-1").await, provenance);
+        assert!(is_compacted(&payload_of(&pool, "gh-1").await));
     }
 
     /// A redelivery of a compacted delivery is still recognised as a duplicate.
