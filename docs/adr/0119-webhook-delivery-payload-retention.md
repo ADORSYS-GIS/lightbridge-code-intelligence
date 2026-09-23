@@ -76,11 +76,11 @@ Compaction sets `payload_json = '{}'::jsonb`. It never deletes a row, never touc
 foreign key. `{}` rather than `NULL`, because the column is `NOT NULL JSONB` and every reader
 already handles an empty object.
 
-`{}` records **that** no payload is retained and nothing about **why**: a delivery stored without
-one and a delivery compacted six days later are identical in the table. No platform sends an empty
-webhook body, so an empty payload is never evidence of an ingest bug. This is deliberate. A
-`compacted_at` marker would be a per-row cost on millions of rows to separate two states that no
-reader treats differently.
+`{}` records **that** no payload is retained, and nothing about **when** or **why**. No platform
+sends an empty webhook body and every writer of this table stores a real one, so an empty payload is
+the sweep's mark and never evidence of an ingest fault — but the table does not say that of itself.
+A `compacted_at` marker was rejected as a per-row cost on millions of rows for a distinction no
+reader acts on.
 
 ### D2 — Retention is dispatcher configuration on the GC tick that already runs
 
@@ -172,9 +172,8 @@ this one.
   operational surface is two settings and one counter.
 - Bad, because a raw webhook body older than the window is gone. Debugging "why did nothing happen
   for this delivery last month" now goes to the forge's own delivery log, not to this database.
-- Bad, because `{}` is ambiguous by construction (D1), and becomes the common case rather than the
-  exception once payloads are stored only for routed events
-  ([#661](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/pull/661)).
+- Bad, because the table carries no record of the compaction itself (D1) — an empty payload has to
+  be read together with this decision to be understood.
 - Neutral, because the first days after deployment write materially more WAL than steady state while
   the backlog drains. D3 bounds it; it is still the period to watch.
 - Neutral, because nothing here reclaims a byte on the volume until D6's Job is run, which should
@@ -243,9 +242,9 @@ this one.
 - [#660](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/pull/660) — this decision, as
   implemented
 - [#661](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/pull/661) — the sibling
-  change: a payload is stored at ingest only for events a router acts on (~94% of deliveries are
-  not). Decided separately; it reduces what this sweep has to compact, and does not change any rule
-  above
+  change: a delivery is recorded at all only when a router acts on it (~94% are not, and a
+  redelivery of one of those does what the first did: nothing). Decided separately; it cuts what
+  this sweep has to compact and shrinks the retention window's footprint, and changes no rule above
 - [ai-helm-values#449](https://github.com/ADORSYS-GIS/ai-helm-values/pull/449) — D6's reclaim Job
   and runbook
 - `ai-helm#1059`, `ai-helm#1060` — the emergency volume growth that bought the time to do this
