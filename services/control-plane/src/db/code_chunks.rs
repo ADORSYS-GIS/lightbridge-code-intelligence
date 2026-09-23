@@ -34,6 +34,26 @@ pub async fn latest_indexed_commit(
     .await
 }
 
+/// The `(file_path, start_line, end_line)` of every chunk already stored for one snapshot.
+///
+/// Together with `repository_id` and `commit_sha` these are the conflict target `upsert_code_chunks`
+/// writes against, so a chunk whose key appears here is already present with its embedding and does
+/// not need to be embedded again.
+pub async fn indexed_chunk_keys(
+    pool: &PgPool,
+    repository_id: i64,
+    commit_sha: &str,
+) -> Result<Vec<(String, i32, i32)>, sqlx::Error> {
+    sqlx::query_as(
+        "SELECT file_path, start_line, end_line FROM code_chunks \
+         WHERE repository_id = $1 AND commit_sha = $2",
+    )
+    .bind(repository_id)
+    .bind(commit_sha)
+    .fetch_all(pool)
+    .await
+}
+
 /// Delete a repository's semantic index (all `code_chunks` rows) — part of the data purge when a repo
 /// is removed/denied (Epic #75, Milestone B). Returns the number of rows deleted.
 pub async fn delete_code_chunks_for_repo(

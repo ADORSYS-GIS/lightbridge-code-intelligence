@@ -1,7 +1,9 @@
 //! Ingest submission: indexed code chunks (for pgvector search) and the structural code graph (for
 //! Neo4j via lci-codegraph).
 
-use serde::Serialize;
+use std::collections::HashSet;
+
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::ControlPlaneClient;
@@ -24,6 +26,20 @@ pub struct ChunkPayload {
     /// definition the graph pass did not emit a node for.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub node_id: Option<String>,
+}
+
+/// One already-stored chunk's position (mirrors `internal.rs::IndexedChunkKey`).
+#[derive(Debug, Deserialize)]
+struct IndexedChunkKey {
+    file_path: String,
+    start_line: i32,
+    end_line: i32,
+}
+
+/// Body of `GET /internal/tasks/{id}/chunks/indexed`.
+#[derive(Debug, Deserialize)]
+struct IndexedChunkKeys {
+    keys: Vec<IndexedChunkKey>,
 }
 
 /// Body for `POST /internal/tasks/{id}/chunks`.
@@ -68,6 +84,36 @@ pub struct GraphBatch {
 }
 
 impl ControlPlaneClient {
+    /// `GET /internal/tasks/{id}/chunks/indexed` — the chunks already stored for this task's
+    /// snapshot, as `(file_path, start_line, end_line)`.
+    ///
+    /// An index re-running over a commit it has partially indexed can embed only what is missing.
+    /// Empty for a snapshot that has never been indexed.
+    pub async fn indexed_chunk_keys(
+        &self,
+        task_id: Uuid,
+    ) -> anyhow::Result<HashSet<(String, i32, i32)>> {
+        use anyhow::Context;
+        let url = format!("{}/internal/tasks/{task_id}/chunks/indexed", self.base_url);
+        let body: IndexedChunkKeys = self
+            .http
+            .get(&url)
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .context("requesting indexed chunk keys")?
+            .error_for_status()
+            .context("control plane rejected the indexed-chunk lookup")?
+            .json()
+            .await
+            .context("parsing indexed chunk keys")?;
+        Ok(body
+            .keys
+            .into_iter()
+            .map(|k| (k.file_path, k.start_line, k.end_line))
+            .collect())
+    }
+
     /// `POST /internal/tasks/{id}/chunks` — submit a batch of indexed code chunks.
     pub async fn submit_chunks(&self, task_id: Uuid, batch: ChunkBatch) -> anyhow::Result<()> {
         use anyhow::Context;

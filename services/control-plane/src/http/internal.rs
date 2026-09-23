@@ -756,6 +756,76 @@ pub async fn ingest_chunks(
     StatusCode::NO_CONTENT.into_response()
 }
 
+/// One already-stored chunk's position, in the shape `upsert_code_chunks` keys on.
+#[derive(Debug, Serialize)]
+pub struct IndexedChunkKey {
+    pub file_path: String,
+    pub start_line: i32,
+    pub end_line: i32,
+}
+
+/// Body for `GET /internal/tasks/{id}/chunks/indexed`.
+#[derive(Debug, Serialize)]
+pub struct IndexedChunkKeys {
+    pub commit_sha: String,
+    pub keys: Vec<IndexedChunkKey>,
+}
+
+/// `GET /internal/tasks/{id}/chunks/indexed` — the chunks already stored for this task's snapshot.
+///
+/// Lets an index that is re-running over a commit it has partially indexed embed only what is
+/// missing. The runner is stateless across attempts and holds no database access, so the set it
+/// needs to skip can only come from here.
+pub async fn indexed_chunks(
+    _auth: RunnerAuth,
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Response {
+    let Some(pool) = state.db.as_ref() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "no database").into_response();
+    };
+
+    let row: Option<(i64, Option<String>, String)> = match sqlx::query_as(
+        "SELECT t.repository_id, t.head_sha, r.default_branch \
+         FROM tasks t JOIN repositories r ON r.id = t.repository_id WHERE t.id = $1",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await
+    {
+        Ok(row) => row,
+        Err(error) => {
+            tracing::error!(%error, task_id = %id, "load task for indexed-chunk lookup failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "query error").into_response();
+        }
+    };
+
+    let Some((repository_id, head_sha, default_branch)) = row else {
+        return (StatusCode::NOT_FOUND, "task not found").into_response();
+    };
+    // The same fallback the runner applies when it stamps `commit_sha` onto a chunk batch.
+    let commit_sha = head_sha.unwrap_or(default_branch);
+
+    match crate::db::indexed_chunk_keys(pool, repository_id, &commit_sha).await {
+        Ok(keys) => Json(IndexedChunkKeys {
+            commit_sha,
+            keys: keys
+                .into_iter()
+                .map(|(file_path, start_line, end_line)| IndexedChunkKey {
+                    file_path,
+                    start_line,
+                    end_line,
+                })
+                .collect(),
+        })
+        .into_response(),
+        Err(error) => {
+            tracing::error!(%error, task_id = %id, "indexed-chunk lookup failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "query error").into_response()
+        }
+    }
+}
+
 /// `DELETE /internal/tasks/{id}/graph` — discard this task's commit snapshot from the graph.
 ///
 /// A graph arrives as a sequence of pages, each committed on its own, so a sequence that stops
