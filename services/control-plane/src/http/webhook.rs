@@ -3,7 +3,8 @@
 //! A single `/webhook` route detects the platform from headers, verifies the signature, dedupes
 //! on the platform's delivery ID, then hands off to platform-specific event routing. With a
 //! database, dedup + persistence happen atomically via the `webhook_deliveries` PRIMARY KEY;
-//! without one (dev) it falls back to an in-memory set.
+//! without one (dev) it falls back to an in-memory set. Only events a router acts on are recorded
+//! at all — see [`persist_delivery`].
 //!
 //! Bitbucket goes on this same route via header detection, exactly like GitHub/GitLab — no
 //! separate path-scoped route (that's ADR-0109's domain-unification scope, a separate epic, not
@@ -108,7 +109,7 @@ async fn github_webhook_body(state: AppState, headers: HeaderMap, body: Bytes) -
         }
     };
     match persist_delivery(&state, Platform::GitHub, &delivery_id, &event, &payload).await {
-        DeliveryResult::Persisted => {}
+        DeliveryResult::Accepted => {}
         DeliveryResult::Duplicate => {
             crate::http::metrics::webhook_duplicate("github");
             tracing::info!(delivery_id, "github: duplicate delivery");
@@ -180,7 +181,7 @@ async fn gitlab_webhook_body(
         .record("delivery_id", &delivery_id)
         .record("event", &event);
     match persist_delivery(&state, Platform::GitLab, &delivery_id, &event, &payload).await {
-        DeliveryResult::Persisted => {}
+        DeliveryResult::Accepted => {}
         DeliveryResult::Duplicate => {
             crate::http::metrics::webhook_duplicate("gitlab");
             tracing::info!(delivery_id, "gitlab: duplicate delivery");
@@ -267,7 +268,7 @@ async fn bitbucket_webhook_body(
         .record("delivery_id", &delivery_id)
         .record("event", &event);
     match persist_delivery(&state, Platform::Bitbucket, &delivery_id, &event, &payload).await {
-        DeliveryResult::Persisted => {}
+        DeliveryResult::Accepted => {}
         DeliveryResult::Duplicate => {
             crate::http::metrics::webhook_duplicate("bitbucket");
             tracing::info!(delivery_id, "bitbucket: duplicate delivery");
@@ -299,13 +300,23 @@ async fn bitbucket_webhook_body(
 }
 
 enum DeliveryResult {
-    Persisted,
+    /// Go on and handle it: either the delivery was recorded, or it is an event this service acts
+    /// on nothing for and records nothing for.
+    Accepted,
     Duplicate,
     Error,
 }
 
-/// Record a delivery for dedup. Only events the platform router acts on keep their payload; every
-/// other event is recorded with `{}`, since its row exists only so a redelivery is recognised.
+/// Record a delivery so a redelivery of it is recognised, and report whether to go on handling it.
+///
+/// Only events a router acts on are recorded. A redelivery is worth recognising exactly when
+/// handling it twice would do something twice; for an event no router acts on, the second pass does
+/// what the first did — nothing — so a row for it would guard against nothing while still costing a
+/// row, an index entry and a write on ~94% of all deliveries. Nothing references those rows either:
+/// every path that creates a task records its own delivery first.
+///
+/// The delivery is still counted and logged, so ingest stays visible, and the forge's own delivery
+/// log remains the record that it arrived.
 async fn persist_delivery(
     state: &AppState,
     platform: Platform,
@@ -313,24 +324,21 @@ async fn persist_delivery(
     event: &str,
     payload: &serde_json::Value,
 ) -> DeliveryResult {
+    if !is_routed_event(platform, event) {
+        return DeliveryResult::Accepted;
+    }
     match &state.db {
         Some(pool) => {
-            let empty = serde_json::Value::Object(serde_json::Map::new());
-            let stored = if is_routed_event(platform, event) {
-                payload
-            } else {
-                &empty
-            };
             let step_name = StepName::from(format!("webhook:{delivery_id}"));
             let step_result = Passthrough
                 .step(step_name, async || {
-                    crate::db::record_delivery(pool, platform, delivery_id, event, stored)
+                    crate::db::record_delivery(pool, platform, delivery_id, event, payload)
                         .await
                         .map_err(|e| StepError::terminal(e.to_string()))
                 })
                 .await;
             match step_result {
-                Ok(true) => DeliveryResult::Persisted,
+                Ok(true) => DeliveryResult::Accepted,
                 Ok(false) => DeliveryResult::Duplicate,
                 Err(step_error) => {
                     let error = match step_error {
@@ -349,7 +357,7 @@ async fn persist_delivery(
                 .expect("dedup lock poisoned")
                 .insert(delivery_id.to_string());
             if is_new {
-                DeliveryResult::Persisted
+                DeliveryResult::Accepted
             } else {
                 DeliveryResult::Duplicate
             }
@@ -496,7 +504,7 @@ fn is_routed_event(platform: Platform, event: &str) -> bool {
 ///   installation_repositories  added | removed         → register pending / disable those repos
 ///
 /// Repos start **pending** and need admin approval before any review/index runs (Epic #75).
-/// Everything else is recorded in `webhook_deliveries` for dedup only, without its payload.
+/// Everything else is acknowledged and dropped — counted and logged, but not recorded.
 enum GithubRoute {
     PullRequest,
     Push,
@@ -574,7 +582,7 @@ async fn route_gitlab_event(
         Some(GitlabRoute::Push) => handle_gitlab_push(state, payload, delivery_id).await,
         Some(GitlabRoute::Note) => handle_gitlab_note(state, payload, delivery_id).await,
         None => {
-            tracing::debug!(%delivery_id, %event, "GitLab event type not handled; recorded only");
+            tracing::debug!(%delivery_id, %event, "GitLab event type not handled; not recorded");
         }
     }
 }
@@ -625,7 +633,7 @@ async fn route_bitbucket_event(
             handle_bitbucket_comment(state, payload, delivery_id).await
         }
         None => {
-            tracing::debug!(%delivery_id, %event, "Bitbucket event type not handled; recorded only");
+            tracing::debug!(%delivery_id, %event, "Bitbucket event type not handled; not recorded");
         }
     }
 }
@@ -2787,12 +2795,12 @@ mod tests {
         }
     }
 
-    /// A GitLab webhook whose event type (`Job Hook`) `route_gitlab_event` doesn't handle — it falls
-    /// into the catch-all debug-log arm — so the request exercises only the dedup+persist block under
-    /// test, not the downstream MR/push/note handling.
-    fn gitlab_job_hook_request() -> (HeaderMap, Bytes) {
+    /// A GitLab webhook carrying a routed event (`Push Hook`), so the dedup+persist block under test
+    /// actually runs. The payload is deliberately missing the project fields `handle_gitlab_push`
+    /// needs, so routing warns and returns immediately instead of pulling in downstream handling.
+    fn gitlab_push_hook_request() -> (HeaderMap, Bytes) {
         let mut headers = HeaderMap::new();
-        headers.insert("x-gitlab-event", "Job Hook".parse().unwrap());
+        headers.insert("x-gitlab-event", "Push Hook".parse().unwrap());
         headers.insert("x-gitlab-token", "secret-a".parse().unwrap());
         headers.insert("x-gitlab-event-uuid", "wrap-test-uuid".parse().unwrap());
         let body = Bytes::from(
@@ -2807,7 +2815,7 @@ mod tests {
     #[sqlx::test]
     async fn webhook_ingress_step_wrap_dedups_a_replayed_delivery(pool: PgPool) {
         let state = gitlab_only_state(pool.clone());
-        let (headers, body) = gitlab_job_hook_request();
+        let (headers, body) = gitlab_push_hook_request();
 
         let first = gitlab_webhook_body(state.clone(), 1001, headers.clone(), body.clone()).await;
         assert_eq!(first.status(), StatusCode::ACCEPTED);
@@ -3633,6 +3641,14 @@ mod tests {
         );
     }
 
+    /// Event names of every row in the table, sorted — what ingest actually recorded.
+    async fn recorded_events(pool: &PgPool) -> Vec<String> {
+        sqlx::query_scalar("SELECT event_name FROM webhook_deliveries ORDER BY event_name")
+            .fetch_all(pool)
+            .await
+            .unwrap()
+    }
+
     async fn stored_payload(pool: &PgPool, delivery_id: &str) -> serde_json::Value {
         sqlx::query_scalar("SELECT payload_json FROM webhook_deliveries WHERE delivery_id = $1")
             .bind(delivery_id)
@@ -3684,9 +3700,9 @@ mod tests {
         );
     }
 
-    /// A routed event is stored with its payload; any other event is stored with `{}`.
+    /// A routed event is recorded with its payload; an event no router acts on is not recorded.
     #[sqlx::test]
-    async fn persist_delivery_stores_payloads_only_for_routed_events(pool: PgPool) {
+    async fn persist_delivery_records_only_routed_deliveries(pool: PgPool) {
         let state = gitlab_only_state(pool.clone());
         let payload = serde_json::json!({ "action": "completed", "workflow_job": { "id": 7 } });
 
@@ -3701,25 +3717,43 @@ mod tests {
         )
         .await;
 
-        assert!(matches!(routed, DeliveryResult::Persisted));
-        assert!(matches!(unrouted, DeliveryResult::Persisted));
+        assert!(matches!(routed, DeliveryResult::Accepted));
+        assert!(matches!(unrouted, DeliveryResult::Accepted));
         assert_eq!(stored_payload(&pool, "routed").await, payload);
         assert_eq!(
-            stored_payload(&pool, "unrouted").await,
-            serde_json::json!({})
+            recorded_events(&pool).await,
+            vec!["pull_request".to_string()],
+            "the unrouted delivery leaves no row behind"
         );
     }
 
-    /// A delivery stored without its payload still dedups a redelivery of the same id.
+    /// A routed delivery still dedups on replay; an unrouted one has nothing to dedup, and its
+    /// replay is accepted again without ever writing a row.
     #[sqlx::test]
-    async fn unrouted_delivery_without_payload_still_dedups(pool: PgPool) {
-        let state = gitlab_only_state(pool);
-        let payload = serde_json::json!({ "action": "queued" });
+    async fn only_routed_deliveries_dedup_on_replay(pool: PgPool) {
+        let state = gitlab_only_state(pool.clone());
+        let payload = serde_json::json!({ "action": "opened" });
 
-        let first = persist_delivery(&state, Platform::GitHub, "d-1", "check_run", &payload).await;
-        let again = persist_delivery(&state, Platform::GitHub, "d-1", "check_run", &payload).await;
+        let routed_first =
+            persist_delivery(&state, Platform::GitHub, "d-1", "pull_request", &payload).await;
+        let routed_again =
+            persist_delivery(&state, Platform::GitHub, "d-1", "pull_request", &payload).await;
+        assert!(matches!(routed_first, DeliveryResult::Accepted));
+        assert!(matches!(routed_again, DeliveryResult::Duplicate));
 
-        assert!(matches!(first, DeliveryResult::Persisted));
-        assert!(matches!(again, DeliveryResult::Duplicate));
+        let noise_first =
+            persist_delivery(&state, Platform::GitHub, "d-2", "check_run", &payload).await;
+        let noise_again =
+            persist_delivery(&state, Platform::GitHub, "d-2", "check_run", &payload).await;
+        assert!(matches!(noise_first, DeliveryResult::Accepted));
+        assert!(
+            matches!(noise_again, DeliveryResult::Accepted),
+            "a redelivery nothing acts on is handled again, which is still nothing"
+        );
+
+        assert_eq!(
+            recorded_events(&pool).await,
+            vec!["pull_request".to_string()]
+        );
     }
 }
