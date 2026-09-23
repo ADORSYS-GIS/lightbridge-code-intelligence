@@ -35,6 +35,24 @@ log_scanner_end() { echo "✓ $1 reported to ${REPORTS_DIR}/$2" >&2; }
 log_error() { echo "ERROR: $1" >&2; }
 log_warn() { echo "WARN: $1" >&2; }
 
+# The pull request's base branch as a ref this checkout can resolve. A pull_request checkout is a
+# detached merge commit where the base branch exists only as a remote-tracking ref, so the bare
+# name in GITHUB_BASE_REF does not resolve by itself; a local run may have it as a local branch.
+PR_BASE_REF=""
+if [[ "$IS_PR" == "pull_request" && -n "$PR_BASE" ]]; then
+  for candidate in "refs/remotes/origin/${PR_BASE}" "refs/heads/${PR_BASE}"; do
+    if git -C "$REPO_ROOT" rev-parse --verify --quiet "${candidate}^{commit}" >/dev/null; then
+      PR_BASE_REF="$candidate"
+      break
+    fi
+  done
+  if [[ -z "$PR_BASE_REF" ]]; then
+    log_error "Base branch '${PR_BASE}' is not in this checkout; cannot tell which lines the pull request changed."
+    exit 1
+  fi
+fi
+readonly PR_BASE_REF
+
 # Track scanner results: name → (exit_code, report_file, kind)
 declare -A SCANNER_RESULTS
 
@@ -159,9 +177,9 @@ if command -v gitleaks &>/dev/null; then
   # gitleaks' output flag is --report-path, not --output (confirmed against `gitleaks detect
   # --help` on the real binary after a real run failed with "unknown flag: --output").
   gitleaks_opts=(--verbose --report-format=sarif --report-path="${REPORTS_DIR}/gitleaks.sarif")
-  if [[ "$IS_PR" == "pull_request" && -n "$PR_BASE" ]]; then
-    # PR: scan only new commits. Use merge-base with local branch name (GitHub Actions checks out base ref).
-    merge_base=$(cd "$REPO_ROOT" && git merge-base "$PR_BASE" HEAD 2>/dev/null || echo "HEAD~10")
+  if [[ -n "$PR_BASE_REF" ]]; then
+    # PR: scan only the commits the pull request adds.
+    merge_base=$(git -C "$REPO_ROOT" merge-base "$PR_BASE_REF" HEAD)
     gitleaks_opts+=(--log-opts="$merge_base..HEAD")
   fi
 
@@ -252,7 +270,7 @@ fi
 log_section "Quality gate evaluation"
 
 # Invoke the gate script; it decides pass/fail based on findings and severity.
-bash "${REPO_ROOT}/.ci/quality/gate.sh" "${REPORTS_DIR}" "$IS_PR" "$GITHUB_REF" "$PR_BASE" || {
+bash "${REPO_ROOT}/.ci/quality/gate.sh" "${REPORTS_DIR}" "$IS_PR" "$GITHUB_REF" "$PR_BASE_REF" || {
   gate_code=$?
   log_error "Quality gate failed with exit code $gate_code."
   exit "$gate_code"
