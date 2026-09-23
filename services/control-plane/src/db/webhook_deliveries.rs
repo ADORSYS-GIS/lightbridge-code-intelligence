@@ -1,4 +1,4 @@
-//! Webhook delivery storage lifecycle.
+//! Webhook delivery storage lifecycle (ADR-0119).
 //!
 //! A delivery row outlives its payload's usefulness by a wide margin. The row itself is permanent:
 //! its `delivery_id` PRIMARY KEY is the webhook dedup guarantee and `tasks.webhook_delivery_id`

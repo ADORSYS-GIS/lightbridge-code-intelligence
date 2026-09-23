@@ -1,4 +1,4 @@
-//! Webhook payload compaction sweeper.
+//! Webhook payload compaction sweeper (ADR-0119).
 //!
 //! Every accepted webhook delivery is stored with its full JSON payload, and nothing else ever
 //! shrinks that table. This sweeper, run on the dispatcher's storage-GC tick alongside the index,

@@ -118,7 +118,7 @@ signed JWT), `TRACEPARENT`, plus (from Secret `lightbridge-agent-secrets`) `LLM_
 (`INDEX_EMBED_BATCH_SIZE`) and observability vars (`OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_TRACES_SAMPLER_ARG`) from the dispatcher's
 own env.
 
-**Storage GC** — file-config only, under `control-plane.json`'s `dispatcher` section. The sweeps
+**Storage GC** ([ADR-0052](../docs/adr/0052-index-snapshot-pruning.md), [ADR-0059](../docs/adr/0059-reconciler-owns-all-github-egress.md), [ADR-0119](../docs/adr/0119-webhook-delivery-payload-retention.md)) — file-config only, under `control-plane.json`'s `dispatcher` section. The sweeps
 run on the dispatcher's `prune_interval_seconds` tick (default `600`); a zero or negative value falls
 back to the default.
 
