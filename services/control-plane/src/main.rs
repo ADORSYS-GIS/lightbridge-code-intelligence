@@ -66,7 +66,7 @@ use sqlx::PgPool;
 use jwt::JwtValidator;
 // Bring the grouped modules into scope under their bare names. `crate::` is required to
 // disambiguate from the extern `http` / `metrics` crates pulled in by axum.
-use crate::http::{admin, internal, metrics, webhook};
+use crate::http::{admin, analytics, internal, metrics, webhook};
 use crate::integrations::{bitbucket, github, gitlab, k8s, neo4j};
 use crate::queue::{dispatcher, tasks};
 
@@ -367,6 +367,9 @@ fn api_v2_router() -> Router<AppState> {
         .route("/tasks/{id}/feedback", get(tasks::get_feedback))
         .route("/tasks/{id}/cancel", post(tasks::cancel))
         .route("/repositories", get(tasks::list_repositories))
+        // Windowed reviewer-reaction aggregates for the LCI app's feedback pages (ADR-0118),
+        // carrying their own previous-window comparison.
+        .route("/analytics/feedback", get(analytics::feedback))
         // Deployment/config read for the web console (GitLab base URL, etc.) — no `GITLAB_URL` env.
         .route("/config", get(http::config::deployment_config))
         // Admin API (approval gate, Epic #75) — gated by the `Admin` extractor (admin realm role).
@@ -712,6 +715,30 @@ fn mint_runner_token_cli() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Env: prefer `RECONCILER_*`; fall back to the legacy `POLLER_*` so the rename doesn't require a
+/// simultaneous values change.
+fn reconciler_env_u64(primary: &str, legacy: &str, default: u64) -> u64 {
+    std::env::var(primary)
+        .or_else(|_| std::env::var(legacy))
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
+/// How many days back the feedback poll keeps reactions current (`RECONCILER_WINDOW_DAYS`, default 14),
+/// clamped to at least 1. Read by the reconciler, which polls within it, and by
+/// `GET /analytics/feedback`, which reports it so a page can say where reactions stop being kept
+/// current. Each reads its own process env, so the two roles must be deployed with the same value.
+pub(crate) fn reconciler_window_days() -> i32 {
+    i32::try_from(reconciler_env_u64(
+        "RECONCILER_WINDOW_DAYS",
+        "POLLER_WINDOW_DAYS",
+        14,
+    ))
+    .unwrap_or(i32::MAX)
+    .max(1)
+}
+
 /// The reconciler role (ADR-0058): a single replica that owns **all platform egress** — it drains
 /// the `outbox` and posts each intent (ADR-0059) — and reads 👍/👎 reactions back into
 /// `review_feedback` (ADR-0035). Requires a database and at least one platform implementation; run
@@ -737,32 +764,21 @@ async fn run_reconciler(state: AppState) -> anyhow::Result<()> {
         );
     }
     spawn_metrics_server(state.metrics.clone());
-    // Env: prefer RECONCILER_*; fall back to the legacy POLLER_* so the rename doesn't require a
-    // simultaneous values change.
-    let env_u64 = |a: &str, b: &str, default: u64| {
-        std::env::var(a)
-            .or_else(|_| std::env::var(b))
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(default)
-    };
-    let interval = std::time::Duration::from_secs(env_u64(
+    let interval = std::time::Duration::from_secs(reconciler_env_u64(
         "RECONCILER_INTERVAL_SECS",
         "POLLER_INTERVAL_SECS",
         300,
     ));
-    let within_days = env_u64("RECONCILER_WINDOW_DAYS", "POLLER_WINDOW_DAYS", 14) as i32;
-    // A window of 0 (or negative) makes the feedback poll's "completed within the last N days" bound
-    // empty, silently disabling it. Clamp to 1 and say so (#216 review).
-    let within_days = if within_days < 1 {
+    // A window of 0 makes the feedback poll's "completed within the last N days" bound empty, silently
+    // disabling it. `reconciler_window_days` clamps to 1; say so here, once, rather than per request.
+    let configured_days = reconciler_env_u64("RECONCILER_WINDOW_DAYS", "POLLER_WINDOW_DAYS", 14);
+    if configured_days < 1 {
         tracing::warn!(
-            within_days,
+            configured_days,
             "RECONCILER_WINDOW_DAYS < 1 would disable the feedback poll; clamping to 1"
         );
-        1
-    } else {
-        within_days
-    };
+    }
+    let within_days = reconciler_window_days();
     queue::reconciler::run(pool, platforms, state.review.clone(), interval, within_days).await
 }
 
