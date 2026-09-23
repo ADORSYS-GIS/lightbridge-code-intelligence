@@ -473,27 +473,13 @@ fn verify_bitbucket_project_webhook_with_registry(
     repo.client.verify_webhook(headers, body)
 }
 
-/// Whether the platform router acts on `event`. Must list the same events as the `route_*_event`
-/// matches below; an event missing here is still routed, it just isn't stored with its payload.
+/// Whether a router acts on `event`, and therefore whether the delivery's payload is worth storing.
+/// Derived from the same `*_route` lookups the routers dispatch on, so the two cannot disagree.
 fn is_routed_event(platform: Platform, event: &str) -> bool {
     match platform {
-        Platform::GitHub => matches!(
-            event,
-            "pull_request"
-                | "push"
-                | "issue_comment"
-                | "installation"
-                | "installation_repositories"
-        ),
-        Platform::GitLab => matches!(event, "Merge Request Hook" | "Push Hook" | "Note Hook"),
-        Platform::Bitbucket => matches!(
-            event,
-            "pullrequest:created"
-                | "pullrequest:fulfilled"
-                | "pullrequest:rejected"
-                | "pullrequest:comment_created"
-                | "repo:push"
-        ),
+        Platform::GitHub => github_route(event).is_some(),
+        Platform::GitLab => gitlab_route(event).is_some(),
+        Platform::Bitbucket => bitbucket_route(event).is_some(),
     }
 }
 
@@ -511,21 +497,41 @@ fn is_routed_event(platform: Platform, event: &str) -> bool {
 ///
 /// Repos start **pending** and need admin approval before any review/index runs (Epic #75).
 /// Everything else is recorded in `webhook_deliveries` for dedup only, without its payload.
+enum GithubRoute {
+    PullRequest,
+    Push,
+    IssueComment,
+    Installation,
+    InstallationRepositories,
+}
+
+/// The single list of GitHub events this service acts on. `None` is "record it and stop".
+fn github_route(event: &str) -> Option<GithubRoute> {
+    match event {
+        "pull_request" => Some(GithubRoute::PullRequest),
+        "push" => Some(GithubRoute::Push),
+        "issue_comment" => Some(GithubRoute::IssueComment),
+        "installation" => Some(GithubRoute::Installation),
+        "installation_repositories" => Some(GithubRoute::InstallationRepositories),
+        _ => None,
+    }
+}
+
 async fn route_github_event(
     state: &AppState,
     event: &str,
     payload: &serde_json::Value,
     delivery_id: &str,
 ) {
-    match event {
-        "pull_request" => handle_pull_request(state, payload, delivery_id).await,
-        "push" => handle_push(state, payload, delivery_id).await,
-        "issue_comment" => handle_issue_comment(state, payload, delivery_id).await,
-        "installation" => handle_installation(state, payload, delivery_id).await,
-        "installation_repositories" => {
+    match github_route(event) {
+        Some(GithubRoute::PullRequest) => handle_pull_request(state, payload, delivery_id).await,
+        Some(GithubRoute::Push) => handle_push(state, payload, delivery_id).await,
+        Some(GithubRoute::IssueComment) => handle_issue_comment(state, payload, delivery_id).await,
+        Some(GithubRoute::Installation) => handle_installation(state, payload, delivery_id).await,
+        Some(GithubRoute::InstallationRepositories) => {
             handle_installation_repositories(state, payload, delivery_id).await
         }
-        _ => {}
+        None => {}
     }
 }
 
@@ -539,18 +545,36 @@ async fn route_github_event(
 ///
 /// GitLab has no installation events — repos are registered as pending via the admin console
 /// (manual approval, same as GitHub's approval gate Epic #75).
+enum GitlabRoute {
+    MergeRequest,
+    Push,
+    Note,
+}
+
+/// The single list of GitLab events this service acts on. `None` is "record it and stop".
+fn gitlab_route(event: &str) -> Option<GitlabRoute> {
+    match event {
+        "Merge Request Hook" => Some(GitlabRoute::MergeRequest),
+        "Push Hook" => Some(GitlabRoute::Push),
+        "Note Hook" => Some(GitlabRoute::Note),
+        _ => None,
+    }
+}
+
 async fn route_gitlab_event(
     state: &AppState,
     event: &str,
     payload: &serde_json::Value,
     delivery_id: &str,
 ) {
-    match event {
-        "Merge Request Hook" => handle_gitlab_merge_request(state, payload, delivery_id).await,
-        "Push Hook" => handle_gitlab_push(state, payload, delivery_id).await,
-        "Note Hook" => handle_gitlab_note(state, payload, delivery_id).await,
-        _ => {
-            tracing::debug!(%delivery_id, %event, "GitLab event type not handled; persisted only");
+    match gitlab_route(event) {
+        Some(GitlabRoute::MergeRequest) => {
+            handle_gitlab_merge_request(state, payload, delivery_id).await
+        }
+        Some(GitlabRoute::Push) => handle_gitlab_push(state, payload, delivery_id).await,
+        Some(GitlabRoute::Note) => handle_gitlab_note(state, payload, delivery_id).await,
+        None => {
+            tracing::debug!(%delivery_id, %event, "GitLab event type not handled; recorded only");
         }
     }
 }
@@ -566,22 +590,42 @@ async fn route_gitlab_event(
 ///
 /// Bitbucket has no installation events — repos are registered as pending via the admin console
 /// (manual approval, same as GitHub/GitLab's approval gate, Epic #75).
+enum BitbucketRoute {
+    PullRequest,
+    Push,
+    Comment,
+}
+
+/// The single list of Bitbucket events this service acts on. `None` is "record it and stop".
+fn bitbucket_route(event: &str) -> Option<BitbucketRoute> {
+    match event {
+        "pullrequest:created" | "pullrequest:fulfilled" | "pullrequest:rejected" => {
+            Some(BitbucketRoute::PullRequest)
+        }
+        "repo:push" => Some(BitbucketRoute::Push),
+        "pullrequest:comment_created" => Some(BitbucketRoute::Comment),
+        _ => None,
+    }
+}
+
 async fn route_bitbucket_event(
     state: &AppState,
     event: &str,
     payload: &serde_json::Value,
     delivery_id: &str,
 ) {
-    match event {
-        "pullrequest:created" | "pullrequest:fulfilled" | "pullrequest:rejected" => {
+    match bitbucket_route(event) {
+        // `handle_bitbucket_pullrequest` reads the event name itself to tell created from
+        // fulfilled/rejected.
+        Some(BitbucketRoute::PullRequest) => {
             handle_bitbucket_pullrequest(state, event, payload, delivery_id).await
         }
-        "repo:push" => handle_bitbucket_push(state, payload, delivery_id).await,
-        "pullrequest:comment_created" => {
+        Some(BitbucketRoute::Push) => handle_bitbucket_push(state, payload, delivery_id).await,
+        Some(BitbucketRoute::Comment) => {
             handle_bitbucket_comment(state, payload, delivery_id).await
         }
-        _ => {
-            tracing::debug!(%delivery_id, %event, "Bitbucket event type not handled; persisted only");
+        None => {
+            tracing::debug!(%delivery_id, %event, "Bitbucket event type not handled; recorded only");
         }
     }
 }
@@ -3597,6 +3641,8 @@ mod tests {
             .unwrap()
     }
 
+    /// Pins the routing tables' contents. `is_routed_event` reads those same tables, so this is a
+    /// statement about which events the service acts on, not a second copy of the list.
     #[test]
     fn is_routed_event_covers_each_platform_router() {
         for event in [
