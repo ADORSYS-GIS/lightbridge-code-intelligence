@@ -13,6 +13,8 @@ use neo4rs::{BoltType, Graph, query};
 use rmcp::schemars;
 use serde::Serialize;
 
+pub(crate) mod identity;
+
 /// One graph node submitted by the runner (from `lci-codegraph`).
 #[derive(Debug, Clone)]
 pub struct GraphNode {
@@ -483,31 +485,19 @@ pub async fn ensure_indexes(graph: &Graph, dimension: i64) -> anyhow::Result<()>
 
     // Every symbol read and write addresses a node by its full identity triple — the graph upsert's
     // MERGE, both endpoint MATCHes on each edge, `find_symbol`, `get_callers`, `symbol_embedding`,
-    // `prune_graph`, and the chunk-side embedding attach. A composite index applies when a query
-    // supplies all three with equality, which all of them do; without one each lookup scans every
-    // `:Symbol` in the database, so one repository's write cost grows with every other repository
-    // indexed.
-    //
-    // A uniqueness constraint rather than a bare index: it creates its own backing range index, it
-    // lets MERGE plan a unique-index seek, and the triple genuinely is unique — a second node
-    // sharing it would be a duplicate symbol.
-    //
-    // Creation is rejected outright if duplicate triples already exist, which `MERGE` on that same
-    // key should never produce. That is reported and stepped over rather than propagated: the
-    // indexes above are already in place by this point, and an absent identity index costs write
-    // latency, not correctness.
-    if let Err(error) = create_index_idempotent(
-        graph,
-        "CREATE CONSTRAINT symbol_identity IF NOT EXISTS \
-         FOR (s:Symbol) REQUIRE (s.repo_id, s.commit, s.node_id) IS UNIQUE",
-        "symbol_identity",
-    )
-    .await
-    {
-        tracing::warn!(
-            ?error,
-            "symbol identity constraint not created; symbol lookups will scan the label"
-        );
+    // and the chunk-side embedding attach. A composite index applies when a query supplies all three
+    // with equality, which all of them do; without one each lookup scans every `:Symbol` in the
+    // database. See `identity` for which of its two indexes serves the key and why.
+    match identity::declare(graph).await? {
+        identity::IdentityIndex::Constraint => {
+            tracing::info!("symbol identity served by its uniqueness constraint");
+        }
+        identity::IdentityIndex::LookupIndex => {
+            tracing::warn!(
+                "symbol identity served by a lookup index: duplicated symbols prevent the \
+                 uniqueness constraint; POST /admin/graph/symbol-identity/repair resolves them"
+            );
+        }
     }
     Ok(())
 }
