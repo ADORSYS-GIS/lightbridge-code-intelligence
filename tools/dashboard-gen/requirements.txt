@@ -1,3 +1,0 @@
-# Pinned so CI regenerates byte-identical dashboards. The version's epoch (N!) tracks the Grafana
-# schema the SDK targets (10.1.x here).
-grafana-foundation-sdk==1769699998!10.1.0
