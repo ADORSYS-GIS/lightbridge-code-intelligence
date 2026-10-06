@@ -9,9 +9,22 @@ open a PR to fix this file.
 > **Keeping this current is part of "done."** When a PR meaningfully ships, unblocks, or retires an item
 > here, update its status in the **same PR** (see [AGENTS.md](AGENTS.md)).
 
-_Last updated: 2026-09-21._
+_Last updated: 2026-09-23._
 
 ## Recently shipped
+
+- **`webhook_deliveries` stops growing, and stops being able to take the platform down with it** —
+  on 2026-08-29 the table's unbounded growth exhausted the shared CNPG cluster's volume: PostgreSQL
+  died with `PANIC: could not write to file`, taking authentication down with it — a 10 MB `app`
+  database killed by a 5,061 MB table, 84% `payload_json`. Deleting rows wasn't an option (`delivery_id`
+  is the redelivery dedup key; `tasks.webhook_delivery_id` and the MCP quota both read it back), so
+  two changes landed instead. **Ingest now skips the row entirely for the 94.4% of deliveries no
+  router acts on** (#661) — mostly CI noise (`workflow_job`/`check_run`/`workflow_run`/`check_suite`
+  alone are 86.7% of ingest). **What's still recorded has its payload blanked after a week** by a new
+  storage-GC sweep (#660), keeping the row for dedup/foreign-key integrity. Growth at the measured
+  40,100 deliveries/day drops from ~214 MB/day to near zero; reclaiming the space already allocated
+  is separate follow-up work (below).
+  ([ADR-0119](docs/adr/0119-webhook-delivery-payload-retention.md), #637, #660, #661)
 
 - **Structural graph writes are bounded, indexed and all-or-nothing** — the structural half of an
   index run used to leave the runner as one request whose size *and* duration both scaled with the
@@ -215,6 +228,16 @@ _Last updated: 2026-09-21._
   its native-only modules.
 - **A2A per-finding review streaming** — stream findings as they are confirmed at finalize.
   ([PR #458](https://github.com/vymalo/lightbridge-code-intelligence/pull/458) — open; no ADR yet)
+- **Reclaim the space `webhook_deliveries` already holds** — compaction stops the growth but does not
+  return the existing multi-GB to the volume; PostgreSQL only makes it reusable inside the table. The
+  rewrite that does holds an `ACCESS EXCLUSIVE` lock on the table the webhook receiver writes to, so
+  it is an operator-run Job with a runbook rather than a migration
+  ([ai-helm-values#449](https://github.com/ADORSYS-GIS/ai-helm-values/pull/449), ADR-0119 D6). Run it
+  once #660's backlog has drained and #661 has been live for the retention window, so the rewrite
+  copies as little live data — and holds the lock for as little time — as possible.
+- **Volume-fill alerting for the shared database** — nothing in the cluster alerts on a PVC filling;
+  the 2026-08-29 outage's first signal was the `PANIC`. Cheaper than any of the work above and not yet
+  tracked by an issue in this repo.
 
 ## Planned — open epics
 
