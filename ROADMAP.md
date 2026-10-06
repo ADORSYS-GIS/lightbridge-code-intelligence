@@ -210,6 +210,18 @@ _Last updated: 2026-09-23._
 
 ## In progress / near-term follow-ups
 
+- **An index snapshot is keyed by the commit it was taken from** — the runner reads
+  `git rev-parse HEAD` in the directory it walked and both halves of the index are stored under that one
+  value, replacing the `head_sha.unwrap_or(default_branch)` fallback that keyed every default-branch index
+  as `'main'`. A run records the commit from its first batch and an `index_snapshots` row, written in the
+  same transaction as the terminal status, makes it readable only once the run succeeds; retrieval pins to
+  the newest completed snapshot, with the previous `code_chunks` query kept as the fallback for repositories
+  indexed before this. Pruning is ADR-0052's and unchanged — it had nothing to prune while each repository
+  held a single key. Watch the volume on first deploy: a repository briefly holds two snapshots between a
+  run completing and the next sweep.
+  ([ADR-0120](docs/adr/0120-snapshot-keyed-by-indexed-commit.md) — Proposed,
+  [#672](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/pull/672), issue
+  [#669](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/669))
 - **Reviewer-feedback analytics for the LCI console** — a windowed `GET /api/v2/analytics/feedback`
   (`task:read`-gated, one repository or the whole estate) behind a new Feedback page and a
   per-repository Feedback tab in `apps/lci`.

@@ -2998,6 +2998,53 @@ async fn a_failed_run_does_not_become_readable(pool: PgPool) {
     assert_eq!(completed, 0, "nothing completed, nothing to pin to");
 }
 
+/// A run's commit is recorded from its first batch, so it is also evidence that something was written
+/// under that key. A run that submits nothing — an empty repository, a walk that produced no chunks or
+/// nodes — therefore marks no snapshot, and retrieval is never pinned to a commit with no rows.
+#[sqlx::test]
+async fn a_run_that_wrote_nothing_marks_no_snapshot(pool: PgPool) {
+    let repo_id = seed(&pool).await;
+    let first = create_index_task(&pool, repo_id, 99)
+        .await
+        .unwrap()
+        .unwrap();
+    upsert_code_chunks(&pool, repo_id, "sha-a", &[chunk_at("a.rs", 1, 0)])
+        .await
+        .unwrap();
+    record_indexed_commit(&pool, first, "sha-a").await.unwrap();
+    set_task_status(&pool, first, "succeeded", None)
+        .await
+        .unwrap();
+
+    // A second run succeeds without ever submitting a batch, so nothing recorded its commit.
+    let second = create_index_task(&pool, repo_id, 99)
+        .await
+        .unwrap()
+        .unwrap();
+    set_task_status(&pool, second, "succeeded", None)
+        .await
+        .unwrap();
+
+    let completed: Vec<String> =
+        sqlx::query_scalar("SELECT commit_sha FROM index_snapshots WHERE repository_id = $1")
+            .bind(repo_id)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        completed,
+        vec!["sha-a".to_string()],
+        "only the run that wrote something marked a snapshot"
+    );
+    assert_eq!(
+        latest_indexed_commit(&pool, repo_id)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("sha-a")
+    );
+}
+
 /// Index pruning (ADR-0052): the keep-set is the latest snapshot ∪ any commit an in-flight
 /// (non-terminal) task pins; `prune_code_chunks` drops everything else (past the recency grace),
 /// and an empty keep-set is a no-op so a live index is never wiped.
