@@ -24,7 +24,7 @@ _Last updated: 2026-09-23._
   from the event name alone, so a redelivered `check_run` is routed where the first one was — nowhere —
   and a row for it guarded against duplicate work that cannot happen, at ~180 bytes on the 94.4% of
   deliveries that are CI noise (measured 2026-09-17: `workflow_job`, `check_run`, `workflow_run` and
-  `check_suite` alone are 80% of ingest). **What is recorded is compacted after a week** (#660): a
+  `check_suite` alone are 86.7% of ingest). **What is recorded is compacted after a week** (#660): a
   fourth sweeper on the storage-GC tick the index, outbox and A2A sweeps already share replaces
   `payload_json` with `{}` past `dispatcher.webhook_payload_retention_days`, keeping every row, so
   dedup and the foreign key are untouched. The batch bound (`webhook_payload_sweep_batch`, 5,000/tick)
