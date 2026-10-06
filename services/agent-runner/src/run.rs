@@ -398,6 +398,12 @@ async fn perform_indexing(
     // One `lci-codegraph` walk produces both halves of the index from a single parse (ADR-0086):
     // the semantic chunks and the structural graph.
     let out = indexer::walk(checkout).await?;
+    // Nothing to store needs nothing to store it under. A repository with no commits has no HEAD to
+    // name a snapshot after, and asking for one would fail a run that has simply found nothing to do.
+    if out.chunks.is_empty() && out.graph.nodes.is_empty() {
+        tracing::info!("nothing to index (no chunks and no symbols)");
+        return Ok((0, "0 nodes / 0 edges".to_string()));
+    }
     // The commit both halves of the index are stored under, read from the tree they describe.
     let commit_sha = clone::head_commit(checkout).await?;
 

@@ -2998,6 +2998,47 @@ async fn a_failed_run_does_not_become_readable(pool: PgPool) {
     assert_eq!(completed, 0, "nothing completed, nothing to pin to");
 }
 
+/// A completion marker is only as good as the rows it names. Whatever removes a repository's chunks —
+/// a purge, a dimension-change `TRUNCATE`, a sweep — must not leave retrieval pinned to a commit that
+/// no longer has any, which is the "provably has chunks" promise `latest_indexed_commit` documents.
+#[sqlx::test]
+async fn a_completed_snapshot_stops_being_readable_once_its_chunks_are_gone(pool: PgPool) {
+    let repo_id = seed(&pool).await;
+    let task = create_index_task(&pool, repo_id, 99)
+        .await
+        .unwrap()
+        .unwrap();
+    upsert_code_chunks(&pool, repo_id, "sha-a", &[chunk_at("a.rs", 1, 0)])
+        .await
+        .unwrap();
+    record_indexed_commit(&pool, task, "sha-a").await.unwrap();
+    set_task_status(&pool, task, "succeeded", None)
+        .await
+        .unwrap();
+    assert_eq!(
+        latest_indexed_commit(&pool, repo_id)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("sha-a")
+    );
+
+    // The chunks go; the marker is still there, as it is after any wipe that predates this table.
+    delete_code_chunks_for_repo(&pool, repo_id).await.unwrap();
+    let markers: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM index_snapshots WHERE repository_id = $1")
+            .bind(repo_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(markers, 1, "the marker outlives the rows it names");
+    assert_eq!(
+        latest_indexed_commit(&pool, repo_id).await.unwrap(),
+        None,
+        "a snapshot with no chunks is not something to pin retrieval to"
+    );
+}
+
 /// A run's commit is recorded from its first batch, so it is also evidence that something was written
 /// under that key. A run that submits nothing — an empty repository, a walk that produced no chunks or
 /// nodes — therefore marks no snapshot, and retrieval is never pinned to a commit with no rows.

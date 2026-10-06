@@ -381,6 +381,29 @@ mod tests {
         assert_ne!(second, "main", "never the branch name");
     }
 
+    /// A repository with no commits has no HEAD to resolve. `perform_indexing` therefore returns before
+    /// asking for one when the walk produced nothing, so an empty repository is an index run with
+    /// nothing to do rather than a failed one.
+    #[tokio::test]
+    async fn head_commit_has_nothing_to_return_for_a_repo_with_no_commits() {
+        use std::process::Command;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(["init", "-q", "-b", "main"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            head_commit(dir).await.is_err(),
+            "an unborn HEAD has no commit to key a snapshot by"
+        );
+    }
+
     // Reproduces the vymalo#275 shape in a real local repo: the base branch advances past the PR's fork
     // point (another PR merged into base after this one branched). The fix must diff `head` against the
     // MERGE-BASE (showing only the PR's own change), never the base tip (which two-dots the base-only
