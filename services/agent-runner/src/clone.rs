@@ -219,6 +219,19 @@ async fn merge_base(dir: &Path, base: &str, head: &str, token: &str) -> Option<S
     (!sha.is_empty()).then_some(sha)
 }
 
+/// The commit a checkout is at.
+///
+/// What an index describes, and the key it is stored under: a branch name moves, so a snapshot named
+/// after one is a different tree each time it is written.
+pub async fn head_commit(dir: &Path) -> anyhow::Result<String> {
+    let out = git(dir, &["rev-parse", "HEAD"], "").await?;
+    let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if sha.is_empty() {
+        anyhow::bail!("git rev-parse HEAD returned nothing for {}", dir.display());
+    }
+    Ok(sha)
+}
+
 /// Run a `git` subcommand in `dir`, returning an error whose message has `token` redacted.
 async fn git(dir: &Path, args: &[&str], token: &str) -> anyhow::Result<Output> {
     let output = tokio::process::Command::new("git")
@@ -330,6 +343,42 @@ mod tests {
     #[test]
     fn scrub_is_a_noop_for_empty_token() {
         assert_eq!(scrub("nothing to hide", ""), "nothing to hide");
+    }
+
+    /// An index is stored under what `head_commit` returns, so it must be the commit the tree is at
+    /// — not the branch pointing at it, which moves.
+    #[tokio::test]
+    async fn head_commit_is_the_commit_the_checkout_is_at() {
+        use std::process::Command;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let git_run = |args: &[&str]| {
+            let ok = Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(["-c", "user.email=t@t.co", "-c", "user.name=t"])
+                .args(args)
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "git {args:?} failed");
+        };
+        git_run(&["init", "-q", "-b", "main"]);
+        std::fs::write(dir.join("a.txt"), "one").unwrap();
+        git_run(&["add", "."]);
+        git_run(&["commit", "-qm", "first"]);
+        let first = head_commit(dir).await.unwrap();
+
+        std::fs::write(dir.join("a.txt"), "two").unwrap();
+        git_run(&["commit", "-qam", "second"]);
+        let second = head_commit(dir).await.unwrap();
+
+        assert_eq!(first.len(), 40, "a full commit id: {first}");
+        assert_ne!(
+            first, second,
+            "a new commit on the same branch is a new key"
+        );
+        assert_ne!(second, "main", "never the branch name");
     }
 
     // Reproduces the vymalo#275 shape in a real local repo: the base branch advances past the PR's fork

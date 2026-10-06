@@ -21,10 +21,25 @@ pub async fn latest_indexed_commit(
     pool: &PgPool,
     repository_id: i64,
 ) -> Result<Option<String>, sqlx::Error> {
-    // `id DESC` tie-breaks when two snapshots share a `created_at` (coarse clock, or rows written in one
-    // transaction where `now()` is constant) — `id` is BIGSERIAL, so the most-recently-inserted snapshot
-    // wins deterministically. Backed by the `(repository_id, created_at DESC, id DESC)` index (migration
-    // 0018) so this is an index lookup, not a scan — it runs on every search/graph query via `task_scope`.
+    // A snapshot being written has no `index_snapshots` row, so retrieval stays on the last one that
+    // finished. Backed by `index_snapshots_latest_idx`, so this is an index lookup, not a scan — it runs
+    // on every search/graph query via `task_scope`.
+    let completed: Option<String> = sqlx::query_scalar(
+        "SELECT commit_sha FROM index_snapshots WHERE repository_id = $1 \
+         ORDER BY completed_at DESC LIMIT 1",
+    )
+    .bind(repository_id)
+    .fetch_optional(pool)
+    .await?;
+    if completed.is_some() {
+        return Ok(completed);
+    }
+
+    // Repositories indexed before snapshots were recorded have no such row, and their newest rows
+    // are the whole index. `id DESC` tie-breaks when two snapshots share a `created_at` (coarse clock, or
+    // rows written in one transaction where `now()` is constant) — `id` is BIGSERIAL, so the
+    // most-recently-inserted snapshot wins deterministically. Backed by the
+    // `(repository_id, created_at DESC, id DESC)` index (migration 0018).
     sqlx::query_scalar(
         "SELECT commit_sha FROM code_chunks WHERE repository_id = $1 \
          ORDER BY created_at DESC, id DESC LIMIT 1",
