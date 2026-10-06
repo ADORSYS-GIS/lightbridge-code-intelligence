@@ -715,6 +715,10 @@ pub async fn ingest_chunks(
         })
         .collect();
 
+    if let Err(error) = crate::db::record_indexed_commit(pool, id, &batch.commit_sha).await {
+        tracing::warn!(%error, task_id = %id, "recording the indexed commit failed");
+    }
+
     match crate::db::upsert_code_chunks(pool, repository_id, &batch.commit_sha, &chunks).await {
         Ok(count) => {
             tracing::info!(task_id = %id, chunk_count = count, "chunks ingested");
@@ -895,6 +899,10 @@ pub async fn ingest_graph(
             relation: e.relation,
         })
         .collect();
+
+    if let Err(error) = crate::db::record_indexed_commit(pool, id, &batch.commit_sha).await {
+        tracing::warn!(%error, task_id = %id, "recording the indexed commit failed");
+    }
 
     match crate::integrations::neo4j::upsert_graph(
         neo4j,

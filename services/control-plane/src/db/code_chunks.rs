@@ -21,10 +21,31 @@ pub async fn latest_indexed_commit(
     pool: &PgPool,
     repository_id: i64,
 ) -> Result<Option<String>, sqlx::Error> {
-    // `id DESC` tie-breaks when two snapshots share a `created_at` (coarse clock, or rows written in one
-    // transaction where `now()` is constant) — `id` is BIGSERIAL, so the most-recently-inserted snapshot
-    // wins deterministically. Backed by the `(repository_id, created_at DESC, id DESC)` index (migration
-    // 0018) so this is an index lookup, not a scan — it runs on every search/graph query via `task_scope`.
+    // A snapshot being written has no `index_snapshots` row, so retrieval stays on the last one that
+    // finished. The `EXISTS` keeps the promise above — a commit that *provably has chunks* — for a
+    // completion marker whose rows are gone: a repository purge, a dimension-change `TRUNCATE`, or a
+    // sweep that collected an older snapshot. Both halves are index lookups: `index_snapshots_latest_idx`
+    // for the outer row, and `code_chunks`' own `(repository_id, commit_sha, …)` key for the check, so
+    // this stays cheap on a path every search and graph query takes via `task_scope`.
+    let completed: Option<String> = sqlx::query_scalar(
+        "SELECT s.commit_sha FROM index_snapshots s \
+         WHERE s.repository_id = $1 \
+           AND EXISTS (SELECT 1 FROM code_chunks c \
+                       WHERE c.repository_id = s.repository_id AND c.commit_sha = s.commit_sha) \
+         ORDER BY s.completed_at DESC LIMIT 1",
+    )
+    .bind(repository_id)
+    .fetch_optional(pool)
+    .await?;
+    if completed.is_some() {
+        return Ok(completed);
+    }
+
+    // Repositories indexed before snapshots were recorded have no such row, and their newest rows
+    // are the whole index. `id DESC` tie-breaks when two snapshots share a `created_at` (coarse clock, or
+    // rows written in one transaction where `now()` is constant) — `id` is BIGSERIAL, so the
+    // most-recently-inserted snapshot wins deterministically. Backed by the
+    // `(repository_id, created_at DESC, id DESC)` index (migration 0018).
     sqlx::query_scalar(
         "SELECT commit_sha FROM code_chunks WHERE repository_id = $1 \
          ORDER BY created_at DESC, id DESC LIMIT 1",
@@ -32,6 +53,21 @@ pub async fn latest_indexed_commit(
     .bind(repository_id)
     .fetch_optional(pool)
     .await
+}
+
+/// Forget that a repository has any completed snapshot — part of the data purge, alongside the
+/// `code_chunks` and `repo_index` deletes. A marker whose chunks are gone is already unreadable
+/// ([`latest_indexed_commit`] checks), so this keeps the table from carrying rows for a wiped
+/// repository rather than guarding a read.
+pub async fn delete_index_snapshots_for_repo(
+    pool: &PgPool,
+    repository_id: i64,
+) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query("DELETE FROM index_snapshots WHERE repository_id = $1")
+        .bind(repository_id)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected())
 }
 
 /// Delete a repository's semantic index (all `code_chunks` rows) — part of the data purge when a repo

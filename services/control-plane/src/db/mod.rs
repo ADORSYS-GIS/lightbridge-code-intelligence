@@ -127,6 +127,11 @@ pub async fn reconcile_embedding_dimension(
     sqlx::query("TRUNCATE TABLE code_chunks")
         .execute(&mut *tx)
         .await?;
+    // The snapshots those chunks were the content of go with them, so their completion markers go too,
+    // in the same transaction — no reader sees a marker for a commit whose rows are gone.
+    sqlx::query("TRUNCATE TABLE index_snapshots")
+        .execute(&mut *tx)
+        .await?;
     // `dimension` is an i64 from typed config (not user free-text), so formatting it into the DDL is
     // safe; the vector type width can't be a bind parameter.
     sqlx::query(sqlx::AssertSqlSafe(format!(

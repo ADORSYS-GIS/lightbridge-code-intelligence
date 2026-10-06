@@ -2903,6 +2903,189 @@ async fn latest_indexed_commit_returns_newest_snapshot(pool: PgPool) {
     );
 }
 
+/// Retrieval pins to a snapshot that finished writing: a run records the commit it is writing under,
+/// and that commit becomes readable only when the run succeeds. Until then the previous snapshot is
+/// what readers get, so a half-written index is never served.
+#[sqlx::test]
+async fn latest_indexed_commit_waits_for_the_run_to_complete(pool: PgPool) {
+    let repo_id = seed(&pool).await;
+    let first = create_index_task(&pool, repo_id, 99)
+        .await
+        .unwrap()
+        .unwrap();
+
+    upsert_code_chunks(&pool, repo_id, "sha-a", &[chunk_at("a.rs", 1, 0)])
+        .await
+        .unwrap();
+    record_indexed_commit(&pool, first, "sha-a").await.unwrap();
+
+    // Rows exist, the run has not finished: a repository with no completed snapshot still reads its
+    // newest rows, which is what repositories indexed before this existed depend on.
+    assert_eq!(
+        latest_indexed_commit(&pool, repo_id)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("sha-a")
+    );
+
+    set_task_status(&pool, first, "succeeded", None)
+        .await
+        .unwrap();
+    assert_eq!(
+        latest_indexed_commit(&pool, repo_id)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("sha-a"),
+        "the completed run's snapshot"
+    );
+
+    // A second run writes a new snapshot. Its rows are newer, but it has not completed.
+    let second = create_index_task(&pool, repo_id, 99)
+        .await
+        .unwrap()
+        .unwrap();
+    upsert_code_chunks(&pool, repo_id, "sha-b", &[chunk_at("b.rs", 1, 0)])
+        .await
+        .unwrap();
+    record_indexed_commit(&pool, second, "sha-b").await.unwrap();
+    assert_eq!(
+        latest_indexed_commit(&pool, repo_id)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("sha-a"),
+        "readers stay on the finished snapshot while the next one is being written"
+    );
+
+    set_task_status(&pool, second, "succeeded", None)
+        .await
+        .unwrap();
+    assert_eq!(
+        latest_indexed_commit(&pool, repo_id)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("sha-b"),
+        "and move once it completes"
+    );
+}
+
+/// A run that does not finish leaves no snapshot behind to read.
+#[sqlx::test]
+async fn a_failed_run_does_not_become_readable(pool: PgPool) {
+    let repo_id = seed(&pool).await;
+    let task = create_index_task(&pool, repo_id, 99)
+        .await
+        .unwrap()
+        .unwrap();
+
+    upsert_code_chunks(&pool, repo_id, "sha-a", &[chunk_at("a.rs", 1, 0)])
+        .await
+        .unwrap();
+    record_indexed_commit(&pool, task, "sha-a").await.unwrap();
+    set_task_status(&pool, task, "failed", Some("boom"))
+        .await
+        .unwrap();
+
+    let completed: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM index_snapshots WHERE repository_id = $1")
+            .bind(repo_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(completed, 0, "nothing completed, nothing to pin to");
+}
+
+/// A completion marker is only as good as the rows it names. Whatever removes a repository's chunks —
+/// a purge, a dimension-change `TRUNCATE`, a sweep — must not leave retrieval pinned to a commit that
+/// no longer has any, which is the "provably has chunks" promise `latest_indexed_commit` documents.
+#[sqlx::test]
+async fn a_completed_snapshot_stops_being_readable_once_its_chunks_are_gone(pool: PgPool) {
+    let repo_id = seed(&pool).await;
+    let task = create_index_task(&pool, repo_id, 99)
+        .await
+        .unwrap()
+        .unwrap();
+    upsert_code_chunks(&pool, repo_id, "sha-a", &[chunk_at("a.rs", 1, 0)])
+        .await
+        .unwrap();
+    record_indexed_commit(&pool, task, "sha-a").await.unwrap();
+    set_task_status(&pool, task, "succeeded", None)
+        .await
+        .unwrap();
+    assert_eq!(
+        latest_indexed_commit(&pool, repo_id)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("sha-a")
+    );
+
+    // The chunks go; the marker is still there, as it is after any wipe that predates this table.
+    delete_code_chunks_for_repo(&pool, repo_id).await.unwrap();
+    let markers: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM index_snapshots WHERE repository_id = $1")
+            .bind(repo_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(markers, 1, "the marker outlives the rows it names");
+    assert_eq!(
+        latest_indexed_commit(&pool, repo_id).await.unwrap(),
+        None,
+        "a snapshot with no chunks is not something to pin retrieval to"
+    );
+}
+
+/// A run's commit is recorded from its first batch, so it is also evidence that something was written
+/// under that key. A run that submits nothing — an empty repository, a walk that produced no chunks or
+/// nodes — therefore marks no snapshot, and retrieval is never pinned to a commit with no rows.
+#[sqlx::test]
+async fn a_run_that_wrote_nothing_marks_no_snapshot(pool: PgPool) {
+    let repo_id = seed(&pool).await;
+    let first = create_index_task(&pool, repo_id, 99)
+        .await
+        .unwrap()
+        .unwrap();
+    upsert_code_chunks(&pool, repo_id, "sha-a", &[chunk_at("a.rs", 1, 0)])
+        .await
+        .unwrap();
+    record_indexed_commit(&pool, first, "sha-a").await.unwrap();
+    set_task_status(&pool, first, "succeeded", None)
+        .await
+        .unwrap();
+
+    // A second run succeeds without ever submitting a batch, so nothing recorded its commit.
+    let second = create_index_task(&pool, repo_id, 99)
+        .await
+        .unwrap()
+        .unwrap();
+    set_task_status(&pool, second, "succeeded", None)
+        .await
+        .unwrap();
+
+    let completed: Vec<String> =
+        sqlx::query_scalar("SELECT commit_sha FROM index_snapshots WHERE repository_id = $1")
+            .bind(repo_id)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        completed,
+        vec!["sha-a".to_string()],
+        "only the run that wrote something marked a snapshot"
+    );
+    assert_eq!(
+        latest_indexed_commit(&pool, repo_id)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("sha-a")
+    );
+}
+
 /// Index pruning (ADR-0052): the keep-set is the latest snapshot ∪ any commit an in-flight
 /// (non-terminal) task pins; `prune_code_chunks` drops everything else (past the recency grace),
 /// and an empty keep-set is a no-op so a live index is never wiped.

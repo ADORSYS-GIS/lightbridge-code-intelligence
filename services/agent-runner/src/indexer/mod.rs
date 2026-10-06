@@ -58,16 +58,11 @@ pub async fn walk(checkout: &Path) -> anyhow::Result<IndexOutput> {
 /// structural graph first ([`graph::index_graph`]) so those symbols exist to be matched.
 pub async fn index_chunks(
     context: &TaskContext,
+    commit_sha: &str,
     out: &IndexOutput,
     client: &ControlPlaneClient,
     embedder: &EmbeddingsClient,
 ) -> anyhow::Result<usize> {
-    let commit_sha = context
-        .head_sha
-        .as_deref()
-        .unwrap_or(&context.default_branch)
-        .to_string();
-
     if out.chunks.is_empty() {
         tracing::info!("no chunks produced (empty or all-binary repo)");
         return Ok(0);
@@ -113,7 +108,7 @@ pub async fn index_chunks(
             .submit_chunks(
                 context.task_id,
                 ChunkBatch {
-                    commit_sha: commit_sha.clone(),
+                    commit_sha: commit_sha.to_string(),
                     chunks: payloads,
                 },
             )

@@ -398,13 +398,21 @@ async fn perform_indexing(
     // One `lci-codegraph` walk produces both halves of the index from a single parse (ADR-0086):
     // the semantic chunks and the structural graph.
     let out = indexer::walk(checkout).await?;
+    // Nothing to store needs nothing to store it under. A repository with no commits has no HEAD to
+    // name a snapshot after, and asking for one would fail a run that has simply found nothing to do.
+    if out.chunks.is_empty() && out.graph.nodes.is_empty() {
+        tracing::info!("nothing to index (no chunks and no symbols)");
+        return Ok((0, "0 nodes / 0 edges".to_string()));
+    }
+    // The commit both halves of the index are stored under, read from the tree they describe.
+    let commit_sha = clone::head_commit(checkout).await?;
 
     // ── Structural index: in-house lci-codegraph → Neo4j (epic #5, slice 3, ADR-0086) ─────
     // Submitted first so each `:Symbol` exists before `index_chunks` offers its vector (ADR-0116).
     // Best-effort: the graph store may be unconfigured (control plane returns 503). A graph failure
     // is logged, not fatal — the task still succeeds with the semantic index alone, and the symbols
     // that failed to land simply carry no vector.
-    let graph_result = indexer::graph::index_graph(context, &out, client).await;
+    let graph_result = indexer::graph::index_graph(context, &commit_sha, &out, client).await;
     let graph = match graph_result {
         Ok((nodes, edges)) => format!("{nodes} nodes / {edges} edges"),
         Err(error) => {
@@ -418,7 +426,7 @@ async fn perform_indexing(
     };
 
     // ── Semantic index: chunks → pgvector, and each linked chunk's vector → its `:Symbol` ──
-    let chunk_count = indexer::index_chunks(context, &out, client, embedder).await?;
+    let chunk_count = indexer::index_chunks(context, &commit_sha, &out, client, embedder).await?;
     Ok((chunk_count, graph))
 }
 

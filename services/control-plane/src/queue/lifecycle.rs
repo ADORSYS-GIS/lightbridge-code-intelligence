@@ -73,6 +73,11 @@ pub async fn purge_repository_data(
     let _ = crate::db::delete_repo_index_rows(pool, repository_id)
         .await
         .map_err(|error| tracing::warn!(%error, repository_id, "purge: delete repo_index failed"));
+    let _ = crate::db::delete_index_snapshots_for_repo(pool, repository_id)
+        .await
+        .map_err(
+            |error| tracing::warn!(%error, repository_id, "purge: delete index_snapshots failed"),
+        );
     tracing::info!(
         repository_id,
         cancelled_tasks = cancelled,

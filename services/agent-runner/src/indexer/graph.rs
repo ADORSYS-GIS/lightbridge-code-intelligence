@@ -35,15 +35,10 @@ pub fn graph_page_size() -> usize {
 /// with no structural facts.
 pub async fn index_graph(
     context: &TaskContext,
+    commit_sha: &str,
     out: &IndexOutput,
     client: &ControlPlaneClient,
 ) -> anyhow::Result<(usize, usize)> {
-    let commit_sha = context
-        .head_sha
-        .as_deref()
-        .unwrap_or(&context.default_branch)
-        .to_string();
-
     if out.graph.nodes.is_empty() {
         tracing::info!("codegraph produced no nodes; skipping graph submit");
         return Ok((0, 0));
@@ -74,7 +69,7 @@ pub async fn index_graph(
     let (n, e) = (nodes.len(), edges.len());
     let page_size = graph_page_size();
     if let Err(error) = client
-        .submit_graph_paged(context.task_id, &commit_sha, &nodes, &edges, page_size)
+        .submit_graph_paged(context.task_id, commit_sha, &nodes, &edges, page_size)
         .await
     {
         // Pages commit individually, so a sequence that stops partway leaves the ones that already

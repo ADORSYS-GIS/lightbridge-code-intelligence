@@ -768,6 +768,25 @@ async fn release_reviews_waiting_on_index(pool: &PgPool, index_task_id: Uuid) {
         .await;
 }
 
+/// Record the commit a run is writing its index under.
+///
+/// Called with the first batch of a run, so the snapshot it is building can be marked complete —
+/// and become readable — when that run succeeds.
+pub async fn record_indexed_commit(
+    pool: &PgPool,
+    id: Uuid,
+    commit_sha: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE tasks SET indexed_sha = $2 WHERE id = $1 AND indexed_sha IS DISTINCT FROM $2",
+    )
+    .bind(id)
+    .bind(commit_sha)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 pub async fn set_task_status(
     pool: &PgPool,
     id: Uuid,
@@ -800,6 +819,18 @@ pub async fn set_task_status(
     // non-A2A task). Atomic with the status flip above; a failure rolls back both, so the runner's
     // retry re-applies the transition and its event together.
     crate::a2a::events::append_transition_events(&mut tx, id, status).await?;
+    // A snapshot becomes readable when the run that wrote it succeeds, in the same transaction as
+    // that status: retrieval pins to completed snapshots, so a half-written one is never served.
+    if status == "succeeded" {
+        sqlx::query(
+            "INSERT INTO index_snapshots (repository_id, commit_sha) \
+             SELECT repository_id, indexed_sha FROM tasks WHERE id = $1 AND indexed_sha IS NOT NULL \
+             ON CONFLICT (repository_id, commit_sha) DO UPDATE SET completed_at = now()",
+        )
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    }
     tx.commit().await?;
     // ADR-0055: a completed index task releases the repo's reviews that were parked behind it. Kept
     // outside the transaction (unchanged behaviour) — it is an independent queue nudge, not part of the
