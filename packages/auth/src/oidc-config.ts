@@ -16,7 +16,7 @@ export interface OidcClientConfig {
   /**
    * Space-delimited scopes; defaults to `openid profile email`.
    *
-   * Silent renewal (`middleware.ts`) runs on a session-bound refresh token, whose
+   * Silent renewal (`apps/web/proxy.ts`) runs on a session-bound refresh token, whose
    * `refresh_expires_in` tracks the realm's SSO Session Idle and resets on every refresh.
    */
   scope: string;

@@ -1,5 +1,8 @@
-//! Code review — the native in-process agent (ADR-0026 + ADR-0037), now a thin **host** over the
-//! extracted `lci-review-agent` assembly (R1e).
+//! Code review — the native in-process agent (ADR-0026 + ADR-0037), a thin **host** over the
+//! extracted `lci-review-agent` assembly (R1e). Production review runs go through
+//! [`opencode::run_opencode_agent`] instead (ADR-0097 slice 5's hard cutover back to an OpenCode
+//! subprocess); [`run_native_agent`] stays in the tree for its test coverage of the shared
+//! gate/tool logic, not as a live request path.
 //!
 //! The runner maps its [`ReviewConfig`] onto the review-agent param structs, builds the model client
 //! (`lci_review_agent::model`), the seeded conversation (`lci_review_agent::prompt::build_messages`),
@@ -7,8 +10,7 @@
 //! drives [`lci_review_agent::flows::run_review`] over the current Kubernetes-Job runtime
 //! ([`Passthrough`]). The agent investigates with retrieval tools and **acts via mediated write tools**
 //! (`add_review_comment` / `add_comment` / `finish`); the control plane buffers those and flushes one
-//! grouped review on finalize (ADR-0037). The former OpenCode subprocess was removed in #140 — this is
-//! the only review path.
+//! grouped review on finalize (ADR-0037).
 //!
 //! Outcome model (#137): the run returns a [`ReviewOutcome`] — `Finished` (the model called `finish`),
 //! `Exhausted` (the turn budget ran out while findings may be buffered), or `Aborted(reason)` (the
