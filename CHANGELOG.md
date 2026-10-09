@@ -1,5 +1,37 @@
 # Changelog
 
+## [0.9.0](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/compare/v0.8.0...v0.9.0) (2026-10-09)
+
+
+### ⚠ BREAKING CHANGES
+
+* **control-plane:** record a webhook delivery only when a router acts on it ([#661](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/661))
+
+### Features
+
+* **codegraph:** bump the lci-codegraph pin to the latest main ([#650](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/650)) ([0a2edd4](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/commit/0a2edd496e27fb86f3c5fd21129c7512ed7131cd))
+* **control-plane:** ADR-0118 windowed reviewer-feedback analytics endpoint ([#649](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/649)) ([49ee422](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/commit/49ee422bcd2dcc589b5f80dc135108b90ffdf102))
+* **control-plane:** compact aged webhook payloads on the storage-GC (garbage collection) tick ([#660](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/660)) ([b7d425d](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/commit/b7d425db12693d1cbfa2f387af3a93d89dcd6735))
+* **control-plane:** record a webhook delivery only when a router acts on it ([#661](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/661)) ([0aa4ca5](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/commit/0aa4ca549682396eaba8c571f835a3ace5ac163c))
+* **graph:** index symbol identity in Neo4j, and submit the graph in pages ([#657](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/657)) ([5c936ab](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/commit/5c936ab258b85553357464c0627a30eb31d7e9d2))
+* **indexer:** key an index by the commit it was taken from ([#672](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/672)) ([7a6792f](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/commit/7a6792f3b3a8693618adc3615b7796152cf19c22))
+* **neo4j:** delete graph data in bounded transactions ([#663](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/663)) ([5bd8bdf](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/commit/5bd8bdf759873fe5548612cd6506ff03086f49c5))
+* **neo4j:** serialize writes to one graph snapshot ([#664](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/664)) ([4a854e8](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/commit/4a854e8976eeb799193f9fbc0e592bb6d02c7358))
+
+
+### Bug Fixes
+
+* **indexer:** one walk, and a symbol's vector rides its own chunk (ADR-0116) ([#655](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/655)) ([f3bd0df](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/commit/f3bd0df647c3e9db0f5195dccb8a429431cdd1d7)), closes [#654](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/654) [#652](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/652) [#651](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/651)
+
+
+### Documentation
+
+* **adr:** retire apps/web's deployment, console moves to apps/lci (ADR-0115) ([#645](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/645)) ([9327031](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/commit/93270319e59945d2fb9aed7b54651c256e891334))
+* **readme:** reflect the one-walk indexing architecture (ADR-0116) ([#676](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/676)) ([e1261f1](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/commit/e1261f121d8ff14f6d6142643f691bac528707c8))
+* record webhook_deliveries unbounded growth as P0 ([#638](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/638)) ([2054b46](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/commit/2054b465ac75cc98c67628d7f0a8ba381c6c5857))
+* **roadmap:** record the webhook_deliveries retention work ([#670](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/670)) ([896d7eb](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/commit/896d7eb19c0afc63d04ff530d1f49da3c4d62fb1))
+* **stale-refs:** fix three doc/comment claims that no longer match the code ([#675](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/issues/675)) ([2b90531](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/commit/2b90531b88fd9a61327f397a07bc938b6a8ae6d2))
+
 ## [0.8.0](https://github.com/ADORSYS-GIS/lightbridge-code-intelligence/compare/v0.7.0...v0.8.0) (2026-08-31)
 
 
