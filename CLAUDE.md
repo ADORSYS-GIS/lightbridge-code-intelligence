@@ -1,4 +1,4 @@
-This is **Lightbridge Code Intelligence**, a pnpm + Turborepo monorepo: `apps/web` (Next.js + better-auth), `packages/*` (shared TypeScript), and `services/control-plane` (a standalone Rust backend built on Axum and bound to cratestack), plus a Cargo `xtask`. See `docs/INDEX.md` and `docs/adr/` for architecture and decisions, and `CONTRIBUTING.md` for the contribution workflow.
+This is **Lightbridge Code Intelligence**, a pnpm + Turborepo monorepo: `apps/web` (Next.js, OIDC via `openid-client`+`jose` — undeployed; its console moved to `apps/lci` in `converse-frontends`, [ADR-0115](docs/adr/0115-retire-apps-web-move-console-to-lci-ui.md)), `packages/*` (shared TypeScript), and `services/control-plane` (a standalone Rust backend built on Axum and bound to cratestack), plus a Cargo `xtask`. See `docs/INDEX.md` and `docs/adr/` for architecture and decisions, and `CONTRIBUTING.md` for the contribution workflow.
 
 Note: your global user instructions still apply on top of this file.
 
