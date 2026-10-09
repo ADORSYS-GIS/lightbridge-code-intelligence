@@ -75,12 +75,6 @@ ignore.workspace = true
 # url strips userinfo/query credentials from the persisted base_url.
 base64.workspace = true
 url.workspace = true
-# Tree-sitter syntax-aware chunking (ADR-0010).
-tree-sitter.workspace = true
-tree-sitter-rust.workspace = true
-tree-sitter-javascript.workspace = true
-tree-sitter-typescript.workspace = true
-tree-sitter-python.workspace = true
 
 [dev-dependencies]
 lci-agent-testkit = { path = "../agent-testkit" }
