@@ -6,10 +6,11 @@
 //! relevant commit, runs the task, and reports a terminal status back. The control plane owns the
 //! trust boundary — it mints the token and validates findings + writes to GitHub (ADR-0002, ADR-0022).
 //!
-//! The lifecycle: clone → semantic index (tree-sitter → pgvector, slice 2) → structural index
-//! (in-house lci-codegraph → Neo4j, slice 3, ADR-0086) → review (the native agent loop, ADR-0026/0037, which acts via mediated
-//! write tools the control plane flushes) → report. Indexing is required; the structural graph and the
-//! review are best-effort and non-fatal.
+//! The lifecycle: clone → index (one lci-codegraph walk emits both the semantic chunks that feed
+//! pgvector, slice 2, and the structural nodes/edges that feed Neo4j, slice 3, ADR-0086/ADR-0116)
+//! → review (the native agent loop, ADR-0026/0037, which acts via mediated write tools the control
+//! plane flushes) → report. Indexing is required; the structural graph and the review are
+//! best-effort and non-fatal.
 //!
 //! This binary is the historical entrypoint. The orchestration now lives in [`agent_runner::run_once`]
 //! (the ADR-0085 `run-once` host), shared with the new `agent-plane` binary (`bin/agent_plane.rs`).

@@ -54,8 +54,7 @@ flowchart TD
 
     subgraph job["Kubernetes Job (ephemeral, per task)"]
         RUNNER["agent-runner<br/>clone · index · review"]
-        TS["tree-sitter chunker"]
-        GFY["lci-codegraph<br/>(in-process, tree-sitter)"]
+        GFY["lci-codegraph<br/>one walk → chunks + graph<br/>(in-process, tree-sitter)"]
         AGENT["native review agent<br/>(in-process, ADR-0026/0037)<br/>SAST + LLM over mediated tools"]
     end
 
@@ -69,10 +68,9 @@ flowchart TD
     Q -->|"claim (SKIP LOCKED)"| DISP
     DISP -->|"one Job per task"| RUNNER
     SERVE <-->|"context · token · status · chunks · tool calls"| RUNNER
-    RUNNER --> TS
     RUNNER --> GFY
     RUNNER --> AGENT
-    TS -->|embeddings| EAIG
+    GFY -->|chunks| EAIG
     EAIG --> VEC
     GFY --> NEO
     SERVE -. "retrieval (mediated)" .-> VEC
@@ -96,11 +94,13 @@ and [docs/INDEX.md](docs/INDEX.md) for the full picture.
 
 ## Why two indexes? (semantic chunks **and** a structural graph)
 
-This is the most common point of confusion, so it's worth being explicit: the two index passes are
-**not** doing the same job twice. Both are driven from **one tree-sitter parse of the checkout** — the
-semantic **chunker** and the in-house **lci-codegraph** structural extractor — and they feed **two
-different stores that answer two different kinds of question** — the dual-retrieval design
-([ADR-0003](docs/adr/0003-dual-retrieval-neo4j-pgvector.md),
+This is the most common point of confusion, so it's worth being explicit: the two stores are **not**
+doing the same job twice. Both come out of **one walk of the checkout**
+([ADR-0116](docs/adr/0116-one-walk-node-id-symbol-embeddings.md)) — the in-house **lci-codegraph**
+crate parses each file once and emits, from that single parse, the semantic chunks *and* the
+structural nodes/edges, recording on each chunk the `node_id` of the definition it's the body of —
+feeding **two different stores that answer two different kinds of question** — the dual-retrieval
+design ([ADR-0003](docs/adr/0003-dual-retrieval-neo4j-pgvector.md),
 [ADR-0010](docs/adr/0010-graphify-treesitter-indexing-baseline.md), superseded for the graph half by
 [ADR-0086](docs/adr/0086-in-house-code-graph-crate.md)). A good code review needs both kinds of recall,
 and no single store does both well.
@@ -109,28 +109,30 @@ and no single store does both well.
 flowchart LR
     SRC["Repo checkout<br/>(one clone, in the runner)"]
 
-    SRC --> TS["tree-sitter chunker<br/>splits into semantic units"]
-    SRC --> GFY["lci-codegraph<br/>extracts symbols + relationships<br/>(in-process, tree-sitter)"]
+    SRC --> GFY["lci-codegraph<br/>one walk: chunks + symbols/edges<br/>(in-process, tree-sitter)"]
 
-    TS --> VEC[("pgvector<br/>embedding per chunk")]
-    GFY --> NEO[("Neo4j<br/>typed graph")]
+    GFY -->|"nodes/edges<br/>(structure only)"| NEO[("Neo4j<br/>typed graph")]
+    GFY -->|"chunks, each carrying<br/>node_id when it's a<br/>definition's body"| EMB["Embeddings client"]
+    EMB -->|"vector + node_id"| VEC[("pgvector<br/>embedding per chunk")]
+    EMB -. "same vector, attached to<br/>the matching :Symbol" .-> NEO
 
     VEC --> QS["Semantic question:<br/>'where is similar behaviour?'"]
     NEO --> QG["Structural question:<br/>'what calls this? PR impact?'"]
 ```
 
-| | **tree-sitter chunker → pgvector** | **lci-codegraph → Neo4j** |
+| | **chunks → pgvector (+ matching `:Symbol`)** | **nodes/edges → Neo4j** |
 |---|---|---|
 | Kind of recall | **Semantic** (vector similarity) | **Structural** (graph traversal) |
 | Question it answers | "where is similar code / behaviour?", natural-language search | "what calls this function?", "what does this PR touch?", containment, test ownership |
-| What it emits | embedding-sized chunks with stable source ranges | nodes (symbols, files) + edges (contains, method, calls) |
-| Why this tool | purpose-built, lightweight, in-process Rust we control; chunk boundaries are a *chunking* concern | in-house Rust crate over the same tree-sitter parse — no Python subprocess, no separate image ([ADR-0086](docs/adr/0086-in-house-code-graph-crate.md)) |
+| What it emits | embedding-sized chunks, each optionally carrying the `node_id` of the definition it's the body of | nodes (symbols, files) + edges (contains, method, calls) |
+| Why this shape | one parse emits both directly — no separate chunker, no line-range guess linking them ([ADR-0116](docs/adr/0116-one-walk-node-id-symbol-embeddings.md)) | same in-house crate, same parse — no Python subprocess, no separate image ([ADR-0086](docs/adr/0086-in-house-code-graph-crate.md)) |
 | Can the other store answer it? | ❌ a graph can't rank by semantic similarity | ❌ vector search can't enumerate exact callers |
 | Status | ✅ built (slice 2) | ✅ built (slice 3; in-house crate, ADR-0086) |
 
-Both run in the **same runner Job over the same checkout** — one indexes for *fuzzy* retrieval, the
-other for *exact* retrieval. The reasoning agent (slice 5) then queries each store via MCP for the
-question it's best at.
+Both come out of the **same walk, in the same runner Job** — one indexes for *fuzzy* retrieval, the
+other for *exact* retrieval, and a chunk that is a definition's body links the two via `node_id`
+([ADR-0114](docs/adr/0114-hybrid-graph-vector-symbol-search.md)). The reasoning agent (slice 5) then
+queries each store via MCP for the question it's best at.
 
 ---
 
