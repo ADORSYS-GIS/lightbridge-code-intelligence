@@ -8,8 +8,9 @@
 //! - [`bootstrap`] — load config ([`config`](bootstrap::config)); the shared `lci-agent-clients`
 //!   crate talks to the control plane and is the only thing holding the runner bearer.
 //! - [`clone`] — checkout the repo at the head SHA using the borrowed install token.
-//! - [`indexer`] — tree-sitter chunking + structural-graph extraction, with the shared embeddings
-//!   client (OpenAI-compatible vectors → control plane) feeding the semantic index.
+//! - [`indexer`] — one `lci-codegraph` walk emitting both semantic chunks and the structural graph
+//!   (ADR-0116), with the shared embeddings client (OpenAI-compatible vectors → control plane)
+//!   feeding the semantic index.
 //! - [`review`] — the native review agent loop (ADR-0026/0037): it investigates with retrieval tools
 //!   and acts via mediated write tools the control plane flushes as one grouped review. SAST
 //!   (`lci-agent-sast`, ADR-0061) is one such tool (`run_sast`, ADR-0073) — opengrep runs only when the
