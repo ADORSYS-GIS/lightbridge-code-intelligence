@@ -161,6 +161,8 @@ pub async fn upsert_graph(
 /// symbol is not in the graph — because the structural submit failed, or the snapshot predates this
 /// commit — is dropped rather than creating a `:Symbol` carrying an embedding and nothing else.
 /// Returns the number of symbols updated, which is at most `rows.len()`.
+// Unused while the write in `http::internal` is commented out (#662).
+#[allow(dead_code)]
 pub async fn attach_symbol_embeddings(
     graph: &Graph,
     repository_id: i64,
@@ -442,7 +444,7 @@ pub async fn ensure_snapshot_write_lock(graph: &Graph) -> anyhow::Result<()> {
 /// `embeddings.dimension` is unset) — the same value `reconcile_embedding_dimension` uses for the
 /// pgvector column. Cypher schema DDL can't be parameterized, so the value is interpolated directly,
 /// which is safe here since it comes from trusted server-side config, never request input.
-pub async fn ensure_indexes(graph: &Graph, dimension: i64) -> anyhow::Result<()> {
+pub async fn ensure_indexes(graph: &Graph, _dimension: i64) -> anyhow::Result<()> {
     if let Err(error) = ensure_snapshot_write_lock(graph).await {
         tracing::error!(
             error = %format!("{error:#}"),
@@ -450,19 +452,21 @@ pub async fn ensure_indexes(graph: &Graph, dimension: i64) -> anyhow::Result<()>
         );
     }
 
-    create_index_idempotent(
-        graph,
-        &format!(
-            "CREATE VECTOR INDEX symbol_embedding_idx IF NOT EXISTS \
-             FOR (s:Symbol) ON s.embedding \
-             OPTIONS {{ indexConfig: {{ \
-               `vector.dimensions`: {dimension}, \
-               `vector.similarity_function`: 'cosine' \
-             }}}}"
-        ),
-        "symbol_embedding_idx",
-    )
-    .await?;
+    // TEMPORARILY DISABLED (#662). Recreated on every restart, this is why a manual DROP INDEX
+    // never held.
+    // create_index_idempotent(
+    //     graph,
+    //     &format!(
+    //         "CREATE VECTOR INDEX symbol_embedding_idx IF NOT EXISTS \
+    //          FOR (s:Symbol) ON s.embedding \
+    //          OPTIONS {{ indexConfig: {{ \
+    //            `vector.dimensions`: {dimension}, \
+    //            `vector.similarity_function`: 'cosine' \
+    //          }}}}"
+    //     ),
+    //     "symbol_embedding_idx",
+    // )
+    // .await?;
     create_index_idempotent(
         graph,
         "CREATE FULLTEXT INDEX symbol_label_fulltext IF NOT EXISTS \
@@ -538,8 +542,8 @@ async fn create_index_idempotent(graph: &Graph, ddl: &str, name: &str) -> anyhow
 /// `source_k` bounds how many candidates each branch contributes before fusion; `final_k` bounds the
 /// fused result. `RRF_CONSTANT = 60.0` is Neo4j's documented default.
 ///
-/// Uses the `db.index.vector.queryNodes()` procedure form rather than the newer
-/// `SEARCH ... IN (VECTOR INDEX...)` clause syntax.
+/// TEMPORARILY LEXICAL-ONLY (#662): the vector branch is removed while `symbol_embedding_idx` is
+/// not created, so a missing index degrades the result instead of failing the query.
 pub async fn hybrid_symbol_search(
     graph: &Graph,
     repository_id: i64,
@@ -557,13 +561,6 @@ pub async fn hybrid_symbol_search(
             query(
                 "CALL () { \
                    CALL db.index.fulltext.queryNodes('symbol_label_fulltext', $query, {limit: $sourceK}) \
-                   YIELD node AS s \
-                   WHERE s.repo_id = $repo AND s.commit = $commit \
-                   WITH collect(s) AS hits \
-                   UNWIND CASE WHEN size(hits) = 0 THEN [] ELSE range(0, size(hits) - 1) END AS rankIndex \
-                   RETURN hits[rankIndex] AS s, rankIndex + 1 AS sourceRank \
-                   UNION ALL \
-                   CALL db.index.vector.queryNodes('symbol_embedding_idx', $sourceK, $queryVector) \
                    YIELD node AS s \
                    WHERE s.repo_id = $repo AND s.commit = $commit \
                    WITH collect(s) AS hits \
