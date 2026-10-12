@@ -1,0 +1,10 @@
+ apps/web/app/dashboard/repositories/page.tsx        |  4 [32m++[m[31m--[m
+ apps/web/app/dashboard/runs/[id]/page.tsx           |  5 [32m+++[m[31m--[m
+ apps/web/components/repos/repo-list.tsx             | 11 [32m++++++[m[31m-----[m
+ apps/web/lib/domain/repos.ts                        | 12 [32m+++++++++[m[31m---[m
+ apps/web/lib/domain/tasks.ts                        | 33 [32m+++++++++++++++++++++++[m[31m----------[m
+ apps/web/lib/utils/config.ts                        | 11 [32m+++++++++++[m
+ services/control-plane/src/db/tasks.rs              |  9 [32m+++++++[m[31m--[m
+ services/control-plane/src/db/tests.rs              | 29 [32m+++++++++++++++++++++++++++++[m
+ services/control-plane/src/integrations/platform.rs |  1 [32m+[m
+ 9 files changed, 91 insertions(+), 24 deletions(-)

@@ -161,6 +161,10 @@ pub async fn upsert_graph(
 /// symbol is not in the graph — because the structural submit failed, or the snapshot predates this
 /// commit — is dropped rather than creating a `:Symbol` carrying an embedding and nothing else.
 /// Returns the number of symbols updated, which is at most `rows.len()`.
+// TEMPORARILY UNUSED: its only non-test caller is commented out in `http::internal` while the
+// `:Symbol` vector write is disabled. Kept intact, and still exercised by the live tests below, so
+// re-enabling is a matter of uncommenting that call rather than rewriting this.
+#[allow(dead_code)]
 pub async fn attach_symbol_embeddings(
     graph: &Graph,
     repository_id: i64,
@@ -442,7 +446,7 @@ pub async fn ensure_snapshot_write_lock(graph: &Graph) -> anyhow::Result<()> {
 /// `embeddings.dimension` is unset) — the same value `reconcile_embedding_dimension` uses for the
 /// pgvector column. Cypher schema DDL can't be parameterized, so the value is interpolated directly,
 /// which is safe here since it comes from trusted server-side config, never request input.
-pub async fn ensure_indexes(graph: &Graph, dimension: i64) -> anyhow::Result<()> {
+pub async fn ensure_indexes(graph: &Graph, _dimension: i64) -> anyhow::Result<()> {
     if let Err(error) = ensure_snapshot_write_lock(graph).await {
         tracing::error!(
             error = %format!("{error:#}"),
@@ -450,19 +454,26 @@ pub async fn ensure_indexes(graph: &Graph, dimension: i64) -> anyhow::Result<()>
         );
     }
 
-    create_index_idempotent(
-        graph,
-        &format!(
-            "CREATE VECTOR INDEX symbol_embedding_idx IF NOT EXISTS \
-             FOR (s:Symbol) ON s.embedding \
-             OPTIONS {{ indexConfig: {{ \
-               `vector.dimensions`: {dimension}, \
-               `vector.similarity_function`: 'cosine' \
-             }}}}"
-        ),
-        "symbol_embedding_idx",
-    )
-    .await?;
+    // TEMPORARILY DISABLED — `symbol_embedding_idx` is no longer created at startup, in lockstep
+    // with the `:Symbol` vector write in `http::internal` (see the commented block there for why).
+    //
+    // `IF NOT EXISTS` is why a manual `DROP INDEX` never held: any restart recreated the index and
+    // repopulated it from the stored properties. Leaving this commented is what makes the drop
+    // durable. `_dimension` stays in the signature so callers are untouched.
+    //
+    // create_index_idempotent(
+    //     graph,
+    //     &format!(
+    //         "CREATE VECTOR INDEX symbol_embedding_idx IF NOT EXISTS \
+    //          FOR (s:Symbol) ON s.embedding \
+    //          OPTIONS {{ indexConfig: {{ \
+    //            `vector.dimensions`: {dimension}, \
+    //            `vector.similarity_function`: 'cosine' \
+    //          }}}}"
+    //     ),
+    //     "symbol_embedding_idx",
+    // )
+    // .await?;
     create_index_idempotent(
         graph,
         "CREATE FULLTEXT INDEX symbol_label_fulltext IF NOT EXISTS \

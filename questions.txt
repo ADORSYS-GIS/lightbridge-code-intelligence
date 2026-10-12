@@ -1,0 +1,27 @@
+F banner
+How is the inline comments made
+
+POST /internal/tasks/{id}/review/finalize — flush the accumulated buffer as one grouped review (ADR-0037). outcome is how the run ended (finished / exhausted / aborted, ADR-0068): the control plane suppresses the post and reacts 👍 ONLY on an explicitly clean finished with zero findings — an aborted/exhausted run's honest note must still post, never masquerade as a clean pass.
+
+RAG
+
+
+
+- **Estimate** the conversation's token cost each turn with a cheap, conservative heuristic
+  (`chars / 4` over the serialized messages + tool defs, plus a small per-message overhead). The
+  gateway model isn't OpenAI-tokenized, so an exact tokenizer would be false precision and a heavy
+  dependency; a conservative over-estimate with headroom is the right tool.
+
+  investigation
+  tools
+
+
+  Trim consumed tool output.
+
+   This reclaims the bulk (file/search bodies
+  the agent has already reasoned over) while leaving the system prompt, the diff, the recorded-finding
+  trail, and recent turns intact — enough headroom for the agent to emit its final verdict.
+
+opencode
+
+mcp

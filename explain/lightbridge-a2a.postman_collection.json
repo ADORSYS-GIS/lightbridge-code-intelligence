@@ -1,0 +1,369 @@
+{
+  "info": {
+    "name": "Lightbridge A2A",
+    "description": "Test the A2A (Agent2Agent v1.0.1) surface of lightbridge-code-intelligence on hetzner-prod. See a2a-report.md for the full write-up. Mirrors docs/a2a-review-skill.md in the lightbridge-code-intelligence repo.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    { "key": "keycloak_base", "value": "https://auth.verif.fyi" },
+    { "key": "realm", "value": "camer-digital" },
+    { "key": "client_id", "value": "" },
+    { "key": "client_secret", "value": "" },
+    { "key": "a2a_base", "value": "https://code-intelligence-api.ai.camer.digital/a2a" },
+    { "key": "access_token", "value": "" },
+    { "key": "task_id", "value": "" }
+  ],
+  "item": [
+    {
+      "name": "0 - Discovery",
+      "item": [
+        {
+          "name": "Get Agent Card (public, no auth)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": { "raw": "{{a2a_base}}/.well-known/agent-card.json", "host": ["{{a2a_base}}"], "path": [".well-known", "agent-card.json"] }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('status is 200', () => pm.response.to.have.status(200));",
+                  "const body = pm.response.json();",
+                  "pm.test('review skill advertised', () => pm.expect(body.skills.map(s => s.id)).to.include('review'));",
+                  "pm.test('OIDC scheme present', () => pm.expect(body.securitySchemes).to.have.property('keycloak-oidc'));"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "1 - Auth",
+      "item": [
+        {
+          "name": "Get Token (client_credentials)",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/x-www-form-urlencoded" }],
+            "body": {
+              "mode": "urlencoded",
+              "urlencoded": [
+                { "key": "grant_type", "value": "client_credentials" },
+                { "key": "client_id", "value": "{{client_id}}" },
+                { "key": "client_secret", "value": "{{client_secret}}" },
+                { "key": "scope", "value": "code-intelligence" }
+              ]
+            },
+            "url": {
+              "raw": "{{keycloak_base}}/realms/{{realm}}/protocol/openid-connect/token",
+              "host": ["{{keycloak_base}}"],
+              "path": ["realms", "{{realm}}", "protocol", "openid-connect", "token"]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('status is 200', () => pm.response.to.have.status(200));",
+                  "const body = pm.response.json();",
+                  "pm.test('got access_token', () => pm.expect(body.access_token).to.be.a('string'));",
+                  "if (body.access_token) { pm.collectionVariables.set('access_token', body.access_token); }",
+                  "// Decode the JWT payload (no signature check) so you can eyeball aud + permissions.",
+                  "try {",
+                  "  const parts = body.access_token.split('.');",
+                  "  const payload = JSON.parse(atob(parts[1].replace(/-/g,'+').replace(/_/g,'/')));",
+                  "  console.log('token aud:', payload.aud, 'permissions:', payload.permissions);",
+                  "  pm.test('aud includes code-intelligence', () => pm.expect(JSON.stringify(payload.aud)).to.include('code-intelligence'));",
+                  "} catch (e) { console.log('could not decode token payload', e); }"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "2 - Review skill (JSON-RPC)",
+      "item": [
+        {
+          "name": "SendMessage",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{access_token}}" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": \"req-1\",\n  \"method\": \"SendMessage\",\n  \"params\": {\n    \"message\": {\n      \"messageId\": \"{{$guid}}\",\n      \"role\": \"ROLE_USER\",\n      \"parts\": [\n        { \"data\": {\n            \"skill\": \"review\",\n            \"forge\": \"github\",\n            \"repo\": \"acme/api\",\n            \"pr\": \"164\",\n            \"headSha\": \"9f2a1c4e8b7d6053a1f4c2e9b8d70a5c3e1f2b6d\",\n            \"baseSha\": \"1b0dd7a4c9e2f6538a0c4b1e9d7f2a5c3e8b6d04\",\n            \"prompt\": \"Focus on the auth changes and the new migration.\"\n        } }\n      ]\n    }\n  }\n}"
+            },
+            "url": { "raw": "{{a2a_base}}/", "host": ["{{a2a_base}}"], "path": [""] }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "const body = pm.response.json();",
+                  "const task = (body.result && body.result.task) || body.task;",
+                  "if (task) {",
+                  "  pm.collectionVariables.set('task_id', task.id);",
+                  "  pm.test('status is SUBMITTED or REJECTED', () => pm.expect(['TASK_STATE_SUBMITTED','TASK_STATE_REJECTED']).to.include(task.status.state));",
+                  "  console.log('task.id =', task.id, 'state =', task.status.state);",
+                  "} else {",
+                  "  console.log('no task in response - check for a JSON-RPC error object', JSON.stringify(body));",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ]
+        },
+        {
+          "name": "GetTask",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{access_token}}" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{ \"jsonrpc\": \"2.0\", \"id\": 2, \"method\": \"GetTask\", \"params\": { \"id\": \"{{task_id}}\" } }"
+            },
+            "url": { "raw": "{{a2a_base}}/", "host": ["{{a2a_base}}"], "path": [""] }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "const body = pm.response.json();",
+                  "const task = (body.result && body.result.task) || body.task;",
+                  "if (task) console.log('state =', task.status.state, '| artifacts:', JSON.stringify(task.artifacts || []).slice(0,300));"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ]
+        },
+        {
+          "name": "CancelTask",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{access_token}}" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{ \"jsonrpc\": \"2.0\", \"id\": 3, \"method\": \"CancelTask\", \"params\": { \"id\": \"{{task_id}}\" } }"
+            },
+            "url": { "raw": "{{a2a_base}}/", "host": ["{{a2a_base}}"], "path": [""] }
+          }
+        }
+      ]
+    },
+    {
+      "name": "3 - Review skill (REST)",
+      "item": [
+        {
+          "name": "POST message:send",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{access_token}}" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{ \"message\": { \"messageId\": \"{{$guid}}\", \"role\": \"ROLE_USER\", \"parts\": [ { \"data\": { \"skill\": \"review\", \"repo\": \"acme/api\", \"pr\": \"164\", \"headSha\": \"9f2a1c4e8b7d6053a1f4c2e9b8d70a5c3e1f2b6d\" } } ] } }"
+            },
+            "url": { "raw": "{{a2a_base}}/message:send", "host": ["{{a2a_base}}"], "path": ["message:send"] }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "const body = pm.response.json();",
+                  "if (body.task) { pm.collectionVariables.set('task_id', body.task.id); console.log('task.id =', body.task.id); }"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ]
+        },
+        {
+          "name": "GET tasks/{id}",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Authorization", "value": "Bearer {{access_token}}" }],
+            "url": { "raw": "{{a2a_base}}/tasks/{{task_id}}", "host": ["{{a2a_base}}"], "path": ["tasks", "{{task_id}}"] }
+          }
+        },
+        {
+          "name": "POST tasks/{id}/cancel",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Authorization", "value": "Bearer {{access_token}}" }],
+            "url": { "raw": "{{a2a_base}}/tasks/{{task_id}}/cancel", "host": ["{{a2a_base}}"], "path": ["tasks", "{{task_id}}", "cancel"] }
+          }
+        }
+      ]
+    },
+    {
+      "name": "4 - Streaming (SSE)",
+      "item": [
+        {
+          "name": "POST message:stream",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{access_token}}" },
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Accept", "value": "text/event-stream" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{ \"message\": { \"messageId\": \"{{$guid}}\", \"role\": \"ROLE_USER\", \"parts\": [ { \"data\": { \"skill\": \"review\", \"repo\": \"acme/api\", \"pr\": \"164\", \"headSha\": \"9f2a1c4e8b7d6053a1f4c2e9b8d70a5c3e1f2b6d\" } } ] } }"
+            },
+            "url": { "raw": "{{a2a_base}}/message:stream", "host": ["{{a2a_base}}"], "path": ["message:stream"] },
+            "description": "Postman's SSE parsing varies by version. If frames don't split nicely in the response pane, run the equivalent `curl -N` from the report's section 8.5 instead."
+          }
+        },
+        {
+          "name": "POST tasks/{id}/subscribe",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{access_token}}" },
+              { "key": "Accept", "value": "text/event-stream" }
+            ],
+            "url": { "raw": "{{a2a_base}}/tasks/{{task_id}}/subscribe", "host": ["{{a2a_base}}"], "path": ["tasks", "{{task_id}}", "subscribe"] }
+          }
+        }
+      ]
+    },
+    {
+      "name": "5 - Push notifications",
+      "item": [
+        {
+          "name": "CreateTaskPushNotificationConfig",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{access_token}}" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{ \"taskId\": \"{{task_id}}\", \"url\": \"https://webhook.site/REPLACE-WITH-YOUR-BIN-ID\", \"token\": \"optional-shared-secret\" }"
+            },
+            "url": { "raw": "{{a2a_base}}/tasks/{{task_id}}/pushNotificationConfigs", "host": ["{{a2a_base}}"], "path": ["tasks", "{{task_id}}", "pushNotificationConfigs"] }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "const body = pm.response.json();",
+                  "console.log('push config:', JSON.stringify(body).slice(0,300));"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ]
+        },
+        {
+          "name": "ListTaskPushNotificationConfigs",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Authorization", "value": "Bearer {{access_token}}" }],
+            "url": { "raw": "{{a2a_base}}/tasks/{{task_id}}/pushNotificationConfigs", "host": ["{{a2a_base}}"], "path": ["tasks", "{{task_id}}", "pushNotificationConfigs"] }
+          }
+        }
+      ]
+    },
+    {
+      "name": "6 - Failure-mode checks",
+      "item": [
+        {
+          "name": "SendMessage with no Authorization (expect 401)",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{ \"jsonrpc\": \"2.0\", \"id\": \"noauth\", \"method\": \"SendMessage\", \"params\": { \"message\": { \"messageId\": \"{{$guid}}\", \"role\": \"ROLE_USER\", \"parts\": [ { \"data\": { \"skill\": \"review\", \"repo\": \"acme/api\", \"pr\": \"164\", \"headSha\": \"deadbeef\" } } ] } } }"
+            },
+            "url": { "raw": "{{a2a_base}}/", "host": ["{{a2a_base}}"], "path": [""] }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": { "exec": ["pm.test('401 without a token', () => pm.response.to.have.status(401));"], "type": "text/javascript" }
+            }
+          ]
+        },
+        {
+          "name": "SendMessage with garbage bearer (expect 401)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer not-a-real-token" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{ \"jsonrpc\": \"2.0\", \"id\": \"badauth\", \"method\": \"SendMessage\", \"params\": { \"message\": { \"messageId\": \"{{$guid}}\", \"role\": \"ROLE_USER\", \"parts\": [ { \"data\": { \"skill\": \"review\", \"repo\": \"acme/api\", \"pr\": \"164\", \"headSha\": \"deadbeef\" } } ] } } }"
+            },
+            "url": { "raw": "{{a2a_base}}/", "host": ["{{a2a_base}}"], "path": [""] }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": { "exec": ["pm.test('401 with a garbage token', () => pm.response.to.have.status(401));"], "type": "text/javascript" }
+            }
+          ]
+        },
+        {
+          "name": "SendMessage missing headSha (expect REJECTED task)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{access_token}}" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{ \"jsonrpc\": \"2.0\", \"id\": \"nohead\", \"method\": \"SendMessage\", \"params\": { \"message\": { \"messageId\": \"{{$guid}}\", \"role\": \"ROLE_USER\", \"parts\": [ { \"data\": { \"skill\": \"review\", \"repo\": \"acme/api\", \"pr\": \"164\" } } ] } } }"
+            },
+            "url": { "raw": "{{a2a_base}}/", "host": ["{{a2a_base}}"], "path": [""] }
+          }
+        },
+        {
+          "name": "SendMessage with role=user (expect INVALID_PARAMS)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{access_token}}" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{ \"jsonrpc\": \"2.0\", \"id\": \"badrole\", \"method\": \"SendMessage\", \"params\": { \"message\": { \"messageId\": \"{{$guid}}\", \"role\": \"user\", \"parts\": [ { \"data\": { \"skill\": \"review\", \"repo\": \"acme/api\", \"pr\": \"164\", \"headSha\": \"deadbeef\" } } ] } } }"
+            },
+            "url": { "raw": "{{a2a_base}}/", "host": ["{{a2a_base}}"], "path": [""] }
+          }
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,125 @@
+================================================================================
+FAILED REVIEW — outbox id: 3568
+task id:     52f23c6c-88e5-4c05-92e8-ffaf198ccb34
+platform:    gitlab
+repository:  adorsys/xs2a/qwac-assessor
+target:      pull_request (MR #206)
+time:        2026-07-30 09:35:06
+status:      FAILED (400 Bad Request from GitLab discussions API)
+================================================================================
+
+
+────────────────────────────────────────────────────────────────────────────────
+COMMENT 1 of 3
+────────────────────────────────────────────────────────────────────────────────
+File:     pom.xml
+Line:     687
+Priority: P1
+Category: correctness
+Title:    BouncyCastle jdk25on artifacts don't exist on Maven Central
+
+Body:
+The `jdk18on` suffix on BouncyCastle artifacts means "Java 1.8 **and later**" —
+`bcprov-jdk18on` / `bcpkix-jdk18on` already run perfectly on Java 25; there is
+no separate `jdk25on` artifact line. The Maven Central directory listing
+(`repo1.maven.org/maven2/org/bouncycastle/`) enumerates `bc-jdk14-bom`,
+`bc-jdk15to18-bom`, `bc-jdk18on-bom`, `bc-lts8on-bom` — no `jdk25on` directory
+— and BouncyCastle's own docs confirm the standard naming is
+`<module>-jdk18on-<version>`. Version 1.84 (the pinned version) is confirmed to
+ship only `jdk18on` artifacts. A search for "bcprov-jdk25on" / "bcpkix-jdk25on"
+returns zero results. If these artifacts cannot be resolved from Central, the
+build fails.
+
+Fix: revert both the property and the two dependency declarations back to
+`bcpkix-jdk18on` / `bcprov-jdk18on` (keep `${...version}` = 1.84 or bump to
+1.85).
+
+**Evidence:** pom.xml:160 `<bcpkix-jdk25on.version>1.84</bcpkix-jdk25on.version>`;
+pom.xml:687 `<artifactId>bcpkix-jdk25on</artifactId>`; pom.xml:693
+`<artifactId>bcprov-jdk25on</artifactId>`. Maven Central directory
+(repo1.maven.org/maven2/org/bouncycastle/) lists no jdk25on artifacts; BC docs
+confirm naming convention is -jdk18on (Java 8+). Version 1.84 confirmed to ship
+jdk18on only.
+
+
+────────────────────────────────────────────────────────────────────────────────
+COMMENT 2 of 3
+────────────────────────────────────────────────────────────────────────────────
+File:     proxy-server/pom.xml
+Line:     57
+Priority: P1
+Category: correctness
+Title:    Gateway route property prefix not updated for new starter
+
+Body:
+The new `spring-cloud-starter-gateway-server-webflux` (Spring Cloud 2025.1 /
+Gateway 5.x) remapped the route property namespace from
+`spring.cloud.gateway.routes[...]` to
+`spring.cloud.gateway.server.webflux.routes[...]` (confirmed by Spring Cloud
+Gateway docs:
+https://docs.spring.io/spring-cloud-gateway/reference/spring-cloud-gateway-server-webflux/configuration.html).
+
+The proxy-server's `src/main/resources/application.properties` still defines all
+9 production routes with the legacy prefix
+(`spring.cloud.gateway.routes[0].id = consents`, etc.). With the new starter,
+these properties are silently ignored — the proxy-server will register zero
+routes and forward nothing. The programmatic `RouteLocator` in
+`ApplicationProxyWireMockTest` still works (Java API is namespace-independent),
+so CI doesn't catch this.
+
+Fix: update every `spring.cloud.gateway.routes` key in `application.properties`
+to `spring.cloud.gateway.server.webflux.routes`.
+
+**Evidence:** proxy-server/pom.xml:57
+`<artifactId>spring-cloud-starter-gateway-server-webflux</artifactId>`;
+proxy-server/src/main/resources/application.properties uses
+`spring.cloud.gateway.routes[0].id = consents` (and [1]..[8]). Spring Cloud
+Gateway server-webflux docs show routes under
+`spring.cloud.gateway.server.webflux.routes`. SO answer: "route configuration
+for the reactive stack must now be defined under
+spring.cloud.gateway.server.webflux.routes".
+
+
+────────────────────────────────────────────────────────────────────────────────
+COMMENT 3 of 3
+────────────────────────────────────────────────────────────────────────────────
+File:     proxy-server/src/test/java/de/adorsys/psd2/qwac/proxy/ApplicationProxyTest.java
+Line:     22
+Priority: P2
+Category: quality
+Title:    Disabled test masks the route regression
+
+Body:
+This test — the integration test that verifies the proxy forwards requests
+(expecting "Connection refused" = route found, backend down) — is disabled with
+"Spring Cloud / Boot compatibility issues." It is exactly the test that would
+fail when the legacy `spring.cloud.gateway.routes` properties are silently
+ignored by the new gateway starter (see the pom.xml finding). Disabling it masks
+the route-registration regression.
+
+Re-enable it after fixing the property namespace; if other issues remain, file a
+separate issue rather than leaving a test permanently `@Disabled`.
+
+**Evidence:** ApplicationProxyTest.java line 22:
+`@org.junit.jupiter.api.Disabled("Disabled temporarily: Spring Cloud / Boot
+compatibility issues")` — test verifies proxy routing via WebTestClient expecting
+"Connection refused" error.
+
+
+================================================================================
+NOTE ON FAILURE
+================================================================================
+All 3 comments above were part of a single post_review call to:
+  POST /projects/adorsys%2Fxs2a%2Fqwac-assessor/merge_requests/206/discussions
+
+The call failed on COMMENT 1 (pom.xml:687) with HTTP 400 Bad Request.
+GitLab rejected it because line 687 is an unchanged context line
+(`<groupId>org.bouncycastle</groupId>`), not an added/changed diff line.
+The actual changed line is 688 (`<artifactId>bcpkix-jdk25on</artifactId>`).
+
+Comments 2 and 3 were never sent because the first error short-circuited the
+loop (Rust `?` operator on error_for_status()).
+
+Similarly, COMMENT 3 anchors to line 22 (an import statement in the new file),
+while the @Disabled annotation landed at line 27 in the post-diff file.
+================================================================================

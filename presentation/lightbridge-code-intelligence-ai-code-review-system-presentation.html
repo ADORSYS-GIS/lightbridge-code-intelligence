@@ -1,0 +1,1068 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Lightbridge Code Intelligence — System Presentation</title>
+
+  <style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500&display=swap');
+
+:root {
+  --bg: #f8fafc;
+  --surface: #ffffff;
+  --surface-hover: #f1f5f9;
+  --border: #e2e8f0;
+  --accent: #4f46e5;
+  --accent2: #0284c7;
+  --accent3: #7c3aed;
+  --gold: #d97706;
+  --green: #059669;
+  --red: #dc2626;
+  --text: #0f172a;
+  --text-muted: #475569;
+  --text-dim: #64748b;
+  --radius: 12px;
+  --radius-sm: 8px;
+  --shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05), 0 2px 4px -2px rgba(0, 0, 0, 0.05);
+}
+
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+html, body {
+  width: 100%; height: 100%;
+  overflow: hidden;
+  font-family: 'Inter', sans-serif;
+  background: var(--bg);
+  color: var(--text);
+}
+
+/* ── DECK ── */
+#deck { position: relative; z-index: 1; width: 100%; height: 100%; }
+
+.slide {
+  position: absolute; inset: 0;
+  display: flex; flex-direction: column;
+  justify-content: flex-start; align-items: center;
+  padding: 60px 80px 80px 80px; /* Normal padding, no side nav */
+  opacity: 0; pointer-events: none;
+  transform: translateX(40px);
+  transition: opacity 0.4s ease, transform 0.4s ease;
+  overflow-y: auto; /* Ensure long content can be scrolled */
+  overflow-x: hidden;
+}
+.slide.active {
+  opacity: 1; pointer-events: all;
+  transform: translateX(0);
+}
+.slide.exit {
+  opacity: 0; pointer-events: none;
+  transform: translateX(-40px);
+}
+
+/* ── NAV ── */
+#nav {
+  display: none !important;
+}
+.nav-btn {
+  background: none; border: none; cursor: pointer;
+  color: var(--text-muted);
+  width: 36px; height: 36px;
+  border-radius: 50%;
+  display: flex; align-items: center; justify-content: center;
+  transition: all 0.2s;
+  font-size: 18px;
+}
+.nav-btn:hover { background: var(--surface-hover); color: var(--text); }
+.nav-btn:disabled { opacity: 0.3; cursor: not-allowed; }
+#slide-counter { display: none; }
+.dots { display: flex; flex-direction: column; gap: 6px; }
+.dot {
+  width: 8px; height: 8px; border-radius: 50%;
+  background: #cbd5e1;
+  cursor: pointer;
+  transition: all 0.25s;
+}
+.dot.active { background: var(--accent); height: 20px; border-radius: 4px; }
+
+#progress-bar {
+  position: fixed; top: 0; left: 0; height: 4px; z-index: 200;
+  background: var(--accent);
+  transition: width 0.4s ease;
+}
+
+/* ── SLIDE NUMBER BADGE ── */
+.slide-badge {
+  position: fixed; top: 24px; right: 32px; z-index: 100;
+  font-size: 12px; color: var(--text-dim);
+  font-family: 'JetBrains Mono', monospace;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  padding: 4px 10px;
+  border-radius: 20px;
+}
+
+/* ── TYPOGRAPHY ── */
+.eyebrow {
+  font-size: 12px; font-weight: 700; letter-spacing: 0.15em;
+  text-transform: uppercase;
+  color: var(--accent);
+  margin-bottom: 12px;
+  display: flex; align-items: center; gap: 8px;
+  justify-content: center;
+}
+.eyebrow::before { content: ''; display: block; width: 24px; height: 2px; background: var(--accent); }
+
+h1.hero {
+  font-size: clamp(40px, 5vw, 64px);
+  font-weight: 800; line-height: 1.1;
+  color: var(--text);
+  margin-bottom: 16px;
+  text-align: center;
+}
+h2.section-title {
+  font-size: clamp(28px, 4vw, 42px);
+  font-weight: 800; line-height: 1.2;
+  color: var(--text);
+  margin-bottom: 16px;
+}
+h3.card-title {
+  font-size: 18px; font-weight: 700; color: var(--text);
+  margin-bottom: 8px;
+}
+p.lead {
+  font-size: 18px; line-height: 1.6;
+  color: var(--text-muted);
+  max-width: 800px; text-align: center;
+  margin: 0 auto;
+}
+p.body-text {
+  font-size: 15px; line-height: 1.6; color: var(--text-muted);
+}
+
+/* ── CARDS ── */
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 24px;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.02);
+  transition: all 0.2s;
+  position: relative;
+}
+.card:hover { box-shadow: var(--shadow); border-color: #cbd5e1; transform: translateY(-2px); }
+
+.card-icon {
+  width: 48px; height: 48px; border-radius: 10px;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 24px; margin-bottom: 16px;
+}
+.icon-indigo { background: #e0e7ff; }
+.icon-cyan { background: #cffafe; }
+.icon-purple { background: #ede9fe; }
+.icon-gold { background: #fef3c7; }
+.icon-green { background: #d1fae5; }
+.icon-red { background: #fee2e2; }
+
+/* ── GRIDS ── */
+.grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; width: 100%; }
+.grid-3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 24px; width: 100%; }
+.grid-4 { display: grid; grid-template-columns: repeat(4, 1fr); gap: 20px; width: 100%; }
+
+/* ── SLIDE LAYOUTS ── */
+.slide-content {
+  width: 100%; max-width: 1100px;
+  display: flex; flex-direction: column;
+  align-items: center;
+  margin: auto 0; /* center vertically if content is short */
+}
+
+.two-col {
+  display: grid; grid-template-columns: 1fr 1fr;
+  gap: 48px; width: 100%; align-items: center;
+}
+.two-col-content { display: flex; flex-direction: column; gap: 16px; }
+
+/* ── CODE BLOCKS ── */
+.code-block {
+  background: #0f172a;
+  border-radius: var(--radius-sm);
+  padding: 16px 20px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 13px;
+  line-height: 1.6;
+  color: #e2e8f0;
+  overflow-x: auto;
+  border: 1px solid #1e293b;
+  box-shadow: inset 0 2px 4px rgba(0,0,0,0.2);
+}
+.code-block .kw { color: #c678dd; }
+.code-block .str { color: #98c379; }
+.code-block .fn { color: #61afef; }
+.code-block .cmt { color: #5c6370; font-style: italic; }
+.code-block .num { color: #d19a66; }
+.code-block .type { color: #e5c07b; }
+
+/* ── FLOW DIAGRAM ── */
+.flow {
+  display: flex; align-items: center; gap: 8px;
+  flex-wrap: nowrap; width: 100%; justify-content: center;
+}
+.flow-node {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 12px 16px;
+  text-align: center;
+  flex: 1;
+  min-width: 120px;
+  box-shadow: 0 1px 2px rgba(0,0,0,0.02);
+}
+.flow-node .fn-label { font-size: 11px; color: var(--text-dim); margin-bottom: 4px; text-transform: uppercase; font-weight: 600; letter-spacing: 0.05em; }
+.flow-node .fn-title { font-size: 14px; font-weight: 600; color: var(--text); }
+.flow-arrow { color: var(--text-dim); font-size: 20px; font-weight: 300; }
+
+/* ── PILLAR ── */
+.pillar {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 24px;
+  display: flex; flex-direction: column; align-items: flex-start;
+  gap: 12px;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.02);
+}
+.pillar-num {
+  font-size: 12px; font-weight: 700; letter-spacing: 0.1em;
+  color: var(--accent); font-family: 'JetBrains Mono', monospace;
+  background: #e0e7ff;
+  padding: 4px 10px;
+  border-radius: 4px;
+}
+
+/* ── TAGS ── */
+.tag {
+  display: inline-flex; align-items: center;
+  font-size: 12px; font-weight: 600;
+  padding: 4px 12px; border-radius: 50px;
+  letter-spacing: 0.02em;
+}
+.tag-indigo { background: #e0e7ff; color: #4338ca; }
+.tag-cyan { background: #cffafe; color: #0369a1; }
+.tag-green { background: #d1fae5; color: #047857; }
+.tag-gold { background: #fef3c7; color: #b45309; }
+.tag-red { background: #fee2e2; color: #b91c1c; }
+.tag-purple { background: #ede9fe; color: #6d28d9; }
+
+/* ── HERO SLIDE ── */
+.hero-badge {
+  background: #d1fae5;
+  color: #047857;
+  border: 1px solid #a7f3d0;
+  border-radius: 50px;
+  padding: 6px 20px;
+  font-size: 13px; font-weight: 600;
+  margin-bottom: 24px;
+  display: inline-flex; align-items: center; gap: 8px;
+}
+.pulse-dot {
+  width: 8px; height: 8px; border-radius: 50%;
+  background: #10b981;
+  animation: pulse 2s ease-in-out infinite;
+}
+@keyframes pulse { 0%,100%{ box-shadow: 0 0 0 0 rgba(16,185,129,0.4); } 50%{ box-shadow: 0 0 0 6px rgba(16,185,129,0); } }
+
+.hero-sub {
+  font-size: 20px; color: var(--text-muted);
+  max-width: 640px; text-align: center; margin-top: 16px; line-height: 1.5;
+}
+.hero-chips {
+  display: flex; gap: 12px; flex-wrap: wrap; justify-content: center; margin-top: 32px;
+}
+
+/* ── TIMELINE ── */
+.timeline { display: flex; flex-direction: column; gap: 0; width: 100%; }
+.tl-item {
+  display: flex; gap: 20px; position: relative;
+  padding-bottom: 24px;
+}
+.tl-item:last-child { padding-bottom: 0; }
+.tl-left { display: flex; flex-direction: column; align-items: center; }
+.tl-num {
+  width: 32px; height: 32px; border-radius: 50%;
+  background: #e0e7ff; border: 2px solid #ffffff;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 13px; font-weight: 700; color: var(--accent);
+  box-shadow: 0 2px 4px rgba(0,0,0,0.05);
+  z-index: 2;
+}
+.tl-line {
+  width: 2px; background: #e2e8f0;
+  flex: 1; margin-top: 4px; margin-bottom: 4px;
+}
+.tl-item:last-child .tl-line { display: none; }
+.tl-body { padding-top: 4px; }
+.tl-title { font-size: 15px; font-weight: 700; color: var(--text); margin-bottom: 4px; }
+.tl-desc { font-size: 14px; color: var(--text-muted); line-height: 1.5; }
+
+/* ── QUOTE ── */
+.big-quote {
+  background: var(--surface);
+  border-left: 4px solid var(--accent);
+  border-radius: 0 var(--radius) var(--radius) 0;
+  padding: 24px 32px;
+  font-size: 16px; line-height: 1.6; color: var(--text-muted);
+  font-style: italic;
+  box-shadow: 0 1px 2px rgba(0,0,0,0.02);
+}
+
+/* ── STAGGER ANIMATION ── */
+.stagger > * {
+  opacity: 0; transform: translateY(16px);
+  transition: opacity 0.4s ease, transform 0.4s ease;
+}
+.active .stagger > *:nth-child(1) { opacity: 1; transform: none; transition-delay: 0.1s; }
+.active .stagger > *:nth-child(2) { opacity: 1; transform: none; transition-delay: 0.2s; }
+.active .stagger > *:nth-child(3) { opacity: 1; transform: none; transition-delay: 0.3s; }
+.active .stagger > *:nth-child(4) { opacity: 1; transform: none; transition-delay: 0.4s; }
+.active .stagger > *:nth-child(5) { opacity: 1; transform: none; transition-delay: 0.5s; }
+.active .stagger > *:nth-child(6) { opacity: 1; transform: none; transition-delay: 0.6s; }
+
+/* ── KEYBOARD HINT ── */
+.keyboard-hint {
+  position: fixed; top: 24px; left: 32px; z-index: 100;
+  font-size: 12px; color: var(--text-muted);
+  display: flex; gap: 8px; align-items: center;
+}
+.kbd {
+  display: inline-flex; align-items: center; justify-content: center;
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: 4px; padding: 2px 6px; font-family: 'JetBrains Mono', monospace;
+  font-size: 11px; color: var(--text); font-weight: 600;
+  box-shadow: 0 1px 1px rgba(0,0,0,0.05);
+}
+
+/* Override overrides for elements that looked weird in light mode */
+.flow-node[style*="background:rgba(99,102,241,0.1)"] {
+    background: #e0e7ff !important; border-color: #c7d2fe !important;
+}
+.flow-node[style*="background:rgba(34,211,238,0.08)"] {
+    background: #cffafe !important; border-color: #a5f3fc !important;
+}
+.flow-node[style*="background:rgba(16,185,129,0.08)"] {
+    background: #d1fae5 !important; border-color: #a7f3d0 !important;
+}
+.card[style*="border-color:rgba(34,211,238,0.3)"] { border-color: #0ea5e9 !important; border-width: 2px; }
+.card[style*="border-color:rgba(167,139,250,0.3)"] { border-color: #8b5cf6 !important; border-width: 2px; }
+.card[style*="border-color:rgba(34,211,238,0.35)"] { border-color: #0ea5e9 !important; border-width: 2px; }
+.card[style*="border-color:rgba(167,139,250,0.35)"] { border-color: #8b5cf6 !important; border-width: 2px; }
+.card[style*="border-color:rgba(16,185,129,0.3)"] { border-color: #10b981 !important; border-width: 2px; }
+.card[style*="border-color:rgba(99,102,241,0.3)"] { border-color: #6366f1 !important; border-width: 2px; }
+
+@media print {
+  @page {
+    size: 16in 9in;
+    margin: 0;
+  }
+
+  html,
+  body {
+    width: 16in;
+    height: auto;
+    overflow: visible;
+    background: var(--bg);
+  }
+
+  #deck {
+    height: auto;
+  }
+
+  .keyboard-hint,
+  .slide-badge,
+  #progress-bar,
+  #nav {
+    display: none !important;
+  }
+
+  .slide,
+  .slide.active,
+  .slide.exit {
+    position: relative;
+    inset: auto;
+    width: 16in;
+    height: 9in;
+    min-height: 9in;
+    opacity: 1 !important;
+    pointer-events: auto;
+    transform: none !important;
+    transition: none !important;
+    overflow: hidden !important;
+    page-break-after: always;
+    break-after: page;
+  }
+
+  .slide:last-child {
+    page-break-after: auto;
+    break-after: auto;
+  }
+
+  .stagger > * {
+    opacity: 1 !important;
+    transform: none !important;
+    transition: none !important;
+  }
+
+  .card:hover {
+    box-shadow: 0 1px 3px rgba(0,0,0,0.02);
+    border-color: var(--border);
+    transform: none;
+  }
+}
+
+/* ── MERMAID STYLES ── */
+.mermaid {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  width: 100%;
+}
+  </style>
+
+  <script type="module">
+    import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+    mermaid.initialize({
+      startOnLoad: true,
+      theme: 'base',
+      flowchart: { curve: 'basis', padding: 20 },
+      themeVariables: {
+        primaryColor: '#e0e7ff',
+        primaryTextColor: '#1e1b4b',
+        primaryBorderColor: '#6366f1',
+        lineColor: '#6366f1',
+        secondaryColor: '#fffbeb',
+        tertiaryColor: '#d1fae5',
+        edgeLabelBackground: '#f8fafc',
+        fontFamily: 'Inter, sans-serif',
+        fontSize: '14px'
+      }
+    });
+  </script>
+</head>
+<body>
+<div id="progress-bar" style="width:6%"></div>
+<div class="keyboard-hint"><span class="kbd">←</span><span class="kbd">→</span> to navigate</div>
+<div class="slide-badge" id="slide-badge">1 / 18</div>
+<div id="deck">
+
+<!-- ═══════════════════════════════ SLIDE 1 — HERO ═══════════════════════════════ -->
+<div class="slide">
+  <div class="slide-content" style="align-items:center;text-align:center;gap:0">
+    <div class="hero-badge"><div class="pulse-dot"></div> Live in Production</div>
+    <h1 class="hero">Lightbridge<br/>Code Intelligence</h1>
+    <p class="hero-sub">An AI-powered code review system that understands your entire codebase — not just the diff.</p>
+    <div class="hero-chips">
+      <span class="tag tag-indigo">🦀 High-Performance Control Plane</span>
+      <span class="tag tag-cyan">🧠 Knowledge Graph</span>
+      <span class="tag tag-purple">🔍 Semantic Search</span>
+      <span class="tag tag-green">⚡ Two-Tier Reviews</span>
+      <span class="tag tag-gold">🛡️ Security Checks</span>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════ SLIDE 2 — WHAT IS CODE INTELLIGENCE ═══════════════════════════════ -->
+<div class="slide">
+  <div class="slide-content stagger" style="gap:32px">
+    <div style="text-align:center">
+      <div class="eyebrow">Foundation</div>
+      <h2 class="section-title">What is Code Intelligence?</h2>
+      <p class="lead">The ability of an automated system to deeply understand source code — its structure, semantics, and relationships — the exact way an experienced engineer does when reviewing a pull request.</p>
+    </div>
+    <div class="grid-3">
+      <div class="card">
+        <div class="card-icon icon-indigo">📐</div>
+        <h3 class="card-title">Structure</h3>
+        <p class="body-text">We map the grammar of the code to understand exactly where functions, classes, and modules begin and end, rather than treating code as raw text.</p>
+      </div>
+      <div class="card">
+        <div class="card-icon icon-cyan">💬</div>
+        <h3 class="card-title">Semantics</h3>
+        <p class="body-text">We convert code into mathematical vectors, enabling the AI to answer conceptual questions like "Where do we handle authentication errors?"</p>
+      </div>
+      <div class="card">
+        <div class="card-icon icon-purple">🕸️</div>
+        <h3 class="card-title">Relationships</h3>
+        <p class="body-text">We build a searchable web of dependencies. The system knows exactly which functions call the code being modified in the current pull request.</p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════ SLIDE 3 — KEY CONCEPTS ═══════════════════════════════ -->
+<div class="slide">
+  <div class="slide-content stagger" style="gap:28px">
+    <div style="text-align:center">
+      <div class="eyebrow">Core Technologies</div>
+      <h2 class="section-title">Five Pillars of the System</h2>
+    </div>
+    <div class="grid-2" style="grid-template-columns:1fr 1fr;gap:16px">
+      <div class="pillar">
+        <div class="pillar-num">01</div>
+        <h3 class="card-title">Syntax Trees</h3>
+        <p class="body-text">The grammatical blueprint of the code. It strips away formatting and comments to reveal the pure logical structure of the application.</p>
+      </div>
+      <div class="pillar">
+        <div class="pillar-num">02</div>
+        <h3 class="card-title">Tree-sitter Engine</h3>
+        <p class="body-text">The ultra-fast parser we use to generate these syntax trees. It is highly tolerant of errors and supports multiple programming languages.</p>
+      </div>
+      <div class="pillar">
+        <div class="pillar-num">03</div>
+        <h3 class="card-title">Knowledge Graph</h3>
+        <p class="body-text">A database mapping how everything connects. Every function is a node; every function call is an edge connecting them together.</p>
+      </div>
+      <div class="pillar">
+        <div class="pillar-num">04</div>
+        <h3 class="card-title">Vector Embeddings</h3>
+        <p class="body-text">Code translated into high-dimensional space. It groups code by *meaning* rather than by exact keyword matches.</p>
+      </div>
+    </div>
+    <div class="pillar" style="flex-direction:row;align-items:center;gap:20px;width:100%">
+      <div>
+        <div class="pillar-num" style="display:inline-block;margin-bottom:8px">05</div>
+        <h3 class="card-title">Security Pattern Checks (Opengrep SAST)</h3>
+        <p class="body-text">Rule-based vulnerability scanning that helps catch known security patterns without relying only on AI judgement.</p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════ SLIDE 4 — SYNTAX TREES ═══════════════════════════════ -->
+<div class="slide" style="padding-top:36px;padding-bottom:44px">
+  <div class="slide-content" style="align-items:center;text-align:center;gap:0;max-width:1000px">
+    <div class="eyebrow">Concept 1 of 5</div>
+    <h2 class="section-title">Syntax Trees</h2>
+    <p class="lead">Hierarchical representation of code structure</p>
+    <div class="grid-2" style="gap:20px;width:100%;margin-top:18px;align-items:stretch">
+      <div class="card" style="padding:22px 24px;background:white">
+        <h3 class="card-title" style="font-size:15px;margin-bottom:8px;text-align:left">Parsing Step</h3>
+        <div style="display:flex;flex-direction:column;align-items:center;gap:18px;padding:20px 8px 0">
+          <div class="flow-node" style="max-width:320px;flex:none;background:#f1f5f9;border-color:#cbd5e1">
+            <div class="fn-title">Raw Code</div>
+            <div class="fn-label" style="text-transform:none;margin-top:6px">`fn validate(token: &amp;str) { ... }`</div>
+          </div>
+          <div style="font-size:28px;color:var(--accent);line-height:1">↓</div>
+          <div class="flow-node" style="max-width:260px;flex:none;background:#e0e7ff;border-color:#6366f1">
+            <div class="fn-title" style="color:#3730a3">Tree-sitter</div>
+            <div class="fn-title" style="color:#3730a3;font-weight:500">Parser Engine</div>
+          </div>
+        </div>
+      </div>
+      <div class="card" style="padding:22px 24px;background:white">
+        <h3 class="card-title" style="font-size:15px;margin-bottom:8px;text-align:left">AST Output</h3>
+        <div style="display:flex;flex-direction:column;align-items:center;gap:12px;padding:14px 4px 0">
+          <div class="flow-node" style="max-width:330px;flex:none;background:#e0e7ff;border-color:#6366f1">
+            <div class="fn-title" style="color:#3730a3">Abstract Syntax Tree (AST)</div>
+            <div class="fn-label" style="text-transform:none;margin-top:6px">logical structure of code</div>
+          </div>
+          <div style="font-size:22px;color:var(--accent);line-height:1">↓</div>
+          <div class="flow-node" style="max-width:250px;flex:none;background:#fffbeb;border-color:#d97706">
+            <div class="fn-title" style="color:#92400e">Function Node</div>
+          </div>
+          <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px;width:100%;margin-top:2px">
+            <div class="flow-node" style="min-width:0;background:#fffbeb;border-color:#d97706">
+              <div class="fn-title" style="color:#92400e;font-size:13px">Parameter</div>
+              <div class="fn-label" style="text-transform:none">`token`</div>
+            </div>
+            <div class="flow-node" style="min-width:0;background:#fffbeb;border-color:#d97706">
+              <div class="fn-title" style="color:#92400e;font-size:13px">Block</div>
+              <div class="fn-label" style="text-transform:none">`{ ... }`</div>
+            </div>
+            <div class="flow-node" style="min-width:0;background:#d1fae5;border-color:#10b981">
+              <div class="fn-title" style="color:#065f46;font-size:13px">Nested</div>
+              <div class="fn-label" style="text-transform:none">statements</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════ SLIDE 5 — TREE-SITTER ═══════════════════════════════ -->
+<div class="slide">
+  <div class="slide-content stagger" style="gap:32px">
+    <div style="text-align:center">
+      <div class="eyebrow">Concept 2 of 5</div>
+      <h2 class="section-title">The Tree-sitter Engine</h2>
+      <p class="lead">The industry-standard parsing technology powering our intelligence.</p>
+    </div>
+    <div class="grid-3" style="margin-top:20px">
+      <div class="card">
+        <div class="card-icon icon-green">🛡️</div>
+        <h3 class="card-title">Error Tolerant</h3>
+        <p class="body-text">Unlike traditional compilers that crash when they hit a syntax error, Tree-sitter gracefully skips the broken line and continues parsing the rest of the file perfectly.</p>
+      </div>
+      <div class="card">
+        <div class="card-icon icon-cyan">⚡</div>
+        <h3 class="card-title">Lightning Fast</h3>
+        <p class="body-text">It is designed for incremental parsing, meaning it can instantly update its understanding of the code the moment a developer types a new character.</p>
+      </div>
+      <div class="card">
+        <div class="card-icon icon-indigo">🌐</div>
+        <h3 class="card-title">Multi-Language</h3>
+        <p class="body-text">A single unified interface allows us to parse Rust, Python, TypeScript, Java, and many others without having to write custom logic for each language.</p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════ SLIDE 6 — KNOWLEDGE GRAPH ═══════════════════════════════ -->
+<div class="slide">
+  <div class="slide-content" style="align-items:center;text-align:center;gap:0">
+    <div class="eyebrow">Concept 3 of 5</div>
+    <h2 class="section-title">The Knowledge Graph</h2>
+    <p class="lead">Structured representation of code relationships</p>
+    <div class="card" style="padding:32px;background:white;width:100%;max-width:800px;margin-top:24px">
+      <div class="mermaid">
+flowchart LR
+    A["AuthService\nloginUser()"] -->|CALLS| B["TokenUtils\nvalidateToken()"]
+    C["PaymentRoute\nprocessCheckout()"] -->|CALLS| B
+    B -->|CALLS| D["Database\nqueryUser()"]
+
+    style A fill:#e0e7ff,stroke:#6366f1,color:#3730a3
+    style C fill:#e0e7ff,stroke:#6366f1,color:#3730a3
+    style B fill:#fffbeb,stroke:#d97706,color:#92400e
+    style D fill:#d1fae5,stroke:#10b981,color:#065f46
+      </div>
+    </div>
+    <p class="body-text" style="margin-top:32px;max-width:600px">Graph database where every function, class, and module is a node, connected by edges representing dependencies and relationships.</p>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════ SLIDE 7 — VECTOR EMBEDDINGS ═══════════════════════════════ -->
+<div class="slide">
+  <div class="slide-content" style="align-items:center;text-align:center;gap:0">
+    <div class="eyebrow">Concept 4 of 5</div>
+    <h2 class="section-title">Vector Embeddings</h2>
+    <p class="lead">Understanding the meaning behind the code, not just the text.</p>
+    <div class="card" style="padding:32px;background:white;width:100%;max-width:800px;margin-top:24px">
+      <div class="mermaid">
+flowchart LR
+    A["Snippet A\n'verify cryptographic\nsignature'"] --> C["Embedding Model"]
+    B["Snippet B\n'validate webhook\nsecret'"] --> C
+    C --> D[("Vector Database\n[0.12, -0.45, 0.88...]")]
+    C --> E[("Vector Database\n[0.14, -0.42, 0.89...]")]
+    D -.->|High Semantic Similarity| E
+
+    style A fill:#fef3c7,stroke:#f59e0b,color:#92400e
+    style B fill:#e0e7ff,stroke:#4f46e5,color:#3730a3
+    style C fill:#f1f5f9,stroke:#94a3b8,color:#334155
+    style D fill:#cffafe,stroke:#0891b2,color:#0e7490
+    style E fill:#cffafe,stroke:#0891b2,color:#0e7490
+      </div>
+    </div>
+    <p class="body-text" style="margin-top:32px;max-width:600px">Codebase is chunked and converted into high-dimensional vectors stored in a database, allowing semantic search beyond exact keyword matching.</p>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════ SLIDE 8 — SAST ═══════════════════════════════ -->
+<div class="slide">
+  <div class="slide-content stagger" style="gap:32px">
+    <div style="text-align:center">
+      <div class="eyebrow">Concept 5 of 5</div>
+      <h2 class="section-title">Security Pattern Checks <span style="font-size:22px;font-weight:500;color:var(--text-muted)">(Opengrep SAST)</span></h2>
+      <p class="lead">Pattern-based security scanning that gives the review agent concrete findings to consider.</p>
+    </div>
+    <div class="grid-3">
+      <div class="card">
+        <div class="card-icon icon-red">🎯</div>
+        <h3 class="card-title">Rule-Based Findings</h3>
+        <p class="body-text">Opengrep matches known-bad code patterns using a curated ruleset. The scan is rule-driven, so the AI can focus on context and judgement.</p>
+      </div>
+      <div class="card">
+        <div class="card-icon icon-gold">⚡</div>
+        <h3 class="card-title">Diff-Scoped Speed</h3>
+        <p class="body-text">Instead of scanning an entire repository, the scanner targets only the files touched in the pull request, returning results in seconds.</p>
+      </div>
+      <div class="card">
+        <div class="card-icon icon-purple">🤝</div>
+        <h3 class="card-title">AI Synergy</h3>
+        <p class="body-text">SAST findings are passed to the AI agent as context so it doesn't re-report known issues and can focus its budget on what Opengrep cannot catch.</p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════ SLIDE 8.5 — TRANSITION ═══════════════════════════════ -->
+<div class="slide">
+  <div class="slide-content stagger" style="gap:32px">
+    <div style="text-align:center">
+      <div class="eyebrow">Putting it together</div>
+      <h2 class="section-title">From Concepts to Architecture</h2>
+      <p class="lead">How these 5 puzzle pieces form the Lightbridge Code Intelligence engine.</p>
+    </div>
+    <div class="grid-3" style="gap:24px;margin-top:20px">
+      <div class="card" style="text-align:center;padding:40px 24px">
+        <div style="font-size:40px;margin-bottom:16px">🌲 + 🧠</div>
+        <h3 class="card-title">Knowledge Base</h3>
+        <p class="body-text" style="font-size:14px">Tree-sitter and Embeddings build our dual-index graph.</p>
+      </div>
+      <div class="card" style="text-align:center;padding:40px 24px">
+        <div style="font-size:40px;margin-bottom:16px">🤖 + 🕸️</div>
+        <h3 class="card-title">Agent Loop</h3>
+        <p class="body-text" style="font-size:14px">The AI Agent queries the graph to understand codebase impact.</p>
+      </div>
+      <div class="card" style="text-align:center;padding:40px 24px">
+        <div style="font-size:40px;margin-bottom:16px">🛡️ + 🚦</div>
+        <h3 class="card-title">Verified Reviews</h3>
+        <p class="body-text" style="font-size:14px">Control Plane bounds and Quality Gates ensure strict safety.</p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════ SLIDE 9 — ARCHITECTURE OVERVIEW ═══════════════════════════════ -->
+<div class="slide" style="padding-top:28px;padding-bottom:120px;overflow-y:auto">
+  <div class="slide-content" style="gap:16px;max-width:1100px">
+    <div style="text-align:center;margin-bottom:8px">
+      <div class="eyebrow">System Design</div>
+      <h2 class="section-title" style="font-size:32px">Architecture at a Glance</h2>
+      <p style="font-size:14px;color:var(--text-muted)">End-to-end flow — from forge event to review posted on the pull request</p>
+    </div>
+    <div class="card" style="padding:32px;background:white;width:100%;max-width:1050px;margin-top:16px">
+      <div class="mermaid">
+flowchart LR
+    A[🐙 GitHub / GitLab] --> C[⚙️ Agent Runner]
+    C --> D[📦 Clone Repo]
+    D --> E[🧠 Build Index]
+    E --> F["🤖 AI Agent Loop\n(opencode)"]
+    F <--> G[🚦 Quality Gates]
+    G --> H[✅ Review Posted]
+
+    subgraph KB [" Knowledge Base "]
+      direction LR
+      I[🕸️ Graph]
+      J[🧠 Embeddings]
+    end
+
+    I & J --> F
+
+    style A fill:#f1f5f9,stroke:#cbd5e1,color:#0f172a
+    style C fill:#fffbeb,stroke:#d97706,color:#92400e
+    style D fill:#f8fafc,stroke:#94a3b8,color:#334155
+    style E fill:#fffbeb,stroke:#d97706,color:#92400e
+    style F fill:#ede9fe,stroke:#8b5cf6,color:#5b21b6
+    style G fill:#cffafe,stroke:#0891b2,color:#0e7490
+    style H fill:#d1fae5,stroke:#10b981,color:#065f46
+    style I fill:#ede9fe,stroke:#8b5cf6,color:#5b21b6
+    style J fill:#cffafe,stroke:#0891b2,color:#0e7490
+    style KB fill:#f8fafc,stroke:#e2e8f0
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════ SLIDE 10 — DUAL INDEX ═══════════════════════════════ -->
+<div class="slide">
+  <div class="slide-content" style="align-items:center;text-align:center;gap:0">
+    <div class="eyebrow">Indexing Pipeline</div>
+    <h2 class="section-title">One Parse, Two Indices</h2>
+    <p class="lead">One clone. Two intelligence pipelines. Structural and semantic in parallel.</p>
+    <div class="card" style="padding:32px;background:white;width:100%;max-width:900px;margin-top:24px">
+      <div class="mermaid">
+flowchart LR
+    SRC["📦 Repo Checkout\none clone in the runner"]
+
+    SRC --> TS["🌲 tree-sitter chunker\nsplits into semantic units"]
+    SRC --> GFY["🔗 lci-codegraph\nextracts symbols + relationships"]
+
+    TS --> VEC[("🧠 pgvector\nembedding per chunk")]
+    GFY --> NEO[("🕸️ Neo4j\ntyped graph")]
+
+    VEC --> QS["🔍 Semantic Question\n'where is similar behaviour?'"]
+    NEO --> QG["📐 Structural Question\n'what calls this? PR impact?'"]
+
+    style SRC fill:#f1f5f9,stroke:#94a3b8,color:#334155
+    style TS fill:#fef3c7,stroke:#f59e0b,color:#92400e
+    style GFY fill:#fef3c7,stroke:#f59e0b,color:#92400e
+    style VEC fill:#cffafe,stroke:#0891b2,color:#0e7490
+    style NEO fill:#ede9fe,stroke:#8b5cf6,color:#5b21b6
+    style QS fill:#d1fae5,stroke:#10b981,color:#065f46
+    style QG fill:#d1fae5,stroke:#10b981,color:#065f46
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════ SLIDE 11 — WEBHOOK TRIGGER ═══════════════════════════════ -->
+<div class="slide">
+  <div class="slide-content stagger" style="gap:32px">
+    <div style="text-align:center">
+      <div class="eyebrow">The Lifecycle: Step 1</div>
+      <h2 class="section-title">The Trigger</h2>
+      <p class="lead">How the system seamlessly integrates into the developer workflow without blocking progress.</p>
+    </div>
+    <div class="grid-3" style="width:100%">
+      <div class="card">
+        <h3 class="card-title">Automatic Trigger</h3>
+        <span class="tag tag-green" style="margin-bottom:12px">Pull Request Opened</span>
+        <p class="body-text">The moment a developer opens a pull request, the system detects it and instantly kicks off a high-speed review task. No manual intervention required.</p>
+      </div>
+      <div class="card">
+        <h3 class="card-title">On-Demand Trigger</h3>
+        <span class="tag tag-purple" style="margin-bottom:12px">@mention in a comment</span>
+        <p class="body-text">If a maintainer needs a deep architectural dive, or wants to ask a specific question, they simply mention the bot. This triggers a comprehensive, context-aware analysis.</p>
+      </div>
+      <div class="card">
+        <h3 class="card-title">Maintenance Trigger</h3>
+        <span class="tag tag-gold" style="margin-bottom:12px">Push to Default Branch</span>
+        <p class="body-text">When code is finally merged into the main branch, the system quietly rebuilds its indices in the background, keeping the repository's brain fresh for the next review.</p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════ SLIDE 12 — HOW THE AGENT READS ═══════════════════════════════ -->
+<div class="slide">
+  <div class="slide-content" style="align-items:center;text-align:center;gap:0">
+    <div class="eyebrow">The Lifecycle: Step 2</div>
+    <h2 class="section-title">How the Agent Reads Code</h2>
+    <p class="lead">Context in. Explore the knowledge base. Post a verified review.</p>
+    <div class="card" style="padding:32px;background:white;width:100%;max-width:1000px;margin-top:24px">
+      <div class="mermaid">
+flowchart LR
+    CTX["📋 Context\nPR diff · AGENTS.md"]
+    CTX --> LOOP["🤖 Agent Loop\n(opencode)"]
+    LOOP --> KB["🧠 Knowledge Base\npgvector · Neo4j"]
+    KB -->|answers| LOOP
+    LOOP --> QG["🚦 Quality Gates"]
+    QG --> POST["✅ Review Posted"]
+
+    style CTX fill:#fef3c7,stroke:#f59e0b,color:#92400e
+    style LOOP fill:#ede9fe,stroke:#8b5cf6,color:#5b21b6
+    style KB fill:#cffafe,stroke:#0891b2,color:#0e7490
+    style QG fill:#cffafe,stroke:#0891b2,color:#0e7490
+    style POST fill:#d1fae5,stroke:#10b981,color:#065f46
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════ SLIDE 13 — TWO TIERS ═══════════════════════════════ -->
+<div class="slide">
+  <div class="slide-content stagger" style="gap:28px">
+    <div style="text-align:center">
+      <div class="eyebrow">The Lifecycle: Step 3</div>
+      <h2 class="section-title">The Two-Tier Strategy</h2>
+      <p class="lead">Balancing instant feedback with deep architectural insight.</p>
+    </div>
+    <div class="grid-2" style="gap:24px;width:100%">
+      <div class="card" style="border-top:4px solid #0ea5e9">
+        <div style="display:flex;align-items:center;gap:12px;margin-bottom:16px">
+          <div class="card-icon icon-cyan" style="margin-bottom:0">⚡</div>
+          <h3 class="card-title" style="margin:0">The Fast Tier</h3>
+        </div>
+        <p class="body-text" style="margin-bottom:16px">Runs automatically on every new PR. It uses a faster model, disables deep repository retrieval, and focuses strictly on the visible diff and security pattern checks.</p>
+        <ul style="color:var(--text-muted);font-size:14px;line-height:2;padding-left:18px">
+          <li><strong>Speed:</strong> Completes in under 2 minutes.</li>
+          <li><strong>Scope:</strong> Diff-only + Security rules.</li>
+          <li><strong>Goal:</strong> Catch obvious typos and glaring errors instantly.</li>
+        </ul>
+      </div>
+      <div class="card" style="border-top:4px solid #8b5cf6">
+        <div style="display:flex;align-items:center;gap:12px;margin-bottom:16px">
+          <div class="card-icon icon-purple" style="margin-bottom:0">🔬</div>
+          <h3 class="card-title" style="margin:0">The Deep Tier</h3>
+        </div>
+        <p class="body-text" style="margin-bottom:16px">Runs when explicitly requested. It uses a frontier AI model and grants full access to the structural graph, semantic index, and file reading capabilities.</p>
+        <ul style="color:var(--text-muted);font-size:14px;line-height:2;padding-left:18px">
+          <li><strong>Speed:</strong> Asynchronous, up to 2 hours if highly complex.</li>
+          <li><strong>Scope:</strong> Full repository awareness.</li>
+          <li><strong>Goal:</strong> Architectural integrity and complex bug hunting.</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════ SLIDE 14 — THE TWO-TIME REVIEW ═══════════════════════════════ -->
+<div class="slide">
+  <div class="slide-content" style="align-items:center;text-align:center;gap:0">
+    <div class="eyebrow">The Lifecycle: Step 4</div>
+    <h2 class="section-title">The "Two-Time" Review (Refute Pass)</h2>
+    <p class="lead">AI findings are challenged before they are trusted.</p>
+    <div class="card" style="padding:32px;background:white;width:100%;max-width:1000px;margin-top:24px">
+      <div class="mermaid">
+flowchart LR
+    REV1["🤖 First Review\n(creative mode)"]
+    REV1 -->|"High-severity finding!\nI think this is a bug."| QG["🚦 Quality Gates"]
+    QG -->|"Not so fast.\nProve it. Re-read the code."| REV2["🔬 Refute Pass\n(skeptic mode)"]
+    REV2 -->|"Still can't prove it.\nLet me re-read..."| REV1
+    REV2 -->|confirmed| PASS["✅ Finding Kept\nPosted to PR"]
+    REV2 -->|retracted| SKIP["🗑️ Finding Dropped\nWas a hallucination"]
+
+    style REV1 fill:#fef3c7,stroke:#f59e0b,color:#92400e
+    style QG fill:#cffafe,stroke:#0891b2,color:#0e7490
+    style REV2 fill:#ede9fe,stroke:#8b5cf6,color:#5b21b6
+    style PASS fill:#d1fae5,stroke:#10b981,color:#065f46
+    style SKIP fill:#fee2e2,stroke:#dc2626,color:#991b1b
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════ SLIDE 15 — QUALITY GATES ═══════════════════════════════ -->
+<div class="slide">
+  <div class="slide-content stagger" style="gap:28px">
+    <div style="text-align:center">
+      <div class="eyebrow">The Lifecycle: Step 5</div>
+      <h2 class="section-title">Final Quality Gates</h2>
+      <p class="lead">The final checks before anything is ever shown to a human developer.</p>
+    </div>
+    <div class="grid-2" style="width:100%">
+      <div class="card" style="padding:32px">
+        <div class="card-icon icon-gold">📋</div>
+        <h3 class="card-title">The Coverage Gate</h3>
+        <p class="body-text">We prevent rubber-stamping. If the AI attempts to finish the review without explicitly reading or commenting on every single file changed in the pull request, the system bounces it back and points out exactly what was ignored.</p>
+      </div>
+      <div class="card" style="padding:32px">
+        <div class="card-icon icon-cyan">✂️</div>
+        <h3 class="card-title">Diff Alignment</h3>
+        <p class="body-text">Findings must accurately anchor to lines that actually changed. If the AI comments on a line outside the diff, the system intelligently categorizes it as a "deferred" finding, rather than dropping it or breaking the GitHub integration.</p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════ SLIDE 16 — CONCLUSION ═══════════════════════════════ -->
+<div class="slide">
+  <div class="slide-content stagger" style="gap:28px">
+    <div style="text-align:center">
+      <div class="eyebrow">Live Deployments</div>
+      <h2 class="section-title">Already Running in Production</h2>
+      <p class="lead">Lightbridge is installed and actively reviewing code across multiple real-world repositories today.</p>
+    </div>
+    <div class="grid-2" style="gap:24px;width:100%">
+      <div class="card" style="border-top:4px solid #2563eb;padding:32px">
+        <div style="display:flex;align-items:center;gap:12px;margin-bottom:16px">
+          <div style="font-size:32px">🐙</div>
+          <div>
+            <h3 class="card-title" style="margin:0">GitHub — AdorsysGIS</h3>
+            <a href="https://github.com/ADORSYS-GIS" target="_blank" style="font-size:12px;color:var(--accent);text-decoration:none">github.com/ADORSYS-GIS</a>
+          </div>
+        </div>
+        <p class="body-text">Installed across the ADORSYS-GIS organisation on GitHub, covering multiple active repositories with automated PR reviews.</p>
+      </div>
+      <div class="card" style="border-top:4px solid #e2432a;padding:32px">
+        <div style="display:flex;align-items:center;gap:12px;margin-bottom:16px">
+          <div style="font-size:32px">🦊</div>
+          <div>
+            <h3 class="card-title" style="margin:0">GitLab — Adorsys Solutions</h3>
+            <a href="https://git.adorsys.de/" target="_blank" style="font-size:12px;color:var(--accent);text-decoration:none">git.adorsys.de</a>
+          </div>
+        </div>
+        <p class="body-text">Deployed on the Adorsys self-hosted GitLab instance, integrated with the <strong>Solutions Team</strong> repository for full merge request intelligence.</p>
+      </div>
+    </div>
+    <div class="card" style="padding:20px;width:100%;text-align:center;background:#f0fdf4;border:1px solid #a7f3d0">
+      <p class="body-text" style="font-size:15px">🟢&nbsp; <strong>Status:</strong> Active &mdash; reviews are being posted automatically on every opened pull request and merge request.</p>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════ SLIDE 17 — END ═══════════════════════════════ -->
+<div class="slide">
+  <div class="slide-content" style="align-items:center;text-align:center;gap:0">
+    <h1 class="hero">Thank You</h1>
+    <p class="hero-sub">Lightbridge Code Intelligence</p>
+    <div style="margin-top:48px;display:flex;gap:32px;justify-content:center">
+      <div style="text-align:center">
+        <div style="font-size:32px;margin-bottom:8px">🐙</div>
+        <p style="font-size:14px;color:var(--text-muted)">GitHub</p>
+      </div>
+      <div style="text-align:center">
+        <div style="font-size:32px;margin-bottom:8px">🦖</div>
+        <p style="font-size:14px;color:var(--text-muted)">GitLab</p>
+      </div>
+      <div style="text-align:center">
+        <div style="font-size:32px;margin-bottom:8px">🤖</div>
+        <p style="font-size:14px;color:var(--text-muted)">AI-Powered</p>
+      </div>
+      <div style="text-align:center">
+        <div style="font-size:32px;margin-bottom:8px">🛡️</div>
+        <p style="font-size:14px;color:var(--text-muted)">Secure</p>
+      </div>
+    </div>
+    <div style="margin-top:48px;padding:24px;background:#f8fafc;border-radius:12px;border:1px solid #e2e8f0">
+      <p style="font-size:14px;color:var(--text-muted)"><strong>Questions?</strong></p>
+    </div>
+  </div>
+</div>
+
+</div><!-- /deck -->
+
+<nav id="nav">
+  <button class="nav-btn" id="prevBtn" aria-label="Previous">&#8592;</button>
+  <span id="slide-counter">1 / 17</span>
+  <div class="dots"></div>
+  <button class="nav-btn" id="nextBtn" aria-label="Next">&#8594;</button>
+</nav>
+
+<script>
+const TOTAL = document.querySelectorAll('.slide').length;
+let current = 0;
+
+const slides    = () => document.querySelectorAll('.slide');
+const dotsEl    = () => document.querySelectorAll('.dot');
+const prevBtn   = document.getElementById('prevBtn');
+const nextBtn   = document.getElementById('nextBtn');
+const counter   = document.getElementById('slide-counter');
+const badge     = document.getElementById('slide-badge');
+const progress  = document.getElementById('progress-bar');
+
+function go(n) {
+  const all = slides();
+  const old = current;
+  all[old].classList.remove('active');
+  all[old].classList.add('exit');
+  setTimeout(() => all[old].classList.remove('exit'), 600);
+
+  current = Math.max(0, Math.min(n, TOTAL - 1));
+
+  all[current].classList.add('active');
+  sync();
+}
+
+function sync() {
+  counter.textContent = `${current + 1} / ${TOTAL}`;
+  badge.textContent   = `${current + 1} / ${TOTAL}`;
+  prevBtn.disabled    = current === 0;
+  nextBtn.disabled    = current === TOTAL - 1;
+  progress.style.width = `${((current + 1) / TOTAL) * 100}%`;
+  dotsEl().forEach((d, i) => d.classList.toggle('active', i === current));
+}
+
+document.getElementById('prevBtn').onclick = () => go(current - 1);
+document.getElementById('nextBtn').onclick = () => go(current + 1);
+
+document.addEventListener('keydown', e => {
+  if (e.key === 'ArrowRight' || e.key === 'ArrowDown' || e.key === ' ') { e.preventDefault(); go(current + 1); }
+  if (e.key === 'ArrowLeft'  || e.key === 'ArrowUp')                    { e.preventDefault(); go(current - 1); }
+});
+
+// Build dots
+const dotsContainer = document.querySelector('.dots');
+for (let i = 0; i < TOTAL; i++) {
+  const d = document.createElement('div');
+  d.className = 'dot' + (i === 0 ? ' active' : '');
+  d.onclick = () => go(i);
+  dotsContainer.appendChild(d);
+}
+
+// Init first slide
+slides()[0].classList.add('active');
+sync();
+</script>
+</body>
+</html>

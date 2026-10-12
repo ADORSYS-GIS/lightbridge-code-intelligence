@@ -1,0 +1,613 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Session 2 — The Production System</title>
+<style>
+  :root{
+    --bg:#ffffff;
+    --page:#f1f5f9;
+    --text:#1f2937;
+    --muted:#6b7280;
+    --accent:#2563eb;
+    --accent-soft:#eff6ff;
+    --border:#cbd5e1;
+    --edge:#94a3b8;
+  }
+  *{box-sizing:border-box;}
+  html,body{margin:0;height:100%;background:var(--page);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    color:var(--text);}
+  .deck{height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;padding:16px;}
+  .slide-frame{width:min(94vw,1150px);aspect-ratio:16/9;background:var(--bg);border-radius:16px;
+    box-shadow:0 10px 34px rgba(15,23,42,0.10);position:relative;overflow:hidden;}
+  .slide{position:absolute;inset:0;display:none;flex-direction:column;padding:50px 68px 36px;}
+  .slide.active{display:flex;}
+  .section-tag{position:absolute;top:24px;left:68px;font-size:11px;letter-spacing:.08em;
+    text-transform:uppercase;color:var(--accent);font-weight:700;}
+  .slide h1{font-size:28px;margin:26px 0 2px;font-weight:650;letter-spacing:-0.01em;}
+  .slide h2{font-size:15.5px;margin:0 0 20px;color:var(--muted);font-weight:450;}
+  .diagram-wrap{flex:1;display:flex;align-items:center;justify-content:center;min-height:0;}
+  svg.diagram{width:100%;height:100%;max-height:330px;}
+  .box{fill:var(--accent-soft);stroke:var(--border);stroke-width:1.5;}
+  .box.accent{fill:#ffffff;stroke:var(--accent);stroke-width:2;}
+  .box.dim{fill:#f8fafc;stroke:#e2e8f0;}
+  .box.diamond{fill:#fff7ed;stroke:#c2410c;}
+  .box-text{font-size:13px;fill:var(--text);font-family:inherit;}
+  .box-text.sub{fill:var(--muted);font-size:11px;}
+  .edge-label{font-size:10.5px;fill:var(--muted);}
+  .caption{font-size:14px;color:var(--muted);text-align:center;margin-top:8px;}
+  .bullets{list-style:none;padding:0;margin:14px 0 0;display:flex;gap:22px;justify-content:center;flex-wrap:wrap;}
+  .bullets li{font-size:13px;color:var(--muted);background:#f8fafc;border:1px solid #e2e8f0;
+    border-radius:8px;padding:6px 14px;}
+  code{background:#f1f5f9;border:1px solid #e2e8f0;border-radius:4px;padding:1px 6px;font-size:0.92em;color:#334155;}
+
+  .title-slide{align-items:center;justify-content:center;text-align:center;}
+  .title-slide h1{font-size:40px;margin:0 0 10px;}
+  .title-slide h2{font-size:17px;}
+  .title-slide .arc{display:flex;gap:14px;margin-top:34px;flex-wrap:wrap;justify-content:center;}
+  .title-slide .arc span{font-size:12.5px;background:var(--accent-soft);color:var(--accent);
+    border:1px solid #bfdbfe;border-radius:20px;padding:7px 16px;font-weight:600;}
+  .title-slide .arrowtxt{color:var(--muted);font-weight:400;align-self:center;}
+
+  .section-slide{align-items:center;justify-content:center;text-align:center;}
+  .section-slide .kicker{font-size:12.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--accent);font-weight:700;margin-bottom:10px;}
+  .section-slide h1{font-size:34px;margin:0;}
+  .section-slide h2{font-size:15px;margin-top:10px;}
+
+  .grid{flex:1;display:grid;gap:14px;align-content:center;justify-content:center;}
+  .grid.cols-4{grid-template-columns:repeat(4,minmax(170px,1fr));}
+  .grid.cols-3{grid-template-columns:repeat(3,minmax(180px,1fr));}
+  .grid.cols-2{grid-template-columns:repeat(2,minmax(260px,1fr));}
+  .card{background:#f8fafc;border:1px solid #e2e8f0;border-radius:12px;padding:16px 14px;text-align:center;}
+  .card .t{font-weight:650;font-size:14px;margin-bottom:4px;}
+  .card .d{font-size:12px;color:var(--muted);}
+  .card.accent{background:#ffffff;border:2px solid var(--accent);}
+  .card .num{display:inline-flex;width:22px;height:22px;border-radius:50%;background:var(--accent-soft);
+    color:var(--accent);font-size:11px;font-weight:700;align-items:center;justify-content:center;margin-bottom:6px;}
+
+  .vs-wrap{flex:1;display:flex;align-items:center;justify-content:center;gap:28px;}
+  .vs-box{width:320px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:14px;padding:22px;text-align:center;}
+  .vs-box.accent{border:2px solid var(--accent);background:#ffffff;}
+  .vs-box .t{font-weight:700;font-size:16px;margin-bottom:6px;}
+  .vs-box .d{font-size:12.5px;color:var(--muted);line-height:1.5;}
+  .vs-sep{font-size:24px;color:var(--border);font-weight:700;}
+
+  .excerpt{font-family:"SF Mono",ui-monospace,Menlo,Consolas,monospace;font-size:12px;
+    line-height:1.6;color:#334155;background:#f8fafc;border-left:3px solid var(--accent);
+    border-radius:6px;padding:14px 18px;margin-top:10px;white-space:pre-wrap;}
+  .excerpt .src{display:block;font-family:inherit;font-size:10.5px;color:var(--muted);
+    margin-top:8px;}
+
+  .hud{display:flex;align-items:center;gap:16px;color:#475569;font-size:13px;width:min(94vw,1150px);}
+  button{border:1px solid #cbd5e1;background:#fff;border-radius:8px;padding:8px 14px;cursor:pointer;
+    font-size:14px;color:#334155;}
+  button:hover{background:#f1f5f9;}
+  button:disabled{opacity:.4;cursor:default;}
+  #counter{min-width:52px;text-align:center;}
+  .progress{flex:1;height:4px;background:#e2e8f0;border-radius:2px;overflow:hidden;}
+  .bar{height:100%;background:var(--accent);width:4%;transition:width .2s;}
+  .hint{font-size:11.5px;color:#94a3b8;}
+</style>
+</head>
+<body>
+<div class="deck">
+  <div class="slide-frame" id="frame">
+
+    <!-- 1 : TITLE -->
+    <section class="slide active title-slide" data-section="">
+      <h1>The Production System</h1>
+      <h2>Session 2 — Lightbridge Code Intelligence</h2>
+      <div class="arc">
+        <span>Control plane</span>
+        <span class="arrowtxt">→</span>
+        <span>Dual retrieval</span>
+        <span class="arrowtxt">→</span>
+        <span>Review flow</span>
+      </div>
+    </section>
+
+    <!-- 2 : AGENDA -->
+    <section class="slide" data-section="">
+      <div class="section-tag">session 2</div>
+      <h1>What this session covers</h1>
+      <h2>The production system: how it's built, how it runs</h2>
+      <div class="grid cols-3">
+        <div class="card accent"><div class="num">1</div><div class="t">Big Picture</div><div class="d">What it is, what it offers</div></div>
+        <div class="card accent"><div class="num">2</div><div class="t">Control Plane</div><div class="d">Roles, queue, dual retrieval</div></div>
+        <div class="card accent"><div class="num">3</div><div class="t">Review Flow</div><div class="d">Webhook to a posted review</div></div>
+      </div>
+    </section>
+
+    <!-- 3 : SECTION -->
+    <section class="slide section-slide" data-section="big picture">
+      <div class="kicker">Part One</div>
+      <h1>The Big Picture</h1>
+      <h2>What this actually is, and how the pieces really relate</h2>
+    </section>
+
+    <!-- 4 -->
+    <section class="slide" data-section="big picture">
+      <div class="section-tag">big picture</div>
+      <h1>What is Lightbridge Code Intelligence?</h1>
+      <h2>An AI code reviewer — GitHub, GitLab, and Bitbucket</h2>
+      <div class="diagram-wrap"><svg class="diagram" data-diagram="whatIsIt"></svg></div>
+    </section>
+
+    <!-- 5 -->
+    <section class="slide" data-section="big picture">
+      <div class="section-tag">big picture</div>
+      <h1>What it offers</h1>
+      <h2>Not a linter — a repo-aware reviewer and a repo you can ask questions</h2>
+      <div class="grid cols-4">
+        <div class="card"><div class="t">Inline code review</div><div class="d">Findings posted as PR comments, grounded in the real repo, not just the diff</div></div>
+        <div class="card"><div class="t">Repository Q&amp;A</div><div class="d">@mention a question on an issue or PR — a conversational answer, not a forced review</div></div>
+        <div class="card"><div class="t">Deterministic + reasoning</div><div class="d">SAST (opengrep) finds the certain stuff; the model investigates and explains the rest</div></div>
+        <div class="card"><div class="t">Hybrid retrieval</div><div class="d">Structural graph + semantic search ground every finding and every answer</div></div>
+      </div>
+    </section>
+
+    <!-- 6 -->
+    <section class="slide" data-section="big picture">
+      <div class="section-tag">big picture</div>
+      <h1>How a review is configured</h1>
+      <h2>Repo-configurable presets, not a hardcoded fast/deep split</h2>
+      <div class="grid cols-3">
+        <div class="card"><div class="t">fast</div><div class="d">Default on every PR open — SAST + one quick, diff-only LLM pass</div></div>
+        <div class="card"><div class="t">deep</div><div class="d">Default on @mention — full graph + vector retrieval, repo-aware</div></div>
+        <div class="card"><div class="t">ultra</div><div class="d">Opt-in — the platform's strongest model, widest budget</div></div>
+      </div>
+      <div class="caption">Shipped defaults, not fixed tiers: a repo can pick its own preset per trigger. Every preset uses the same tools and gates — only the model and budget change.</div>
+    </section>
+
+    <!-- 7 : SECTION -->
+    <section class="slide section-slide" data-section="control plane">
+      <div class="kicker">Part Two</div>
+      <h1>The Control Plane</h1>
+      <h2>Trust boundary, roles, queue, dual retrieval</h2>
+    </section>
+
+    <!-- 8 -->
+    <section class="slide" data-section="control plane">
+      <div class="section-tag">control plane</div>
+      <h1>The trust boundary</h1>
+      <h2>One Rust binary holds every credential — nothing else does</h2>
+      <div class="diagram-wrap"><svg class="diagram" data-diagram="trustBoundary"></svg></div>
+    </section>
+
+    <!-- 9 -->
+    <section class="slide" data-section="control plane">
+      <div class="section-tag">control plane</div>
+      <h1>One binary, many roles</h1>
+      <h2>Selected by <code>CONTROL_PLANE_ROLE</code> — one Deployment per role</h2>
+      <div class="diagram-wrap"><svg class="diagram" data-diagram="roles"></svg></div>
+    </section>
+
+    <!-- 10 -->
+    <section class="slide" data-section="control plane">
+      <div class="section-tag">control plane</div>
+      <h1>The task queue</h1>
+      <h2>Postgres as a real work queue — <code>FOR UPDATE SKIP LOCKED</code></h2>
+      <div class="diagram-wrap"><svg class="diagram" data-diagram="queue"></svg></div>
+    </section>
+
+    <!-- 11 -->
+    <section class="slide" data-section="control plane">
+      <div class="section-tag">control plane</div>
+      <h1>Dual retrieval</h1>
+      <div class="vs-wrap">
+        <div class="vs-box">
+          <div class="t">Neo4j</div>
+          <div class="d">"what calls this? what does this call?" — exact structural relationships.</div>
+        </div>
+        <div class="vs-sep">+</div>
+        <div class="vs-box">
+          <div class="t">pgvector</div>
+          <div class="d">"where is something that means this?" — semantic similarity.</div>
+        </div>
+      </div>
+      <div class="caption">Neither store answers both questions well alone.</div>
+    </section>
+
+    <!-- 12 -->
+    <section class="slide" data-section="control plane">
+      <div class="section-tag">control plane</div>
+      <h1>Hybrid search</h1>
+      <h2>Two ways to find a symbol, fused into one ranked result</h2>
+      <div class="diagram-wrap"><svg class="diagram" data-diagram="hybrid"></svg></div>
+      <div class="caption">Find it by name, or by what it does — one query, one ranked answer.</div>
+    </section>
+
+    <!-- 13 : SECTION -->
+    <section class="slide section-slide" data-section="control plane">
+      <div class="kicker">Part Two — Housekeeping</div>
+      <h1>The Sweepers</h1>
+      <h2>Storage doesn't clean itself up — four periodic jobs do</h2>
+    </section>
+
+    <!-- 14 -->
+    <section class="slide" data-section="control plane">
+      <div class="section-tag">control plane</div>
+      <h1>Where they live</h1>
+      <h2>All four share one tick on the dispatcher's own event loop</h2>
+      <div class="diagram-wrap"><svg class="diagram" data-diagram="sweeperFlow"></svg></div>
+    </section>
+
+    <!-- 15 -->
+    <section class="slide" data-section="control plane">
+      <div class="section-tag">control plane</div>
+      <h1>What each one cleans up</h1>
+      <div class="grid cols-4">
+        <div class="card"><div class="t">Index sweeper</div><div class="d">pgvector + Neo4j snapshots — keep latest + in-flight, prune the rest — every 10 min</div></div>
+        <div class="card"><div class="t">Outbox sweeper</div><div class="d">posted rows after 7d, failed after 30d, pending never touched — every 10 min</div></div>
+        <div class="card"><div class="t">A2A task sweeper</div><div class="d">terminal task mappings past a 30d TTL, cascades to events — every 10 min</div></div>
+        <div class="card"><div class="t">Webhook payload sweeper</div><div class="d">compacts payloads older than 7d — the delivery row itself is kept — every 10 min</div></div>
+      </div>
+    </section>
+
+    <!-- 16 : SECTION -->
+    <section class="slide section-slide" data-section="review flow">
+      <div class="kicker">Part Three</div>
+      <h1>The Review Flow</h1>
+      <h2>From a webhook to a posted review</h2>
+    </section>
+
+    <!-- 17 -->
+    <section class="slide" data-section="review flow">
+      <div class="section-tag">review flow</div>
+      <h1>From webhook to review</h1>
+      <div class="diagram-wrap"><svg class="diagram" data-diagram="fullFlow"></svg></div>
+    </section>
+
+    <!-- 18 -->
+    <section class="slide" data-section="review flow">
+      <div class="section-tag">review flow</div>
+      <h1>One Kubernetes Job per task</h1>
+      <h2>Why isolation matters: a PR can come from a fork</h2>
+      <div class="diagram-wrap"><svg class="diagram" data-diagram="jobIsolation"></svg></div>
+    </section>
+
+    <!-- 19 -->
+    <section class="slide" data-section="review flow">
+      <div class="section-tag">review flow</div>
+      <h1>What actually drives the review?</h1>
+      <h2>OpenCode — a vendored AI coding-agent runtime, not a native integration</h2>
+      <div class="diagram-wrap"><svg class="diagram" data-diagram="openCode"></svg></div>
+    </section>
+
+    <!-- 20 -->
+    <section class="slide" data-section="review flow">
+      <div class="section-tag">review flow</div>
+      <h1>How it's actually spawned</h1>
+      <h2>A child process, driven over the Agent Client Protocol (ACP)</h2>
+      <div class="diagram-wrap"><svg class="diagram" data-diagram="openCodeSpawn"></svg></div>
+    </section>
+
+    <!-- 21 -->
+    <section class="slide" data-section="review flow">
+      <div class="section-tag">review flow</div>
+      <h1>What it's actually fed</h1>
+      <h2>Two channels: a system prompt (once) and a user prompt (per turn)</h2>
+      <div class="vs-wrap">
+        <div class="vs-box">
+          <div class="t">System prompt</div>
+          <div class="d">Operator persona (ai-helm <code>config.reviewSystemPrompt</code>) + a code-owned tool protocol, appended last. Written to <code>review-prompt.md</code>, read once as OpenCode's own <code>agent.build.prompt</code>.</div>
+        </div>
+        <div class="vs-sep">+</div>
+        <div class="vs-box">
+          <div class="t">User prompt</div>
+          <div class="d">The maintainer's request + the diff (file-boundary-packed, budget-capped) + repo instructions/memory. Sent as the ACP <code>session/prompt</code> text — re-sent each driver cycle.</div>
+        </div>
+      </div>
+      <div class="excerpt">"Investigate with the search/graph tools before making any claim — never speculate about code you have not looked up. ... Nothing you record is posted until you call `finish` with your overall verdict — call `finish` exactly once when you are done, even if you found nothing."<span class="src">verbatim — TOOL_PROTOCOL, services/review-agent/src/prompt.rs:47-62 (appended after the operator's own prompt)</span></div>
+    </section>
+
+    <!-- 22 -->
+    <section class="slide" data-section="review flow">
+      <div class="section-tag">review flow</div>
+      <h1>The tools it actually has</h1>
+      <h2>All mediated — over the <code>lightbridge</code> MCP server, plus one optional second server</h2>
+      <div class="grid cols-4">
+        <div class="card"><div class="t">vector_semantic_search</div><div class="d">pgvector: find code by meaning</div></div>
+        <div class="card"><div class="t">graph_find_symbol</div><div class="d">Neo4j: look up a symbol</div></div>
+        <div class="card"><div class="t">graph_get_callers</div><div class="d">Neo4j: reverse call graph</div></div>
+        <div class="card"><div class="t">graph_semantic_search</div><div class="d">hybrid: symbols by what they do</div></div>
+        <div class="card"><div class="t">read_file</div><div class="d">read source, 64 KiB slices</div></div>
+        <div class="card accent"><div class="t">add_review_comment</div><div class="d">record one inline finding</div></div>
+        <div class="card"><div class="t">retract_finding</div><div class="d">drop one that didn't verify</div></div>
+        <div class="card"><div class="t">add_comment</div><div class="d">plain reply, not diff-pinned</div></div>
+        <div class="card"><div class="t">run_sast</div><div class="d">deterministic opengrep findings</div></div>
+        <div class="card accent"><div class="t">finish</div><div class="d">post everything, verdict required</div></div>
+        <div class="card"><div class="t">abort</div><div class="d">bail cleanly, buffer discarded</div></div>
+        <div class="card"><div class="t">report_progress</div><div class="d">progress note, observability only</div></div>
+      </div>
+      <div class="caption">Plus two optional surfaces: operator-configured external knowledge MCP servers (ADR-0066), and a second, separate read-only GitHub MCP server offered only to GitHub-platformed tasks.</div>
+    </section>
+
+    <!-- 23 -->
+    <section class="slide" data-section="review flow">
+      <div class="section-tag">review flow</div>
+      <h1>Deterministic findings: SAST</h1>
+      <h2>opengrep, called on demand — not a separate pipeline stage</h2>
+      <div class="diagram-wrap"><svg class="diagram" data-diagram="sastFlow"></svg></div>
+      <div class="caption">Same mediated channel as every other finding — a SAST hit is just another <code>add_review_comment</code>, cross-checked later by the quality gate.</div>
+    </section>
+
+    <!-- 24 -->
+    <section class="slide" data-section="review flow">
+      <div class="section-tag">review flow</div>
+      <h1>The quality gate</h1>
+      <h2>Calling <code>finish</code> doesn't end the run — two checks have to accept it first</h2>
+      <div class="diagram-wrap"><svg class="diagram" data-diagram="qualityGate"></svg></div>
+      <div class="caption">Wired into every cycle (<code>ReviewDriver::on_cycle</code>), not optional or mocked — both gates trace back to a real production false positive (ADORSYS-GIS/webank-mobile#145).</div>
+    </section>
+
+    <!-- 25 : CLOSING -->
+    <section class="slide title-slide" data-section="">
+      <h1>End of Session 2</h1>
+      <h2>Questions, or back to anything for a deeper look</h2>
+      <div class="arc">
+        <span>Session 1: the engine</span>
+        <span class="arrowtxt">→</span>
+        <span>Session 2: the product</span>
+      </div>
+    </section>
+
+  </div>
+
+  <div class="hud">
+    <button id="prev">← Prev</button>
+    <span id="counter">1 / 23</span>
+    <div class="progress"><div class="bar" id="bar"></div></div>
+    <span class="hint">←/→ or space to navigate</span>
+    <button id="next">Next →</button>
+  </div>
+</div>
+
+<script>
+/* ---------- tiny box-and-arrow SVG renderer (same as Session 1) ---------- */
+function anchor(n, side){
+  switch(side){
+    case 'top': return [n.x + n.w/2, n.y];
+    case 'bottom': return [n.x + n.w/2, n.y + n.h];
+    case 'left': return [n.x, n.y + n.h/2];
+    default: return [n.x + n.w, n.y + n.h/2];
+  }
+}
+function esc(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+function renderDiagram(svg, def){
+  const byId = {}; def.nodes.forEach(n => byId[n.id] = n);
+  let s = '<defs><marker id="arrow-' + def._k + '" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#94a3b8"/></marker></defs>';
+  (def.edges||[]).forEach(e => {
+    const a = anchor(byId[e.from], e.fromSide || 'right');
+    const b = anchor(byId[e.to], e.toSide || 'left');
+    const dash = e.dashed ? ' stroke-dasharray="5,4"' : '';
+    const double = e.doubleArrow ? (' marker-start="url(#arrow-' + def._k + ')"') : '';
+    s += '<line x1="'+a[0]+'" y1="'+a[1]+'" x2="'+b[0]+'" y2="'+b[1]+'" stroke="#94a3b8" stroke-width="1.5"'+dash+' marker-end="url(#arrow-'+def._k+')"'+double+'/>';
+  });
+  (def.edges||[]).forEach(e => {
+    if(!e.label) return;
+    const a = anchor(byId[e.from], e.fromSide || 'right');
+    const b = anchor(byId[e.to], e.toSide || 'left');
+    const mx=(a[0]+b[0])/2, my=(a[1]+b[1])/2;
+    const w = 14 + e.label.length*5.6;
+    s += '<rect x="'+(mx-w/2)+'" y="'+(my-9)+'" width="'+w+'" height="16" fill="#ffffff"/>';
+    s += '<text x="'+mx+'" y="'+(my+4)+'" text-anchor="middle" class="edge-label">'+esc(e.label)+'</text>';
+  });
+  def.nodes.forEach(n => {
+    if (n.diamond) {
+      const cx = n.x + n.w/2, cy = n.y + n.h/2;
+      const pts = [[cx, n.y],[n.x+n.w, cy],[cx, n.y+n.h],[n.x, cy]].map(p=>p.join(',')).join(' ');
+      s += '<polygon points="'+pts+'" class="box diamond"/>';
+    } else {
+      const cls = 'box' + (n.accent ? ' accent' : '') + (n.dim ? ' dim' : '');
+      s += '<rect x="'+n.x+'" y="'+n.y+'" width="'+n.w+'" height="'+n.h+'" rx="10" class="'+cls+'"/>';
+    }
+    const lines = String(n.label).split('\\n');
+    const startY = n.y + n.h/2 - (lines.length-1)*9 + 5;
+    lines.forEach((line,i) => {
+      s += '<text x="'+(n.x+n.w/2)+'" y="'+(startY+i*18)+'" text-anchor="middle" class="box-text'+(i>0?' sub':'')+'">'+esc(line)+'</text>';
+    });
+  });
+  svg.setAttribute('viewBox', def.vb);
+  svg.innerHTML = s;
+}
+
+/* ---------- diagram data ---------- */
+const DIAGRAMS = {
+  whatIsIt: { vb:'0 0 860 280', nodes:[
+    {id:'gh', x:20, y:20, w:170, h:55, label:'GitHub', dim:true},
+    {id:'gl', x:20, y:100, w:170, h:55, label:'GitLab', dim:true},
+    {id:'bb', x:20, y:180, w:170, h:55, label:'Bitbucket', dim:true},
+    {id:'cp', x:300, y:85, w:200, h:90, label:'Control Plane\\n(Rust, Axum)', accent:true},
+    {id:'pg', x:640, y:20, w:180, h:55, label:'Postgres + pgvector'},
+    {id:'neo', x:640, y:100, w:180, h:55, label:'Neo4j'},
+    {id:'k8s', x:640, y:180, w:180, h:65, label:'Kubernetes Jobs\\n(index / review)'},
+  ], edges:[
+    {from:'gh', to:'cp', toSide:'left', doubleArrow:true},
+    {from:'gl', to:'cp', label:'webhook / API', toSide:'left', doubleArrow:true},
+    {from:'bb', to:'cp', toSide:'left', doubleArrow:true},
+    {from:'cp', to:'pg', toSide:'left'},
+    {from:'cp', to:'neo', toSide:'left'},
+    {from:'cp', to:'k8s', toSide:'left'},
+  ]},
+
+  trustBoundary: { vb:'0 0 820 260', nodes:[
+    {id:'cp', x:300, y:90, w:220, h:90, label:'Control Plane\\nholds every credential', accent:true},
+    {id:'job', x:20, y:30, w:180, h:60, label:'Agent Job\\n(untrusted repo code)', dim:true},
+    {id:'ghc', x:600, y:30, w:180, h:60, label:'GitHub App key'},
+    {id:'dbc', x:600, y:110, w:180, h:60, label:'Postgres + Neo4j creds'},
+    {id:'oidc', x:600, y:190, w:180, h:60, label:'OIDC resource server\\n(Keycloak)'},
+    {id:'job2', x:20, y:190, w:180, h:60, label:'Job gets a short-lived\\ntask-scoped token only', dim:true},
+  ], edges:[
+    {from:'job', to:'cp', label:'HTTP only', doubleArrow:true},
+    {from:'cp', to:'ghc', toSide:'left'},
+    {from:'cp', to:'dbc', toSide:'left'},
+    {from:'cp', to:'oidc', toSide:'left'},
+    {from:'cp', to:'job2', fromSide:'left', toSide:'right'},
+  ]},
+
+  roles: { vb:'0 0 1040 380', nodes:[
+    {id:'env', x:410, y:20, w:220, h:50, label:'CONTROL_PLANE_ROLE', accent:true},
+    {id:'serve', x:20, y:140, w:155, h:82, label:'serve\\nHTTP API, webhooks'},
+    {id:'disp', x:190, y:140, w:155, h:82, label:'dispatcher\\nclaims queue,\\nlaunches Jobs'},
+    {id:'recon', x:360, y:140, w:155, h:82, label:'reconciler\\nsole write egress\\n(all platforms)'},
+    {id:'a2a', x:530, y:140, w:155, h:82, label:'a2a\\nAgent2Agent ingress'},
+    {id:'notif', x:700, y:140, w:155, h:82, label:'notifier\\nA2A push\\nwebhooks'},
+    {id:'mcp', x:870, y:140, w:155, h:82, label:'mcp\\nMCP server for\\nexternal clients'},
+  ], edges:[
+    {from:'env', to:'serve', fromSide:'bottom', toSide:'top'},
+    {from:'env', to:'disp', fromSide:'bottom', toSide:'top'},
+    {from:'env', to:'recon', fromSide:'bottom', toSide:'top'},
+    {from:'env', to:'a2a', fromSide:'bottom', toSide:'top'},
+    {from:'env', to:'notif', fromSide:'bottom', toSide:'top'},
+    {from:'env', to:'mcp', fromSide:'bottom', toSide:'top'},
+  ]},
+
+  sweeperFlow: { vb:'0 0 1040 330', nodes:[
+    {id:'disp', x:20, y:120, w:170, h:70, label:'dispatcher role\\n(one event loop)', accent:true},
+    {id:'tick', x:250, y:120, w:170, h:70, label:'storage-GC tick\\nevery 10 min'},
+    {id:'idx', x:490, y:20, w:220, h:60, label:'index sweeper\\npgvector + Neo4j'},
+    {id:'ob', x:490, y:95, w:220, h:60, label:'outbox sweeper\\nposted / failed rows'},
+    {id:'a2a', x:490, y:170, w:220, h:60, label:'A2A task sweeper'},
+    {id:'wh', x:490, y:245, w:220, h:60, label:'webhook payload\\nsweeper -- compacts'},
+  ], edges:[
+    {from:'disp', to:'tick'},
+    {from:'tick', to:'idx', toSide:'left'},
+    {from:'tick', to:'ob', toSide:'left'},
+    {from:'tick', to:'a2a', toSide:'left'},
+    {from:'tick', to:'wh', toSide:'left'},
+  ]},
+
+  queue: { vb:'0 0 820 220', nodes:[
+    {id:'tasks', x:20, y:70, w:200, h:80, label:'tasks\\nstatus=queued', dim:true},
+    {id:'claim', x:300, y:70, w:240, h:80, label:'FOR UPDATE SKIP LOCKED\\none dispatcher claims it', accent:true},
+    {id:'job', x:620, y:70, w:180, h:80, label:'one Kubernetes Job\\nis launched'},
+  ], edges:[
+    {from:'tasks', to:'claim'},
+    {from:'claim', to:'job'},
+  ]},
+
+  hybrid: { vb:'0 0 900 220', nodes:[
+    {id:'lex', x:20, y:30, w:220, h:60, label:'search by name'},
+    {id:'vec', x:20, y:130, w:220, h:60, label:'search by meaning'},
+    {id:'rrf', x:340, y:80, w:220, h:70, label:'fused and ranked', accent:true},
+    {id:'out', x:660, y:80, w:200, h:70, label:'one ranked result'},
+  ], edges:[
+    {from:'lex', to:'rrf', toSide:'left'},
+    {from:'vec', to:'rrf', toSide:'left'},
+    {from:'rrf', to:'out'},
+  ]},
+
+  fullFlow: { vb:'0 0 1000 200', nodes:[
+    {id:'wh', x:20, y:70, w:130, h:60, label:'Webhook', dim:true},
+    {id:'task', x:190, y:70, w:130, h:60, label:'Task row'},
+    {id:'disp', x:360, y:70, w:130, h:60, label:'Dispatcher'},
+    {id:'job', x:530, y:70, w:130, h:60, label:'K8s Job'},
+    {id:'idx', x:700, y:20, w:140, h:50, label:'Index (maybe)'},
+    {id:'rev', x:700, y:110, w:140, h:50, label:'Review loop'},
+    {id:'ob', x:870, y:70, w:110, h:60, label:'Outbox', accent:true},
+  ], edges:[
+    {from:'wh', to:'task'},
+    {from:'task', to:'disp'},
+    {from:'disp', to:'job'},
+    {from:'job', to:'idx', toSide:'left'},
+    {from:'job', to:'rev', toSide:'left'},
+    {from:'rev', to:'ob', fromSide:'right'},
+  ]},
+
+  openCode: { vb:'0 0 900 220', nodes:[
+    {id:'job', x:20, y:75, w:150, h:60, label:'K8s Job starts', dim:true},
+    {id:'driver', x:230, y:75, w:200, h:60, label:'acp-host spawns\\nOpenCode (ACP, stdio JSON-RPC)', accent:true},
+    {id:'oc', x:490, y:75, w:160, h:60, label:'OpenCode\\n(vendored agent)'},
+    {id:'mcp', x:710, y:20, w:170, h:60, label:'review-mcp\\n(tool surface)'},
+    {id:'gates', x:710, y:120, w:170, h:60, label:'ReviewGates\\n(coverage, refute)'},
+  ], edges:[
+    {from:'job', to:'driver'},
+    {from:'driver', to:'oc'},
+    {from:'oc', to:'mcp', toSide:'left'},
+    {from:'oc', to:'gates', toSide:'left'},
+  ]},
+
+  openCodeSpawn: { vb:'0 0 900 300', nodes:[
+    {id:'job', x:20, y:95, w:170, h:70, label:'agent-runner Job\\n(the review host)', dim:true},
+    {id:'acphost', x:230, y:95, w:170, h:70, label:'acp-host\\n(Rust ACP client)', accent:true},
+    {id:'spawn', x:440, y:30, w:230, h:65, label:'Command::new("opencode")\\n.arg("acp") -- child process'},
+    {id:'wire', x:440, y:120, w:230, h:65, label:'stdin/stdout piped --\\nnewline-delimited JSON-RPC'},
+    {id:'oc', x:710, y:95, w:170, h:70, label:'OpenCode\\n(the subprocess)', dim:true},
+    {id:'init', x:20, y:225, w:190, h:55, label:'initialize'},
+    {id:'sess', x:250, y:225, w:200, h:55, label:'session/new\\n(one session)'},
+    {id:'prompt', x:490, y:225, w:270, h:55, label:'session/prompt (loop)\\none call per driver cycle', accent:true},
+  ], edges:[
+    {from:'job', to:'acphost'},
+    {from:'acphost', to:'spawn', toSide:'left'},
+    {from:'acphost', to:'wire', toSide:'left'},
+    {from:'spawn', to:'oc', toSide:'left'},
+    {from:'wire', to:'oc', toSide:'left'},
+    {from:'init', to:'sess'},
+    {from:'sess', to:'prompt'},
+  ]},
+
+  sastFlow: { vb:'0 0 1040 160', nodes:[
+    {id:'call', x:20, y:45, w:190, h:70, label:'model calls\\nrun_sast', dim:true},
+    {id:'scan', x:270, y:45, w:220, h:70, label:'opengrep subprocess\\nscoped to changed files', accent:true},
+    {id:'parse', x:550, y:45, w:200, h:70, label:'SARIF parsed\\ninto findings'},
+    {id:'buffer', x:810, y:45, w:210, h:70, label:'buffered + sent to\\nSastAnchorGate as leads'},
+  ], edges:[
+    {from:'call', to:'scan'},
+    {from:'scan', to:'parse'},
+    {from:'parse', to:'buffer'},
+  ]},
+
+  qualityGate: { vb:'0 0 1040 160', nodes:[
+    {id:'finishCall', x:20, y:45, w:180, h:70, label:'model calls\\nfinish', dim:true},
+    {id:'coverage', x:260, y:45, w:240, h:70, label:'CoverageGate\\nevery changed file opened or\\ncommented on? else: bounce + nudge'},
+    {id:'refute', x:560, y:45, w:240, h:70, label:'RefuteGate\\nholding a P0/P1 finding? re-verify\\nonce -- confirm or retract'},
+    {id:'accept', x:860, y:45, w:160, h:70, label:'accepted --\\nReviewResolution::Finished', accent:true},
+  ], edges:[
+    {from:'finishCall', to:'coverage'},
+    {from:'coverage', to:'refute', label:'covered'},
+    {from:'refute', to:'accept', label:'confirmed'},
+  ]},
+
+  jobIsolation: { vb:'0 0 820 220', nodes:[
+    {id:'pr', x:20, y:70, w:160, h:60, label:'PR from a fork\\n(untrusted code)', dim:true},
+    {id:'job', x:280, y:40, w:220, h:120, label:'Dedicated K8s Job\\nscoped token, TTL cleanup,\\nleast-privilege SA', accent:true},
+    {id:'rest', x:580, y:70, w:220, h:60, label:'Every other task, isolated\\nfrom this one'},
+  ], edges:[
+    {from:'pr', to:'job'},
+    {from:'job', to:'rest', dashed:true, label:'cannot interfere'},
+  ]},
+
+};
+
+Object.keys(DIAGRAMS).forEach(k => DIAGRAMS[k]._k = k);
+
+document.querySelectorAll('svg.diagram').forEach(svg => {
+  const key = svg.getAttribute('data-diagram');
+  if (DIAGRAMS[key]) renderDiagram(svg, DIAGRAMS[key]);
+});
+
+/* ---------- navigation ---------- */
+const slides = Array.from(document.querySelectorAll('.slide'));
+let idx = 0;
+function show(i){
+  slides[idx].classList.remove('active');
+  idx = Math.max(0, Math.min(slides.length - 1, i));
+  slides[idx].classList.add('active');
+  document.getElementById('counter').textContent = (idx+1) + ' / ' + slides.length;
+  document.getElementById('bar').style.width = ((idx+1)/slides.length*100) + '%';
+  document.getElementById('prev').disabled = idx === 0;
+  document.getElementById('next').disabled = idx === slides.length - 1;
+}
+document.getElementById('prev').onclick = () => show(idx - 1);
+document.getElementById('next').onclick = () => show(idx + 1);
+window.addEventListener('keydown', e => {
+  if (e.key === 'ArrowRight' || e.key === ' ') { e.preventDefault(); show(idx + 1); }
+  if (e.key === 'ArrowLeft') { e.preventDefault(); show(idx - 1); }
+});
+show(0);
+</script>
+</body>
+</html>

@@ -690,7 +690,11 @@ pub async fn ingest_chunks(
 
     // A chunk that is a definition's body carries that definition's `node_id`, so its vector serves
     // both stores: the pgvector row below, and the matching `:Symbol` (ADR-0116).
-    let symbol_vectors: Vec<(String, Vec<f32>)> = batch
+    //
+    // TEMPORARILY UNUSED: the `:Symbol` half is disabled (see the commented block below), so this is
+    // built but not consumed. Underscore-prefixed to keep `clippy -D warnings` green; drop the
+    // prefix when re-enabling.
+    let _symbol_vectors: Vec<(String, Vec<f32>)> = batch
         .chunks
         .iter()
         .filter_map(|c| {
@@ -729,33 +733,46 @@ pub async fn ingest_chunks(
         }
     }
 
+    // TEMPORARILY DISABLED — a symbol's vector is no longer attached to its `:Symbol` node.
+    //
+    // A 4096-dim vector costs ~37 KiB as a `:Symbol` property (Bolt has no 32-bit float, so the
+    // f32s are stored as doubles) plus ~43 KiB in `symbol_embedding_idx`, against ~0.6 KiB for the
+    // structural facts. Embeddings were ~93% of a 39 GiB store, which filled the volume three
+    // times. pgvector keeps the same vectors (`code_chunks.embedding`, written above) and still
+    // serves chunk-level semantic search, so only symbol-level vector search is lost.
+    //
+    // Re-enable by uncommenting this block, dropping the `_` from `_symbol_vectors` above, and
+    // restoring the `symbol_embedding_idx` creation in `neo4j::ensure_indexes`. Do not re-enable
+    // before the encoding question is settled (int8 property, a smaller dimension, or serving
+    // symbol vectors from pgvector) — otherwise the growth returns unchanged.
+    //
     // Best-effort, and deliberately after the pgvector write: semantic search is the load-bearing
     // store, so an unconfigured or failing graph must not reject a batch that already landed there.
-    if let Some(neo4j) = state.neo4j.as_ref()
-        && !symbol_vectors.is_empty()
-    {
-        match crate::integrations::neo4j::attach_symbol_embeddings(
-            neo4j,
-            repository_id,
-            &batch.commit_sha,
-            &symbol_vectors,
-        )
-        .await
-        {
-            Ok(updated) => tracing::info!(
-                task_id = %id,
-                offered = symbol_vectors.len(),
-                updated,
-                "symbol embeddings attached"
-            ),
-            Err(error) => tracing::warn!(
-                %error,
-                task_id = %id,
-                offered = symbol_vectors.len(),
-                "attaching symbol embeddings failed (non-fatal)"
-            ),
-        }
-    }
+    // if let Some(neo4j) = state.neo4j.as_ref()
+    //     && !symbol_vectors.is_empty()
+    // {
+    //     match crate::integrations::neo4j::attach_symbol_embeddings(
+    //         neo4j,
+    //         repository_id,
+    //         &batch.commit_sha,
+    //         &symbol_vectors,
+    //     )
+    //     .await
+    //     {
+    //         Ok(updated) => tracing::info!(
+    //             task_id = %id,
+    //             offered = symbol_vectors.len(),
+    //             updated,
+    //             "symbol embeddings attached"
+    //         ),
+    //         Err(error) => tracing::warn!(
+    //             %error,
+    //             task_id = %id,
+    //             offered = symbol_vectors.len(),
+    //             "attaching symbol embeddings failed (non-fatal)"
+    //         ),
+    //     }
+    // }
 
     StatusCode::NO_CONTENT.into_response()
 }
