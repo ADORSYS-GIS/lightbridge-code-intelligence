@@ -690,7 +690,8 @@ pub async fn ingest_chunks(
 
     // A chunk that is a definition's body carries that definition's `node_id`, so its vector serves
     // both stores: the pgvector row below, and the matching `:Symbol` (ADR-0116).
-    let symbol_vectors: Vec<(String, Vec<f32>)> = batch
+    // Unused while the `:Symbol` half below is disabled; drop the `_` when re-enabling.
+    let _symbol_vectors: Vec<(String, Vec<f32>)> = batch
         .chunks
         .iter()
         .filter_map(|c| {
@@ -729,33 +730,34 @@ pub async fn ingest_chunks(
         }
     }
 
-    // Best-effort, and deliberately after the pgvector write: semantic search is the load-bearing
-    // store, so an unconfigured or failing graph must not reject a batch that already landed there.
-    if let Some(neo4j) = state.neo4j.as_ref()
-        && !symbol_vectors.is_empty()
-    {
-        match crate::integrations::neo4j::attach_symbol_embeddings(
-            neo4j,
-            repository_id,
-            &batch.commit_sha,
-            &symbol_vectors,
-        )
-        .await
-        {
-            Ok(updated) => tracing::info!(
-                task_id = %id,
-                offered = symbol_vectors.len(),
-                updated,
-                "symbol embeddings attached"
-            ),
-            Err(error) => tracing::warn!(
-                %error,
-                task_id = %id,
-                offered = symbol_vectors.len(),
-                "attaching symbol embeddings failed (non-fatal)"
-            ),
-        }
-    }
+    // TEMPORARILY DISABLED (#662): a vector cost ~80 KiB per symbol across the property and the
+    // index, ~93% of the graph's disk. pgvector still holds the same vectors (written above).
+    // Re-enable with `symbol_embedding_idx` in `neo4j::ensure_indexes`, not on its own.
+    // if let Some(neo4j) = state.neo4j.as_ref()
+    //     && !symbol_vectors.is_empty()
+    // {
+    //     match crate::integrations::neo4j::attach_symbol_embeddings(
+    //         neo4j,
+    //         repository_id,
+    //         &batch.commit_sha,
+    //         &symbol_vectors,
+    //     )
+    //     .await
+    //     {
+    //         Ok(updated) => tracing::info!(
+    //             task_id = %id,
+    //             offered = symbol_vectors.len(),
+    //             updated,
+    //             "symbol embeddings attached"
+    //         ),
+    //         Err(error) => tracing::warn!(
+    //             %error,
+    //             task_id = %id,
+    //             offered = symbol_vectors.len(),
+    //             "attaching symbol embeddings failed (non-fatal)"
+    //         ),
+    //     }
+    // }
 
     StatusCode::NO_CONTENT.into_response()
 }
