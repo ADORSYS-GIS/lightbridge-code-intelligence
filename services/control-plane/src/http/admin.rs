@@ -843,12 +843,16 @@ struct GraphNotFound {
     message: &'static str,
 }
 
-/// The commit scope to query the graph at, for a repository as a whole (not a specific task/PR).
-/// `agent-runner`'s base-index write uses the repo's default branch name as the graph's `commit`
-/// property when there's no specific head SHA (see `indexer::graph::index_graph`) — this mirrors that
-/// exactly, rather than assuming a `latest_indexed_commit` column that doesn't exist.
-fn repo_commit_scope(repo: &crate::db::RepositoryRow) -> &str {
-    &repo.default_branch
+/// The commit scope to query the graph at, for a repository as a whole (not a specific task/PR):
+/// the latest commit with a completed index snapshot (ADR-0120). Falls back to the default branch
+/// only for a repository that has never finished indexing, when there is no snapshot yet to prefer.
+async fn repo_commit_scope(
+    pool: &sqlx::PgPool,
+    repo: &crate::db::RepositoryRow,
+) -> Result<String, sqlx::Error> {
+    Ok(crate::db::latest_indexed_commit(pool, repo.id)
+        .await?
+        .unwrap_or_else(|| repo.default_branch.clone()))
 }
 
 /// Query params shared by the neighborhood/overview endpoint.
@@ -908,7 +912,13 @@ pub async fn get_graph(
             return (StatusCode::INTERNAL_SERVER_ERROR, "query error").into_response();
         }
     };
-    let commit = repo_commit_scope(&repo).to_string();
+    let commit = match repo_commit_scope(pool, &repo).await {
+        Ok(commit) => commit,
+        Err(error) => {
+            tracing::error!(%error, repo_id = id, "graph endpoint: commit scope lookup failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "query error").into_response();
+        }
+    };
 
     let result = match q.node.as_deref() {
         Some(node_id) => {
@@ -987,7 +997,13 @@ pub async fn get_similar(
             return (StatusCode::INTERNAL_SERVER_ERROR, "query error").into_response();
         }
     };
-    let commit = repo_commit_scope(&repo).to_string();
+    let commit = match repo_commit_scope(pool, &repo).await {
+        Ok(commit) => commit,
+        Err(error) => {
+            tracing::error!(%error, repo_id = id, "similar endpoint: commit scope lookup failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "query error").into_response();
+        }
+    };
     let limit = clamp_graph_limit(q.limit);
 
     let (label, embedding) = match crate::integrations::neo4j::symbol_embedding(
@@ -2034,5 +2050,38 @@ mod tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// The graph view renders whatever commit is actually on disk: the default branch's name for a
+    /// repository that has never finished indexing, and the latest indexed commit once one exists.
+    #[sqlx::test]
+    async fn repo_commit_scope_prefers_latest_indexed_commit(pool: PgPool) {
+        let repo_id = insert_gitlab_repo(&pool).await;
+        let repo = crate::db::get_repository_by_id(&pool, repo_id)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(repo_commit_scope(&pool, &repo).await.unwrap(), "main");
+
+        crate::db::upsert_code_chunks(
+            &pool,
+            repo_id,
+            "a1b2c3",
+            &[crate::db::CodeChunk {
+                file_path: "lib.rs".to_string(),
+                language: "rust".to_string(),
+                chunk_type: "function".to_string(),
+                symbol_name: Some("lib.rs".to_string()),
+                start_line: 1,
+                end_line: 5,
+                content: "// lib.rs".to_string(),
+                embedding: vec![0.0; 4096],
+            }],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(repo_commit_scope(&pool, &repo).await.unwrap(), "a1b2c3");
     }
 }
