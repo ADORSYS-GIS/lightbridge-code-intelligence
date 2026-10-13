@@ -277,10 +277,9 @@ mod tests {
     }
 
     fn rejection(query: AnalyticsQuery) -> String {
-        match AnalyticsParams::try_from(query) {
-            Ok(params) => panic!("expected a rejection, got {params:?}"),
-            Err(AnalyticsRejection(message)) => message,
-        }
+        AnalyticsParams::try_from(query)
+            .expect_err("expected a rejection")
+            .0
     }
 
     const FROM: &str = "2026-08-01T00:00:00Z";
