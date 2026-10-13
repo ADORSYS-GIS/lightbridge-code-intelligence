@@ -391,6 +391,10 @@ fn api_v2_router() -> Router<AppState> {
         // Code graph browse and similarity search.
         .route("/admin/repositories/{id}/graph", get(admin::get_graph))
         .route(
+            "/admin/graph/symbol-identity/repair",
+            post(admin::repair_symbol_identity),
+        )
+        .route(
             "/admin/repositories/{id}/symbols/{node_id}/similar",
             get(admin::get_similar),
         )
