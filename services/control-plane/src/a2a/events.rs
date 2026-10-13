@@ -31,7 +31,9 @@ use serde_json::Value;
 use sqlx::{PgConnection, PgPool};
 use uuid::Uuid;
 
-use super::mapping::{ReviewContext, review_artifacts, task_state_from_status};
+use super::mapping::{
+    ReviewContext, conclusion_artifact, finding_artifact, task_state_from_status,
+};
 
 /// Postgres `LISTEN`/`NOTIFY` channel prefix for a per-A2A-task stream. The SSE tail loop listens on
 /// `{prefix}{a2a_task_id}`; producers `NOTIFY` it as a *wake hint* only (the `seq`-cursor SELECT is
@@ -91,6 +93,24 @@ async fn has_final(conn: &mut PgConnection, a2a_task_id: Uuid) -> Result<bool, s
     .await
 }
 
+/// Whether the per-finding review stream ([`append_review_stream`]) has already been appended for this
+/// A2A task. `artifact-update` is the ONLY event kind that path emits (the terminal transition no
+/// longer carries an artifact — the polling `GetTask` rebuilds it from the `reviews` row instead), so
+/// any `artifact-update` row means the stream already ran. Makes a re-finalize (crash-after-finalize
+/// requeue) idempotent — it re-appends nothing rather than duplicating every finding chunk.
+async fn has_artifact_update(
+    conn: &mut PgConnection,
+    a2a_task_id: Uuid,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM a2a_task_events \
+         WHERE a2a_task_id = $1 AND kind = 'artifact-update')",
+    )
+    .bind(a2a_task_id)
+    .fetch_one(conn)
+    .await
+}
+
 /// Append one event, assigning `seq = COALESCE(MAX(seq), 0) + 1` for the task inside the caller's
 /// transaction. A duplicate `seq` (should never happen given the serialization above) is a PK
 /// violation the caller surfaces as a retryable error, never a silent gap.
@@ -128,77 +148,16 @@ async fn notify(conn: &mut PgConnection, a2a_task_id: Uuid) -> Result<(), sqlx::
         .map(|_| ())
 }
 
-/// Build the completed-review artifact (summary + findings + review context) for `underlying_id`, or
-/// `None` if no review row is persisted yet. Mirrors the `GetTask` completed branch so streaming and
-/// polling deliver the *same* artifact.
-///
-/// NOTE (ADR-0077 timing): the `reviews` row for a *posted* review lands asynchronously via the
-/// reconciler (`upsert_review`), which typically runs **after** the runner reports `succeeded`. So on
-/// the common posting path the artifact is not yet available when the terminal `COMPLETED` event is
-/// appended, and the stream closes without it (the caller retrieves it with a follow-up `GetTask`, per
-/// the ADR's "mix streaming and polling" contract). On the silent-clean path (ADR-0068), the review
-/// row is written by `insert_review_if_absent` *before* `succeeded`, so the artifact IS streamed.
-async fn completed_artifact(
-    conn: &mut PgConnection,
-    underlying_id: Uuid,
-) -> Result<Option<Artifact>, sqlx::Error> {
-    let review: Option<(String, Value, Option<String>)> =
-        sqlx::query_as("SELECT summary, findings, review_url FROM reviews WHERE task_id = $1")
-            .bind(underlying_id)
-            .fetch_optional(&mut *conn)
-            .await?;
-    let Some((summary, findings, review_url)) = review else {
-        return Ok(None);
-    };
-
-    // The effective SHAs / repo / pr for the context part; the row may already be reaped, in which case
-    // the context echoes only the review_url (ReviewContext handles the nulls). Columns:
-    // (repo owner, repo name, pr/target_id, base_sha, head_sha).
-    type ContextRow = (
-        Option<String>,
-        Option<String>,
-        i64,
-        Option<String>,
-        Option<String>,
-    );
-    let ctx: Option<ContextRow> = sqlx::query_as(
-        "SELECT r.owner, r.name, t.target_id, t.base_sha, t.head_sha \
-             FROM tasks t LEFT JOIN repositories r ON r.id = t.repository_id WHERE t.id = $1",
-    )
-    .bind(underlying_id)
-    .fetch_optional(&mut *conn)
-    .await?;
-
-    let context = match ctx {
-        Some((owner, name, target_id, base_sha, head_sha)) => ReviewContext {
-            repo: match (owner, name) {
-                (Some(o), Some(n)) => Some(format!("{o}/{n}")),
-                _ => None,
-            },
-            pr: Some(target_id),
-            base_sha,
-            head_sha,
-            review_url,
-        },
-        None => ReviewContext {
-            review_url,
-            ..Default::default()
-        },
-    };
-
-    Ok(review_artifacts(&summary, &findings, &context)
-        .into_iter()
-        .next())
-}
-
 /// Append A2A stream events for a `tasks.status` transition, for every A2A task that fronts
 /// `underlying_id`. Runs **inside** the `set_task_status` transaction (see [`crate::db::set_task_status`]),
 /// so an event exists for every transition a poller could observe — streaming and polling can never
 /// disagree. A non-A2A task (no `a2a_tasks` row) appends nothing.
 ///
-/// On a `succeeded` transition, a completed-review artifact-update is appended **before** the terminal
-/// `COMPLETED` status-update (lower `seq`) when the review row is already persisted — so a subscriber
-/// sees the artifact, then the terminal event, then closes.
+/// The transition itself carries only the status-update; the review's artifacts (per-finding chunks +
+/// conclusion) are streamed earlier, at finalize, by [`append_review_stream`] (ADR-0098) — so on the
+/// terminal `succeeded → COMPLETED` transition a subscriber has already received the findings and this
+/// event simply closes the stream. (`GetTask` polling still rebuilds the full artifact from the
+/// `reviews` row, independently of this log.)
 pub async fn append_transition_events(
     conn: &mut PgConnection,
     underlying_id: Uuid,
@@ -218,31 +177,11 @@ pub async fn append_transition_events(
     let is_terminal = mapped.is_terminal();
     let wire = state_wire(&mapped);
 
-    // Load the completed artifact once (only relevant on the succeeded → COMPLETED transition).
-    let artifact = if mapped == TaskState::Completed {
-        completed_artifact(&mut *conn, underlying_id).await?
-    } else {
-        None
-    };
-
     for (a2a_task_id, context_id) in fronts {
         // The log is frozen once terminal: never append after a final event (idempotent re-reports, a
         // cancel racing a completion, etc. all no-op here).
         if has_final(&mut *conn, a2a_task_id).await? {
             continue;
-        }
-
-        if let Some(artifact) = &artifact {
-            let payload = artifact_update_payload(&a2a_task_id, &context_id, artifact.clone());
-            append_event(
-                &mut *conn,
-                a2a_task_id,
-                "artifact-update",
-                None,
-                false,
-                &payload,
-            )
-            .await?;
         }
 
         let payload = status_update_payload(&a2a_task_id, &context_id, mapped.clone());
@@ -259,6 +198,87 @@ pub async fn append_transition_events(
         notify(&mut *conn, a2a_task_id).await?;
     }
     Ok(())
+}
+
+/// Stream a finalized review's findings incrementally to every A2A task fronting `underlying_id`
+/// (ADR-0098): one `artifact-update` per confirmed, deduped finding, then the conclusion (summary +
+/// context) as the last `review` artifact. Called from `finalize_review` at the moment both the
+/// findings and the verdict exist synchronously — while the task is still non-terminal, so these
+/// chunks carry a lower `seq` than the eventual terminal `COMPLETED` status-update, which closes the
+/// stream. A non-A2A (webhook) run has no fronting `a2a_tasks` row and this no-ops.
+///
+/// This is an ADDITIONAL output to the caller — the PR review still posts through the outbox — so a
+/// caller treats it best-effort: a failure here must never fail the finalize.
+///
+/// **Idempotent & freeze-safe.** For each front it no-ops when the stream already ran
+/// ([`has_artifact_update`]) or the log is already frozen ([`has_final`]). The `tasks` row is locked
+/// `FOR UPDATE` first (the same discipline as [`append_terminal_status`]) so the appends serialize
+/// against a concurrent `set_task_status` transition on the same run and can't interleave `seq`s.
+pub async fn append_review_stream(
+    pool: &PgPool,
+    underlying_id: Uuid,
+    findings: &[crate::review::Finding],
+    summary: &str,
+    context: &ReviewContext,
+) -> Result<(), sqlx::Error> {
+    let fronts: Vec<(Uuid, String)> = sqlx::query_as(
+        "SELECT a2a_task_id, context_id FROM a2a_tasks WHERE underlying_task_id = $1",
+    )
+    .bind(underlying_id)
+    .fetch_all(pool)
+    .await?;
+    if fronts.is_empty() {
+        return Ok(());
+    }
+
+    let mut tx = pool.begin().await?;
+
+    // Serialize against the `set_task_status` append on the same run (matches `append_terminal_status`).
+    sqlx::query("SELECT id FROM tasks WHERE id = $1 FOR UPDATE")
+        .bind(underlying_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+    for (a2a_task_id, context_id) in fronts {
+        // Already streamed (idempotent re-finalize) or already terminal (frozen) → skip this front.
+        if has_artifact_update(&mut tx, a2a_task_id).await?
+            || has_final(&mut tx, a2a_task_id).await?
+        {
+            continue;
+        }
+
+        for finding in findings {
+            let payload =
+                artifact_update_payload(&a2a_task_id, &context_id, finding_artifact(finding));
+            append_event(
+                &mut tx,
+                a2a_task_id,
+                "artifact-update",
+                None,
+                false,
+                &payload,
+            )
+            .await?;
+        }
+
+        // The conclusion rides as the last artifact chunk; the terminal status-update (appended later,
+        // by the succeeded transition) sets `final` and closes the stream.
+        let conclusion = conclusion_artifact(summary, context);
+        let payload = artifact_update_payload(&a2a_task_id, &context_id, conclusion);
+        append_event(
+            &mut tx,
+            a2a_task_id,
+            "artifact-update",
+            None,
+            false,
+            &payload,
+        )
+        .await?;
+
+        notify(&mut tx, a2a_task_id).await?;
+    }
+
+    tx.commit().await
 }
 
 /// Append a single terminal `status-update` for one A2A task that never flows through
